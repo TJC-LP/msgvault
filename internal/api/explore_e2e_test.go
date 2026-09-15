@@ -51,6 +51,29 @@ func TestExploreHTTPUsesCommittedDuckDBReadModel(t *testing.T) {
 	assertions.Equal("Newest", row["title"])
 }
 
+func TestExploreResourceLimitExplainsRecovery(t *testing.T) {
+	_, analyticsDir := newExploreDuckDBFixtureWithDir(t)
+	engine, err := query.NewDuckDBEngine(analyticsDir, "", nil, query.DuckDBOptions{
+		MemoryLimit: "1MB",
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, engine.Close()) })
+	srv := newTestServerWithEngine(t, engine)
+
+	for _, path := range []string{"/api/v1/explore", "/api/v1/files/search"} {
+		t.Run(path, func(t *testing.T) {
+			response := postExploreJSON(t, srv, path, `{ "limit": 100 }`)
+			assert.Equal(t, http.StatusServiceUnavailable, response.Code)
+			var body ErrorResponse
+			require.NoError(t, json.Unmarshal(response.Body.Bytes(), &body))
+			assert.Equal(t, "query_resource_exhausted", body.Error, response.Body.String())
+			assert.Contains(t, body.Message, "analytics.query_memory_limit")
+			assert.Contains(t, body.Message, "analytics.query_temp_limit")
+			assert.Contains(t, body.Message, "restart")
+		})
+	}
+}
+
 func TestExploreGroupsAndFilesUseCompleteDuckDBFacts(t *testing.T) {
 	assertions := assert.New(t)
 	requirements := require.New(t)
