@@ -129,6 +129,9 @@ See [searching](usage/searching.md), [vector search](usage/vector-search.md),
 
 ### Browser, terminal, and integrations
 
+- Share shorter Web UI links. Ordinary tabs use readable workspace and search
+  mode parameters. Links omit defaults, keyboard focus, scroll position, and
+  choices from other tabs; browser Back and Forward retain that session context.
 - Use Web Directory to edit profiles, relationships, and employment, review
   identity matches and facts, merge or split profiles, publish CardDAV contacts,
   and inspect curated networks and person attachment galleries.

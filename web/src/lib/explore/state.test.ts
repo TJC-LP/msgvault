@@ -17,6 +17,53 @@ import { createAllMatchingSelection, predicateFingerprint } from './selection';
 import { SEARCH_MODE_PREFERENCE_KEY } from '../search/modes';
 
 describe('Explore URL state', () => {
+  it('shares an ordinary tab without defaults or another workspace selection', () => {
+    const search = serializeExploreURLState({
+      ...defaultExploreURLState,
+      workspace: 'everything',
+      relationshipTarget: 'cluster:42',
+      directoryQuery: 'Alex',
+      fileFilenameQuery: 'invoice',
+      activeRow: 'message:7',
+      scrollAnchor: { key: 'message:7', offset: 10 },
+    });
+
+    expect(search).toBe('?workspace=everything&mode=full_text');
+    expect(parseExploreURLState(search)).toMatchObject({
+      workspace: 'everything', relationshipTarget: null, directoryQuery: '', fileFilenameQuery: '',
+    });
+  });
+
+  it('restores readable workspace and search-mode parameters with selected filters', () => {
+    const search = '?workspace=files&mode=hybrid&explore=' + encodeURIComponent(JSON.stringify({
+      schemaVersion: 2,
+      query: 'project notes',
+      filters: [{ dimension: 'source', values: ['7'] }],
+      fileMIMEFamilies: ['pdf'],
+    }));
+    expect(parseExploreURLState(search)).toMatchObject({
+      workspace: 'files', searchMode: 'hybrid', query: 'project notes',
+      filters: [{ dimension: 'source', values: ['7'] }], fileMIMEFamilies: ['pdf'],
+    });
+  });
+
+  it('keeps inactive workspace choices in browser history while sharing only the current view', async () => {
+    window.history.replaceState(null, '', '/');
+    const state = new ExploreState(window);
+    state.commitNavigation({ relationshipTarget: 'cluster:42' });
+    state.commitWorkspace('everything');
+    expect(window.location.search).toBe('?workspace=everything&mode=full_text');
+
+    window.history.back();
+    await new Promise((resolve) => window.addEventListener('popstate', resolve, { once: true }));
+    expect(state.current).toMatchObject({ workspace: 'relationships', relationshipTarget: 'cluster:42' });
+    window.history.forward();
+    await new Promise((resolve) => window.addEventListener('popstate', resolve, { once: true }));
+    state.commitWorkspace('relationships');
+    expect(state.current.relationshipTarget).toBe('cluster:42');
+    state.destroy();
+  });
+
   it('restores the conflict identity review queue from URL state', () => {
     const restored = parseExploreURLState(serializeExploreURLState({
       ...defaultExploreURLState,
@@ -29,6 +76,20 @@ describe('Explore URL state', () => {
       workspace: 'directory_review',
       reviewKind: 'identity',
       identityState: 'conflict'
+    });
+  });
+
+  it('keeps the selected person when sharing a Fact review', () => {
+    const restored = parseExploreURLState(serializeExploreURLState({
+      ...defaultExploreURLState,
+      workspace: 'directory_review',
+      reviewKind: 'fact',
+      directoryPersonID: 7,
+      directoryQuery: 'Alex',
+    }));
+
+    expect(restored).toMatchObject({
+      workspace: 'directory_review', reviewKind: 'fact', directoryPersonID: 7, directoryQuery: '',
     });
   });
 
@@ -246,22 +307,10 @@ describe('Explore URL state', () => {
     }
   });
 
-  it('round-trips every durable field in the versioned envelope', () => {
+  it('preserves Files filters, layout, and the selected item in shared URLs', () => {
     const state: ExploreURLState = {
-      schemaVersion: 2,
+      ...defaultExploreURLState,
       workspace: 'files',
-      directoryQuery: '',
-      directoryContactState: '',
-      directoryCategory: '',
-      directoryOrganization: '',
-      directoryPrimaryChannel: '',
-      directoryLastContactAfter: '',
-      directoryLastContactBefore: '',
-      directorySort: 'name',
-      directoryPersonID: null,
-      reviewKind: 'identity',
-      identityState: 'candidate',
-      relationshipReviewState: 'pending',
       query: 'from:alice quarterly plan',
       searchMode: 'hybrid',
       filters: [
@@ -274,32 +323,12 @@ describe('Explore URL state', () => {
       fileSort: { field: 'filename', direction: 'asc' },
       fileFilenameQuery: 'invoice',
       fileMIMEFamilies: ['pdf', 'image'],
-	  personFilePresentation: 'media',
-	  personFileDirections: ['from_person', 'group'],
-	  identityQuery: 'Shared Name',
-	  identitySort: { field: 'display_label', direction: 'asc' },
-	  analysisTarget: 'person:42',
-	  selectedIdentifier: 'email:alice@example.com',
-      relationshipFacet: 'domains',
-      relationshipTarget: 'domain:example.com',
-      relationshipShowAll: true,
-      relationshipFiles: true,
-      operationLane: '',
-      operationKind: '',
-      operationState: '',
-      operationStartedFrom: '',
-      operationStartedBefore: '',
-      operationRunID: null,
-      operationStatus: '',
-      settingsAuthority: '',
       columns: ['kind', 'people', 'title', 'excerpt', 'time', 'attachments', 'size'],
       columnWidths: { people: 240, title: 360 },
       selectedRow: 'message:42',
       inspectorPinned: true,
       inspectorWidth: 456,
-      conversationAnchor: 'message:37',
-      scrollAnchor: { key: 'message:31', offset: 12 },
-      activeRow: 'message:33'
+      conversationAnchor: 'message:37'
     };
 
     expect(parseExploreURLState(serializeExploreURLState(state))).toEqual(state);
@@ -1039,7 +1068,7 @@ describe('ExploreState history ownership', () => {
     state.destroy();
   });
 
-  it('restores row, scroll, inspector, grouping, and mode on popstate', () => {
+  it('restores row, scroll, inspector, grouping, and mode on popstate', async () => {
     const state = new ExploreState(window);
     const restored: ExploreURLState = {
       ...defaultExploreURLState,
@@ -1051,9 +1080,10 @@ describe('ExploreState history ownership', () => {
       searchMode: 'hybrid',
       activeRow: 'conversation:8'
     };
-    window.history.replaceState(null, '', serializeExploreURLState(restored));
-
-    window.dispatchEvent(new PopStateEvent('popstate'));
+    state.commitNavigation(restored);
+    state.commitWorkspace('settings');
+    window.history.back();
+    await new Promise((resolve) => window.addEventListener('popstate', resolve, { once: true }));
 
     expect(state.current).toMatchObject(restored);
     state.destroy();
@@ -1201,9 +1231,7 @@ describe('ExploreState history ownership', () => {
 
     const replacement = {
       ...defaultExploreURLState,
-      query: 'replacement',
-      activeRow: 'message:replacement',
-      scrollAnchor: { key: 'message:replacement', offset: 12 }
+      query: 'replacement'
     };
     window.history.replaceState(null, '', serializeExploreURLState(replacement));
     window.dispatchEvent(new PopStateEvent('popstate'));

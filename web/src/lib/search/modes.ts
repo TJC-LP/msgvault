@@ -83,7 +83,9 @@ export function resolveInitialSearchMode(
 }
 
 export function explicitSearchModeFromURL(search: string, parameter = 'explore'): ExploreSearchMode | undefined {
-  const encoded = new URLSearchParams(search.startsWith('?') ? search.slice(1) : search).get(parameter);
+  const parameters = new URLSearchParams(search.startsWith('?') ? search.slice(1) : search);
+  if (parameters.has('mode')) return parseSearchMode(parameters.get('mode'));
+  const encoded = parameters.get(parameter);
   if (encoded === null) return undefined;
   try {
     const value = JSON.parse(encoded) as { searchMode?: unknown };

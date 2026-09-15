@@ -65,6 +65,21 @@ test.beforeEach(async ({ page }) => {
   await expect(page.getByText('Synthetic archive subject')).toBeVisible();
 });
 
+test('compact workspace links preserve browser navigation and reopen the selected tab', async ({ page }) => {
+  await selectKitTopBarTab(page, 'Files');
+  await expect(page.getByText('synthetic.pdf', { exact: true })).toBeVisible();
+  await expect(page).toHaveURL(/\?workspace=files&mode=full_text$/);
+  const filesURL = page.url();
+
+  await selectKitTopBarTab(page, 'Everything');
+  await expect(page.getByText('Synthetic archive subject', { exact: true })).toBeVisible();
+  await expect(page).toHaveURL(/\?workspace=everything&mode=full_text$/);
+  await page.goBack();
+  await expect(page.getByText('synthetic.pdf', { exact: true })).toBeVisible();
+  await page.goto(filesURL);
+  await expect(page.getByText('synthetic.pdf', { exact: true })).toBeVisible();
+});
+
 test('one registry drives selection, searchable help, palette, and editable suspension', async ({ page }) => {
   const grid = page.getByRole('grid', { name: 'Everything results' });
   const renderedRow = page.locator('[data-row-key="message:1"]');

@@ -1,5 +1,5 @@
 ---
-last_edited: "2026-09-09"
+last_edited: "2026-09-15"
 title: Web UI
 description: Browse messages and files, maintain people, and monitor archive work from your browser.
 ---
@@ -107,8 +107,12 @@ warns that its session cookie travels without TLS. `HttpOnly` and
 Everything opens as a compact, sortable table of logical entries: one row per
 email, calendar event, meeting note, other durable item, or chat conversation.
 Raw chat fragments appear only after drilling into a conversation. Filter,
-Group by, Show as, and Search compose into one URL-backed context, so browser
-Back and Forward restore the analytical slice and focused item.
+Group by, Show as, and Search form a shareable view. Ordinary tabs use short
+URLs such as `?workspace=everything&mode=full_text`. Filters, layout changes,
+and the selected item appear only when needed; default values and choices from
+other workspaces stay out of the link. Keyboard focus, scroll position, and
+choices from other workspaces stay in browser history, where Back and Forward
+restore them.
 
 Search mode is always explicit:
 

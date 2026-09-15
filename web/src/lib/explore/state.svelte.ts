@@ -187,7 +187,7 @@ export const defaultExploreURLState: ExploreURLState = {
 
 interface ExploreWindow {
   location: Pick<Location, 'href' | 'pathname' | 'search' | 'hash'>;
-  history: Pick<History, 'pushState' | 'replaceState'>;
+  history: Pick<History, 'state' | 'pushState' | 'replaceState'>;
   addEventListener(type: 'popstate', listener: () => void): void;
   removeEventListener(type: 'popstate', listener: () => void): void;
 }
@@ -515,19 +515,47 @@ function normalize(value: unknown): ExploreURLState {
 
 export function serializeExploreURLState(state: ExploreURLState, baseSearch = ''): string {
   const parameters = new URLSearchParams(baseSearch.startsWith('?') ? baseSearch.slice(1) : baseSearch);
-  parameters.set(STATE_PARAMETER, JSON.stringify(normalize(state)));
+  const normalized = normalize(state);
+  parameters.delete(STATE_PARAMETER);
+  parameters.set('workspace', normalized.workspace);
+  // An explicit mode keeps a shared link independent of browser preferences.
+  parameters.set('mode', normalized.searchMode);
+  const details = Object.fromEntries(Object.entries(normalized).filter(([key, value]) => {
+    if (key === 'workspace' || key === 'searchMode') return false;
+    if (key === 'activeRow' || key === 'scrollAnchor') return false;
+    if (key.startsWith('directory') && normalized.workspace !== 'directory' &&
+      !(key === 'directoryPersonID' && normalized.workspace === 'directory_review' &&
+        normalized.reviewKind === 'fact')) return false;
+    if (key.startsWith('file') && normalized.workspace !== 'files') return false;
+    if (['reviewKind', 'identityState', 'relationshipReviewState'].includes(key)) {
+      if (normalized.workspace !== 'directory_review') return false;
+    } else if ((key.startsWith('relationship') || key.startsWith('identity') ||
+      key.startsWith('personFile') || key === 'analysisTarget' || key === 'selectedIdentifier') &&
+      normalized.workspace !== 'relationships') return false;
+    if (key.startsWith('operation') && normalized.workspace !== 'operations') return false;
+    if (key === 'settingsAuthority' && normalized.workspace !== 'settings') return false;
+    return JSON.stringify(value) !== JSON.stringify(defaultExploreURLState[key]);
+  }));
+  if (Object.keys(details).length) {
+    parameters.set(STATE_PARAMETER, JSON.stringify({ schemaVersion: normalized.schemaVersion, ...details }));
+  }
   return `?${parameters.toString()}`;
 }
 
 export function parseExploreURLState(search: string): ExploreURLState {
   const parameters = new URLSearchParams(search.startsWith('?') ? search.slice(1) : search);
   const encoded = parameters.get(STATE_PARAMETER);
-  if (encoded === null) return freshDefaults();
+  let details: unknown = {};
   try {
-    return normalize(JSON.parse(encoded));
+    if (encoded !== null) details = JSON.parse(encoded);
   } catch {
-    return freshDefaults();
+    // A malformed detail payload must not discard the selected workspace.
   }
+  return normalize({
+    ...(isRecord(details) ? details : {}),
+    ...(parameters.has('workspace') ? { workspace: parameters.get('workspace') } : {}),
+    ...(parameters.has('mode') ? { searchMode: parameters.get('mode') } : {}),
+  });
 }
 
 export class ExploreState {
@@ -696,7 +724,11 @@ export class ExploreState {
   }
 
   private readURLState(): ExploreURLState {
-    const parsed = parseExploreURLState(this.browser.location.search);
+    const history = this.browser.history.state;
+    const parsed = isRecord(history) && history.exploreSearch === this.browser.location.search &&
+      isRecord(history.exploreState)
+      ? normalize(history.exploreState)
+      : parseExploreURLState(this.browser.location.search);
     parsed.searchMode = resolveInitialSearchMode(
       explicitSearchModeFromURL(this.browser.location.search),
       this.preferenceStorage,
@@ -729,8 +761,11 @@ export class ExploreState {
           .map((key) => [key, this.current[key]])
       ) as Partial<ExploreURLState>;
       const priorEntry = normalize({ ...this.committed, ...transient, ...priorFocus });
-      const committedURL = `${this.browser.location.pathname}${serializeExploreURLState(priorEntry, baseSearch)}${this.browser.location.hash}`;
-      this.browser.history.replaceState(null, '', committedURL);
+      const priorSearch = serializeExploreURLState(priorEntry, baseSearch);
+      const committedURL = `${this.browser.location.pathname}${priorSearch}${this.browser.location.hash}`;
+      this.browser.history.replaceState({
+        exploreSearch: priorSearch, exploreState: JSON.parse(JSON.stringify(priorEntry)),
+      }, '', committedURL);
     }
     const next = normalize({ ...this.current, ...effectivePatch });
     // Preserve per-field reactivity: transient scroll/column changes must not
@@ -742,12 +777,14 @@ export class ExploreState {
     for (const key of keysToApply) {
       if (key in next) this.current[key] = next[key];
     }
-    const url = `${this.browser.location.pathname}${serializeExploreURLState(this.current, baseSearch)}${this.browser.location.hash}`;
+    const search = serializeExploreURLState(this.current, baseSearch);
+    const url = `${this.browser.location.pathname}${search}${this.browser.location.hash}`;
+    const history = { exploreSearch: search, exploreState: JSON.parse(JSON.stringify(this.current)) };
     if (mode === 'push') {
-      this.browser.history.pushState(null, '', url);
+      this.browser.history.pushState(history, '', url);
       this.committed = normalize(this.current);
       this.pendingSearchPriorFocus = undefined;
-    } else this.browser.history.replaceState(null, '', url);
+    } else this.browser.history.replaceState(history, '', url);
   }
 }
 
