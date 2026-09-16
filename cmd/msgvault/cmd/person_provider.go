@@ -3,7 +3,8 @@ package cmd
 import (
 	"context"
 	"encoding/hex"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -86,11 +87,11 @@ type personProviderCommandDeps struct {
 type personProviderStatusOutput struct {
 	Name                string                              `json:"name,omitempty"`
 	Profile             peoplesweep.ProviderProfile         `json:"profile"`
-	Check               *store.PersonInferenceCheck         `json:"check,omitempty"`
+	Check               *store.PersonInferenceCheck         `json:"check,omitzero"`
 	Consent             store.PersonInferenceConsentStatus  `json:"consent"`
-	StaleProgramCheck   bool                                `json:"stale_program_check,omitempty"`
-	StaleProgramConsent bool                                `json:"stale_program_consent,omitempty"`
-	CodexIsolation      *personProviderCodexIsolationStatus `json:"codex_isolation,omitempty"`
+	StaleProgramCheck   bool                                `json:"stale_program_check,omitzero"`
+	StaleProgramConsent bool                                `json:"stale_program_consent,omitzero"`
+	CodexIsolation      *personProviderCodexIsolationStatus `json:"codex_isolation,omitzero"`
 }
 
 type personProviderUseOutput struct {
@@ -477,7 +478,7 @@ func runPersonProviderList(
 		})
 	}
 	if jsonOutput {
-		return json.NewEncoder(command.OutOrStdout()).Encode(output)
+		return json.MarshalEncode(jsontext.NewEncoder(command.OutOrStdout()), output, json.Deterministic(true))
 	}
 	for _, item := range output.Profiles {
 		selected := ""
@@ -684,10 +685,10 @@ func runPersonProviderSet(
 		if err != nil {
 			return err
 		}
-		return json.NewEncoder(command.OutOrStdout()).Encode(personProviderSetOutput{
+		return json.MarshalEncode(jsontext.NewEncoder(command.OutOrStdout()), personProviderSetOutput{
 			Name: name, Fingerprint: checkedProfile.Fingerprint, Checked: true,
 			DaemonRestartRequired: daemonRunning,
-		})
+		}, json.Deterministic(true))
 	}
 	_, _ = fmt.Fprintf(command.OutOrStdout(),
 		"Updated and checked people provider profile %q; run `msgvault person provider consent %q --yes` to grant consent for the new policy.\n",
@@ -801,10 +802,10 @@ func runPersonProviderUse(
 		return err
 	}
 	if jsonOutput {
-		return json.NewEncoder(command.OutOrStdout()).Encode(personProviderUseOutput{
+		return json.MarshalEncode(jsontext.NewEncoder(command.OutOrStdout()), personProviderUseOutput{
 			Name: name, Fingerprint: profile.Fingerprint, Enabled: true,
 			DaemonRestartRequired: daemonRunning,
-		})
+		}, json.Deterministic(true))
 	}
 	_, _ = fmt.Fprintf(command.OutOrStdout(), "Selected people provider profile %q.\n", name)
 	if daemonRunning {
@@ -942,9 +943,9 @@ func runPersonProviderRemove(
 		}
 	}
 	if jsonOutput {
-		return json.NewEncoder(command.OutOrStdout()).Encode(personProviderRemoveOutput{
+		return json.MarshalEncode(jsontext.NewEncoder(command.OutOrStdout()), personProviderRemoveOutput{
 			Name: name, Removed: true, DaemonRestartRequired: daemonRunning,
-		})
+		}, json.Deterministic(true))
 	}
 	_, _ = fmt.Fprintf(command.OutOrStdout(), "Removed people provider profile %q; audit history was retained.\n", name)
 	if daemonRunning {
@@ -1359,9 +1360,9 @@ func runPersonProviderRevoke(
 			return err
 		}
 		if jsonOutput {
-			return json.NewEncoder(command.OutOrStdout()).Encode(personProviderRevokeAllOutput{
+			return json.MarshalEncode(jsontext.NewEncoder(command.OutOrStdout()), personProviderRevokeAllOutput{
 				Revoked: revoked, Profiles: statuses,
-			})
+			}, json.Deterministic(true))
 		}
 		_, _ = fmt.Fprintf(command.OutOrStdout(),
 			"Consent revoked for %d active people inference profile(s).\n", revoked)
@@ -1406,9 +1407,9 @@ func runPersonProviderRevokeFingerprint(
 		return err
 	}
 	if jsonOutput {
-		return json.NewEncoder(command.OutOrStdout()).Encode(personProviderRevokeFingerprintOutput{
+		return json.MarshalEncode(jsontext.NewEncoder(command.OutOrStdout()), personProviderRevokeFingerprintOutput{
 			Fingerprint: fingerprint, Revoked: revoked,
-		})
+		}, json.Deterministic(true))
 	}
 	_, _ = fmt.Fprintf(command.OutOrStdout(), "Consent revoked for %s\n", fingerprint)
 	return nil
@@ -1518,9 +1519,9 @@ func runPersonSemanticProviderRevoke(
 			return err
 		}
 		if jsonOutput {
-			return json.NewEncoder(command.OutOrStdout()).Encode(personSemanticProviderRevokeAllOutput{
+			return json.MarshalEncode(jsontext.NewEncoder(command.OutOrStdout()), personSemanticProviderRevokeAllOutput{
 				Revoked: revoked, Profiles: statuses,
-			})
+			}, json.Deterministic(true))
 		}
 		_, _ = fmt.Fprintf(command.OutOrStdout(),
 			"Consent revoked for %d active semantic person embedding profile(s).\n", revoked)
@@ -1665,7 +1666,7 @@ func checkPersonProvider(
 
 func writePersonProviderCheckOutput(w io.Writer, output personProviderCheckOutput, jsonOutput bool) error {
 	if jsonOutput {
-		return json.NewEncoder(w).Encode(output)
+		return json.MarshalEncode(jsontext.NewEncoder(w), output, json.Deterministic(true))
 	}
 	_, _ = fmt.Fprintf(w,
 		"People inference provider check succeeded (model=%s, request_id=%s, input_tokens=%d, output_tokens=%d).\n",
@@ -1708,7 +1709,7 @@ func runPersonProviderLogin(
 	}
 	return client.StartDeviceLogin(command.Context(), func(login peoplesweep.DeviceLogin) error {
 		if jsonOutput {
-			return json.NewEncoder(command.OutOrStdout()).Encode(login)
+			return json.MarshalEncode(jsontext.NewEncoder(command.OutOrStdout()), login, json.Deterministic(true))
 		}
 		_, _ = fmt.Fprintf(command.OutOrStdout(), "Verification URL: %s\n", login.VerificationURL)
 		_, _ = fmt.Fprintf(command.OutOrStdout(), "User code: %s\n", login.UserCode)
@@ -1731,7 +1732,7 @@ func runPersonProviderModels(
 		return err
 	}
 	if jsonOutput {
-		return json.NewEncoder(command.OutOrStdout()).Encode(personProviderModelsOutput{Models: models})
+		return json.MarshalEncode(jsontext.NewEncoder(command.OutOrStdout()), personProviderModelsOutput{Models: models}, json.Deterministic(true))
 	}
 	for _, model := range models {
 		_, _ = fmt.Fprintf(command.OutOrStdout(),
@@ -1900,7 +1901,7 @@ func writePersonProviderStatus(
 	jsonOutput bool,
 ) error {
 	if jsonOutput {
-		return json.NewEncoder(w).Encode(output)
+		return json.MarshalEncode(jsontext.NewEncoder(w), output, json.Deterministic(true))
 	}
 	printPersonProviderDisclosure(w, output.Profile)
 	if output.Check == nil {
@@ -1946,9 +1947,9 @@ func writePersonSemanticProviderStatus(
 		return errors.New("semantic person embedding consent status is empty")
 	}
 	if jsonOutput {
-		return json.NewEncoder(w).Encode(personSemanticProviderStatusOutput{
+		return json.MarshalEncode(jsontext.NewEncoder(w), personSemanticProviderStatusOutput{
 			Profile: profile, Consent: *status,
-		})
+		}, json.Deterministic(true))
 	}
 	printPersonSemanticProviderDisclosure(w, profile)
 	state := "inactive"
@@ -2004,7 +2005,7 @@ func writePersonProviderStatuses(
 	jsonOutput bool,
 ) error {
 	if jsonOutput {
-		return json.NewEncoder(w).Encode(personProviderStatusesOutput{Profiles: statuses})
+		return json.MarshalEncode(jsontext.NewEncoder(w), personProviderStatusesOutput{Profiles: statuses}, json.Deterministic(true))
 	}
 	if len(statuses) == 0 {
 		_, _ = fmt.Fprintln(w, "No stored people inference provider profiles.")
@@ -2027,7 +2028,7 @@ func writePersonSemanticProviderStatuses(
 	jsonOutput bool,
 ) error {
 	if jsonOutput {
-		return json.NewEncoder(w).Encode(personSemanticProviderStatusesOutput{Profiles: statuses})
+		return json.MarshalEncode(jsontext.NewEncoder(w), personSemanticProviderStatusesOutput{Profiles: statuses}, json.Deterministic(true))
 	}
 	if len(statuses) == 0 {
 		_, _ = fmt.Fprintln(w, "No stored semantic person embedding profiles.")

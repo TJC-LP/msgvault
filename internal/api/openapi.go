@@ -1,8 +1,7 @@
 package api
 
 import (
-	"bytes"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"fmt"
 	"net/http"
 	"strings"
@@ -321,7 +320,7 @@ const APISchemaVersion = "2.26.0"
 // OpenAPIDocument builds the API schema from the same Huma route registration
 // used by the daemon. It binds no socket and needs no database.
 func OpenAPIDocument() *huma.OpenAPI {
-	doc := baseOpenAPIDocument()
+	doc := baseOpenAPIDocument(false)
 	hardenSourceStatusPublicSchemas(doc)
 	relaxResponseAdditionalProperties(doc)
 	hardenOperationSchemas(doc)
@@ -329,7 +328,7 @@ func OpenAPIDocument() *huma.OpenAPI {
 }
 
 func openAPIClientDocument() *huma.OpenAPI {
-	doc := baseOpenAPIDocument()
+	doc := baseOpenAPIDocument(true)
 	hardenSourceStatusClientSchemas(doc)
 	clearResponseAdditionalProperties(doc)
 	hardenOperationSchemas(doc)
@@ -358,10 +357,17 @@ func hardenOperationSchemas(doc *huma.OpenAPI) {
 	}
 }
 
-func baseOpenAPIDocument() *huma.OpenAPI {
+func baseOpenAPIDocument(includeHidden bool) *huma.OpenAPI {
 	mux := http.NewServeMux()
 	s := &Server{cfg: config.NewDefaultConfig()}
 	api := s.setupHumaAPI(mux)
+	if includeHidden {
+		group := huma.NewGroup(api)
+		group.UseSimpleModifier(func(operation *huma.Operation) {
+			operation.Hidden = false
+		})
+		api = group
+	}
 	apiV1 := s.setupAPIV1Group(api)
 	s.registerHumaRoutes(api, apiV1)
 	doc := api.OpenAPI()
@@ -704,12 +710,11 @@ func OpenAPIJSONVersion(version string) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("render OpenAPI %s JSON: %w", version, err)
 	}
-	var pretty bytes.Buffer
-	if err := json.Indent(&pretty, raw, "", "  "); err != nil {
+	pretty := jsontext.Value(raw)
+	if err := pretty.Indent(jsontext.WithIndent("  ")); err != nil {
 		return nil, err
 	}
-	pretty.WriteByte('\n')
-	return pretty.Bytes(), nil
+	return append(pretty, '\n'), nil
 }
 
 func relaxResponseAdditionalProperties(doc *huma.OpenAPI) {
@@ -787,8 +792,8 @@ func applyClientCodegenExtensions(doc *huma.OpenAPI) {
 			if property.Extensions == nil {
 				property.Extensions = map[string]any{}
 			}
-			property.Extensions["x-go-type"] = "json.RawMessage"
-			property.Extensions["x-go-type-import"] = map[string]any{pathKey: "encoding/json"}
+			property.Extensions["x-go-type"] = "jsontext.Value"
+			property.Extensions["x-go-type-import"] = map[string]any{pathKey: "encoding/json/jsontext"}
 		}
 		for _, propertyName := range []string{"rejected_at", "superseded_at"} {
 			nullableSchemaProperty(brief, propertyName)
@@ -799,8 +804,8 @@ func applyClientCodegenExtensions(doc *huma.OpenAPI) {
 	if view := schemas["SavedView"]; view != nil {
 		state := view.Properties["canonical_state"]
 		state.Extensions = map[string]any{
-			"x-go-type":        "json.RawMessage",
-			"x-go-type-import": map[string]any{pathKey: "encoding/json"},
+			"x-go-type":        "jsontext.Value",
+			"x-go-type-import": map[string]any{pathKey: "encoding/json/jsontext"},
 		}
 	}
 	if response := schemas["PersonMergeSnapshotResponse"]; response != nil {
@@ -808,8 +813,8 @@ func applyClientCodegenExtensions(doc *huma.OpenAPI) {
 			if snapshot.Extensions == nil {
 				snapshot.Extensions = map[string]any{}
 			}
-			snapshot.Extensions["x-go-type"] = "json.RawMessage"
-			snapshot.Extensions["x-go-type-import"] = map[string]any{pathKey: "encoding/json"}
+			snapshot.Extensions["x-go-type"] = "jsontext.Value"
+			snapshot.Extensions["x-go-type-import"] = map[string]any{pathKey: "encoding/json/jsontext"}
 		}
 	}
 	if manifest := schemas["Manifest"]; manifest != nil {
@@ -817,8 +822,8 @@ func applyClientCodegenExtensions(doc *huma.OpenAPI) {
 			if rawFilter.Extensions == nil {
 				rawFilter.Extensions = map[string]any{}
 			}
-			rawFilter.Extensions["x-go-type"] = "json.RawMessage"
-			rawFilter.Extensions["x-go-type-import"] = map[string]any{pathKey: "encoding/json"}
+			rawFilter.Extensions["x-go-type"] = "jsontext.Value"
+			rawFilter.Extensions["x-go-type-import"] = map[string]any{pathKey: "encoding/json/jsontext"}
 		}
 	}
 	for schemaName, properties := range map[string][]string{

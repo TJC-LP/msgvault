@@ -1,7 +1,8 @@
 package cmd
 
 import (
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"text/tabwriter"
@@ -77,7 +78,7 @@ func writePersonDirectoryPage(cmd *cobra.Command, page *generated.DirectoryPeopl
 		return errors.New("person directory response was empty")
 	}
 	if jsonOutput {
-		return json.NewEncoder(cmd.OutOrStdout()).Encode(page)
+		return json.MarshalEncode(jsontext.NewEncoder(cmd.OutOrStdout()), page, json.Deterministic(true))
 	}
 	writer := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
 	_, _ = fmt.Fprintln(writer, "ID\tDISPLAY NAME\tLAST CONTACT")

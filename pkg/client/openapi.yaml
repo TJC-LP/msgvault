@@ -5329,9 +5329,9 @@ components:
         id:
           type: string
         raw_filter:
-          x-go-type: json.RawMessage
+          x-go-type: jsontext.Value
           x-go-type-import:
-            path: encoding/json
+            path: encoding/json/jsontext
         source:
           $ref: "#/components/schemas/SourceReference"
         status:
@@ -7429,9 +7429,9 @@ components:
     PersonBrief:
       properties:
         boundary:
-          x-go-type: json.RawMessage
+          x-go-type: jsontext.Value
           x-go-type-import:
-            path: encoding/json
+            path: encoding/json/jsontext
         dropped_item_count:
           format: int64
           type: integer
@@ -7470,9 +7470,9 @@ components:
         status:
           type: string
         structured:
-          x-go-type: json.RawMessage
+          x-go-type: jsontext.Value
           x-go-type-import:
-            path: encoding/json
+            path: encoding/json/jsontext
         superseded_at:
           format: date-time
           nullable: true
@@ -8903,9 +8903,9 @@ components:
         sha256:
           type: string
         snapshot:
-          x-go-type: json.RawMessage
+          x-go-type: jsontext.Value
           x-go-type-import:
-            path: encoding/json
+            path: encoding/json/jsontext
         version:
           format: int64
           type: integer
@@ -10135,9 +10135,9 @@ components:
       properties:
         canonical_state:
           description: Stored definition, including incompatible values; check incompatibility_reason before execution
-          x-go-type: json.RawMessage
+          x-go-type: jsontext.Value
           x-go-type-import:
-            path: encoding/json
+            path: encoding/json/jsontext
         created_at:
           format: date-time
           type: string
@@ -12168,6 +12168,28 @@ info:
   version: 2.26.0
 openapi: 3.0.3
 paths:
+  /api/daemon/identity:
+    get:
+      operationId: daemonIdentity
+      responses:
+        "204":
+          description: No Content
+        default:
+          description: Error
+      summary: Prove local daemon identity
+      tags:
+        - Daemon
+  /api/daemon/shutdown:
+    post:
+      operationId: daemonShutdown
+      responses:
+        "202":
+          description: Accepted
+        default:
+          description: Error
+      summary: Stop the local daemon
+      tags:
+        - Daemon
   /api/ping:
     get:
       operationId: daemonPing
