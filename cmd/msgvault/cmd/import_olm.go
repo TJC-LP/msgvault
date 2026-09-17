@@ -106,6 +106,9 @@ Examples:
 		_, _ = fmt.Fprintf(out, "  Updated:        %d messages\n", summary.MessagesUpdated)
 		_, _ = fmt.Fprintf(out, "  Skipped:        %d messages\n", summary.MessagesSkipped)
 		_, _ = fmt.Fprintf(out, "  Errors:         %d\n", summary.Errors)
+		if summary.RecipientNamesLearned > 0 {
+			_, _ = fmt.Fprintf(out, "  Recipients:     %d display names matched to addresses\n", summary.RecipientNamesLearned)
+		}
 		_, _ = fmt.Fprintf(out, "  Duration:       %s\n", summary.Duration.Round(1e9))
 
 		resultErr := ctx.Err()
