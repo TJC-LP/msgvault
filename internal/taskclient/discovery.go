@@ -114,22 +114,6 @@ func DefaultDescriptorPath() string {
 	return filepath.Join(os.TempDir(), fmt.Sprintf("msgvault-%d", currentUserID()), "task-integration.json")
 }
 
-func validateSecureRegularFile(path string, expectedOwner uint32) error {
-	file, err := openSecureRegularFile(path)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return os.ErrNotExist
-		}
-		return fmt.Errorf("%w: open secure file", ErrInsecureDescriptor)
-	}
-	defer func() { _ = file.Close() }()
-	info, err := file.Stat()
-	if err != nil {
-		return fmt.Errorf("%w: inspect secure file", ErrInsecureDescriptor)
-	}
-	return validateSecureFileInfo(info, expectedOwner)
-}
-
 func readSecureRegularFile(path string, expectedOwner uint32, maximum int64) ([]byte, error) {
 	file, err := openSecureRegularFile(path)
 	if err != nil {
@@ -156,9 +140,5 @@ func validateSecureFileInfo(info os.FileInfo, expectedOwner uint32) error {
 	if info.Mode().Perm()&0o077 != 0 {
 		return fmt.Errorf("%w: file permissions must deny group and other access", ErrInsecureDescriptor)
 	}
-	owner, err := fileInfoOwnerID(info)
-	if err != nil || owner != expectedOwner {
-		return fmt.Errorf("%w: file owner does not match daemon user", ErrInsecureDescriptor)
-	}
-	return nil
+	return validateSecureFileOwner(info, expectedOwner)
 }
