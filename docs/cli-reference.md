@@ -1,5 +1,5 @@
 ---
-last_edited: "2026-09-15"
+last_edited: "2026-09-17"
 title: CLI Reference
 description: Complete command reference for all msgvault commands.
 ---
@@ -11,7 +11,7 @@ in your installed binary. This reference follows current `main`; see
 | Task | Commands and guides |
 |---|---|
 | Add and sync a source | [Choose a source](guides/sources.md), [sync](#sync), [sync-full](#sync-full) |
-| Import local exports | [import-eml](#import-eml), [import-mbox](#import-mbox), [import-maildir](#import-maildir), [import-emlx](#import-emlx), [import-pst](#import-pst), [import-slackdump](#import-slackdump), [text imports](usage/text-messages.md) |
+| Import local exports | [import-eml](#import-eml), [import-mbox](#import-mbox), [import-maildir](#import-maildir), [import-emlx](#import-emlx), [import-pst](#import-pst), [import-olm](#import-olm), [import-slackdump](#import-slackdump), [text imports](usage/text-messages.md) |
 | Search and browse | [search](#search), [tui](#tui), [show-message](#show-message), [documents](#documents), [embeddings](#embeddings) |
 | Maintain people and contacts | [person](#person), [people guide](usage/people.md), [CardDAV](usage/people-carddav.md) |
 | Organize accounts | [identity](#identity), [collection](#collection), [update-account](#update-account) |
@@ -960,6 +960,29 @@ The importer preserves PST folder structure as labels, imports email messages, a
 | `--no-resume` | `false` | Start fresh, ignoring interrupted progress |
 | `--checkpoint-interval` | `200` | Save progress every N messages |
 | `--no-attachments` | `false` | Skip writing attachments to disk |
+
+See [Importing Local Email](/docs/usage/importing/) for usage examples.
+
+---
+
+## import-olm
+
+Import an Outlook for Mac `.olm` export into msgvault.
+
+```bash
+msgvault import-olm <identifier> <olm-file>
+```
+
+Legacy Outlook for Mac writes the whole mailbox to one `.olm` file through File > Export. The importer preserves the folder tree as labels, imports mail messages with attachments, and ignores calendar, contact, note, and task items. OLM exports carry no original transport headers, so From, To, Cc, Date, Subject, Message-ID, and In-Reply-To are rebuilt from the exported fields and the message is marked `X-Msgvault-Synthesized: true`.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--source-type` | `olm` | Source type recorded in database |
+| `--skip-folder` | — | Folder name to skip, case-insensitive; repeat for multiple folders |
+| `--no-resume` | `false` | Start fresh, ignoring interrupted progress |
+| `--checkpoint-interval` | `200` | Save progress every N messages |
+| `--no-attachments` | `false` | Skip writing attachments to disk |
+| `--no-default-identity` | `false` | Do not auto-confirm the identifier as this source's "me" identity |
 
 See [Importing Local Email](/docs/usage/importing/) for usage examples.
 

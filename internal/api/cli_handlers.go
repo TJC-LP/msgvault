@@ -1676,6 +1676,7 @@ func cliRunCommandAllowed(args []string) bool {
 		"import-imessage",
 		"import-mbox",
 		"import-messenger",
+		"import-olm",
 		"import-pst",
 		"import-slackdump",
 		"import-synctech-sms",

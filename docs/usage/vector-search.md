@@ -1,5 +1,5 @@
 ---
-last_edited: "2026-09-08"
+last_edited: "2026-09-17"
 title: Vector Search
 description: Find messages by meaning and set up separate people, visual, and document search indexes.
 ---
@@ -388,7 +388,7 @@ trigger).
 | Manual `sync-slack` / `sync-beeper` / `sync-granola` / `sync-circleback` / `sync-notion` | No. Run `msgvault embeddings build` afterward |
 | Scheduled account syncs in `msgvault serve` (Gmail, IMAP, Teams, Discord) | Yes, when `[vector.embed.schedule].run_after_sync = true` |
 | Scheduled calendar, Slack, Beeper, Granola, Circleback, and Notion syncs in `msgvault serve` | No immediate post-sync run. Picked up by the embed worker's `[vector.embed.schedule].cron` schedule |
-| Local email imports (`import-pst`, `import-emlx`, `import-eml`, `import-mbox`) | No. Run `msgvault embeddings build` afterward |
+| Local email imports (`import-pst`, `import-olm`, `import-emlx`, `import-eml`, `import-mbox`) | No. Run `msgvault embeddings build` afterward |
 | Local chat/text imports | No. Run `msgvault embeddings build` afterward |
 
 For ingest paths that do not immediately schedule embedding work, running

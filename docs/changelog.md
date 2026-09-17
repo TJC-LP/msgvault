@@ -1,5 +1,5 @@
 ---
-last_edited: "2026-09-15"
+last_edited: "2026-09-17"
 title: Changelog
 description: Release history for msgvault
 ---
@@ -179,6 +179,8 @@ See [Web UI](web-ui.md), [TUI](usage/tui.md),
 [MCP](usage/chat.md).
 
 ### Sync, imports, and maintenance
+
+- Outlook for Mac `.olm` export import via `msgvault import-olm`, with folder labels, attachments, resumable checkpoints, and synthesized headers marked `X-Msgvault-Synthesized`. Gives Microsoft 365 users an archive path when IMAP OAuth and Graph are blocked by tenant policy.
 
 - Sync Notion AI Meeting Notes with available transcripts, verified attendees,
   changed-note refresh, and bounded retries for late transcripts.

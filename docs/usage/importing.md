@@ -1,5 +1,5 @@
 ---
-last_edited: "2026-09-09"
+last_edited: "2026-09-17"
 title: Importing Local Email
 description: Bring local email archives into msgvault, or backfill older Gmail and IMAP messages.
 ---
@@ -13,6 +13,7 @@ labels where the format provides them.
 | What you have | Command or guide |
 |---|---|
 | Outlook `.pst` archive | [`import-pst`](#import-pst) |
+| Outlook for Mac `.olm` export | [`import-olm`](#import-olm) |
 | MBOX file or ZIP of MBOX files | [`import-mbox`](#import-mbox) |
 | Maildir or Maildir++ archive | [`import-maildir`](#import-maildir) |
 | MailMate-style tree of `.eml` files | [`import-eml`](#import-eml) |
@@ -62,6 +63,44 @@ msgvault import-pst you@outlook.com backup.pst --no-resume
 | `--no-attachments` | `false` | Skip writing attachments to disk |
 
 PST imports are resumable. msgvault records a content-based archive fingerprint so an interrupted import resumes only when the file still matches the checkpointed archive.
+
+## import-olm
+
+Import an Outlook for Mac `.olm` export.
+
+```bash
+msgvault import-olm <identifier> <olm-file>
+```
+
+Use this when a Microsoft 365 mailbox cannot be reached over IMAP or Graph, for example when your organization does not allow app registrations. Only Legacy Outlook for Mac offers File > Export; the new Outlook for Mac has no OLM export. Export Mail only, then import the file. The identifier is the email address of the mailbox. Outlook folders become labels, so `Inbox/Projects` is a searchable label path. Calendar, contact, note, and task items are never read.
+
+OLM files do not contain the original message headers. msgvault rebuilds From, To, Cc, Bcc, Date, Subject, Message-ID, In-Reply-To, Thread-Topic, and Thread-Index from the exported fields, keeps text and HTML bodies, and stores attachments referenced by the export. Timestamps in the export are UTC. Each imported message carries `X-Msgvault-Synthesized: true` so you can tell it apart from mail archived with its original headers.
+
+### Examples
+
+```bash
+# Import an Outlook for Mac export
+msgvault import-olm you@company.com ~/Desktop/export.olm
+
+# Skip folders you do not want in the archive
+msgvault import-olm you@company.com export.olm --skip-folder "Deleted Items" --skip-folder "Junk Email"
+
+# Start from the beginning instead of resuming an interrupted run
+msgvault import-olm you@company.com export.olm --no-resume
+```
+
+### Flags
+
+| Flag | Default | Description |
+|---|---|---|
+| `--source-type` | `olm` | Source type recorded in the database |
+| `--skip-folder` | — | Folder name to skip, case-insensitive; repeat for multiple folders |
+| `--no-resume` | `false` | Start fresh instead of resuming an interrupted import |
+| `--checkpoint-interval` | `200` | Save progress every N messages |
+| `--no-attachments` | `false` | Skip writing attachments to disk |
+| `--no-default-identity` | `false` | Do not auto-confirm the identifier as this source's "me" identity |
+
+OLM imports are resumable and idempotent for the same file. A fresh export of the same mailbox is a new archive: messages it shares with an earlier import are stored again under the new archive and surface in [deduplication](/docs/usage/deduplication/) review.
 
 ## import-mbox
 
@@ -313,6 +352,8 @@ Apple Mail stores its data at `~/Library/Mail/` on macOS. The auto-discover mode
 MBOX, EML, and EMLX imports deduplicate messages by SHA-256 hash of the raw MIME content. Running the same import twice produces no duplicates. If the same message appears in multiple mailboxes within that source, it is stored once and given labels from each location.
 
 PST imports namespace source message IDs by a stable archive fingerprint, so importing multiple PST files into the same source does not collide on Outlook EntryIDs that are only unique inside one archive. Re-running the same PST import is idempotent and resumes from checkpoints by default.
+
+OLM imports key each message by a fingerprint of the archive's zip directory plus the message's entry path. Re-importing the same `.olm` file skips everything already archived. A re-export from Outlook produces a different fingerprint, so its messages import as new rows and are matched to earlier copies by content in deduplication review.
 
 ## Resumable Imports
 

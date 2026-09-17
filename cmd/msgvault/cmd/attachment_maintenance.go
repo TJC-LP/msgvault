@@ -333,6 +333,7 @@ func attachmentProducingCommand(args []string) bool {
 		"import-imessage",
 		importMboxCommand,
 		"import-messenger",
+		"import-olm",
 		"import-pst",
 		"import-slackdump",
 		"import-synctech-sms",
