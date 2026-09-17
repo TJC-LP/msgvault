@@ -76,7 +76,7 @@ Use this when a Microsoft 365 mailbox cannot be reached over IMAP or Graph, for 
 
 OLM files do not contain the original message headers. msgvault rebuilds From, To, Cc, Bcc, Reply-To, Date, Subject, Message-ID, In-Reply-To, References, Thread-Topic, and Thread-Index from the exported fields and keeps text and HTML bodies. Timestamps in the export are UTC. Each imported message carries `X-Msgvault-Synthesized: true` so you can tell it apart from mail archived with its original headers.
 
-Expect three gaps that come from the export itself. Most messages list recipients only as display names, so the To header often has names without addresses. Outlook exports attachment bytes only for attachments it had cached; a listed attachment with no exported file is recorded by name in an `X-Msgvault-Olm-Attachments-Missing` header instead of as an attachment. Meeting requests and responses carry their calendar data as a sibling `.ics` file, which msgvault attaches as `invite.ics`.
+Expect three gaps that come from the export itself. Most messages list recipients only as display names. msgvault first scans the archive for every name that appears with an address, then fills in addresses for name-only recipients when one address accounts for at least 70 percent of that name's appearances; pass `--no-resolve-recipients` to skip this and keep the names as exported. Names the archive cannot vouch for stay names without addresses. Outlook exports attachment bytes only for attachments it had cached; a listed attachment with no exported file is recorded by name in an `X-Msgvault-Olm-Attachments-Missing` header instead of as an attachment. Meeting requests and responses carry their calendar data as a sibling `.ics` file, which msgvault attaches as `invite.ics`.
 
 ### Examples
 
@@ -101,6 +101,7 @@ msgvault import-olm you@company.com export.olm --no-resume
 | `--checkpoint-interval` | `200` | Save progress every N messages |
 | `--no-attachments` | `false` | Skip writing attachments to disk |
 | `--no-default-identity` | `false` | Do not auto-confirm the identifier as this source's "me" identity |
+| `--no-resolve-recipients` | `false` | Keep name-only recipients as names instead of matching them to addresses seen in the archive |
 
 OLM imports are resumable and idempotent for the same file. A fresh export of the same mailbox is a new archive: messages it shares with an earlier import are stored again under the new archive and surface in [deduplication](/docs/usage/deduplication/) review.
 

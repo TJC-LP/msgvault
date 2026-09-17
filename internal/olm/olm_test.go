@@ -2,6 +2,7 @@ package olm
 
 import (
 	"bytes"
+	"context"
 	"mime"
 	"net/mail"
 	"os"
@@ -236,7 +237,7 @@ func TestBuildRFC5322(t *testing.T) {
 	raw, err := BuildRFC5322(msg, []Attachment{
 		{Ref: msg.Attachments[0], Content: []byte("a,b\n1,2\n")},
 		{Ref: msg.Attachments[1], Content: []byte("\x89PNG fake")},
-	})
+	}, nil)
 	require.NoError(err)
 
 	parsed, err := mail.ReadMessage(bytes.NewReader(raw))
@@ -283,7 +284,7 @@ func TestBuildRFC5322_FallsBackToSenderAndReceivedTime(t *testing.T) {
 		ReceivedAt: time.Date(2024, 1, 2, 3, 4, 5, 0, time.UTC),
 		BodyText:   "plain",
 	}
-	raw, err := BuildRFC5322(msg, nil)
+	raw, err := BuildRFC5322(msg, nil, nil)
 	require.NoError(err)
 	parsed, err := mail.ReadMessage(bytes.NewReader(raw))
 	require.NoError(err)
@@ -317,7 +318,7 @@ func TestParseMessage_DisplayToAndReplyTo(t *testing.T) {
 	require.Len(msg.Attachments, 1)
 	assert.False(msg.Attachments[0].HasPayload(), "no OPFAttachmentURL means no exported bytes")
 
-	raw, err := BuildRFC5322(msg, nil)
+	raw, err := BuildRFC5322(msg, nil, nil)
 	require.NoError(err)
 	parsed, err := mail.ReadMessage(bytes.NewReader(raw))
 	require.NoError(err)
@@ -344,4 +345,74 @@ func TestInviteEntryName(t *testing.T) {
 func TestMessageFolder_IgnoresAttachmentDirectories(t *testing.T) {
 	_, ok := messageFolder("Accounts/acct/com.microsoft.__Messages/Inbox/com.microsoft.__Attachments/report.xml")
 	assert.False(t, ok)
+}
+
+func TestAddressBook_ResolveByMajority(t *testing.T) {
+	assert := assert.New(t)
+	book := NewAddressBook()
+	for range 9 {
+		book.Learn(&Message{From: []Address{{Name: "Reader, Bea", Email: "Bea@Example.com"}}})
+	}
+	book.Learn(&Message{To: []Address{{Name: "reader,  bea", Email: "notify@github.com"}}})
+	book.Learn(&Message{CC: []Address{{Name: "Split Person", Email: "a@example.com"}}})
+	book.Learn(&Message{CC: []Address{{Name: "Split Person", Email: "b@example.com"}}})
+	book.Learn(&Message{From: []Address{{Name: "", Email: "anon@example.com"}}})
+
+	email, ok := book.Resolve("Reader, Bea")
+	assert.True(ok)
+	assert.Equal("bea@example.com", email, "lower-cased, majority address wins")
+
+	_, ok = book.Resolve("Split Person")
+	assert.False(ok, "an even split stays unresolved")
+
+	_, ok = book.Resolve("Nobody Known")
+	assert.False(ok)
+	assert.Equal(2, book.Len())
+
+	var nilBook *AddressBook
+	_, ok = nilBook.Resolve("Reader, Bea")
+	assert.False(ok, "nil book is safe")
+}
+
+func TestBuildRFC5322_ResolvesDisplayToThroughAddressBook(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	book := NewAddressBook()
+	book.Learn(&Message{From: []Address{{Name: "Reader, Bea", Email: "bea@example.com"}}})
+
+	msg := &Message{
+		Subject:   "hi",
+		From:      []Address{{Name: "Alex", Email: "alex@example.com"}},
+		DisplayTo: "Reader, Bea; Unknown Person; direct@example.org",
+		BodyText:  "x",
+	}
+	raw, err := BuildRFC5322(msg, nil, book)
+	require.NoError(err)
+	parsed, err := mail.ReadMessage(bytes.NewReader(raw))
+	require.NoError(err)
+	to, err := parsed.Header.AddressList("To")
+	// A bare display name is not a valid address, so the list parser fails;
+	// check the raw header instead.
+	if err == nil {
+		assert.Len(to, 3)
+	}
+	decoded, err := new(mime.WordDecoder).DecodeHeader(parsed.Header.Get("To"))
+	require.NoError(err)
+	assert.Contains(decoded, "Reader, Bea <bea@example.com>")
+	assert.Contains(decoded, "Unknown Person")
+	assert.Contains(decoded, "<direct@example.org>")
+}
+
+func TestBuildAddressBook_FromArchive(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	p := writeFixtureArchive(t)
+	a, err := Open(p)
+	require.NoError(err)
+	defer func() { _ = a.Close() }()
+	book, err := BuildAddressBook(context.Background(), a)
+	require.NoError(err)
+	email, ok := book.Resolve("Bea Reader")
+	assert.True(ok)
+	assert.Equal("bea@example.com", email)
 }

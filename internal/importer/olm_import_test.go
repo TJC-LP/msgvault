@@ -263,3 +263,38 @@ func TestImportOlm_AttachesMeetingInviteKeyedByMessageID(t *testing.T) {
 	assert.Equal("invite.ics", name)
 	assert.Equal("text/calendar", ctype)
 }
+
+func TestImportOlm_ResolvesNameOnlyRecipients(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	st := openTestStorePst(t)
+	// m1 carries a real To address for "Me"; m2 lists the same name only in
+	// DisplayTo. After import both should have a "to" recipient row.
+	withAddr := olmTestXML("m1", "")
+	nameOnly := strings.Replace(olmTestXML("m2", ""),
+		`<OPFMessageCopyToAddresses><emailAddress OPFContactEmailAddressName="Me" OPFContactEmailAddressAddress="user@example.com"/></OPFMessageCopyToAddresses>`,
+		`<OPFMessageCopyDisplayTo>Me</OPFMessageCopyDisplayTo>`, 1)
+	require.NotEqual(withAddr, nameOnly)
+	p := filepath.Join(t.TempDir(), "names.olm")
+	testutil.CreateZip(t, p, []testutil.ArchiveEntry{
+		{Name: "Accounts/acct/com.microsoft.__Messages/Inbox/message_00001.xml", Content: withAddr},
+		{Name: "Accounts/acct/com.microsoft.__Messages/Inbox/message_00002.xml", Content: nameOnly},
+	})
+
+	summary, err := ImportOlm(context.Background(), st, p, OlmImportOptions{Identifier: "user@example.com"})
+	require.NoError(err)
+	assert.Equal(int64(2), summary.MessagesAdded)
+	assert.Equal(2, summary.RecipientNamesLearned, "Sender and Me")
+
+	var toRows int
+	require.NoError(st.DB().QueryRow(`SELECT COUNT(*) FROM message_recipients r JOIN messages m ON m.id = r.message_id WHERE m.source_id = ? AND r.recipient_type = 'to'`, summary.SourceID).Scan(&toRows))
+	assert.Equal(2, toRows, "name-only recipient resolved to an address")
+
+	// With resolution off, the name-only message has no addressable recipient.
+	st2 := openTestStorePst(t)
+	summary2, err := ImportOlm(context.Background(), st2, p, OlmImportOptions{Identifier: "user@example.com", NoResolveRecipients: true})
+	require.NoError(err)
+	assert.Equal(0, summary2.RecipientNamesLearned)
+	require.NoError(st2.DB().QueryRow(`SELECT COUNT(*) FROM message_recipients r JOIN messages m ON m.id = r.message_id WHERE m.source_id = ? AND r.recipient_type = 'to'`, summary2.SourceID).Scan(&toRows))
+	assert.Equal(1, toRows)
+}

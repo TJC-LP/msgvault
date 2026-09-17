@@ -43,6 +43,11 @@ type OlmImportOptions struct {
 	// RemoteImages is nil unless remote image archiving was explicitly enabled.
 	RemoteImages *remoteimage.Fetcher
 
+	// NoResolveRecipients skips the pre-pass that learns display-name to
+	// address pairings from the archive. Without it, recipients that Outlook
+	// exported as names only stay names only.
+	NoResolveRecipients bool
+
 	// MaxMessageBytes limits the synthesized message size (body plus
 	// attachments). Defaults to 128 MiB. Attachments larger than the limit
 	// are dropped with a warning; the message itself is still imported.
@@ -76,6 +81,10 @@ type OlmImportSummary struct {
 	MessagesSkipped   int64
 	Errors            int64
 	HardErrors        bool
+
+	// RecipientNamesLearned is the number of distinct display names the
+	// pre-pass could pair with an address; zero when the pre-pass is off.
+	RecipientNamesLearned int
 }
 
 // olmCheckpoint tracks resume state. ArchiveID is the central-directory
@@ -414,6 +423,25 @@ func ImportOlm(
 		return false
 	}
 
+	// Learn display-name to address pairings before importing so name-only
+	// recipients can be resolved. One extra parse of every message; cheap
+	// next to ingestion.
+	var book *olm.AddressBook
+	if !opts.NoResolveRecipients {
+		b, err := olm.BuildAddressBook(ctx, archive)
+		if err != nil {
+			if ctx.Err() != nil {
+				summary.Duration = time.Since(start)
+				return summary, nil
+			}
+			log.Warn("recipient address book failed; continuing with names only", "error", err)
+		} else {
+			book = b
+			summary.RecipientNamesLearned = b.Len()
+			log.Info("learned recipient addresses from archive", "names", b.Len())
+		}
+	}
+
 	labelCache := make(map[string]int64)
 
 	for fi, folder := range folders {
@@ -449,7 +477,7 @@ func ImportOlm(
 				continue
 			}
 
-			raw, fallbackDate, err := buildOlmMessage(archive, ref, opts.MaxMessageBytes, log)
+			raw, fallbackDate, err := buildOlmMessage(archive, ref, opts.MaxMessageBytes, book, log)
 			if err != nil {
 				cp.ErrorsCount++
 				summary.Errors++
@@ -519,7 +547,7 @@ func ImportOlm(
 // buildOlmMessage parses one message entry, resolves its attachments within
 // the byte budget, and synthesizes RFC 5322 bytes. Oversized or missing
 // attachments are logged and dropped so the message itself still imports.
-func buildOlmMessage(archive *olm.Archive, ref olm.MessageRef, maxBytes int64, log *slog.Logger) ([]byte, time.Time, error) {
+func buildOlmMessage(archive *olm.Archive, ref olm.MessageRef, maxBytes int64, book *olm.AddressBook, log *slog.Logger) ([]byte, time.Time, error) {
 	rc, err := archive.OpenMessage(ref)
 	if err != nil {
 		return nil, time.Time{}, err
@@ -566,7 +594,7 @@ func buildOlmMessage(archive *olm.Archive, ref olm.MessageRef, maxBytes int64, l
 		}
 	}
 
-	raw, err := olm.BuildRFC5322(msg, attachments)
+	raw, err := olm.BuildRFC5322(msg, attachments, book)
 	if err != nil {
 		return nil, time.Time{}, err
 	}

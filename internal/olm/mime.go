@@ -24,7 +24,10 @@ type Attachment struct {
 // structure is delegated to the PST builder, which already handles
 // multipart/alternative and multipart/mixed layout, quoted-printable and
 // base64 encoding, and filename sanitization.
-func BuildRFC5322(msg *Message, attachments []Attachment) ([]byte, error) {
+//
+// book may be nil. When provided, name-only recipients from
+// OPFMessageCopyDisplayTo are resolved to addresses learned from the archive.
+func BuildRFC5322(msg *Message, attachments []Attachment, book *AddressBook) ([]byte, error) {
 	var hdr bytes.Buffer
 
 	from := msg.From
@@ -36,9 +39,10 @@ func BuildRFC5322(msg *Message, attachments []Attachment) ([]byte, error) {
 	}
 	if v := formatAddressList(msg.To); v != "" {
 		writeHeader(&hdr, "To", v)
-	} else if v := formatDisplayList(msg.DisplayTo); v != "" {
+	} else if v := formatDisplayList(msg.DisplayTo, book); v != "" {
 		// Most OLM records carry recipients only as a display string of
-		// names without addresses; emit them as bare display names.
+		// names without addresses. Resolve what the archive can vouch for
+		// and emit the rest as bare display names.
 		writeHeader(&hdr, "To", v)
 	}
 	if v := formatAddressList(msg.CC); v != "" {
@@ -160,15 +164,25 @@ func missingAttachmentNames(msg *Message) []string {
 }
 
 // formatDisplayList converts Outlook's semicolon-separated display string
-// into a comma-separated header of Q-encoded display names. Names may
-// themselves contain commas ("Last, First"), which is why the split is on
-// semicolons only.
-func formatDisplayList(display string) string {
+// into a comma-separated address header. Names may themselves contain
+// commas ("Last, First"), which is why the split is on semicolons only. A
+// token that is itself an address is emitted as one; a name the address
+// book resolves becomes "Name <email>"; anything else stays a bare
+// Q-encoded display name.
+func formatDisplayList(display string, book *AddressBook) string {
 	parts := strings.Split(display, ";")
 	out := make([]string, 0, len(parts))
 	for _, p := range parts {
 		p = strings.TrimSpace(sanitizeHeaderValue(p))
 		if p == "" {
+			continue
+		}
+		if strings.Contains(p, "@") && !strings.ContainsAny(p, " <>\"") {
+			out = append(out, "<"+p+">")
+			continue
+		}
+		if email, ok := book.Resolve(p); ok {
+			out = append(out, fmt.Sprintf("%s <%s>", mime.QEncoding.Encode("utf-8", p), email))
 			continue
 		}
 		out = append(out, mime.QEncoding.Encode("utf-8", p))

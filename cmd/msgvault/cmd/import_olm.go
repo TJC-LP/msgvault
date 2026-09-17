@@ -21,6 +21,7 @@ var (
 	importOlmCheckpointInterval int
 	importOlmNoAttachments      bool
 	importOlmNoDefaultIdentity  bool
+	importOlmNoResolveRecipient bool
 )
 
 var importOlmCmd = &cobra.Command{
@@ -32,7 +33,8 @@ All mail messages are imported. Calendar items, contacts, notes, and tasks
 are skipped. The Outlook folder structure is preserved as labels (e.g. the
 Inbox folder becomes the "Inbox" label). OLM exports do not carry the
 original transport headers, so From, To, Date, Subject, and Message-ID are
-rebuilt from the exported fields.
+rebuilt from the exported fields. Recipients that Outlook exported as display
+names only are matched to addresses seen elsewhere in the same archive.
 
 The import is resumable: if interrupted with Ctrl+C, rerunning with the same
 arguments continues from where it left off. Re-importing the same file skips
@@ -68,14 +70,15 @@ Examples:
 		dbPath := cfg.DatabaseDSN()
 
 		summary, importErr := importer.ImportOlm(ctx, st, olmPath, importer.OlmImportOptions{
-			SourceType:         importOlmSourceType,
-			Identifier:         identifier,
-			SkipFolders:        importOlmSkipFolders,
-			NoResume:           importOlmNoResume,
-			CheckpointInterval: importOlmCheckpointInterval,
-			AttachmentsDir:     attachmentsDir,
-			RemoteImages:       configuredRemoteImageFetcher(),
-			Logger:             logger,
+			SourceType:          importOlmSourceType,
+			Identifier:          identifier,
+			SkipFolders:         importOlmSkipFolders,
+			NoResume:            importOlmNoResume,
+			CheckpointInterval:  importOlmCheckpointInterval,
+			AttachmentsDir:      attachmentsDir,
+			RemoteImages:        configuredRemoteImageFetcher(),
+			NoResolveRecipients: importOlmNoResolveRecipient,
+			Logger:              logger,
 		})
 		if importErr != nil {
 			return errors.Join(importErr, rebuildCacheAfterWrite(dbPath))
@@ -124,6 +127,7 @@ func init() {
 	importOlmCmd.Flags().IntVar(&importOlmCheckpointInterval, "checkpoint-interval", 200, "Save progress every N messages")
 	importOlmCmd.Flags().BoolVar(&importOlmNoAttachments, "no-attachments", false, "Do not store attachments to disk (messages are still imported)")
 	importOlmCmd.Flags().BoolVar(&importOlmNoDefaultIdentity, "no-default-identity", false, noDefaultIdentityHelp)
+	importOlmCmd.Flags().BoolVar(&importOlmNoResolveRecipient, "no-resolve-recipients", false, "Do not learn recipient addresses from the archive; keep name-only recipients as names")
 }
 
 func runOlmPostImportMigrations(
