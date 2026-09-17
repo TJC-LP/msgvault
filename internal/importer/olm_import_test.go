@@ -241,3 +241,25 @@ func TestImportOlm_IngestErrorMarksHardErrors(t *testing.T) {
 	assert.Equal(int64(4), summary.Errors)
 	assert.Equal(int64(0), summary.MessagesAdded)
 }
+
+func TestImportOlm_AttachesMeetingInviteKeyedByMessageID(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	st := openTestStorePst(t)
+	p := filepath.Join(t.TempDir(), "invite.olm")
+	testutil.CreateZip(t, p, []testutil.ArchiveEntry{
+		{Name: "Accounts/acct/com.microsoft.__Messages/Sent Items/message_00001.xml", Content: olmTestXML("meet1", "")},
+		{Name: "Accounts/acct/com.microsoft.__Messages/Sent Items/com.microsoft.__Attachments/meet1@example.com.ics", Content: "BEGIN:VCALENDAR\nEND:VCALENDAR\n"},
+	})
+
+	summary, err := ImportOlm(context.Background(), st, p, OlmImportOptions{
+		Identifier: "user@example.com", AttachmentsDir: t.TempDir(),
+	})
+	require.NoError(err)
+	assert.Equal(int64(1), summary.MessagesAdded)
+
+	var name, ctype string
+	require.NoError(st.DB().QueryRow(`SELECT a.filename, a.mime_type FROM attachments a JOIN messages m ON m.id = a.message_id WHERE m.source_id = ?`, summary.SourceID).Scan(&name, &ctype))
+	assert.Equal("invite.ics", name)
+	assert.Equal("text/calendar", ctype)
+}

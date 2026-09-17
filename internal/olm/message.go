@@ -22,10 +22,14 @@ type AttachmentRef struct {
 	Name        string
 	ContentType string
 	ContentID   string
-	// URL is the zip entry name holding the attachment bytes. Empty for
-	// attachments Outlook exported without a payload.
+	// URL is the zip entry name holding the attachment bytes. Outlook only
+	// writes it when the payload was exported; records without a URL have
+	// no bytes anywhere in the archive.
 	URL string
 }
+
+// HasPayload reports whether the archive contains this attachment's bytes.
+func (a AttachmentRef) HasPayload() bool { return a.URL != "" }
 
 // Message holds the fields parsed from one OLM message XML document.
 type Message struct {
@@ -46,6 +50,11 @@ type Message struct {
 	To     []Address
 	CC     []Address
 	BCC    []Address
+	// ReplyTo is OPFMessageCopyReplyToAddresses.
+	ReplyTo []Address
+	// DisplayTo is the semicolon-separated recipient display string. Most
+	// exported messages carry only this, not OPFMessageCopyToAddresses.
+	DisplayTo string
 
 	BodyText string
 	BodyHTML string
@@ -114,6 +123,8 @@ func ParseMessage(r io.Reader) (*Message, error) {
 				addrList = &msg.CC
 			case "OPFMessageCopyBCCAddresses":
 				addrList = &msg.BCC
+			case "OPFMessageCopyReplyToAddresses":
+				addrList = &msg.ReplyTo
 			case "emailAddress":
 				if addrList != nil {
 					*addrList = append(*addrList, Address{
@@ -130,6 +141,8 @@ func ParseMessage(r io.Reader) (*Message, error) {
 				})
 			case "OPFMessageCopySubject":
 				textField = &msg.Subject
+			case "OPFMessageCopyDisplayTo":
+				textField = &msg.DisplayTo
 			case "OPFMessageCopyMessageID":
 				textField = &msg.MessageID
 			case "OPFMessageCopyInReplyTo":
@@ -161,7 +174,8 @@ func ParseMessage(r io.Reader) (*Message, error) {
 		case xml.EndElement:
 			switch t.Name.Local {
 			case "OPFMessageCopyFromAddresses", "OPFMessageCopySenderAddress",
-				"OPFMessageCopyToAddresses", "OPFMessageCopyCCAddresses", "OPFMessageCopyBCCAddresses":
+				"OPFMessageCopyToAddresses", "OPFMessageCopyCCAddresses", "OPFMessageCopyBCCAddresses",
+				"OPFMessageCopyReplyToAddresses":
 				addrList = nil
 			}
 			if textField != nil {

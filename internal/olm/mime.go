@@ -36,12 +36,19 @@ func BuildRFC5322(msg *Message, attachments []Attachment) ([]byte, error) {
 	}
 	if v := formatAddressList(msg.To); v != "" {
 		writeHeader(&hdr, "To", v)
+	} else if v := formatDisplayList(msg.DisplayTo); v != "" {
+		// Most OLM records carry recipients only as a display string of
+		// names without addresses; emit them as bare display names.
+		writeHeader(&hdr, "To", v)
 	}
 	if v := formatAddressList(msg.CC); v != "" {
 		writeHeader(&hdr, "Cc", v)
 	}
 	if v := formatAddressList(msg.BCC); v != "" {
 		writeHeader(&hdr, "Bcc", v)
+	}
+	if v := formatAddressList(msg.ReplyTo); v != "" {
+		writeHeader(&hdr, "Reply-To", v)
 	}
 
 	t := msg.SentAt
@@ -72,6 +79,12 @@ func BuildRFC5322(msg *Message, attachments []Attachment) ([]byte, error) {
 	}
 	writeHeader(&hdr, "X-Msgvault-Source", "olm")
 	writeHeader(&hdr, "X-Msgvault-Synthesized", "true")
+	if missing := missingAttachmentNames(msg); len(missing) > 0 {
+		// Outlook listed these attachments but did not export their bytes.
+		// Record the names so the gap is visible on the archived message.
+		writeHeader(&hdr, "X-Msgvault-Olm-Attachments-Missing",
+			mime.QEncoding.Encode("utf-8", strings.Join(missing, "; ")))
+	}
 
 	pstAtts := make([]pst.AttachmentEntry, 0, len(attachments))
 	for _, a := range attachments {
@@ -127,6 +140,40 @@ func angleWrap(id string) string {
 		id += ">"
 	}
 	return id
+}
+
+// missingAttachmentNames lists attachments whose payload is absent from the
+// archive, in export order.
+func missingAttachmentNames(msg *Message) []string {
+	var out []string
+	for _, a := range msg.Attachments {
+		if a.HasPayload() {
+			continue
+		}
+		name := strings.TrimSpace(sanitizeHeaderValue(a.Name))
+		if name == "" {
+			name = "(unnamed)"
+		}
+		out = append(out, name)
+	}
+	return out
+}
+
+// formatDisplayList converts Outlook's semicolon-separated display string
+// into a comma-separated header of Q-encoded display names. Names may
+// themselves contain commas ("Last, First"), which is why the split is on
+// semicolons only.
+func formatDisplayList(display string) string {
+	parts := strings.Split(display, ";")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(sanitizeHeaderValue(p))
+		if p == "" {
+			continue
+		}
+		out = append(out, mime.QEncoding.Encode("utf-8", p))
+	}
+	return strings.Join(out, ", ")
 }
 
 // formatAddressList renders addresses as a comma-separated header value,

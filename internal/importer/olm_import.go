@@ -533,9 +533,12 @@ func buildOlmMessage(archive *olm.Archive, ref olm.MessageRef, maxBytes int64, l
 	var (
 		attachments []olm.Attachment
 		budget      = maxBytes
+		referenced  = map[string]bool{}
 	)
 	for _, a := range msg.Attachments {
-		if a.URL == "" {
+		if !a.HasPayload() {
+			// Outlook listed the attachment but exported no bytes; the MIME
+			// builder records its name in a header instead.
 			continue
 		}
 		content, err := archive.ReadEntry(a.URL, budget)
@@ -543,8 +546,24 @@ func buildOlmMessage(archive *olm.Archive, ref olm.MessageRef, maxBytes int64, l
 			log.Warn("skipping attachment", "entry", ref.EntryPath, "attachment", a.Name, "error", err)
 			continue
 		}
+		referenced[a.URL] = true
 		budget -= int64(len(content))
 		attachments = append(attachments, olm.Attachment{Ref: a, Content: content})
+	}
+
+	// Meeting requests and responses carry their iCalendar payload as a
+	// sibling file named after the Message-ID rather than as a listed
+	// attachment. Attach it so the invitation survives the import.
+	if ics := olm.InviteEntryName(ref, msg); ics != "" && !referenced[ics] && archive.HasEntry(ics) {
+		content, err := archive.ReadEntry(ics, budget)
+		if err != nil {
+			log.Warn("skipping meeting invite", "entry", ref.EntryPath, "error", err)
+		} else {
+			attachments = append(attachments, olm.Attachment{
+				Ref:     olm.AttachmentRef{Name: "invite.ics", ContentType: "text/calendar", URL: ics},
+				Content: content,
+			})
+		}
 	}
 
 	raw, err := olm.BuildRFC5322(msg, attachments)

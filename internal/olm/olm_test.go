@@ -298,3 +298,50 @@ func TestFormatAddressList_StripsHeaderInjection(t *testing.T) {
 	assert.NotContains(t, got, "\n")
 	assert.Contains(t, got, "<e@example.com>")
 }
+
+func TestParseMessage_DisplayToAndReplyTo(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	xmlDoc := `<emails xml:space="preserve" elementCount="1"><email xml:space="preserve">
+<OPFMessageCopySubject xml:space="preserve">Hi</OPFMessageCopySubject>
+<OPFMessageCopyDisplayTo xml:space="preserve">Reader, Bea; Team List</OPFMessageCopyDisplayTo>
+<OPFMessageCopyReplyToAddresses><emailAddress OPFContactEmailAddressName="Replies" OPFContactEmailAddressAddress="replies@example.com" OPFContactEmailAddressType="SMTP"/></OPFMessageCopyReplyToAddresses>
+<OPFMessageCopyAttachmentList><messageAttachment xml:space="preserve" OPFAttachmentContentExtension="pdf" OPFAttachmentContentFileSize="8.7E4" OPFAttachmentContentType="application/pdf" OPFAttachmentName="deck.pdf"></messageAttachment></OPFMessageCopyAttachmentList>
+</email></emails>`
+	msg, err := ParseMessage(strings.NewReader(xmlDoc))
+	require.NoError(err)
+	assert.Equal("Reader, Bea; Team List", msg.DisplayTo)
+	assert.Empty(msg.To)
+	require.Len(msg.ReplyTo, 1)
+	assert.Equal("replies@example.com", msg.ReplyTo[0].Email)
+	require.Len(msg.Attachments, 1)
+	assert.False(msg.Attachments[0].HasPayload(), "no OPFAttachmentURL means no exported bytes")
+
+	raw, err := BuildRFC5322(msg, nil)
+	require.NoError(err)
+	parsed, err := mail.ReadMessage(bytes.NewReader(raw))
+	require.NoError(err)
+	dec := new(mime.WordDecoder)
+	to, err := dec.DecodeHeader(parsed.Header.Get("To"))
+	require.NoError(err)
+	assert.Equal("Reader, Bea, Team List", to, "display names split on semicolons only")
+	assert.Equal("Replies <replies@example.com>", parsed.Header.Get("Reply-To"))
+	missing, err := dec.DecodeHeader(parsed.Header.Get("X-Msgvault-Olm-Attachments-Missing"))
+	require.NoError(err)
+	assert.Equal("deck.pdf", missing)
+	assert.True(strings.HasPrefix(parsed.Header.Get("Content-Type"), "text/plain"), "no MIME attachment part for a payload-less record")
+}
+
+func TestInviteEntryName(t *testing.T) {
+	ref := MessageRef{EntryPath: "Accounts/acct/com.microsoft.__Messages/Sent Items/message_00001.xml"}
+	assert.Equal(t,
+		"Accounts/acct/com.microsoft.__Messages/Sent Items/com.microsoft.__Attachments/abc@example.com.ics",
+		InviteEntryName(ref, &Message{MessageID: "<abc@example.com>"}))
+	assert.Empty(t, InviteEntryName(ref, &Message{}))
+	assert.Empty(t, InviteEntryName(ref, &Message{MessageID: "<../escape>"}))
+}
+
+func TestMessageFolder_IgnoresAttachmentDirectories(t *testing.T) {
+	_, ok := messageFolder("Accounts/acct/com.microsoft.__Messages/Inbox/com.microsoft.__Attachments/report.xml")
+	assert.False(t, ok)
+}

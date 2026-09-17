@@ -74,7 +74,9 @@ msgvault import-olm <identifier> <olm-file>
 
 Use this when a Microsoft 365 mailbox cannot be reached over IMAP or Graph, for example when your organization does not allow app registrations. Only Legacy Outlook for Mac offers File > Export; the new Outlook for Mac has no OLM export. Export Mail only, then import the file. The identifier is the email address of the mailbox. Outlook folders become labels, so `Inbox/Projects` is a searchable label path. Calendar, contact, note, and task items are never read.
 
-OLM files do not contain the original message headers. msgvault rebuilds From, To, Cc, Bcc, Date, Subject, Message-ID, In-Reply-To, Thread-Topic, and Thread-Index from the exported fields, keeps text and HTML bodies, and stores attachments referenced by the export. Timestamps in the export are UTC. Each imported message carries `X-Msgvault-Synthesized: true` so you can tell it apart from mail archived with its original headers.
+OLM files do not contain the original message headers. msgvault rebuilds From, To, Cc, Bcc, Reply-To, Date, Subject, Message-ID, In-Reply-To, References, Thread-Topic, and Thread-Index from the exported fields and keeps text and HTML bodies. Timestamps in the export are UTC. Each imported message carries `X-Msgvault-Synthesized: true` so you can tell it apart from mail archived with its original headers.
+
+Expect three gaps that come from the export itself. Most messages list recipients only as display names, so the To header often has names without addresses. Outlook exports attachment bytes only for attachments it had cached; a listed attachment with no exported file is recorded by name in an `X-Msgvault-Olm-Attachments-Missing` header instead of as an attachment. Meeting requests and responses carry their calendar data as a sibling `.ics` file, which msgvault attaches as `invite.ics`.
 
 ### Examples
 

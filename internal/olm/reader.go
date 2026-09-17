@@ -28,6 +28,10 @@ import (
 // messagesSegment is the path segment that marks the mail-item subtree.
 const messagesSegment = "com.microsoft.__Messages"
 
+// attachmentsSegment names the per-folder directory holding attachment
+// payloads and meeting invitations.
+const attachmentsSegment = "com.microsoft.__Attachments"
+
 // ErrNoMessages is returned by Open when the archive contains no mail items.
 var ErrNoMessages = errors.New("olm archive contains no mail messages")
 
@@ -170,6 +174,17 @@ func (a *Archive) OpenMessage(ref MessageRef) (io.ReadCloser, error) {
 	return rc, nil
 }
 
+// HasEntry reports whether a zip entry exists under the given name after
+// normalization.
+func (a *Archive) HasEntry(name string) bool {
+	clean, ok := cleanEntryName(name)
+	if !ok {
+		return false
+	}
+	_, exists := a.entries[clean]
+	return exists
+}
+
 // ReadEntry reads a zip entry (typically an attachment referenced by
 // OPFAttachmentURL) into memory, refusing entries larger than maxBytes.
 // The URL is resolved relative to the archive root; a leading slash and
@@ -207,6 +222,19 @@ func (a *Archive) ReadEntry(name string, maxBytes int64) ([]byte, error) {
 	return data, nil
 }
 
+// InviteEntryName returns the zip entry name where Outlook stores a
+// message's iCalendar payload: <folder>/com.microsoft.__Attachments/<Message-ID>.ics
+// with the angle brackets removed. It returns "" when the message has no
+// Message-ID. Callers check HasEntry; most messages have no such file.
+func InviteEntryName(ref MessageRef, msg *Message) string {
+	id := strings.TrimSpace(msg.MessageID)
+	id = strings.TrimSuffix(strings.TrimPrefix(id, "<"), ">")
+	if id == "" || strings.ContainsAny(id, "/\\") {
+		return ""
+	}
+	return path.Dir(ref.EntryPath) + "/" + attachmentsSegment + "/" + id + ".ics"
+}
+
 // cleanEntryName normalizes a zip entry name and rejects names that escape
 // the archive root.
 func cleanEntryName(name string) (string, bool) {
@@ -231,9 +259,12 @@ func messageFolder(clean string) (string, bool) {
 	segs := strings.Split(clean, "/")
 	idx := -1
 	for i, s := range segs {
-		if s == messagesSegment {
+		if s == attachmentsSegment {
+			// Attachment payloads (even .xml ones) are never messages.
+			return "", false
+		}
+		if s == messagesSegment && idx < 0 {
 			idx = i
-			break
 		}
 	}
 	if idx < 0 || idx == len(segs)-1 {

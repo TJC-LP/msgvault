@@ -973,7 +973,7 @@ Import an Outlook for Mac `.olm` export into msgvault.
 msgvault import-olm <identifier> <olm-file>
 ```
 
-Legacy Outlook for Mac writes the whole mailbox to one `.olm` file through File > Export. The importer preserves the folder tree as labels, imports mail messages with attachments, and ignores calendar, contact, note, and task items. OLM exports carry no original transport headers, so From, To, Cc, Date, Subject, Message-ID, and In-Reply-To are rebuilt from the exported fields and the message is marked `X-Msgvault-Synthesized: true`.
+Legacy Outlook for Mac writes the whole mailbox to one `.olm` file through File > Export. The importer preserves the folder tree as labels, imports mail messages with attachments, and ignores calendar, contact, note, and task items. OLM exports carry no original transport headers, so From, To, Cc, Reply-To, Date, Subject, Message-ID, In-Reply-To, and References are rebuilt from the exported fields and the message is marked `X-Msgvault-Synthesized: true`. Recipients are often display names only, attachments Outlook did not export are listed in an `X-Msgvault-Olm-Attachments-Missing` header, and meeting invitations are attached as `invite.ics`. See [Importing Local Email](/docs/usage/importing/#import-olm) for details.
 
 | Flag | Default | Description |
 |---|---|---|
