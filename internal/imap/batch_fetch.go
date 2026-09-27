@@ -309,9 +309,9 @@ func (c *Client) selectBatchMailbox(
 }
 
 // fetchChunk runs one UID FETCH, reconnecting and retrying once on network
-// errors. fatal reports that the connection could not be re-established and
-// the whole batch should be abandoned; otherwise a non-nil error is local
-// to this chunk.
+// errors. fatal reports that the connection or selected mailbox could not be
+// re-established and the whole batch should be abandoned; otherwise a non-nil
+// error is local to this chunk.
 func (c *Client) fetchChunk(
 	ctx context.Context,
 	mailbox string,
@@ -332,12 +332,61 @@ func (c *Client) fetchChunk(
 	}
 	if selErr := c.selectMailbox(mailbox); selErr != nil {
 		c.logger.Warn("mailbox reselect failed after reconnect", "mailbox", mailbox, "error", selErr)
-		return nil, false, selErr
+		return nil, true, selErr
 	}
 	msgs, err = c.conn.Fetch(uidSet, fetchOpts).Collect()
 	if err != nil {
 		c.logger.Warn("UID FETCH failed after reconnect", "mailbox", mailbox, "error", err)
 		return nil, false, fmt.Errorf("UID FETCH after reconnect in mailbox %q: %w", mailbox, err)
+	}
+	return msgs, false, nil
+}
+
+// fetchMessageIDChunk is fetchChunk for the Message-ID header. Some servers,
+// DavMail among them, answer BODY.PEEK[HEADER.FIELDS ("Message-ID")] with a
+// zero-length section: they keep the quotes around the field name, which the
+// client sends as a quoted string, and match no header. A conforming server
+// returns at least the blank line that ends the header even when the message
+// has no Message-ID, so an empty section is a server fault and not an absent
+// header. Those UIDs are fetched again with BODY.PEEK[HEADER], which takes no
+// field list.
+func (c *Client) fetchMessageIDChunk(
+	ctx context.Context,
+	mailbox string,
+	uidSet imap.UIDSet,
+) (msgs []*imapclient.FetchMessageBuffer, fatal bool, err error) {
+	msgs, fatal, err = c.fetchChunk(ctx, mailbox, uidSet, messageIDHeaderFetchOptions())
+	if err != nil {
+		return msgs, fatal, err
+	}
+
+	emptyByUID := make(map[imap.UID]*imapclient.FetchMessageBuffer)
+	var emptySet imap.UIDSet
+	for _, msg := range msgs {
+		if len(msg.BodySection) == 0 || len(msg.BodySection[0].Bytes) == 0 {
+			emptyByUID[msg.UID] = msg
+			emptySet.AddNum(msg.UID)
+		}
+	}
+	if len(emptyByUID) == 0 {
+		return msgs, false, nil
+	}
+
+	full, fatal, err := c.fetchChunk(ctx, mailbox, emptySet, fullHeaderFetchOptions())
+	if fatal {
+		return nil, true, err
+	}
+	if err != nil {
+		// The first response stands; its empty sections surface to the caller
+		// the same way they would have without the fallback.
+		c.logger.Warn("full-header fallback fetch failed",
+			"mailbox", mailbox, "uids", len(emptyByUID), "error", err)
+		return msgs, false, nil
+	}
+	for _, msg := range full {
+		if orig, ok := emptyByUID[msg.UID]; ok && len(msg.BodySection) > 0 {
+			orig.BodySection = msg.BodySection
+		}
 	}
 	return msgs, false, nil
 }
@@ -425,9 +474,7 @@ func (c *Client) recheckOmittedRaw(
 	}
 	msgs, fatal, err := c.fetchChunk(ctx, mailbox, uidSet, fetchOpts)
 	if fatal {
-		// The reconnect failed, so there is no connection left to run the next
-		// chunk on. The batch has to end here, exactly as it does when the
-		// first fetch of a chunk hits this.
+		// Without a connection and selected mailbox, later chunks cannot run.
 		return nil, err
 	}
 	if err != nil {
@@ -645,7 +692,6 @@ func (c *Client) fetchMailboxLabelBatch(
 	ctx context.Context,
 	mailbox string,
 	items []batchFetchItem,
-	fetchOpts *imap.FetchOptions,
 	results []gmailapi.MessageLabelsBatchResult,
 ) error {
 	uidToIdx := make(map[imap.UID]int, len(items))
@@ -665,7 +711,7 @@ func (c *Client) fetchMailboxLabelBatch(
 			uidSet.AddNum(item.uid)
 		}
 
-		msgs, fatal, err := c.fetchChunk(ctx, mailbox, uidSet, fetchOpts)
+		msgs, fatal, err := c.fetchMessageIDChunk(ctx, mailbox, uidSet)
 		if fatal {
 			return err
 		}
@@ -678,7 +724,7 @@ func (c *Client) fetchMailboxLabelBatch(
 		if len(omitted) > 0 {
 			var fatalErr error
 			omitted, fatalErr = c.recheckOmittedLabels(
-				ctx, results, uidToIdx, mailbox, omitted, fetchOpts)
+				ctx, results, uidToIdx, mailbox, omitted)
 			if fatalErr != nil {
 				return fatalErr
 			}
@@ -697,13 +743,12 @@ func (c *Client) recheckOmittedLabels(
 	uidToIdx map[imap.UID]int,
 	mailbox string,
 	omitted []batchFetchItem,
-	fetchOpts *imap.FetchOptions,
 ) ([]batchFetchItem, error) {
 	var uidSet imap.UIDSet
 	for _, item := range omitted {
 		uidSet.AddNum(item.uid)
 	}
-	msgs, fatal, err := c.fetchChunk(ctx, mailbox, uidSet, fetchOpts)
+	msgs, fatal, err := c.fetchMessageIDChunk(ctx, mailbox, uidSet)
 	if fatal {
 		return nil, err
 	}
@@ -739,7 +784,6 @@ func (c *Client) GetMessageLabelsBatch(ctx context.Context, messageIDs []string)
 		return nil, err
 	}
 
-	fetchOpts := messageIDHeaderFetchOptions()
 	for _, mailbox := range batchMailboxOrder(byMailbox, c.allMailFolder) {
 		if ctx.Err() != nil {
 			return results, ctx.Err()
@@ -754,7 +798,7 @@ func (c *Client) GetMessageLabelsBatch(ctx context.Context, messageIDs []string)
 			continue
 		}
 
-		if err := c.fetchMailboxLabelBatch(ctx, mailbox, items, fetchOpts, results); err != nil {
+		if err := c.fetchMailboxLabelBatch(ctx, mailbox, items, results); err != nil {
 			return results, err
 		}
 	}
