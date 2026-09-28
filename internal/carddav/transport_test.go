@@ -1,17 +1,20 @@
 package carddav
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5" // #nosec G501 -- RFC 7616 MD5 interoperability fixture.
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
 	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -791,4 +794,70 @@ func fixtureDNSResponse(request []byte, addresses ...netip.Addr) []byte {
 		response = append(response, address.AsSlice()...)
 	}
 	return response
+}
+
+func TestClientLogsUpstreamBodyOnlyAtDebug(t *testing.T) {
+	for _, level := range []slog.Level{slog.LevelInfo, slog.LevelDebug} {
+		t.Run(level.String(), func(t *testing.T) {
+			assert := assert.New(t)
+			require := require.New(t)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				_, err := w.Write([]byte(`{"error": {"code": 400, "status": "INVALID_ARGUMENT"}}`))
+				assert.NoError(err)
+			}))
+			t.Cleanup(server.Close)
+			var logged bytes.Buffer
+			previous := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&logged, &slog.HandlerOptions{Level: level})))
+			t.Cleanup(func() { slog.SetDefault(previous) })
+
+			client := newFixtureClient(t, server.URL, "alice", "secret")
+			_, err := client.Do(t.Context(), Request{Method: http.MethodPut, URL: server.URL + "/books/personal/alice.vcf"})
+			var status *StatusError
+			require.ErrorAs(err, &status)
+			assert.Equal(http.StatusBadRequest, status.StatusCode)
+			assert.Contains(logged.String(), "level=WARN")
+			assert.Contains(logged.String(), "method=PUT")
+			assert.Contains(logged.String(), "status=400")
+			for line := range strings.Lines(logged.String()) {
+				if strings.Contains(line, "level=WARN") {
+					assert.NotContains(line, "body=")
+				}
+			}
+			if level == slog.LevelDebug {
+				assert.Contains(logged.String(), "level=DEBUG")
+				assert.Contains(logged.String(), "INVALID_ARGUMENT")
+			} else {
+				assert.NotContains(logged.String(), "INVALID_ARGUMENT")
+			}
+			assert.NotContains(logged.String(), "/books/personal/", "the request URL is not logged")
+		})
+	}
+}
+
+func TestClientLogsExpectedFailuresAtDebug(t *testing.T) {
+	for _, status := range []int{http.StatusNotFound, http.StatusGone, http.StatusPreconditionFailed} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			assert := assert.New(t)
+			require := require.New(t)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(status)
+			}))
+			t.Cleanup(server.Close)
+			var logged bytes.Buffer
+			previous := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&logged, &slog.HandlerOptions{Level: slog.LevelDebug})))
+			t.Cleanup(func() { slog.SetDefault(previous) })
+
+			client := newFixtureClient(t, server.URL, "alice", "secret")
+			_, err := client.Do(t.Context(), Request{Method: http.MethodPut, URL: server.URL + "/books/personal/alice.vcf"})
+			var statusErr *StatusError
+			require.ErrorAs(err, &statusErr)
+			assert.Equal(status, statusErr.StatusCode)
+			assert.Contains(logged.String(), "level=DEBUG")
+			assert.NotContains(logged.String(), "level=WARN")
+		})
+	}
 }

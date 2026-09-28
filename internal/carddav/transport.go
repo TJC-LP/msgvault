@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/netip"
@@ -160,6 +161,7 @@ func (c *Client) Do(ctx context.Context, request Request) (*Response, error) {
 			continue
 		}
 		if status >= http.StatusBadRequest {
+			logRequestFailure(operationCtx, request.Method, status, response.Body)
 			return response, &StatusError{
 				StatusCode:   status,
 				RetryAfter:   retryAfter(response.Header.Get("Retry-After"), time.Now()),
@@ -190,6 +192,25 @@ func (c *Client) doWithBudget(
 		}
 	}
 	return response, err
+}
+
+// logRequestFailure records the upstream status at WARN and a bounded body
+// excerpt only at DEBUG. Response bodies are arbitrary server text, so they
+// require opting into debug logging. Absent resources and precondition failures
+// are expected outcomes of member fetches and conditional publications, so they
+// are logged at DEBUG only. The URL is omitted because it can embed the account
+// identity.
+func logRequestFailure(ctx context.Context, method string, status int, body []byte) {
+	const excerptLimit = 512
+	excerpt := strings.TrimSpace(string(body))
+	if len(excerpt) > excerptLimit {
+		excerpt = excerpt[:excerptLimit] + "..."
+	}
+	excerpt = strings.ToValidUTF8(excerpt, "")
+	if !isAbsentStatusCode(status) && status != http.StatusPreconditionFailed {
+		slog.WarnContext(ctx, "CardDAV request failed", "method", method, "status", status)
+	}
+	slog.DebugContext(ctx, "CardDAV request failed", "method", method, "status", status, "body", excerpt)
 }
 
 func davErrorPrecondition(body []byte) string {
