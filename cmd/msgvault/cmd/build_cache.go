@@ -2111,7 +2111,10 @@ func (s *cacheSourceSnapshot) prepareTables(tables []cacheSnapshotTable) error {
 		// DuckDB handles both forward and backslash paths, but normalize to forward.
 		escaped := strings.ReplaceAll(csvPath, "\\", "/")
 		escaped = strings.ReplaceAll(escaped, "'", "''")
-		csvOpts := "header=true, nullstr='\\N'"
+		// Pin quoting to what encoding/csv writes. It only quotes fields that
+		// need it, so the sniffer's 20,480-row sample may see none and settle
+		// on quote=(empty), splitting a later quoted field into extra columns.
+		csvOpts := "header=true, quote='\"', escape='\"', nullstr='\\N'"
 		if t.typeOverrides != "" {
 			csvOpts += ", " + t.typeOverrides
 		}

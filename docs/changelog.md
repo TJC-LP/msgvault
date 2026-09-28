@@ -11,6 +11,10 @@ All notable changes to msgvault, grouped by release.
 - Beeper media sync stops retrying files the network has deleted, such as expired WhatsApp media. Each is requested once, recorded as unavailable, and reported in the sync summary. Other failed downloads get at most three attempts per run instead of eight, so one bad file no longer stalls a sync.
 - `msgvault search` keeps complete sender and subject/snippet text when piped or redirected. Terminal tables fit the available display width, with aligned Unicode and emoji and complete fixed fields.
 - `msgvault search` shows snippets for subjectless chat hits, keeps Unicode characters whole when truncating, and shows `-` when a message has no recorded size.
+- Analytics cache rebuilds on macOS and Windows no longer fail when a quoted
+  CSV field, such as a display name with a comma, first appears deep in a large
+  archive. The CSV snapshot now tells DuckDB the quote character instead of
+  letting it guess from a sample.
 - Query published analytics while the daemon refreshes the cache in the
   background. `query --fresh` waits for current results; HTTP and MCP callers
   can track refresh jobs. The new `query_sql` MCP tool restricts SQL to archive

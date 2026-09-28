@@ -2394,6 +2394,69 @@ func TestBuildCacheCSVInvalidUTF8PastSampleExplainsRepairPath(t *testing.T) {
 	assert.Contains(err.Error(), "not a msgvault option")
 }
 
+func TestBuildCacheCSVQuotedFieldPastSniffSampleRoundTrips(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	t.Setenv("MSGVAULT_FORCE_CSV_SNAPSHOT", "1")
+	tmpDir := setupTestSQLite(t)
+	dbPath := filepath.Join(tmpDir, "test.db")
+	analyticsDir := filepath.Join(tmpDir, "analytics")
+
+	// encoding/csv only quotes a field when it must, and DuckDB's sniffer
+	// only looks at the first 20,480 rows to guess the quote character. Put
+	// the first field that needs quoting well past that window so a rebuild
+	// that trusts the sniffer sees quote=(empty) and splits the row.
+	const bulkRows = 30000
+	quotedName := "Example \"Co\", LLC\nAttn: Sales"
+
+	db, err := sql.Open("sqlite3", dbPath)
+	require.NoError(err)
+	_, err = db.Exec(`
+		INSERT INTO messages (id, source_id, source_message_id, sent_at)
+		WITH RECURSIVE seq(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM seq WHERE i < ?)
+		SELECT 1000 + i, 1, 'bulk-' || i, datetime('2024-04-01', '+' || i || ' minutes') FROM seq;
+	`, bulkRows)
+	require.NoError(err)
+	_, err = db.Exec(`
+		INSERT INTO message_recipients (message_id, participant_id, recipient_type, display_name)
+		WITH RECURSIVE seq(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM seq WHERE i < ?)
+		SELECT 1000 + i, 1, 'to', 'Recipient ' || i FROM seq;
+	`, bulkRows)
+	require.NoError(err)
+	_, err = db.Exec(`
+		INSERT INTO messages (id, source_id, source_message_id, sent_at)
+		VALUES (?, 1, 'quoted', '2024-05-01 12:00:00')
+	`, 1000+bulkRows+1)
+	require.NoError(err)
+	_, err = db.Exec(`
+		INSERT INTO message_recipients (message_id, participant_id, recipient_type, display_name)
+		VALUES (?, 2, 'from', ?)
+	`, 1000+bulkRows+1, quotedName)
+	require.NoError(err)
+	require.NoError(db.Close())
+
+	_, err = buildCache(dbPath, analyticsDir, true)
+	require.NoError(err, "a quoted CSV field past the sniffer sample must not break the rebuild")
+
+	duckdb, err := sql.Open("duckdb", "")
+	require.NoError(err)
+	defer func() { _ = duckdb.Close() }()
+	glob := filepath.Join(analyticsDir, "message_recipients", "*.parquet")
+
+	var got string
+	err = duckdb.QueryRow(
+		`SELECT display_name FROM read_parquet(?) WHERE message_id = ? AND recipient_type = 'from'`,
+		glob, 1000+bulkRows+1,
+	).Scan(&got)
+	require.NoError(err)
+	assert.Equal(quotedName, got, "commas, embedded quotes, and newlines must round-trip through the CSV snapshot")
+
+	var total int64
+	err = duckdb.QueryRow(`SELECT COUNT(*) FROM read_parquet(?)`, glob).Scan(&total)
+	require.NoError(err)
+	assert.Equal(int64(12+bulkRows+1), total, "every fixture, bulk, and quoted recipient row is exported")
+}
+
 func TestBuildCacheExportsAttachmentMetadataForRawQuery(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
