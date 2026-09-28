@@ -75,6 +75,8 @@ type PropertyOccurrence struct {
 	Identity       PropertyIdentity `json:"identity"`
 	Property       Property         `json:"property"`
 	Classification HandlingStrategy `json:"classification"`
+	// GeneratedFullName identifies a renderer-owned fallback, not an imported FN.
+	GeneratedFullName bool `json:"generated_full_name,omitzero"`
 }
 
 // PropertyEdit replaces or removes exactly one property occurrence. A zero
@@ -271,6 +273,7 @@ func applyPropertyEdits(
 		occurrence.Property = mergeEditedProperty(
 			occurrence.Property, cloneProperty(edit.Property), edit.OwnedParameters,
 		)
+		occurrence.GeneratedFullName = false
 		occurrence.Classification = classifyProperty(edit.Property)
 		properties = append(properties, occurrence)
 	}
@@ -307,7 +310,7 @@ func indexPropertyEdits(edits []PropertyEdit) (map[string]PropertyEdit, error) {
 }
 
 // RenderView returns the requested wire-version view without mutating the
-// envelope. A no-op view returns StoredBody byte-for-byte.
+// envelope. A no-op view with a non-empty FN returns StoredBody byte-for-byte.
 func (e ResourceEnvelope) RenderView(version Version) ([]byte, error) {
 	if version == "" {
 		version = e.RenderMetadata.StoredVersion
@@ -315,7 +318,11 @@ func (e ResourceEnvelope) RenderView(version Version) ([]byte, error) {
 	if version == Version21 {
 		return nil, errors.New("vCard 2.1 is read-only and cannot be emitted")
 	}
-	if !e.RenderMetadata.RenderRequired && version == e.RenderMetadata.StoredVersion {
+	if !e.RenderMetadata.RenderRequired && version == e.RenderMetadata.StoredVersion &&
+		slices.ContainsFunc(e.PropertyTree, func(occurrence PropertyOccurrence) bool {
+			return strings.EqualFold(occurrence.Property.Name, "FN") &&
+				strings.TrimSpace(occurrence.Property.RawValue) != ""
+		}) {
 		return append([]byte(nil), e.StoredBody...), nil
 	}
 	if version != Version30 && version != Version40 {
@@ -423,6 +430,9 @@ func (e ResourceEnvelope) cardForRender(version Version) (Card, error) {
 	sourceVersion := e.RenderMetadata.StoredVersion
 	properties := make([]Property, 0, len(e.PropertyTree)+1)
 	for _, occurrence := range e.PropertyTree {
+		if occurrence.GeneratedFullName {
+			continue
+		}
 		property := cloneProperty(occurrence.Property)
 		if strings.EqualFold(property.Name, "VERSION") {
 			property.RawValue = string(version)
@@ -488,6 +498,43 @@ func ensureRenderedFullName(properties []Property, version Version) ([]Property,
 			continue
 		}
 		return slices.Insert(properties, index+1, fullName), nil
+	}
+	for _, propName := range []string{"ORG", "EMAIL", "TEL"} {
+		for index, property := range properties {
+			if strings.EqualFold(property.Name, propName) && strings.TrimSpace(property.RawValue) != "" {
+				val, err := UnescapeText(property.RawValue)
+				if err != nil {
+					return nil, fmt.Errorf("derive FN from %s: %w", propName, err)
+				}
+				val = strings.TrimSpace(val)
+				if scheme, value, ok := strings.Cut(val, ":"); ok &&
+					(propName == "EMAIL" && strings.EqualFold(scheme, "mailto") ||
+						propName == "TEL" && semanticValueType(version, property) == valueTypeURI &&
+							strings.EqualFold(scheme, "tel")) {
+					val = value
+				}
+				if val != "" {
+					fullName, err := NewProperty(property.Group, "FN", EscapeText(val))
+					if err == nil {
+						if version == Version40 {
+							if derived, err := NewParameter("DERIVED", "true"); err == nil {
+								fullName.Parameters = append(fullName.Parameters, derived)
+							}
+						}
+						return slices.Insert(properties, index+1, fullName), nil
+					}
+				}
+			}
+		}
+	}
+	fullName, err := NewProperty("", "FN", "Unnamed Contact")
+	if err == nil {
+		if version == Version40 {
+			if derived, err := NewParameter("DERIVED", "true"); err == nil {
+				fullName.Parameters = append(fullName.Parameters, derived)
+			}
+		}
+		return append(properties, fullName), nil
 	}
 	return properties, nil
 }
@@ -612,6 +659,9 @@ func ResidueWithMappings(
 	}
 	residue := make([]PropertyOccurrence, 0)
 	for _, property := range properties {
+		if property.GeneratedFullName {
+			continue
+		}
 		if kind, ok := mapped[property.Identity.Key()]; ok {
 			if kind == HandlingPreserve {
 				residue = append(residue, property)
@@ -884,7 +934,15 @@ func cloneResourceEnvelope(e ResourceEnvelope) ResourceEnvelope {
 // now carries; the rest receive ordinals after every identity in the stable
 // tree.
 func reconcilePropertyTree(stable, wire []PropertyOccurrence) []PropertyOccurrence {
+	generatedFullName := !slices.ContainsFunc(stable, func(occurrence PropertyOccurrence) bool {
+		return !occurrence.GeneratedFullName && strings.EqualFold(occurrence.Property.Name, "FN") &&
+			strings.TrimSpace(occurrence.Property.RawValue) != ""
+	})
 	used := make([]bool, len(stable))
+	for index, occurrence := range stable {
+		// An explicit FN replaces the generated fallback and keeps its own owner.
+		used[index] = occurrence.GeneratedFullName && !generatedFullName
+	}
 	nextOrdinal := nextPropertyOrdinal(stable)
 	reconciled := make([]PropertyOccurrence, 0, len(wire))
 	for _, wireOccurrence := range wire {
@@ -896,6 +954,8 @@ func reconcilePropertyTree(stable, wire []PropertyOccurrence) []PropertyOccurren
 			match = matchingStableOccurrence(stable, used, wireOccurrence, false)
 		}
 		candidate := clonePropertyOccurrence(wireOccurrence)
+		candidate.GeneratedFullName = generatedFullName && strings.EqualFold(candidate.Property.Name, "FN") &&
+			strings.TrimSpace(candidate.Property.RawValue) != ""
 		if match >= 0 {
 			used[match] = true
 			candidate.Identity.Ordinal = stable[match].Identity.Ordinal
