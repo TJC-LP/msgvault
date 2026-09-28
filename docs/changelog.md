@@ -94,6 +94,11 @@ See [Beeper audio](usage/beeper.md#send-audio-to-docbank).
   daemon-backed MCP advertises configured search tools only when their health
   facts and routes are supported. Search still checks readiness per request.
 
+- Added fresh IMAP draft composition, reply-all recipient selection, explicit
+  destination and sender selection, and frozen sender restrictions for
+  delegated draft creation. Drafts keep their To, Cc, and Bcc roles and are
+  never sent by msgvault.
+
 ## 0.20.0
 <small>2026-09-22</small>
 
