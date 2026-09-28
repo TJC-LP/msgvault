@@ -47,6 +47,7 @@
   } from '../../api/generated/models';
   import type { CardDAVSettingsRequest, SettingsNavigationTarget } from '../../carddav/navigation';
   import CardDAVSettingsWorkspace from './CardDAVSettingsWorkspace.svelte';
+  import PeopleInferenceSettings from './PeopleInferenceSettings.svelte';
   import CronField from './CronField.svelte';
   import PersonEnrichmentProviderCard from './PersonEnrichmentProviderCard.svelte';
   import PersonEnrichmentProviderCreator from './PersonEnrichmentProviderCreator.svelte';
@@ -109,6 +110,7 @@
   const categories: SettingsCategory[] = $derived([
     ...settingsGroups.map((group) => ({ id: group.id, label: group.label })),
     { id: 'carddav', label: 'CardDAV account' },
+    { id: 'people', label: 'People sweep' },
   ]);
   const dirtyCount = $derived(Object.keys(drafts).length + Object.keys(secretUpdates).length);
   // An emptied number field is a draft in progress, not a value: it keeps the
@@ -612,7 +614,7 @@
       {categories}
       bind:active={activeCategory}
       title="Settings"
-      footer={activeCategory === 'carddav' ? undefined : settingsFooter}
+      footer={activeCategory === 'carddav' || activeCategory === 'people' ? undefined : settingsFooter}
     >
       {#snippet panel(activeId)}
         <div class="notices">
@@ -638,6 +640,8 @@
             {onCardDAVRequestConsumed}
             onSettingsRefresh={() => loadSettings(true)}
           />
+        {:else if activeId === 'people'}
+          <PeopleInferenceSettings {client} />
         {:else}
           {#each settingsGroups.filter((candidate) => candidate.id === activeId) as group (group.id)}
             {@const posture = restartPosture(group.settings)}

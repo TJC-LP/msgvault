@@ -92,19 +92,34 @@ GOLANGCI_LINT_TMP ?= $(GOLANGCI_LINT_CACHE)/tmp
 
 # Build the binary (debug)
 build: web-embed
+ifeq ($(shell go env GOOS),linux)
+	CGO_ENABLED=0 go build -trimpath -buildvcs=false -o msgvault-codex-bridge ./cmd/msgvault-codex-bridge
+	chmod 755 msgvault-codex-bridge
+	@bridge_digest=$$(sha256sum msgvault-codex-bridge | cut -d' ' -f1); \
+		CGO_ENABLED=1 go build -tags "$(BUILD_TAGS)" -ldflags="$(LDFLAGS) -X go.kenn.io/msgvault/internal/peoplesweep.codexBridgeSHA256=$$bridge_digest" -o msgvault ./cmd/msgvault
+else
 	CGO_ENABLED=1 go build -tags "$(BUILD_TAGS)" -ldflags="$(LDFLAGS)" -o msgvault ./cmd/msgvault
+endif
 	@chmod +x msgvault
 
 # Build with optimizations (release)
 build-release: web-embed
+ifeq ($(shell go env GOOS),linux)
+	CGO_ENABLED=0 go build -trimpath -buildvcs=false -o msgvault-codex-bridge ./cmd/msgvault-codex-bridge
+	chmod 755 msgvault-codex-bridge
+	@bridge_digest=$$(sha256sum msgvault-codex-bridge | cut -d' ' -f1); \
+		CGO_ENABLED=1 go build -tags "$(BUILD_TAGS)" -ldflags="$(LDFLAGS_RELEASE) -X go.kenn.io/msgvault/internal/peoplesweep.codexBridgeSHA256=$$bridge_digest" -trimpath -o msgvault ./cmd/msgvault
+else
 	CGO_ENABLED=1 go build -tags "$(BUILD_TAGS)" -ldflags="$(LDFLAGS_RELEASE)" -trimpath -o msgvault ./cmd/msgvault
+endif
 	@chmod +x msgvault
 
 # Install to ~/.local/bin, $GOBIN, or $GOPATH/bin
-install: web-embed
-	@if [ -d "$(HOME)/.local/bin" ]; then \
+install: build
+	@set -e; if [ -d "$(HOME)/.local/bin" ]; then \
 		echo "Installing to ~/.local/bin/msgvault"; \
-		CGO_ENABLED=1 go build -tags "$(BUILD_TAGS)" -ldflags="$(LDFLAGS)" -o "$(HOME)/.local/bin/msgvault" ./cmd/msgvault; \
+		install -m 755 msgvault "$(HOME)/.local/bin/msgvault"; \
+		if [ "$$(go env GOOS)" = linux ]; then install -m 755 msgvault-codex-bridge "$(HOME)/.local/bin/msgvault-codex-bridge"; fi; \
 	else \
 		INSTALL_DIR="$${GOBIN:-$$(go env GOBIN)}"; \
 		if [ -z "$$INSTALL_DIR" ]; then \
@@ -113,12 +128,13 @@ install: web-embed
 		fi; \
 		mkdir -p "$$INSTALL_DIR"; \
 		echo "Installing to $$INSTALL_DIR/msgvault"; \
-		CGO_ENABLED=1 go build -tags "$(BUILD_TAGS)" -ldflags="$(LDFLAGS)" -o "$$INSTALL_DIR/msgvault" ./cmd/msgvault; \
+		install -m 755 msgvault "$$INSTALL_DIR/msgvault"; \
+		if [ "$$(go env GOOS)" = linux ]; then install -m 755 msgvault-codex-bridge "$$INSTALL_DIR/msgvault-codex-bridge"; fi; \
 	fi
 
 # Clean build artifacts
 clean:
-	rm -f msgvault msgvault.exe mimeshootout
+	rm -f msgvault msgvault.exe msgvault-codex-bridge mimeshootout
 	rm -rf bin/
 
 # Scale the SQLite suite when both CPU and memory budgets allow it. An explicit

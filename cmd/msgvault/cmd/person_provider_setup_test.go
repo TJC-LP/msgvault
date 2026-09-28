@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/charmbracelet/x/term"
 	"github.com/spf13/cobra"
@@ -20,6 +21,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/peoplesweep"
+	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/testutil"
 )
 
@@ -274,6 +276,45 @@ func TestPersonProviderAddValidatesPolicyBeforeReadingCredentialOrNegotiating(t 
 	assert.Zero(lookups)
 	assert.Zero(negotiations)
 	assert.NotContains(output, providerSetupSecretCanary)
+}
+
+func TestPersonProviderPresetRejectsEndpointSwapBeforeCredential(t *testing.T) {
+	path, loaded := providerSetupConfigFile(t)
+	deps := providerSetupCommandDeps(t, path, loaded, nil)
+	var lookups, negotiations int
+	deps.setup.lookupEnv = func(string) (string, bool) {
+		lookups++
+		return providerSetupSecretCanary, true
+	}
+	deps.setup.negotiate = func(context.Context, peoplesweep.ProviderConfig, peoplesweep.Credential) (peoplesweep.NegotiatedCapabilities, error) {
+		negotiations++
+		return peoplesweep.NegotiatedCapabilities{}, nil
+	}
+
+	_, err := executePersonProviderCommand(t, deps,
+		"add", "venice-bound", "--provider", "venice", "--model", "venice/model",
+		"--endpoint", "https://elsewhere.example.test/v1", "--credential-env", "VENICE_KEY",
+		"--retention-posture", "operator_asserted", "--training-posture", "operator_asserted",
+		"--source", "conversation_text", "--source-since", "2025-01-01", "--yes")
+	require.ErrorContains(t, err, "preset")
+	assert.Zero(t, lookups)
+	assert.Zero(t, negotiations)
+}
+
+func TestPersonProviderPresetCandidateKeepsAssertionsExplicit(t *testing.T) {
+	assert := assert.New(t)
+	candidate, err := personProviderCandidate(personProviderAddOptions{
+		presetID: "openrouter", model: "explicit/model", credentialEnv: "EXACT_ROUTER_KEY",
+		retentionPosture: "operator_asserted", trainingPosture: "operator_asserted",
+		allowedSources: []string{"conversation_text"}, sourceSince: "2025-01-01",
+	})
+	require.NoError(t, err)
+	assert.Equal("openrouter", candidate.PresetID)
+	assert.Equal("https://openrouter.ai/api/v1", candidate.Endpoint)
+	assert.Equal(peoplesweep.CredentialEnv, candidate.Credential)
+	assert.Equal("EXACT_ROUTER_KEY", candidate.CredentialEnv)
+	assert.Equal("operator_asserted", candidate.RetentionPosture)
+	assert.Equal("explicit/model", candidate.Model)
 }
 
 func TestPersonProviderAddRejectsLocalOptionConflictsBeforeCatalogOrState(t *testing.T) {
@@ -1306,6 +1347,8 @@ func TestPersonProviderDefaultDependenciesResolveCredentialsAfterConfigLoad(t *t
 	assert.Contains(string(configData), `credential = "env"`)
 	assert.Contains(string(configData), `credential_env = "LIVE_PROVIDER_KEY"`)
 
+	deps.isDaemonSubprocess = func() bool { return false }
+	deps.providerStoreOwnedByDaemon = func(context.Context) (bool, error) { return false, nil }
 	removeRoot := newPersonProviderInvocationTestRoot()
 	removePerson := &cobra.Command{Use: "person"}
 	removePerson.AddCommand(newPersonProviderCommand(deps))
@@ -1387,6 +1430,8 @@ func TestPersonProviderDefaultDependenciesResolveStoredCredentialsAfterConfigLoa
 	assert.NotContains(string(configData), providerSetupSecretCanary)
 	assert.Contains(string(configData), `credential = "stored"`)
 
+	deps.isDaemonSubprocess = func() bool { return false }
+	deps.providerStoreOwnedByDaemon = func(context.Context) (bool, error) { return false, nil }
 	removeRoot := newPersonProviderInvocationTestRoot()
 	removePerson := &cobra.Command{Use: "person"}
 	removePerson.AddCommand(newPersonProviderCommand(deps))
@@ -1647,12 +1692,14 @@ func TestPersonProviderLifecycleJSONOutput(t *testing.T) {
 		DaemonRestartRequired: true,
 	}, used)
 
+	deps.isDaemonSubprocess = func() bool { return false }
+	deps.providerStoreOwnedByDaemon = func(context.Context) (bool, error) { return false, nil }
 	removeRaw, err := executePersonProviderCommand(t, deps, "remove", "default", "--json")
 	require.NoError(err)
 	var removed personProviderRemoveOutput
 	require.NoError(json.Unmarshal([]byte(removeRaw), &removed), removeRaw)
 	assert.Equal(personProviderRemoveOutput{
-		Name: "default", Removed: true, DaemonRestartRequired: true,
+		Name: "default", Removed: true, DaemonRestartRequired: false,
 	}, removed)
 }
 
@@ -1847,6 +1894,10 @@ func TestPersonProviderRemoveRevokesAndDeletesOnlyExactCredential(t *testing.T) 
 	require.NoError(err)
 	_, err = st.EnsurePersonInferenceProfile(t.Context(), profile)
 	require.NoError(err)
+	require.NoError(st.RecordPersonInferenceCheck(t.Context(), store.PersonInferenceCheck{
+		ProfileFingerprint: profile.Fingerprint, CheckedAt: time.Now(),
+		DriverVersion: profile.DriverVersion, OutputMode: profile.OutputMode, ModelVersion: profile.Model,
+	}))
 	_, _, err = st.GrantPersonInferenceConsent(t.Context(), profile.Fingerprint, "cli")
 	require.NoError(err)
 	deps := localPersonProviderDeps(loaded.People.Sweep, st, nil)
@@ -1865,6 +1916,8 @@ func TestPersonProviderRemoveRevokesAndDeletesOnlyExactCredential(t *testing.T) 
 	}
 	deps.setup.credentials = credentialStore
 
+	deps.isDaemonSubprocess = func() bool { return false }
+	deps.providerStoreOwnedByDaemon = func(context.Context) (bool, error) { return false, nil }
 	output, err := executePersonProviderCommand(t, deps, "remove", "old")
 	require.NoError(err)
 	assert.Contains(output, "old")
@@ -1879,6 +1932,9 @@ func TestPersonProviderRemoveRevokesAndDeletesOnlyExactCredential(t *testing.T) 
 	active, err := st.HasActivePersonInferenceConsent(t.Context(), profile.Fingerprint)
 	require.NoError(err)
 	assert.False(active)
+	checked, err := st.HasSuccessfulPersonInferenceCheck(t.Context(), profile.Fingerprint)
+	require.NoError(err)
+	assert.False(checked, "removal must discard the old credential's check")
 	profiles, err := st.ListPersonInferenceProfiles(t.Context())
 	require.NoError(err)
 	assert.Len(profiles, 1, "immutable audit profile must remain")
@@ -1898,6 +1954,8 @@ func TestPersonProviderRemoveRevokesAndDeletesOnlyExactCredential(t *testing.T) 
 	activeDeps.restoreConfigFile = func(published, before config.ConfigFile) (config.ConfigFile, error) {
 		return config.RestoreConfigFile(activePath, published, before)
 	}
+	activeDeps.isDaemonSubprocess = func() bool { return false }
+	activeDeps.providerStoreOwnedByDaemon = func(context.Context) (bool, error) { return false, nil }
 	_, err = executePersonProviderCommand(t, activeDeps, "remove", "default")
 	require.ErrorContains(err, "active")
 }
@@ -1959,6 +2017,8 @@ func TestPersonProviderRemoveUsesOneFreshConfigSnapshotForAllSideEffects(t *test
 	}
 	deps.setup.credentials = credentialStore
 
+	deps.isDaemonSubprocess = func() bool { return false }
+	deps.providerStoreOwnedByDaemon = func(context.Context) (bool, error) { return false, nil }
 	_, err = executePersonProviderCommand(t, deps, "remove", "old")
 	require.NoError(err)
 	stillActive, err := st.HasActivePersonInferenceConsent(t.Context(), staleProfile.Fingerprint)
@@ -2024,6 +2084,8 @@ func TestPersonProviderRemoveConfigConflictHasNoConsentOrCredentialSideEffects(t
 	}
 	deps.setup.credentials = credentialStore
 
+	deps.isDaemonSubprocess = func() bool { return false }
+	deps.providerStoreOwnedByDaemon = func(context.Context) (bool, error) { return false, nil }
 	_, err = executePersonProviderCommand(t, deps, "remove", "old")
 	require.ErrorIs(err, config.ErrConfigConflict)
 	active, err := st.HasActivePersonInferenceConsent(t.Context(), profile.Fingerprint)

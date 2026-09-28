@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
@@ -17,9 +18,11 @@ import (
 
 	"github.com/spf13/cobra"
 	"go.kenn.io/msgvault/internal/config"
+	"go.kenn.io/msgvault/internal/daemonclient"
 	"go.kenn.io/msgvault/internal/peoplesweep"
 	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/vector"
+	"go.kenn.io/msgvault/pkg/client/generated"
 )
 
 const (
@@ -36,6 +39,7 @@ type personProviderStore interface {
 	RevokeAllPersonInferenceConsents(ctx context.Context, actor string) (int64, error)
 	GetPersonInferenceConsentStatus(ctx context.Context, fingerprint string) (*store.PersonInferenceConsentStatus, error)
 	HasSuccessfulPersonInferenceCheck(ctx context.Context, fingerprint string) (bool, error)
+	InvalidatePersonInferenceCheck(ctx context.Context, fingerprint string) (bool, error)
 	RecordPersonInferenceCheck(ctx context.Context, check store.PersonInferenceCheck) error
 	GetPersonInferenceCheck(ctx context.Context, fingerprint string) (*store.PersonInferenceCheck, error)
 	HasActivePersonInferenceConsent(ctx context.Context, fingerprint string) (bool, error)
@@ -66,18 +70,19 @@ type personProviderCommandDeps struct {
 	openStore                  func() (personProviderStore, func(), error)
 	openReadStore              func() (personProviderStore, func(), error)
 	newChecker                 func(peoplesweep.Config, personProviderStore, personProviderSetupDeps) (personProviderChecker, error)
-	newCodexClient             func(peoplesweep.Config) (personProviderCodexClient, error)
+	newCodexClient             func(peoplesweep.Config, personProviderSetupDeps) (personProviderCodexClient, error)
 	isDaemonSubprocess         func() bool
 	providerStoreOwnedByDaemon func(context.Context) (bool, error)
 	// daemonAliveForRestartNotice reports whether any daemon process in
 	// this machine's data dir is alive, regardless of API compatibility.
-	// It backs only the restart guidance for local config mutations: a
-	// daemon left running across a CLI upgrade fails the compatibility
-	// check yet its scheduled sweeps still keep the startup config.
+	// Local config mutations use it for restart guidance; removal refuses a
+	// daemon left running across a CLI upgrade that fails the compatibility
+	// check because its scheduled sweeps still keep the startup config.
 	daemonAliveForRestartNotice func(context.Context) (bool, error)
 	remoteConfigured            func() bool
 	lookupEnv                   peoplesweep.CredentialLookup
 	proxy                       func(*cobra.Command, []string, map[string]string) error
+	removeWithDaemon            func(context.Context, string, string) error
 	readConfigFile              func() (config.ConfigFile, error)
 	configHomeDir               func() string
 	editConfigTables            func(string, []config.TableEdit) (config.ConfigFile, error)
@@ -187,6 +192,10 @@ func defaultPersonProviderCommandDeps(contexts ...context.Context) personProvide
 			if state != nil && state.cfg != nil {
 				currentCfg = state.cfg
 			}
+			deps.setup.codexAuthHome = ""
+			if currentCfg != nil {
+				deps.setup.codexAuthHome = filepath.Join(currentCfg.TokensDir(), "people-codex")
+			}
 			deps.config = func() peoplesweep.Config {
 				if currentCfg == nil {
 					return peoplesweep.Config{}
@@ -258,10 +267,11 @@ func defaultPersonProviderCommandDeps(contexts ...context.Context) personProvide
 			return nil, nil, errors.New("configuration is unavailable")
 		},
 		newChecker: func(config peoplesweep.Config, st personProviderStore, setup personProviderSetupDeps) (personProviderChecker, error) {
-			registry, err := peoplesweep.NewDriverRegistry(
+			registry, err := peoplesweep.NewDriverRegistryWithCodexAuthHome(
 				http.DefaultClient,
 				peoplesweep.NewCodexCommandStarter(),
 				peoplesweep.NewReleasedCodexIsolationGate(),
+				setup.codexAuthHome,
 			)
 			if err != nil {
 				return nil, err
@@ -284,15 +294,19 @@ func defaultPersonProviderCommandDeps(contexts ...context.Context) personProvide
 				peoplesweep.NewCredentialResolver(credentialStore, os.LookupEnv),
 			)
 		},
-		newCodexClient: func(config peoplesweep.Config) (personProviderCodexClient, error) {
+		newCodexClient: func(config peoplesweep.Config, setup personProviderSetupDeps) (personProviderCodexClient, error) {
+			if !peoplesweep.CodexReleaseAvailable() {
+				return nil, peoplesweep.ErrCodexIsolationUnreleased
+			}
 			_, provider, err := config.ActiveProviderConfig()
 			if err != nil {
 				return nil, err
 			}
-			registry, err := peoplesweep.NewDriverRegistry(
+			registry, err := peoplesweep.NewDriverRegistryWithCodexAuthHome(
 				http.DefaultClient,
 				peoplesweep.NewCodexCommandStarter(),
 				peoplesweep.NewReleasedCodexIsolationGate(),
+				setup.codexAuthHome,
 			)
 			if err != nil {
 				return nil, err
@@ -326,6 +340,7 @@ func defaultPersonProviderCommandDeps(contexts ...context.Context) personProvide
 			}
 			return findAnyDaemonRuntimeContext(ctx, state.cfg.Data.DataDir) != nil, nil
 		},
+		removeWithDaemon: removePersonProviderWithDaemon,
 		lookupEnv:        os.LookupEnv,
 		remoteConfigured: func() bool { return false },
 		proxy: func(command *cobra.Command, args []string, env map[string]string) error {
@@ -373,6 +388,7 @@ func newPersonProviderCommand(deps personProviderCommandDeps) *cobra.Command {
 	}
 	provider.AddCommand(
 		newPersonProviderAddCommand(deps),
+		newPersonProviderCodexEnrollCommand(defaultCodexEnrollDeps()),
 		newPersonProviderSetCommand(deps),
 		newPersonProviderRemoveCommand(deps),
 		newPersonProviderListCommand(deps),
@@ -576,7 +592,8 @@ func rejectRemotePersonProviderMutation(deps personProviderCommandDeps, operatio
 // compatibility-sensitive because it routes store operations (nothing may
 // be proxied to an API-incompatible daemon), while a daemon left live across
 // a CLI upgrade fails that compatibility check yet still serves stale
-// startup config, so the restart notice falls back to the compatibility-
+// startup config. Removal must reject directStore && daemonRunning; other
+// mutations use restart guidance from the compatibility-
 // agnostic liveness probe. With no ownership signal at all, remove's
 // existing convention is preserved: assume the store is daemon-owned.
 func personProviderMutationScope(
@@ -894,12 +911,31 @@ func runPersonProviderRemove(
 	if err := peoplesweep.ValidateProviderProfileName(name); err != nil {
 		return err
 	}
-	if deps.readConfigFile == nil || deps.editConfigTables == nil || deps.restoreConfigFile == nil {
+	if deps.readConfigFile == nil {
 		return errors.New("people provider config editing is unavailable")
 	}
 	before, err := deps.readConfigFile()
 	if err != nil {
 		return err
+	}
+	directStore, daemonRunning, err := personProviderMutationScope(command.Context(), deps)
+	if err != nil {
+		return err
+	}
+	if !directStore {
+		if deps.removeWithDaemon == nil {
+			return errors.New("people provider daemon removal is unavailable")
+		}
+		if err := deps.removeWithDaemon(command.Context(), name, before.ETag); err != nil {
+			return err
+		}
+		return writePersonProviderRemoved(command, name, true, jsonOutput)
+	}
+	if daemonRunning {
+		return errors.New("cannot identify the running people provider policy; stop the daemon before removing a profile")
+	}
+	if deps.editConfigTables == nil || deps.restoreConfigFile == nil {
+		return errors.New("people provider config editing is unavailable")
 	}
 	configured, err := personProviderConfigFromSnapshot(deps, before)
 	if err != nil {
@@ -960,22 +996,10 @@ func runPersonProviderRemove(
 			}
 		}()
 	}
-	directStore, daemonRunning, scopeErr := personProviderMutationScope(command.Context(), deps)
-	if scopeErr != nil {
-		return scopeErr
-	}
-	if !directStore {
-		if err := proxySavedPersonProviderRevoke(command, deps, name, profile.Fingerprint); err != nil {
-			return err
-		}
-	}
 	after, err := deps.editConfigTables(before.ETag, edits)
 	if err != nil {
 		if errors.Is(err, config.ErrConfigChanged) {
-			return rollbackUncertainPersonProviderRemove(err, deps, before, after, !directStore)
-		}
-		if !directStore {
-			return errors.Join(err, errors.New("exact people provider consent remains revoked after config conflict"))
+			return errors.Join(err, restoreRemovedPersonProviderConfig(deps, after, before))
 		}
 		return err
 	}
@@ -983,17 +1007,18 @@ func runPersonProviderRemove(
 		return errors.Join(cause, restoreRemovedPersonProviderConfig(deps, after, before))
 	}
 
-	if directStore {
-		st, cleanup, openErr := deps.openStore()
-		if openErr != nil {
-			return rollback(openErr)
-		}
-		defer cleanup()
-		if _, err := st.RevokePersonInferenceConsent(
-			command.Context(), profile.Fingerprint, personProviderConsentActor,
-		); err != nil {
-			return rollback(err)
-		}
+	st, cleanup, openErr := deps.openStore()
+	if openErr != nil {
+		return rollback(openErr)
+	}
+	defer cleanup()
+	if _, err := st.RevokePersonInferenceConsent(
+		command.Context(), profile.Fingerprint, personProviderConsentActor,
+	); err != nil {
+		return rollback(err)
+	}
+	if _, err := st.InvalidatePersonInferenceCheck(command.Context(), profile.Fingerprint); err != nil {
+		return rollback(err)
 	}
 	if provider.Credential == peoplesweep.CredentialStored {
 		if err := credentials.Delete(name, deletionGuard); err != nil {
@@ -1002,6 +1027,10 @@ func runPersonProviderRemove(
 				errors.New("exact people provider consent remains revoked"))
 		}
 	}
+	return writePersonProviderRemoved(command, name, false, jsonOutput)
+}
+
+func writePersonProviderRemoved(command *cobra.Command, name string, daemonRunning, jsonOutput bool) error {
 	if jsonOutput {
 		return json.MarshalEncode(jsontext.NewEncoder(command.OutOrStdout()), personProviderRemoveOutput{
 			Name: name, Removed: true, DaemonRestartRequired: daemonRunning,
@@ -1024,17 +1053,38 @@ func restoreRemovedPersonProviderConfig(
 	return nil
 }
 
-func rollbackUncertainPersonProviderRemove(
-	cause error,
-	deps personProviderCommandDeps,
-	before, expected config.ConfigFile,
-	consentRevoked bool,
-) error {
-	cause = errors.Join(cause, restoreRemovedPersonProviderConfig(deps, expected, before))
-	if consentRevoked {
-		cause = errors.Join(cause, errors.New("exact people provider consent remains revoked"))
+// removePersonProviderWithDaemon uses the Settings operation so revocation can
+// include the policy captured by the daemon at startup. Never auto-start or
+// fall back to a local write if the owning daemon cannot perform the removal.
+func removePersonProviderWithDaemon(ctx context.Context, name, ifMatch string) error {
+	state := invocationFromContext(ctx)
+	if state == nil || state.cfg == nil {
+		return errors.New("configuration is unavailable")
 	}
-	return cause
+	currentCfg := state.cfg
+	runtime, err := findCompatibleDaemonRuntimeContext(ctx, currentCfg.Data.DataDir)
+	if err != nil {
+		return err
+	}
+	if runtime == nil {
+		return errors.New("people provider daemon is unavailable; retry after stopping or restarting it")
+	}
+	if err := probeLocalDaemonAuth(ctx, runtime, currentCfg); err != nil {
+		return err
+	}
+	client, err := localDaemonAPIClient(urlFromDaemonRuntime(runtime), currentCfg.Server.APIKey)
+	if err != nil {
+		return err
+	}
+	response, err := client.DeleteSettingsPeopleInferenceProviderWithResponse(ctx,
+		&generated.DeleteSettingsPeopleInferenceProviderRequestOptions{
+			PathParams: &generated.DeleteSettingsPeopleInferenceProviderPath{Name: name},
+			Header:     &generated.DeleteSettingsPeopleInferenceProviderHeaders{IfMatch: ifMatch},
+		})
+	if err != nil || response == nil || response.StatusCode != http.StatusOK {
+		return fmt.Errorf("remove people provider: %w", daemonclient.APIResponseError(response, err))
+	}
+	return nil
 }
 
 func newPersonProviderConsentCommand(deps personProviderCommandDeps) *cobra.Command {
@@ -1130,7 +1180,7 @@ func newPersonProviderRevokeCommand(deps personProviderCommandDeps) *cobra.Comma
 			if fingerprint != "" {
 				return errors.New("--fingerprint requires one named people provider revoke")
 			}
-			return runPersonProviderRevoke(command, runDeps, all, jsonOutput, semanticEmbeddings)
+			return runPersonProviderRevoke(command, runDeps, all, jsonOutput, semanticEmbeddings, ifFingerprint != "")
 		},
 	}
 	command.Flags().BoolVar(&all, "all", false, "Revoke consent for every stored provider policy")
@@ -1401,6 +1451,7 @@ func runPersonProviderRevoke(
 	all bool,
 	jsonOutput bool,
 	semanticEmbeddings bool,
+	invalidateCheck bool,
 ) error {
 	if semanticEmbeddings {
 		return runPersonSemanticProviderRevoke(command, deps, all, jsonOutput)
@@ -1443,6 +1494,13 @@ func runPersonProviderRevoke(
 		command.Context(), profile.Fingerprint, personProviderConsentActor,
 	); err != nil {
 		return err
+	}
+	// Fingerprint-guarded revocation precedes profile replacement.
+	// Its capability proof must not survive publication of a new credential.
+	if invalidateCheck {
+		if _, err := st.InvalidatePersonInferenceCheck(command.Context(), profile.Fingerprint); err != nil {
+			return err
+		}
 	}
 	if jsonOutput {
 		output, err := personProviderStatusFor(command.Context(), st, profile)
@@ -1829,7 +1887,7 @@ func currentPersonProviderCodexClient(
 	if deps.newCodexClient == nil {
 		return nil, errors.New("codex app-server operations are unavailable")
 	}
-	return deps.newCodexClient(config)
+	return deps.newCodexClient(config, deps.setup)
 }
 
 func openPersonProviderProfile(
