@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"math/rand"
 	"net/http"
 	"net/http/httptrace"
@@ -18,15 +19,18 @@ import (
 	"sync/atomic"
 	"time"
 
+	"go.kenn.io/msgvault/internal/httpretry"
+
 	"golang.org/x/oauth2"
 	"golang.org/x/sync/errgroup"
 )
 
 const (
-	baseURL        = "https://gmail.googleapis.com/gmail/v1"
-	maxRetries     = 12  // Upper bound; the request deadline also limits retries
-	maxBackoff     = 600 // Max backoff in seconds
-	defaultTimeout = 30 * time.Second
+	baseURL         = "https://gmail.googleapis.com/gmail/v1"
+	maxRetries      = 12  // Upper bound; the request deadline also limits retries
+	maxQuotaRetries = 5   // Quota waits use the caller's context, outside the request budget
+	maxBackoff      = 600 // Max backoff in seconds
+	defaultTimeout  = 30 * time.Second
 	// Raw MIME includes attachments and needs more time on slow connections.
 	rawRequestTimeout = 5 * time.Minute
 )
@@ -97,12 +101,35 @@ func (c *Client) Close() error {
 // request makes an HTTP request with rate limiting and retry logic.
 // bodyBytes can be nil for requests without a body.
 func (c *Client) request(ctx context.Context, op Operation, method, path string, bodyBytes []byte) ([]byte, error) {
-	// Quota pauses can exceed the request timeout. Wait using the caller's
-	// context so a previous request's throttle does not exhaust this budget.
-	if err := c.rateLimiter.Acquire(ctx, op); err != nil {
-		return nil, fmt.Errorf("rate limit: %w", err)
+	var lastErr error
+	for quotaRetries := 0; ; quotaRetries++ {
+		// Quota pauses can exceed the request timeout. Wait under the caller's
+		// context, then start a fresh HTTP/retry budget after tokens are available.
+		if err := c.rateLimiter.Acquire(ctx, op); err != nil {
+			return nil, fmt.Errorf("rate limit: %w", retryBudgetError(err, quotaRetries, lastErr))
+		}
+		data, err := c.requestWithRetryBudget(ctx, op, method, path, bodyBytes, lastErr)
+		// A deadline can carry an earlier quota response for diagnostics;
+		// only a fresh throttle response starts another quota retry.
+		if _, throttled := errors.AsType[*ThrottledError](err); !throttled ||
+			errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			return data, err
+		}
+		if ctx.Err() != nil {
+			return nil, retryBudgetError(ctx.Err(), quotaRetries+1, err)
+		}
+		if quotaRetries >= maxQuotaRetries {
+			return nil, fmt.Errorf("quota retries exhausted after %d retries: %w", quotaRetries, err)
+		}
+		lastErr = err
+		c.logger.Info("Gmail throttled request; retrying after quota pause",
+			"path", path, "attempt", quotaRetries+1, "max", maxQuotaRetries, "error", err)
 	}
+}
 
+// requestWithRetryBudget retries transient failures within one I/O budget.
+// A quota response ends this budget so request can wait out the shared pause.
+func (c *Client) requestWithRetryBudget(ctx context.Context, op Operation, method, path string, bodyBytes []byte, lastErr error) ([]byte, error) {
 	// Share one budget across HTTP I/O and retry backoff after acquiring tokens.
 	// It bounds the Gmail request path once a token is available; tokens are
 	// fetched beforehand via the contextless TokenSource.Token(), so sources
@@ -118,7 +145,6 @@ func (c *Client) request(ctx context.Context, op Operation, method, path string,
 
 	reqURL := baseURL + path
 
-	var lastErr error
 	remoteMutation := op.remoteMutation()
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		if attempt > 0 {
@@ -127,8 +153,11 @@ func (c *Client) request(ctx context.Context, op Operation, method, path string,
 
 			select {
 			case <-ctx.Done():
-				return nil, ctx.Err()
+				return nil, retryBudgetError(ctx.Err(), attempt, lastErr)
 			case <-time.After(backoff):
+			}
+			if err := c.rateLimiter.Acquire(ctx, op); err != nil {
+				return nil, retryBudgetError(err, attempt, lastErr)
 			}
 		}
 
@@ -171,6 +200,11 @@ func (c *Client) request(ctx context.Context, op Operation, method, path string,
 				}
 				return nil, fmt.Errorf("%w: http request: %w", errWriteOutcomeUnknown, err)
 			}
+			if ctx.Err() != nil {
+				// The budget expired mid-request; report the response that
+				// drove the retries rather than this interrupted attempt.
+				return nil, retryBudgetError(ctx.Err(), attempt+1, lastErr)
+			}
 			lastErr = fmt.Errorf("http request: %w", err)
 			continue // Retry on network errors
 		}
@@ -180,6 +214,9 @@ func (c *Client) request(ctx context.Context, op Operation, method, path string,
 		if err != nil {
 			if remoteMutation {
 				return nil, fmt.Errorf("%w: read response: %w", errWriteOutcomeUnknown, err)
+			}
+			if ctx.Err() != nil {
+				return nil, retryBudgetError(ctx.Err(), attempt+1, lastErr)
 			}
 			lastErr = fmt.Errorf("read response: %w", err)
 			continue
@@ -195,28 +232,31 @@ func (c *Client) request(ctx context.Context, op Operation, method, path string,
 		case http.StatusTooManyRequests: // Rate limited
 			// Log at Debug level since rate limiting is expected during high-volume syncs
 			// and the retry logic handles it automatically
-			c.logger.Debug("rate limited, backing off 30s", "path", path, "attempt", attempt)
+			detail := gmailErrorDetail(resp.Header, respBody)
+			// The caller's context bounds the wait; don't shorten Gmail's Retry-After.
+			pause := max(30*time.Second, httpretry.RetryAfter(resp.Header.Get("Retry-After"), 0, math.MaxInt64))
+			c.logger.Debug("rate limited, backing off", "pause", pause, "path", path, "attempt", attempt, "detail", detail)
 			// Throttle the rate limiter to back off
-			c.rateLimiter.Throttle(30 * time.Second)
+			c.rateLimiter.Throttle(pause)
 			if remoteMutation {
 				return nil, newStatusError(resp.StatusCode, respBody)
 			}
-			lastErr = errors.New("rate limited (429)")
-			continue
+			return nil, &ThrottledError{Summary: "rate limited (429)", Detail: detail}
 
 		case http.StatusForbidden: // Could be rate limit or permission error
 			// Gmail returns 403 for quota exceeded with "rateLimitExceeded" reason
 			if isRateLimitError(respBody) {
 				// Log at Debug level since quota throttling is expected during high-volume syncs
 				// and the retry logic handles it automatically
-				c.logger.Debug("quota exceeded, backing off 60s", "path", path, "attempt", attempt)
+				detail := gmailErrorDetail(resp.Header, respBody)
+				pause := max(time.Minute, httpretry.RetryAfter(resp.Header.Get("Retry-After"), 0, math.MaxInt64))
+				c.logger.Debug("quota exceeded, backing off", "pause", pause, "path", path, "attempt", attempt, "detail", detail)
 				// Throttle the rate limiter - quota errors need longer backoff
-				c.rateLimiter.Throttle(60 * time.Second)
+				c.rateLimiter.Throttle(pause)
 				if remoteMutation {
 					return nil, newStatusError(resp.StatusCode, respBody)
 				}
-				lastErr = errors.New("quota exceeded (403)")
-				continue // Retry with backoff
+				return nil, &ThrottledError{Summary: "quota exceeded (403)", Detail: detail}
 			}
 			// Actual permission error - don't retry
 			return nil, newStatusError(resp.StatusCode, respBody)
@@ -241,6 +281,58 @@ func (c *Client) request(ctx context.Context, op Operation, method, path string,
 	}
 
 	return nil, fmt.Errorf("max retries exceeded: %w", lastErr)
+}
+
+// retryBudgetError reports why a request ran out of retry budget. The context
+// error stays in the chain for errors.Is checks; the last upstream response is
+// attached so callers see Gmail's reason instead of only the deadline.
+func retryBudgetError(ctxErr error, attempts int, lastErr error) error {
+	if lastErr == nil || errors.Is(lastErr, ctxErr) {
+		return ctxErr
+	}
+	return fmt.Errorf("%w after %d attempt(s); last response: %w", ctxErr, attempts, lastErr)
+}
+
+// ThrottledError is a Gmail 429 or quota 403 response. The client retries it
+// after the shared quota pause, up to maxQuotaRetries times.
+type ThrottledError struct {
+	Summary string // e.g. "quota exceeded (403)"
+	Detail  string // Gmail's stated reason, message and Retry-After, if any
+}
+
+func (e *ThrottledError) Error() string {
+	if e.Detail == "" {
+		return e.Summary
+	}
+	return e.Summary + ": " + e.Detail
+}
+
+// gmailErrorDetail extracts the reason from a Gmail API error response so a
+// quota refusal says why Google refused the call. It reads the standard
+// {"error":{"message","errors":[{"reason"}]}} shape and reports a Retry-After
+// header; an unfamiliar body contributes nothing.
+func gmailErrorDetail(header http.Header, body []byte) string {
+	var parsed struct {
+		Error struct {
+			Message string `json:"message"`
+			Errors  []struct {
+				Reason string `json:"reason"`
+			} `json:"errors"`
+		} `json:"error"`
+	}
+	var parts []string
+	if err := json.Unmarshal(body, &parsed); err == nil {
+		if len(parsed.Error.Errors) > 0 && parsed.Error.Errors[0].Reason != "" {
+			parts = append(parts, parsed.Error.Errors[0].Reason)
+		}
+		if parsed.Error.Message != "" {
+			parts = append(parts, parsed.Error.Message)
+		}
+	}
+	if retryAfter := header.Get("Retry-After"); retryAfter != "" {
+		parts = append(parts, "Retry-After "+retryAfter)
+	}
+	return strings.Join(parts, "; ")
 }
 
 func newStatusError(statusCode int, body []byte) *StatusError {
