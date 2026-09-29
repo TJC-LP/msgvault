@@ -7,6 +7,7 @@
   import { onDestroy, onMount } from 'svelte';
   import type { APIClient } from '../../api/client';
   import { scheduleSummary } from '../../settings/cron';
+  import PageHeader from '../shell/PageHeader.svelte';
   import type {
     SourceStatus as GeneratedSourceStatus,
     SyncRunStatus as GeneratedSyncRunStatus,
@@ -301,16 +302,11 @@
 </script>
 
 <main class="sources" aria-label="Sources">
-  <header>
-    <div>
-      <p>Archive workspace</p>
-      <h1>Sources</h1>
-    </div>
-    <div class="header-actions">
-      <span>Status and incremental sync</span>
+  <PageHeader title="Sources" description="Accounts and imports in your archive, and when they last synced.">
+    {#snippet actions()}
       <Button size="sm" surface="soft" label="View source operations" onclick={onOpenOperations} />
-    </div>
-  </header>
+    {/snippet}
+  </PageHeader>
   {#if statusError}<div class="notice notice--error" role="alert">
       <span>{statusError}</span>
       <Button size="sm" surface="soft" label="Retry" onclick={refresh} />
@@ -356,7 +352,7 @@
               {#if source.scheduled}
                 {#if source.schedule}
                   <strong title={source.schedule}>{scheduleSummary(source.schedule)}</strong>
-                  <span class="schedule-expression" data-mono>{source.schedule}</span>
+                  <span class="schedule-expression" data-metadata>{source.schedule}</span>
                 {:else}
                   <strong>Schedule unavailable</strong>
                 {/if}
@@ -448,31 +444,8 @@
     flex: 1;
     flex-direction: column;
     gap: var(--space-4);
-    padding: var(--space-5) var(--space-6);
+    padding: var(--space-5) var(--space-6) var(--space-4);
   }
-  header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: var(--space-4);
-  }
-  .header-actions {
-    display: flex;
-    align-items: center;
-    gap: var(--space-3);
-  }
-  header p,
-  h1 {
-    margin: 0;
-  }
-  header p {
-    color: var(--status-warning-ink);
-    font-size: var(--font-size-2xs);
-    font-weight: 800;
-    letter-spacing: 0.1em;
-    text-transform: uppercase;
-  }
-  header span,
   td span,
   td time {
     color: var(--text-muted);
@@ -539,5 +512,10 @@
   .notice--error {
     border-color: var(--accent-red);
     color: var(--text-danger);
+  }
+  @media (max-width: 760px) {
+    .sources {
+      padding-inline: var(--space-4);
+    }
   }
 </style>

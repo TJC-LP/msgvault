@@ -1,14 +1,15 @@
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/svelte';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/svelte';
 import { appShortcuts } from '@kenn-io/kit-ui';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createRawSnippet } from 'svelte';
 
 import { meetingFixtureResponse } from '../../meetings/fixtures.test-support';
 import { createAPIClient } from '../../api/client';
 import { LOAD_THROUGH_END_MAX_PAGES } from '../../explore/paging';
-import { ExploreState, parseExploreURLState, serializeExploreURLState } from '../../explore/state.svelte';
+import { ExploreState, serializeExploreURLState } from '../../explore/state.svelte';
 import { chooseSelectOption } from '../../../test/kit-ui';
 import AppShell from './AppShell.svelte';
+import { SIDEBAR_COLLAPSED_KEY } from './navigation';
 
 function exploreResponse(overrides: Record<string, unknown> = {}) {
   return {
@@ -287,10 +288,12 @@ describe('AppShell', () => {
     });
 
     await fireEvent.click(screen.getByRole('button', { name: 'Change theme (current: Dark)' }));
-    await fireEvent.click(screen.getByRole('button', { name: 'Use daemon theme' }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Display' }));
+    await fireEvent.click(screen.getByRole('menuitem', { name: 'Use daemon theme' }));
 
     expect(screen.getByRole('button', { name: 'Change theme (current: Dark)' })).toBeDefined();
-    expect(screen.queryByRole('button', { name: 'Use daemon theme' })).toBeNull();
+    await fireEvent.click(screen.getByRole('button', { name: 'Display' }));
+    expect(screen.queryByRole('menuitem', { name: 'Use daemon theme' })).toBeNull();
     expect(sessionStorage.getItem('msgvault.appearance.override')).toBeNull();
 
     rendered.unmount();
@@ -313,7 +316,7 @@ describe('AppShell', () => {
     const rendered = render(AppShell, { client: createAPIClient(fetchFn), state, enabled: false });
 
     for (const [tab, label, workspace] of [
-      ['Saved Views', 'Saved Views', 'saved_views'],
+      ['Saved views', 'Saved views', 'saved_views'],
       ['Sources', 'Sources', 'sources'],
       ['Operations', 'Operations', 'operations'],
       ['Deletions', 'Deletions', 'deletions']
@@ -328,23 +331,254 @@ describe('AppShell', () => {
   });
 
 
-  it('presents the primary navigation tabs with Relationships first and People/Domains retired', async () => {
-    window.history.replaceState(null, '', `/?explore=${encodeURIComponent(JSON.stringify({ workspace: 'everything' }))}`);
-    const state = new ExploreState(window);
-    const rendered = render(AppShell, {
-      client: createAPIClient(vi.fn<typeof fetch>(async () => Response.json(exploreResponse()))),
-      state, enabled: false
+  describe('shell chrome', () => {
+    const states: ExploreState[] = [];
+
+    function shellState(workspace: string): ExploreState {
+      window.history.replaceState(null, '', `/?explore=${encodeURIComponent(JSON.stringify({ workspace }))}`);
+      const state = new ExploreState(window);
+      states.push(state);
+      return state;
+    }
+
+    function exploreClient() {
+      return createAPIClient(vi.fn<typeof fetch>(async () => Response.json(exploreResponse())));
+    }
+
+    afterEach(() => {
+      cleanup();
+      for (const state of states.splice(0)) state.destroy();
+      localStorage.removeItem(SIDEBAR_COLLAPSED_KEY);
+      window.innerWidth = 1024;
     });
 
-    const nav = screen.getByRole('navigation', { name: 'Primary' });
-    expect(within(nav).getAllByRole('button').map((button) => button.textContent?.trim())).toEqual([
-      'Relationships', 'Directory', 'Reviews', 'Everything', 'Files', 'Saved Views', 'Sources', 'Operations', 'Deletions', 'Settings'
-    ]);
-    expect(screen.queryByRole('button', { name: 'People' })).toBeNull();
-    expect(screen.queryByRole('button', { name: 'Domains' })).toBeNull();
+    it('groups workspaces in the sidebar with Relationships first', () => {
+      render(AppShell, { client: exploreClient(), state: shellState('everything'), enabled: false });
+      const nav = screen.getByRole('navigation', { name: 'Primary' });
+      expect(within(nav).getAllByRole('button').map((button) => button.textContent?.trim())).toEqual([
+        'Relationships', 'Directory', 'Reviews', 'Everything', 'Files', 'Saved views', 'Sources', 'Operations', 'Deletions', 'Settings'
+      ]);
+      expect(within(nav).getByRole('button', { name: 'Everything' }).getAttribute('aria-current')).toBe('page');
+      expect(screen.queryByRole('button', { name: 'People' })).toBeNull();
+      expect(screen.queryByRole('button', { name: 'Domains' })).toBeNull();
+    });
 
-    rendered.unmount();
-    state.destroy();
+    it('names the browser tab after the workspace', async () => {
+      const fetchFn = vi.fn<typeof fetch>(async (input) => {
+        const path = new URL(input instanceof Request ? input.url : String(input)).pathname;
+        if (path.endsWith('/sources/status')) return Response.json({ sources: [] });
+        return Response.json(exploreResponse());
+      });
+      render(AppShell, { client: createAPIClient(fetchFn), state: shellState('sources'), enabled: false });
+      expect(await screen.findByRole('main', { name: 'Sources' })).toBeDefined();
+      await waitFor(() => expect(document.title).toBe('Sources · msgvault'));
+      await fireEvent.click(screen.getByRole('button', { name: 'Directory' }));
+      await waitFor(() => expect(document.title).toBe('Directory · msgvault'));
+    });
+
+    it.each([
+      ['relationships', 'Relationships'], ['directory', 'Directory'], ['directory_review', 'Reviews'],
+      ['everything', 'Everything'], ['files', 'Files'], ['saved_views', 'Saved views'],
+      ['sources', 'Sources'], ['operations', 'Operations'], ['deletions', 'Deletions']
+    ])('shows one visible page title in %s', async (workspace, title) => {
+      const fetchFn = vi.fn<typeof fetch>(async (input) => {
+        const path = new URL(input instanceof Request ? input.url : String(input)).pathname;
+        if (path.endsWith('/saved-views')) return Response.json({ saved_views: [] });
+        if (path.endsWith('/sources/status')) return Response.json({ sources: [] });
+        if (path.endsWith('/operations/status')) return Response.json({ lanes: [] });
+        if (path.endsWith('/operations/runs')) return Response.json({ runs: [], unavailable_kinds: [], membership_revision: 1 });
+        if (path.endsWith('/deletions')) return Response.json({ manifests: [] });
+        return Response.json(exploreResponse());
+      });
+      render(AppShell, { client: createAPIClient(fetchFn), state: shellState(workspace), enabled: false });
+      const headings = await screen.findAllByRole('heading', { level: 1 });
+      expect(headings.map((heading) => heading.textContent?.trim())).toEqual([title]);
+      expect(headings[0]!.closest('.kit-sr-only')).toBeNull();
+      expect(screen.queryByText(/archive workspace|archive operations/i)).toBeNull();
+    });
+
+    it('puts the Files title above the Everything context bar', async () => {
+      render(AppShell, { client: exploreClient(), state: shellState('files'), enabled: false });
+      const heading = await screen.findByRole('heading', { level: 1, name: 'Files' });
+      const bar = screen.getByRole('region', { name: 'Active analytical context' });
+      expect(heading.compareDocumentPosition(bar) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    });
+
+    it.each([
+      ['ungrouped', []],
+      ['grouped', ['source']]
+    ])('keeps the %s Files title inside one Files main landmark', async (_case, groupingChain) => {
+      window.history.replaceState(
+        null, '', `/?explore=${encodeURIComponent(JSON.stringify({ workspace: 'files', groupingChain }))}`
+      );
+      const state = new ExploreState(window);
+      states.push(state);
+      render(AppShell, { client: exploreClient(), state, enabled: false });
+      const heading = await screen.findByRole('heading', { level: 1, name: 'Files' });
+      const mains = screen.getAllByRole('main', { name: 'Files' });
+      expect(mains).toHaveLength(1);
+      expect(mains[0]!.contains(heading)).toBe(true);
+      expect(screen.getAllByRole('main')).toHaveLength(1);
+      // testing-library maps every <header> to banner; browsers only do so outside sectioning content.
+      const banners = [...document.querySelectorAll('header')].filter((header) => !header.closest('main, section, article, aside, nav'));
+      expect(banners).toHaveLength(1);
+    });
+
+    it('shows the file count beside the Files title without a second heading', async () => {
+      const fetchFn = vi.fn<typeof fetch>(async (input) => {
+        const path = new URL(input instanceof Request ? input.url : String(input)).pathname;
+        if (path.endsWith('/files/search')) {
+          return Response.json({ files: [], total_count: 7, cache_revision: 'cache-1', search_provenance: {} });
+        }
+        return Response.json(exploreResponse());
+      });
+      render(AppShell, { client: createAPIClient(fetchFn), state: shellState('files'), enabled: false });
+      expect(await screen.findByText('7 files')).toBeDefined();
+      expect(screen.getAllByRole('heading', { level: 1 })).toHaveLength(1);
+    });
+
+    it('opens Everything with the query when searching from another workspace', async () => {
+      const state = shellState('sources');
+      const length = window.history.length;
+      render(AppShell, { client: exploreClient(), state, enabled: false });
+
+      const search = screen.getByRole('searchbox', { name: 'Search everything' });
+      await fireEvent.input(search, { target: { value: 'pipeline' } });
+      expect(state.current.workspace).toBe('sources');
+      await fireEvent.submit(screen.getByRole('search', { name: 'Search Everything' }));
+
+      expect(state.current.workspace).toBe('everything');
+      expect(state.current.query).toBe('pipeline');
+      expect(window.history.length).toBe(length + 1);
+    });
+
+    it('moves focus to the Files results after submitting search on Files', async () => {
+      const fetchFn = vi.fn<typeof fetch>(async (input) => {
+        const path = new URL(input instanceof Request ? input.url : String(input)).pathname;
+        if (path.endsWith('/files/search')) {
+          return Response.json({ files: [], total_count: 0, cache_revision: 'cache-1', search_provenance: {} });
+        }
+        return Response.json(exploreResponse());
+      });
+      const state = shellState('files');
+      render(AppShell, { client: createAPIClient(fetchFn), state, enabled: false });
+      const grid = await screen.findByRole('grid', { name: 'Files results' });
+
+      const search = screen.getByRole('searchbox', { name: 'Search everything' });
+      search.focus();
+      await fireEvent.input(search, { target: { value: 'invoice' } });
+      await fireEvent.submit(screen.getByRole('search', { name: 'Search Everything' }));
+
+      expect(state.current.query).toBe('invoice');
+      expect(document.activeElement).toBe(grid);
+    });
+
+    it('drops an unsubmitted search draft when the sidebar opens another workspace', async () => {
+      const state = shellState('sources');
+      render(AppShell, { client: exploreClient(), state, enabled: false });
+
+      const search = screen.getByRole('searchbox', { name: 'Search everything' }) as HTMLInputElement;
+      await fireEvent.input(search, { target: { value: 'pipeline' } });
+      await fireEvent.click(within(screen.getByRole('navigation', { name: 'Primary' })).getByRole('button', { name: 'Everything' }));
+
+      expect(state.current.workspace).toBe('everything');
+      expect(state.current.query).toBe('');
+      await waitFor(() => expect(search.value).toBe(''));
+    });
+
+    it('updates Everything results as the global search is typed', async () => {
+      const state = shellState('everything');
+      render(AppShell, { client: exploreClient(), state, enabled: false });
+      await fireEvent.input(screen.getByRole('searchbox', { name: 'Search everything' }), { target: { value: 'gas' } });
+      expect(state.current.query).toBe('gas');
+    });
+
+    it('remembers the collapsed sidebar across reloads', async () => {
+      const state = shellState('everything');
+      const first = render(AppShell, { client: createAPIClient(vi.fn()), state, enabled: false });
+      await fireEvent.click(screen.getByRole('button', { name: 'Collapse sidebar' }));
+      first.unmount();
+      render(AppShell, { client: createAPIClient(vi.fn()), state, enabled: false });
+      expect(screen.getByRole('button', { name: 'Expand sidebar' })).toBeTruthy();
+    });
+
+    it('opens a modal navigation menu on narrow screens and closes it on Escape', async () => {
+      window.innerWidth = 480;
+      render(AppShell, { client: createAPIClient(vi.fn()), state: shellState('everything'), enabled: false });
+
+      expect(screen.queryByRole('navigation', { name: 'Primary' })).toBeNull();
+      const opener = screen.getByRole('button', { name: 'Open navigation' });
+      await fireEvent.click(opener);
+      const current = await screen.findByRole('button', { name: 'Everything' });
+      await waitFor(() => expect(document.activeElement).toBe(current));
+
+      await fireEvent.keyDown(current, { key: 'Escape' });
+      await waitFor(() => expect(screen.queryByRole('navigation', { name: 'Primary' })).toBeNull());
+      expect(document.activeElement).toBe(opener);
+    });
+
+    it('closes the narrow navigation menu after choosing a workspace and returns focus to its opener', async () => {
+      window.innerWidth = 480;
+      const state = shellState('everything');
+      render(AppShell, { client: createAPIClient(vi.fn()), state, enabled: false });
+
+      const opener = screen.getByRole('button', { name: 'Open navigation' });
+      await fireEvent.click(opener);
+      await fireEvent.click(await screen.findByRole('button', { name: 'Settings' }));
+
+      expect(state.current.workspace).toBe('settings');
+      await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Navigation' })).toBeNull());
+      expect(document.activeElement).toBe(opener);
+    });
+
+    it('returns focus to the sidebar entry when the shortcuts dialog closes', async () => {
+      render(AppShell, { client: createAPIClient(vi.fn()), state: shellState('everything'), enabled: false });
+      const entry = screen.getByRole('button', { name: 'Keyboard shortcuts' });
+      await fireEvent.click(entry);
+      const search = await screen.findByRole('searchbox', { name: 'Search keyboard shortcuts' });
+
+      await fireEvent.keyDown(search, { key: 'Escape' });
+      await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Keyboard shortcuts' })).toBeNull());
+      await waitFor(() => expect(document.activeElement).toBe(entry));
+    });
+
+    it('returns focus to the prior control when the shortcuts dialog was opened with ?', async () => {
+      render(AppShell, { client: createAPIClient(vi.fn()), state: shellState('settings'), enabled: false });
+      const theme = screen.getByRole('button', { name: /^Change theme/ });
+      theme.focus();
+      await fireEvent.keyDown(theme, { key: '?', shiftKey: true });
+      await fireEvent.click(await screen.findByRole('button', { name: 'Close' }));
+
+      await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Keyboard shortcuts' })).toBeNull());
+      await waitFor(() => expect(document.activeElement).toBe(theme));
+    });
+
+    it('returns focus to the navigation opener when shortcuts opened from the narrow menu close', async () => {
+      window.innerWidth = 480;
+      render(AppShell, { client: createAPIClient(vi.fn()), state: shellState('everything'), enabled: false });
+      const opener = screen.getByRole('button', { name: 'Open navigation' });
+      await fireEvent.click(opener);
+      await fireEvent.click(await screen.findByRole('button', { name: 'Keyboard shortcuts' }));
+      const search = await screen.findByRole('searchbox', { name: 'Search keyboard shortcuts' });
+
+      await fireEvent.keyDown(search, { key: 'Escape' });
+      await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Keyboard shortcuts' })).toBeNull());
+      await waitFor(() => expect(document.activeElement).toBe(opener));
+    });
+
+    it('focuses the navigation opener after Back on narrow screens', async () => {
+      window.innerWidth = 480;
+      const state = shellState('sources');
+      render(AppShell, { client: exploreClient(), state, enabled: false });
+      await fireEvent.click(screen.getByRole('button', { name: 'Open navigation' }));
+      await fireEvent.click(await screen.findByRole('button', { name: 'Settings' }));
+      await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Navigation' })).toBeNull());
+      (document.activeElement as HTMLElement).blur();
+
+      window.history.back();
+      await waitFor(() => expect(state.current.workspace).toBe('sources'));
+      await waitFor(() => expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Open navigation' })));
+    });
   });
 
   it('restores Operations filters and detail through popstate and routes related authority through shell state', async () => {
@@ -1464,6 +1698,58 @@ describe('AppShell', () => {
     state.destroy();
   });
 
+  it.each(['sidebar', 'global search'] as const)(
+    'drops the relationship promotion when leaving Directory by %s and going back',
+    async (exit) => {
+      window.history.replaceState(null, '', `/?explore=${encodeURIComponent(JSON.stringify({
+        workspace: 'relationships', relationshipTarget: 'cluster:11'
+      }))}`);
+      const fetchFn = vi.fn<typeof fetch>(async (input) => {
+        const request = input instanceof Request ? input : new Request(input);
+        const path = new URL(request.url).pathname;
+        const meetingResponse = meetingFixtureResponse(path);
+        if (meetingResponse) return meetingResponse;
+        if (path === '/api/v1/relationships') return Response.json({ rows: [] });
+        if (path === '/api/v1/participants/11') return Response.json({
+          id: 11, display_label: 'Synthetic Candidate', partial_label: false, identifiers: [],
+          activity_count: 1, file_count: 0, source_counts: [], first_at: '2026-07-19T10:00:00Z',
+          last_at: '2026-07-19T10:00:00Z', cache_revision: 'cache-rel'
+        });
+        if (path === '/api/v1/relationships/11/timeline') return Response.json({
+          canonical_id: 11, identity_revision: 1, cache_revision: 'cache-rel', rows: [], total_count: 0
+        });
+        if (path === '/api/v1/people/directory') return Response.json({ people: [] });
+        return Response.json(exploreResponse());
+      });
+      const state = new ExploreState(window);
+      const rendered = render(AppShell, { client: createAPIClient(fetchFn), state });
+
+      expect(await screen.findByRole('heading', { name: 'Synthetic Candidate' })).toBeDefined();
+      await fireEvent.click(screen.getByRole('button', { name: 'Open in Directory' }));
+      expect(await screen.findByRole('button', { name: 'Promote to person' })).toBeDefined();
+
+      if (exit === 'sidebar') {
+        await fireEvent.click(within(screen.getByRole('navigation', { name: 'Primary' }))
+          .getByRole('button', { name: 'Everything' }));
+      } else {
+        await fireEvent.input(screen.getByRole('searchbox', { name: 'Search everything' }), {
+          target: { value: 'pipeline' }
+        });
+        await fireEvent.submit(screen.getByRole('search', { name: 'Search Everything' }));
+      }
+      expect(await screen.findByRole('main', { name: 'Everything' })).toBeDefined();
+
+      const restored = new Promise((resolve) => window.addEventListener('popstate', resolve, { once: true }));
+      window.history.back();
+      await restored;
+      expect(await screen.findByRole('main', { name: 'Directory' })).toBeDefined();
+      expect(screen.queryByRole('button', { name: 'Promote to person' })).toBeNull();
+
+      rendered.unmount();
+      state.destroy();
+    }
+  );
+
   it('renders actionable Directory guidance for a relationship promotion conflict', async () => {
     window.history.replaceState(null, '', `/?explore=${encodeURIComponent(JSON.stringify({
       workspace: 'relationships', relationshipTarget: 'cluster:11'
@@ -1984,6 +2270,71 @@ describe('AppShell', () => {
     expect(screen.getByRole('button', { name: 'Filters' }).getAttribute('aria-expanded')).toBe('true');
     await fireEvent.keyDown(window, { key: 'r' });
     expect(screen.getByRole('status', { name: 'Sort status' }).textContent).toContain('newest first');
+    rendered.unmount();
+    state.destroy();
+  });
+
+  it('selects three rows when Shift+Space is pressed outside the grid', async () => {
+    window.history.replaceState(null, '', `/?explore=${encodeURIComponent(JSON.stringify({ workspace: 'everything' }))}`);
+    const state = new ExploreState(window);
+    const rows = [0, 1, 2].map((index) => entry(index));
+    const fetchFn = vi.fn<typeof fetch>(async (input) => {
+      const path = new URL(input instanceof Request ? input.url : String(input)).pathname;
+      if (path.endsWith('/explore/preflight')) {
+        return Response.json({
+          count: 3, deletable_count: 3, estimated_bytes: 30, cache_revision: 'cache-1',
+          search_provenance: {}, unavailable_actions: [], action_targets: []
+        });
+      }
+      return Response.json(exploreResponse({ rows, total_count: 3 }));
+    });
+    const rendered = render(AppShell, { client: createAPIClient(fetchFn), state });
+    const grid = await screen.findByRole('grid', { name: 'Everything results' });
+    await screen.findByText('Synthetic subject 0');
+    grid.focus();
+    await fireEvent.keyDown(grid, { key: ' ' });
+    await fireEvent.keyDown(grid, { key: 'j' });
+    await fireEvent.keyDown(grid, { key: 'j' });
+    await waitFor(() => expect(screen.getByText('1 selected')).toBeTruthy());
+    grid.blur();
+    expect(document.activeElement).toBe(document.body);
+
+    await fireEvent.keyDown(document.body, { key: ' ', shiftKey: true });
+
+    await waitFor(() => expect(screen.getByText('3 selected')).toBeTruthy());
+    rendered.unmount();
+    state.destroy();
+  });
+
+  it('selects the visible rows once when plain a is pressed outside the grid', async () => {
+    window.history.replaceState(null, '', `/?explore=${encodeURIComponent(JSON.stringify({ workspace: 'everything' }))}`);
+    const state = new ExploreState(window);
+    const rows = [0, 1, 2].map((index) => entry(index));
+    const fetchFn = vi.fn<typeof fetch>(async (input) => {
+      const path = new URL(input instanceof Request ? input.url : String(input)).pathname;
+      if (path.endsWith('/explore/preflight')) {
+        return Response.json({
+          count: 3, deletable_count: 3, estimated_bytes: 30, cache_revision: 'cache-1',
+          search_provenance: {}, unavailable_actions: [], action_targets: []
+        });
+      }
+      return Response.json(exploreResponse({ rows, total_count: 3 }));
+    });
+    const rendered = render(AppShell, { client: createAPIClient(fetchFn), state });
+    const grid = await screen.findByRole('grid', { name: 'Everything results' });
+    await screen.findByText('Synthetic subject 0');
+    const gridKeys: string[] = [];
+    grid.addEventListener('keydown', (event) => gridKeys.push(event.key));
+
+    await fireEvent.keyDown(document.body, { key: 'a' });
+
+    await waitFor(() => expect(screen.getByText('3 selected')).toBeTruthy());
+    expect(gridKeys).toEqual(['A']);
+
+    gridKeys.length = 0;
+    grid.focus();
+    await fireEvent.keyDown(grid, { key: 'a' });
+    expect(gridKeys).toEqual(['a']);
     rendered.unmount();
     state.destroy();
   });

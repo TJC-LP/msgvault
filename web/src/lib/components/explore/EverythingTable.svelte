@@ -675,7 +675,7 @@
     outline: none;
   }
 
-  /* Column headers speak the small-caps label voice; the sheen under the
+  /* Column headers use the small sentence-case label voice; the sheen under the
    * header hairline gives the sticky edge its machined depth. */
   .table-header {
     position: sticky;
@@ -689,8 +689,6 @@
     color: var(--text-muted);
     font-size: var(--font-size-2xs);
     font-weight: 600;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
   }
 
   .header-cell--time,
@@ -754,7 +752,7 @@
   }
 
   .data-row--selected {
-    background: color-mix(in srgb, var(--accent-teal) 12%, var(--bg-surface));
+    background: var(--selected-bg);
     box-shadow: inset 2px 0 0 var(--accent-blue), inset 0 0 0 1px var(--selected-border);
   }
 

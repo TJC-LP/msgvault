@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { Button, KbdBadge, SearchInput, SegmentedControl } from '@kenn-io/kit-ui';
+  import { Button, SegmentedControl } from '@kenn-io/kit-ui';
   import { onDestroy, untrack } from 'svelte';
 
   import type { APIClient } from '../../api/client';
@@ -16,7 +16,6 @@
     ExploreFileFact,
     ExploreGroupDimension,
     ExploreGroupRow,
-    ExploreSearchMode,
     ExploreURLState,
     ExploreWorkspace,
   } from '../../explore/models';
@@ -35,10 +34,10 @@
   import SplitPane from '../layout/SplitPane.svelte';
   import PersonTimeline from '../people/PersonTimeline.svelte';
   import SearchCoverage from '../search/SearchCoverage.svelte';
-  import SearchModeControl from '../search/SearchModeControl.svelte';
   import ReadingPane, { type ReadingPaneSelection, type ReadingPaneStatus } from '../reader/ReadingPane.svelte';
   import type { SearchCoverageAction } from '../../search/modes';
   import MeetingPanel from '../meetings/MeetingPanel.svelte';
+  import PageHeader from './PageHeader.svelte';
   import { exploreMeetingScope } from '../../meetings/scopes';
   import type { EverythingSessionState } from './EverythingSessionState.svelte';
 
@@ -54,14 +53,13 @@
     readingTargetKey: string | null;
     conversationAnchorId: number | undefined;
     sortNotice: string;
-    searchInput?: HTMLInputElement;
+    searchInput: HTMLInputElement | undefined;
     selectionPreflight: ExplorePreflight | undefined;
     meetingSelection: GeneratedExploreSelection | undefined;
     exportSelection: () => void;
     commitNavigation: (patch: Partial<ExploreURLState>) => void;
     commitWorkspace: (workspace: ExploreWorkspace) => void;
     commitGrouping: (dimension: ExploreGroupDimension) => void;
-    commitSearch: (query: string, mode: ExploreSearchMode) => void;
     fixedSortNotice: () => void;
     focusGrid: () => void;
     openRow: (row: EntryRow) => void;
@@ -84,14 +82,13 @@
     readingTargetKey,
     conversationAnchorId,
     sortNotice,
-    searchInput = $bindable(undefined),
+    searchInput,
     selectionPreflight,
     meetingSelection,
     exportSelection,
     commitNavigation,
     commitWorkspace,
     commitGrouping,
-    commitSearch,
     fixedSortNotice,
     focusGrid,
     openRow,
@@ -559,12 +556,6 @@
     }
   }
 
-  function submitSearch(event: SubmitEvent): void {
-    event.preventDefault();
-    commitSearch(exploreState.current.query.trim(), exploreState.current.searchMode);
-    focusGrid();
-  }
-
   function inspectGroup(row: ExploreGroupRow): void {
     const dimension = exploreState.current.groupingChain[0];
     if (dimension && groupingByDimension(dimension).drillable) {
@@ -585,11 +576,8 @@
 </script>
 
 <main class="everything-workspace" aria-label="Everything">
-  <header class="workspace-header">
-    <div>
-      <h1>Everything</h1>
-    </div>
-    <div class="workspace-view-controls">
+  <PageHeader title="Everything">
+    {#snippet actions()}
       {#if canPreviewRight}
         <div class="preview-position">
           <span>Preview position</span>
@@ -610,29 +598,8 @@
           Modality-neutral archive
         {/if}
       </p>
-    </div>
-  </header>
-
-  <form class="search-bar" role="search" aria-label="Search Everything" onsubmit={submitSearch}>
-    <div class="query-control">
-      <SearchInput
-        id="everything-search"
-        bind:inputEl={searchInput}
-        value={exploreState.current.query}
-        ariaLabel="Search everything"
-        placeholder="Search people, conversations, events, and files…"
-        block
-        oninput={(value) => exploreState.replaceSearchDraft(value, exploreState.current.searchMode)}
-      />
-    </div>
-    <SearchModeControl
-      requestedMode={exploreState.current.searchMode}
-      status={session.coverage?.status}
-      error={loader.error}
-      onchange={(mode: ExploreSearchMode) => exploreState.replaceSearchDraft(exploreState.current.query, mode)}
-    />
-    <Button type="submit" label="Search" tone="info" surface="solid" />
-  </form>
+    {/snippet}
+  </PageHeader>
 
   {#if loader.result?.candidatePoolSaturated}
     <div class="search-limit" role="status">
@@ -847,58 +814,27 @@
     </SplitPane>
   </div>
 
-  <footer class="keyboard-help" aria-label="Keyboard shortcuts">
-    <span><KbdBadge keys={['J']} />/<KbdBadge keys={['K']} /> move</span>
-    <span><KbdBadge keys={['Enter']} /> open</span>
-    <span><KbdBadge keys={['Space']} /> select</span>
-    <span><KbdBadge keys={['Shift', 'Space']} /> range</span>
-    <span><KbdBadge keys={['A']} /> visible</span>
-    <span><KbdBadge keys={['X']} /> clear</span>
-    <span><KbdBadge keys={['/']} /> search</span>
-    <span><KbdBadge keys={['Esc']} /> back</span>
-  </footer>
 </main>
 
 <style>
   .everything-workspace {
     display: flex;
     width: 100%;
-    max-width: 1760px;
     min-height: 0;
     flex: 1;
     flex-direction: column;
     gap: var(--space-4);
-    margin-inline: auto;
-    padding: var(--space-6) var(--space-7) var(--space-4);
+    padding: var(--space-5) var(--space-6) var(--space-4);
   }
 
   .meeting-overview { max-height: 42vh; overflow: auto; flex: none; border: 1px solid var(--border-muted); }
 
-  .workspace-header {
-    display: flex;
-    align-items: baseline;
-    justify-content: space-between;
-    gap: var(--space-6);
-  }
-
-  .workspace-view-controls,
   .preview-position {
     display: flex;
     align-items: center;
     gap: var(--space-4);
-  }
-
-  .preview-position {
     color: var(--text-muted);
     font-size: var(--font-size-xs);
-  }
-
-  h1 {
-    margin: 0;
-    font-family: var(--font-sans);
-    font-size: var(--font-size-xl);
-    font-weight: 650;
-    line-height: 1.2;
   }
 
   .result-count {
@@ -906,17 +842,6 @@
     color: var(--text-muted);
     font-size: var(--font-size-xs);
     font-variant-numeric: tabular-nums;
-  }
-
-  .search-bar {
-    display: flex;
-    align-items: center;
-    gap: var(--space-4);
-  }
-
-  .query-control {
-    min-width: 240px;
-    flex: 1;
   }
 
   .scope-note {
@@ -985,31 +910,9 @@
     border-radius: 0 var(--radius-md) var(--radius-md) 0;
   }
 
-  .keyboard-help {
-    display: flex;
-    min-height: 22px;
-    align-items: center;
-    gap: var(--space-5);
-    color: var(--text-muted);
-    font-size: var(--font-size-2xs);
-  }
-
   @media (max-width: 760px) {
     .everything-workspace {
       padding-inline: var(--space-4);
-    }
-
-    .search-bar {
-      align-items: stretch;
-      flex-wrap: wrap;
-    }
-
-    .query-control {
-      min-width: 100%;
-    }
-
-    .keyboard-help {
-      overflow-x: auto;
     }
   }
 </style>

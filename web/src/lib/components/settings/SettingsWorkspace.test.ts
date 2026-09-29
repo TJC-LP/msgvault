@@ -257,6 +257,9 @@ describe('SettingsWorkspace', () => {
 
     expect(await screen.findByRole('heading', { name: 'Appearance' })).toBeDefined();
     expect(screen.getByRole('main', { name: 'Settings' })).toBeDefined();
+    const title = screen.getByRole('heading', { level: 1, name: 'Settings' });
+    expect(title.closest('.kit-sr-only')).toBeNull();
+    expect(screen.getAllByText('Settings')).toHaveLength(1);
     expect(screen.getByText('Changes apply right away.')).toBeDefined();
     expect(screen.queryByText(/Restart required/)).toBeNull();
     await openSettingsCategory('Daemon');
@@ -857,6 +860,8 @@ describe('SettingsWorkspace', () => {
 
     await openSettingsCategory('CardDAV account');
     expect(await screen.findByRole('heading', { name: 'CardDAV account' })).toBeDefined();
+    const levels = screen.getAllByRole('heading').map((heading) => Number(heading.tagName.slice(1)));
+    expect(levels.every((level, index) => index === 0 || level <= levels[index - 1]! + 1)).toBe(true);
     expect(screen.getByLabelText('Base URL')).toBeDefined();
     expect(screen.getByLabelText('Username')).toBeDefined();
     expect(screen.getByLabelText('Password')).toBeDefined();
