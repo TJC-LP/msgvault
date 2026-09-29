@@ -206,7 +206,8 @@ func (s *Store) PutPersonEnrichmentWorkContext(
 }
 
 // CancelPersonEnrichmentWorkOutsideProfilesContext terminalizes active
-// attempts and removes work whose immutable profile is no longer configured.
+// attempts for unavailable profiles, retaining queued work until that exact
+// profile is configured again. Claims select only configured fingerprints.
 func (s *Store) CancelPersonEnrichmentWorkOutsideProfilesContext(
 	ctx context.Context, activeFingerprints []string,
 ) error {
@@ -273,7 +274,7 @@ func (s *Store) CancelPersonEnrichmentWorkOutsideProfilesContext(
 					SET state = 'terminal', failure_class = ?, completed_at = ?, next_action_at = NULL,
 					    lease_owner = NULL, lease_until = NULL
 					WHERE id = ? AND state IN ('queued','starting','pending','retry_wait','uncertain_start')`,
-					personenrichment.FailurePolicy, completedAt, item.activeAttempt.Int64)
+					personenrichment.FailureProfileUnavailable, completedAt, item.activeAttempt.Int64)
 				if err != nil {
 					return fmt.Errorf("terminalize unavailable person enrichment attempt: %w", err)
 				}
@@ -281,10 +282,18 @@ func (s *Store) CancelPersonEnrichmentWorkOutsideProfilesContext(
 					return err
 				}
 			}
-			result, err := tx.ExecContext(ctx, `DELETE FROM person_enrichment_work
-				WHERE person_id = ? AND profile_fingerprint = ?`, item.personID, item.fingerprint)
+			result, err := tx.ExecContext(ctx, `UPDATE person_enrichment_work
+				SET trigger_mask = CASE WHEN active_attempt_id IS NOT NULL AND NOT has_fresh_trigger
+				        THEN 1 ELSE trigger_mask END,
+				    trigger_generation = CASE WHEN active_attempt_id IS NOT NULL AND NOT has_fresh_trigger
+				        THEN 'profile:' || CAST(active_attempt_id AS TEXT) ELSE trigger_generation END,
+				    due_at = CASE WHEN active_attempt_id IS NOT NULL AND NOT has_fresh_trigger
+				        THEN ? ELSE due_at END,
+				    lease_owner = NULL, lease_until = NULL, run_id = NULL,
+				    active_attempt_id = NULL, has_fresh_trigger = FALSE
+				WHERE person_id = ? AND profile_fingerprint = ?`, completedAt, item.personID, item.fingerprint)
 			if err != nil {
-				return fmt.Errorf("delete unavailable person enrichment work: %w", err)
+				return fmt.Errorf("retain unavailable person enrichment work: %w", err)
 			}
 			if err := requireOneLeaseRow(result); err != nil {
 				return err
@@ -317,7 +326,7 @@ func (s *Store) ClaimWork(
 	options.Owner = strings.TrimSpace(options.Owner)
 	options.ProviderName = strings.TrimSpace(options.ProviderName)
 	if options.RunID <= 0 || options.Owner == "" || options.ProviderName == "" ||
-		options.Now.IsZero() || options.LeaseDuration <= 0 {
+		!validLowerSHA256(options.ProfileFingerprint) || options.Now.IsZero() || options.LeaseDuration <= 0 {
 		return nil, errors.New("person enrichment claim options are invalid")
 	}
 	options.Now = options.Now.UTC()
@@ -351,7 +360,7 @@ func (s *Store) claimWorkOnce(
 			SELECT w.person_id, w.profile_fingerprint
 			FROM person_enrichment_work w
 			JOIN person_enrichment_profiles p ON p.fingerprint = w.profile_fingerprint
-			WHERE p.provider_name = ?
+			WHERE p.provider_name = ? AND w.profile_fingerprint = ?
 			  AND (w.run_id = ? OR w.run_id IS NULL)
 			  AND w.due_at <= ?
 			  AND (w.lease_owner IS NULL OR w.lease_until <= ?)
@@ -374,7 +383,7 @@ func (s *Store) claimWorkOnce(
 			until                               nullableTimestamp
 		)
 		err := tx.QueryRowContext(ctx, query,
-			options.ProviderName, options.RunID, options.Now, options.Now, options.RunID,
+			options.ProviderName, options.ProfileFingerprint, options.RunID, options.Now, options.Now, options.RunID,
 			options.RunID, options.Owner, leaseUntil).Scan(
 			&personID, &fingerprint, &triggerMask, &generation, &runID, &activeID, &fence, &until)
 		if errors.Is(err, sql.ErrNoRows) {
@@ -1298,7 +1307,7 @@ func (s *Store) MarkTerminal(
 		state = "identity_rejected"
 	case personenrichment.FailureSuppressed:
 		state = "suppressed"
-	case personenrichment.FailurePolicy, personenrichment.FailureRateLimited,
+	case personenrichment.FailurePolicy, personenrichment.FailureProfileUnavailable, personenrichment.FailureRateLimited,
 		personenrichment.FailureTransient, personenrichment.FailureInvalidOutput,
 		personenrichment.FailureTerminal, personenrichment.FailureUncertainStart:
 		// The default terminal state is correct for every other safe failure.
@@ -1913,7 +1922,7 @@ func validateSafeFailure(failure personenrichment.SafeFailure) error {
 
 func validPersonEnrichmentFailureClass(class personenrichment.FailureClass) bool {
 	switch class {
-	case personenrichment.FailurePolicy, personenrichment.FailureSuppressed,
+	case personenrichment.FailurePolicy, personenrichment.FailureProfileUnavailable, personenrichment.FailureSuppressed,
 		personenrichment.FailureRateLimited, personenrichment.FailureTransient,
 		personenrichment.FailureInvalidOutput, personenrichment.FailureIdentityRejected,
 		personenrichment.FailureTerminal, personenrichment.FailureUncertainStart:
