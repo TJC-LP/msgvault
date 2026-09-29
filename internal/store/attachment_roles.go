@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 
 	"go.kenn.io/msgvault/internal/attachmentpolicy"
 )
@@ -274,6 +275,27 @@ func (s *Store) DeleteKeyedAttachmentsExceptContext(
 	})
 }
 
+// DeleteMIMEAttachmentsExceptContext removes the MIME-owned attachment rows of
+// a message whose source part key is not in keep. A connector that stores a
+// newer MIME for the same message calls it after the new rows are written, so
+// a failed write never loses the old rows.
+func (s *Store) DeleteMIMEAttachmentsExceptContext(
+	ctx context.Context, messageID int64, keep []string,
+) error {
+	query := `DELETE FROM attachments WHERE message_id = ? AND source_attachment_id IS NULL`
+	args := []any{messageID}
+	if len(keep) > 0 {
+		query += ` AND COALESCE(source_part_key, '') NOT IN (?` + strings.Repeat(`, ?`, len(keep)-1) + `)`
+		for _, k := range keep {
+			args = append(args, k)
+		}
+	}
+	return s.withSyncMessageWriteContext(ctx, messageID, func(q querier) error {
+		_, err := q.Exec(query, args...)
+		return err
+	})
+}
+
 // DeleteUnstoredAttachmentByHashContext removes an obsolete placeholder for
 // one exact content or synthetic hash.
 func (s *Store) DeleteUnstoredAttachmentByHashContext(
@@ -513,4 +535,30 @@ func (s *Store) replaceMIMEAttachmentsWith(
 		}
 	}
 	return nil
+}
+
+// AttachmentPartsStoredContext reports whether every part key and content hash
+// pair has a stored row for the message. An empty key matches NULL or empty keys.
+func (s *Store) AttachmentPartsStoredContext(ctx context.Context, messageID int64, parts []AttachmentRef) (bool, error) {
+	want := make(map[[2]string]struct{}, len(parts))
+	for _, p := range parts {
+		want[[2]string{p.SourcePartKey, p.ContentHash}] = struct{}{}
+	}
+	if len(want) == 0 {
+		return true, nil
+	}
+	args := []any{messageID}
+	match := make([]string, 0, len(want))
+	for kh := range want {
+		match = append(match, "(COALESCE(source_part_key, '') = ? AND content_hash = ?)")
+		args = append(args, kh[0], kh[1])
+	}
+	var n int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(DISTINCT COALESCE(source_part_key, '') || ':' || content_hash) FROM attachments
+		WHERE message_id = ? AND (`+strings.Join(match, " OR ")+`)`, args...).Scan(&n)
+	if err != nil {
+		return false, fmt.Errorf("check stored attachment parts: %w", err)
+	}
+	return n == len(want), nil
 }
