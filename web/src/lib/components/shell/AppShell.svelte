@@ -2,6 +2,7 @@
   import { getCLIMessageRaw as generatedGetCLIMessageRaw } from '../../api/generated/api/api';
   import { preflightExploreSelection as generatedPreflightExploreSelection } from '../../api/generated/exploration/exploration';
   import {
+    Button,
     CommandPalette,
     getThemeMode,
     IconButton,
@@ -21,7 +22,6 @@
     EntryRow,
     ExploreGroupDimension,
     ExploreGroupRow,
-    ExploreFileFact,
     ExploreSearchMode,
     OperationStatusAuthority,
     ExploreURLState,
@@ -29,8 +29,9 @@
     FileViewerTarget,
     FileSearchSort,
   } from '../../explore/models';
-  import { attachmentSelection, parseAttachmentSelection } from '../../explore/attachment-authority';
+  import { parseAttachmentSelection } from '../../explore/attachment-authority';
   import { filtersForGroup } from '../../explore/group-context';
+  import { FILE_FAMILY_LABELS } from '../../explore/labels';
   import { ExploreLoader } from '../../explore/loader.svelte';
   import { GROUPING_CATALOG, groupingByDimension } from '../../grouping/catalog';
   import { canonicalFingerprint, predicateFingerprint } from '../../explore/selection';
@@ -57,6 +58,7 @@
   } from '../../theme/preferences.svelte';
   import ContextBar from '../explore/ContextBar.svelte';
   import GroupTable from '../explore/GroupTable.svelte';
+  import SaveViewDialog from '../saved-views/SaveViewDialog.svelte';
   import SavedViewsWorkspace from '../saved-views/SavedViewsWorkspace.svelte';
   import SourcesWorkspace from '../sources/SourcesWorkspace.svelte';
   import OperationsWorkspace from '../operations/OperationsWorkspace.svelte';
@@ -104,11 +106,74 @@
   }: Props = $props();
   const ownsState = untrack(() => providedState === undefined);
   const exploreState = untrack(() => providedState ?? new ExploreState());
-  const ATTACHMENT_HISTORY_MARKER = 'msgvaultAttachmentViewer';
   const archivedMeeting = new ArchiveMeetingNavigation(untrack(() => client));
   let archiveReturnFocus: HTMLElement | undefined;
   let archiveReturnSelection = $state<string | null>(null);
   let fileCount = $state<number | null>(null);
+  let fileCountLoading = $state(false);
+  // Reset before the next render so returning to Files never shows the count it had when it was left.
+  $effect.pre(() => {
+    void exploreState.current.workspace;
+    fileCount = null;
+    fileCountLoading = false;
+  });
+  const FILE_SORTS: Array<FileSearchSort & { label: string }> = [
+    { field: 'occurred_at', direction: 'desc', label: 'Newest first' },
+    { field: 'occurred_at', direction: 'asc', label: 'Oldest first' },
+    { field: 'filename', direction: 'asc', label: 'Filename A–Z' },
+    { field: 'filename', direction: 'desc', label: 'Filename Z–A' },
+    { field: 'size', direction: 'desc', label: 'Largest first' },
+    { field: 'size', direction: 'asc', label: 'Smallest first' },
+  ];
+  function fileSortValue(sort: FileSearchSort | undefined): string {
+    return sort ? `${sort.field}:${sort.direction}` : 'occurred_at:desc';
+  }
+  const FILE_SORT_OPTIONS = FILE_SORTS.map((sort) => ({ value: fileSortValue(sort), label: sort.label }));
+  function commitFileSort(value: string): void {
+    const match = FILE_SORTS.find((sort) => fileSortValue(sort) === value);
+    if (!match) return;
+    commitNavigation({
+      fileSort: { field: match.field, direction: match.direction },
+      activeRow: null,
+      scrollAnchor: null,
+    });
+  }
+  const filesCountLabel = $derived.by(() => {
+    if (exploreState.current.groupingChain.length > 0) {
+      if (loader.loading) return 'Counting…';
+      const groups = loader.error || loader.unavailable ? undefined : loader.result?.totalCount;
+      if (groups === undefined) return '';
+      return `${groups.toLocaleString()} ${groups === 1 ? 'group' : 'groups'}`;
+    }
+    if (fileCountLoading) return 'Counting…';
+    if (fileCount === null) return '';
+    return `${fileCount.toLocaleString()} ${fileCount === 1 ? 'file' : 'files'}`;
+  });
+  // Grouped Files hides the Filename and Type controls, but the group request still applies them.
+  const groupedFileFilterChips = $derived.by(() => {
+    const { groupingChain, fileFilenameQuery, fileMIMEFamilies } = exploreState.current;
+    if (groupingChain.length === 0) return [];
+    const chips = [];
+    if (fileFilenameQuery) {
+      chips.push({
+        key: 'filename',
+        label: `Filename: “${fileFilenameQuery}”`,
+        removeLabel: 'Remove filename filter',
+        onRemove: () =>
+          commitNavigation({ fileFilenameQuery: '', activeRow: null, selectedRow: null, scrollAnchor: null }),
+      });
+    }
+    if (fileMIMEFamilies.length > 0) {
+      chips.push({
+        key: 'type',
+        label: `Type: ${fileMIMEFamilies.map((family) => FILE_FAMILY_LABELS[family]).join(', ')}`,
+        removeLabel: 'Remove type filter',
+        onRemove: () =>
+          commitNavigation({ fileMIMEFamilies: [], activeRow: null, selectedRow: null, scrollAnchor: null }),
+      });
+    }
+    return chips;
+  });
   let archiveWasOpen = false;
   const archiveMeetingID = $derived(parseArchiveMeetingSelection(exploreState.current.selectedRow));
   const archiveNavigationFingerprint = $derived(canonicalFingerprint(exploreState.current));
@@ -330,6 +395,7 @@
     : undefined);
   let operationAnnouncementKey = 0;
   let operationAnnouncement = $state({ key: 0, message: '' });
+  let saveViewOpen = $state(false);
   type APIExploreSelection = GeneratedExploreSelection;
   type ExplorePreflight = GeneratedExplorePreflightResponse;
   const NARROW_WIDTH = 900;
@@ -463,8 +529,7 @@
     const workspace = exploreState.current.workspace;
     if (workspace === 'everything' || workspace === 'files') {
       commitSearch(query, mode);
-      // The ungrouped Files grid stays out of currentGrid() so shortcut relays keep ignoring it.
-      (currentGrid() ?? document.querySelector<HTMLElement>('[role="grid"][aria-label="Files results"]'))?.focus();
+      focusGrid();
       return;
     }
     beforeCommit();
@@ -645,42 +710,27 @@
     selection.clear();
     replaceCommittedNavigation(state);
     await tick();
-    const grid = currentGrid();
+    const grid = focusableResultsGrid();
     if (grid) grid.focus();
     else searchInput?.focus();
   }
-  function viewerTargetFromFact(file: ExploreFileFact): FileViewerTarget {
-    return {
-      id: file.id,
-      key: file.key,
-      entry_key: file.entry_key,
-      message_id: file.message_id,
-      conversation_id: file.conversation_id,
-      filename: file.filename,
-      mime_type: file.mime_type,
-      size_bytes: file.size,
-    };
-  }
   $effect(() => {
     const attachmentID = selectedAttachmentID;
-    const facts = loader.fileFacts;
     if (attachmentID === undefined) {
       contextualViewerFile = undefined;
       if (previousAttachmentID !== undefined) {
-        void tick().then(() => (contextualViewerReturnFocus ?? currentGrid())?.focus());
+        void tick().then(() => (contextualViewerReturnFocus ?? focusableResultsGrid())?.focus());
       }
       previousAttachmentID = undefined;
       return;
     }
     previousAttachmentID = attachmentID;
     if (!untrack(() => contextualViewerReturnFocus)) {
-      contextualViewerReturnFocus = currentGrid() ?? undefined;
+      contextualViewerReturnFocus = focusableResultsGrid() ?? undefined;
     }
-    const local = facts.find((file) => file.id === attachmentID);
-    const existing = untrack(() => contextualViewerFile);
-    if (local) {
-      if (existing?.key !== local.key) contextualViewerFile = viewerTargetFromFact(local);
-    } else if (existing?.id !== attachmentID) contextualViewerFile = { id: attachmentID };
+    if (untrack(() => contextualViewerFile)?.id !== attachmentID) {
+      contextualViewerFile = { id: attachmentID };
+    }
   });
   const conversationAnchorId = $derived.by(() => {
     const anchor = exploreState.current.conversationAnchor;
@@ -717,7 +767,7 @@
     editableScopeCleanup = focused ? appShortcuts.pushScope('everything-editable') : undefined;
   }
   function focusGrid(): void {
-    currentGrid()?.focus();
+    focusableResultsGrid()?.focus();
   }
   async function restoreHistoryFocus(): Promise<void> {
     await tick();
@@ -725,16 +775,29 @@
       if (exploreState.current.selectedRow === null) focusGrid();
       return;
     }
-    navigationFocusTarget()?.focus();
+    const grid = exploreState.current.workspace === 'files' && exploreState.current.selectedRow === null
+      ? focusableResultsGrid()
+      : null;
+    (grid ?? navigationFocusTarget())?.focus();
   }
   async function focusGridAfterUpdate(): Promise<void> {
     await tick();
     focusGrid();
   }
+  function filesGrid(): HTMLElement | null {
+    return document.querySelector<HTMLElement>('[role="grid"][aria-label="Files results"]');
+  }
+  // Shortcut relays target this grid. The ungrouped Files grid handles its own keys, so it is
+  // left out; grouped Files uses the same GroupTable as grouped Everything.
   function currentGrid(): HTMLElement | null {
-    return document.querySelector<HTMLElement>(
-      '[role="grid"][aria-label="Everything results"], [role="grid"][aria-label^="Everything grouped by"], [role="grid"][aria-label="Files in current context"]',
-    );
+    return document.querySelector<HTMLElement>([
+      '[role="grid"][aria-label="Everything results"]',
+      '[role="grid"][aria-label^="Everything grouped by"]',
+      '[role="grid"][aria-label^="Files grouped by"]',
+    ].join(', '));
+  }
+  function focusableResultsGrid(): HTMLElement | null {
+    return currentGrid() ?? filesGrid();
   }
   function relayGridKey(event: KeyboardEvent, key: string, init: KeyboardEventInit = {}): void {
     if (event.target instanceof Element && event.target.closest('button, a, summary, [role="button"]')) return;
@@ -767,7 +830,9 @@
     // Kit releases its focus trap during teardown; focus the surviving source
     // link after that cleanup (or the current workspace's own control).
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
-    const target = archiveReturnFocus?.isConnected ? archiveReturnFocus : currentGrid() ?? navigationFocusTarget();
+    const target = archiveReturnFocus?.isConnected
+      ? archiveReturnFocus
+      : focusableResultsGrid() ?? navigationFocusTarget();
     target?.focus();
   }
 
@@ -821,35 +886,16 @@
       scrollAnchor: null,
     });
   }
-  function openContextualFile(file: ExploreFileFact): void {
-    contextualViewerReturnFocus = currentGrid() ?? undefined;
-    contextualViewerFile = viewerTargetFromFact(file);
-    commitNavigation({
-      selectedRow: attachmentSelection(file.id),
-      conversationAnchor: null,
-    });
-    window.history.replaceState(
-      {
-        ...(window.history.state && typeof window.history.state === 'object' ? window.history.state : {}),
-        [ATTACHMENT_HISTORY_MARKER]: file.id,
-      },
-      '',
-      window.location.href,
-    );
-  }
   async function closeContextualViewer(): Promise<void> {
-    if (window.history.state?.[ATTACHMENT_HISTORY_MARKER] === selectedAttachmentID) {
-      window.history.back();
-      return;
-    }
     replaceCommittedNavigation({ selectedRow: null });
     contextualViewerFile = undefined;
     await tick();
-    (contextualViewerReturnFocus ?? currentGrid())?.focus();
+    (contextualViewerReturnFocus ?? focusableResultsGrid())?.focus();
   }
   function changeConversationAnchor(anchorId: number): void {
     replaceCommittedNavigation({ conversationAnchor: String(anchorId) });
   }
+  let claimedEscape: KeyboardEvent | undefined;
   // The Relationships hub owns its own Esc layering (reading pane → timeline
   // → list) and only lets an Esc it didn't consume bubble here once it has
   // nothing left to close. This function's branches read/write state that
@@ -859,6 +905,7 @@
   // the user isn't even in (e.g. a groupingChain left behind by
   // commitWorkspace, which does not reset it).
   function handleEscape(event: KeyboardEvent): void {
+    if (event === claimedEscape) return;
     if (editableTarget(event.target)) return;
     if (exploreState.current.workspace === 'relationships') return;
     if (selectedAttachmentID !== undefined) {
@@ -878,14 +925,18 @@
         ? 'button[aria-label="Filters"]'
         : kind === 'grouping'
           ? '[data-group-picker] button'
-          : 'button[aria-label="Sort: newest first"]';
+          : '[data-sort-menu] button';
     const control = document.querySelector<HTMLButtonElement>(selector);
     control?.focus();
     control?.click();
   }
   function fixedSortNotice(): void {
-    sortNotice = 'Everything remains newest first; reverse order is not supported by the canonical entry API.';
-    document.querySelector<HTMLButtonElement>('button[aria-label="Sort: newest first"]')?.focus();
+    sortNotice = exploreState.current.groupingChain.length > 0
+      ? 'Sorting isn’t available while grouped.'
+      : exploreState.current.workspace === 'files'
+        ? 'Use the Sort menu to change the order.'
+        : 'Everything is always shown newest first.';
+    document.querySelector<HTMLButtonElement>('[data-sort-menu] button')?.focus();
   }
   function navigateReader(delta: number): void {
     if (!exploreState.current.selectedRow || loader.rows.length === 0) return;
@@ -949,7 +1000,7 @@
         return [
           {
             id: `unavailable:${entry.concept}`,
-            label: `${entry.label} — unavailable: ${entry.unavailableReason}`,
+            label: `Group by ${entry.label} (not available yet)`,
             section: 'Group by',
             keywords: `${entry.keywords} ${entry.unavailableReason ?? ''}`,
             keys: [],
@@ -1125,6 +1176,13 @@
     });
   }
   onMount(() => {
+    // Kit popovers close on Escape from a document listener and claim the key with preventDefault
+    // so outer layers stay open. The window shortcut listener prevents every key it handles, so
+    // note the claim first; this listener must be added before initShortcuts adds that one.
+    const noteClaimedEscape = (event: KeyboardEvent): void => {
+      claimedEscape = event.key === 'Escape' && event.defaultPrevented ? event : undefined;
+    };
+    window.addEventListener('keydown', noteClaimedEscape);
     const detachShortcuts = initShortcuts();
     let disposed = false;
     const resyncEditableScope = (): void => {
@@ -1164,6 +1222,7 @@
       document.removeEventListener('focusin', handleFocusIn, true);
       document.removeEventListener('focusout', handleFocusOut, true);
       document.removeEventListener('keydown', preserveNativeControlKey);
+      window.removeEventListener('keydown', noteClaimedEscape);
       window.removeEventListener('popstate', handleHistoryFocus);
       editableObserver.disconnect();
       editableScopeCleanup?.();
@@ -1246,8 +1305,6 @@
       {:else if exploreState.current.workspace === 'saved_views'}
         <SavedViewsWorkspace
           {client}
-          currentState={exploreState.current}
-          selection={selection.snapshot()}
           onOpen={(state) => {
             void openSavedView(state);
           }}
@@ -1352,11 +1409,7 @@
       {:else if exploreState.current.workspace === 'files'}
         <main class="files-shell" aria-label="Files">
           <PageHeader title="Files">
-            {#snippet actions()}
-              {#if fileCount !== null && exploreState.current.groupingChain.length === 0}
-                <span class="files-count" aria-live="polite">{fileCount.toLocaleString()} files</span>
-              {/if}
-            {/snippet}
+            {#snippet actions()}<Button surface="outline" label="Save view…" onclick={() => (saveViewOpen = true)} />{/snippet}
           </PageHeader>
           <ContextBar
             {client}
@@ -1364,7 +1417,13 @@
             searchMode={exploreState.current.searchMode}
             filters={exploreState.current.filters}
             groupingChain={exploreState.current.groupingChain}
-            totalCount={exploreState.current.groupingChain.length > 0 ? loader.result?.totalCount : undefined}
+            countLabel={filesCountLabel}
+            extraChips={groupedFileFilterChips}
+            sort={exploreState.current.groupingChain.length > 0 ? undefined : {
+              options: FILE_SORT_OPTIONS,
+              value: fileSortValue(exploreState.current.fileSort),
+              onchange: commitFileSort,
+            }}
             presentation="files"
             onPresentationChange={(presentation) => {
               if (presentation === 'files') return;
@@ -1390,6 +1449,14 @@
             onFiltersChange={(filters) =>
               commitNavigation({
                 filters,
+                activeRow: null,
+                selectedRow: null,
+                scrollAnchor: null,
+              })}
+            onRemoveQuery={() => commitSearch('', exploreState.current.searchMode)}
+            onRemoveFilter={(index) =>
+              commitNavigation({
+                filters: exploreState.current.filters.filter((_, position) => position !== index),
                 activeRow: null,
                 selectedRow: null,
                 scrollAnchor: null,
@@ -1428,15 +1495,21 @@
               embedded
               showHeader={false}
               bind:fileCount
+              bind:fileCountLoading
               predicate={{ ...exploreState.predicate(), grouping: undefined }}
               sort={exploreState.current.fileSort ?? { field: 'occurred_at', direction: 'desc' }}
               filenameQuery={exploreState.current.fileFilenameQuery}
               mimeFamilies={exploreState.current.fileMIMEFamilies}
               activeKey={exploreState.current.activeRow}
-              selectedKey={exploreState.current.selectedRow}
+              selectedKey={selectedAttachmentID === undefined ? exploreState.current.selectedRow : null}
               restorationEpoch={exploreState.restorationEpoch}
               onRestorationComplete={(epoch) => {
                 exploreState.acknowledgeRestoration(epoch);
+                // Like Everything, a restored list without an open item takes keyboard focus,
+                // unless the person has already moved focus somewhere.
+                if (exploreState.current.selectedRow === null && document.activeElement === document.body) {
+                  filesGrid()?.focus();
+                }
               }}
               onSortChange={(fileSort: FileSearchSort) =>
                 commitNavigation({
@@ -1481,23 +1554,37 @@
           {selectionPreflight}
           meetingSelection={apiSelection}
           exportSelection={() => void exportSelection()}
+          onReviewDeletion={openDeletionReview}
           {commitNavigation}
+          {commitSearch}
           {commitWorkspace}
           {commitGrouping}
           {fixedSortNotice}
           {focusGrid}
           {openRow}
           {drillGroup}
-          {openFileItem}
-          {openContextualFile}
           closeReadingPane={() => void closeReadingPane()}
           {openRelationship}
           {changeConversationAnchor}
           onOpenMeeting={(meeting) => void openArchivedMeeting(meeting)}
+          onSaveView={() => (saveViewOpen = true)}
         />
       {/if}
     </div>
   </div>
+  {#if saveViewOpen}
+    <SaveViewDialog
+      {client}
+      state={exploreState.current}
+      onSaved={(view) => {
+        saveViewOpen = false;
+        announceOperation(`Saved view ${view.name}.`);
+      }}
+      onclose={() => {
+        saveViewOpen = false;
+      }}
+    />
+  {/if}
   {#if narrow && drawerOpen}
     <NavigationDrawer onclose={() => void closeDrawer()}>
       <AppSidebar
@@ -1582,13 +1669,9 @@
     min-height: var(--header-height);
     align-items: center;
     gap: var(--space-3);
-    padding: 0 var(--space-5);
+    padding: 0 var(--page-gutter);
     background: var(--bg-surface);
     border-bottom: 1px solid var(--border-default);
-  }
-
-  .app-shell--narrow .app-top-bar {
-    padding: 0 var(--space-3);
   }
 
   .app-top-bar__menu {
@@ -1617,17 +1700,6 @@
     flex: 1;
     flex-direction: column;
     gap: var(--space-4);
-    padding: var(--space-5) var(--space-6) var(--space-4);
-  }
-
-  .files-count {
-    color: var(--text-muted);
-    font-size: var(--font-size-xs);
-  }
-
-  @media (max-width: 760px) {
-    .files-shell {
-      padding-inline: var(--space-4);
-    }
+    padding: var(--space-5) var(--page-gutter) var(--space-4);
   }
 </style>

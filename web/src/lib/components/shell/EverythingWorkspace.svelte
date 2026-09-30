@@ -12,10 +12,9 @@
     EntryRow,
     AllMatchingExploreSelection,
     ExploreCacheUnavailable,
-    ExploreColumn,
-    ExploreFileFact,
     ExploreGroupDimension,
     ExploreGroupRow,
+    ExploreSearchMode,
     ExploreURLState,
     ExploreWorkspace,
   } from '../../explore/models';
@@ -26,9 +25,9 @@
   import { groupingByDimension } from '../../grouping/catalog';
   import { canonicalFingerprint, createAllMatchingSelection, predicateFingerprint } from '../../explore/selection';
   import type { ExploreSelectionState, ExploreState } from '../../explore/state.svelte';
+  import ColumnsMenu from '../explore/ColumnsMenu.svelte';
   import ContextBar from '../explore/ContextBar.svelte';
   import EverythingTable from '../explore/EverythingTable.svelte';
-  import FilesPresentation from '../explore/FilesPresentation.svelte';
   import GroupTable from '../explore/GroupTable.svelte';
   import SelectionBar from '../explore/SelectionBar.svelte';
   import SplitPane from '../layout/SplitPane.svelte';
@@ -38,7 +37,12 @@
   import type { SearchCoverageAction } from '../../search/modes';
   import MeetingPanel from '../meetings/MeetingPanel.svelte';
   import PageHeader from './PageHeader.svelte';
-  import { exploreMeetingScope } from '../../meetings/scopes';
+  import {
+    exploreMeetingScope,
+    filtersToMeetingTranscripts,
+    isMeetingTranscript,
+    restrictsToMeetingTranscripts,
+  } from '../../meetings/scopes';
   import type { EverythingSessionState } from './EverythingSessionState.svelte';
 
   type ExplorePreflight = GeneratedExplorePreflightResponse;
@@ -57,19 +61,20 @@
     selectionPreflight: ExplorePreflight | undefined;
     meetingSelection: GeneratedExploreSelection | undefined;
     exportSelection: () => void;
+    onReviewDeletion: (mode: 'explicit' | 'all_matching') => void;
     commitNavigation: (patch: Partial<ExploreURLState>) => void;
+    commitSearch: (query: string, mode: ExploreSearchMode) => void;
     commitWorkspace: (workspace: ExploreWorkspace) => void;
     commitGrouping: (dimension: ExploreGroupDimension) => void;
     fixedSortNotice: () => void;
     focusGrid: () => void;
     openRow: (row: EntryRow) => void;
     drillGroup: (row: ExploreGroupRow) => void;
-    openFileItem: (entryKey: string) => void;
-    openContextualFile: (file: ExploreFileFact) => void;
     closeReadingPane: () => void;
     openRelationship: (participantID: number) => void;
     changeConversationAnchor: (anchorId: number) => void;
     onOpenMeeting?: (meeting: MeetingRef) => void;
+    onSaveView: () => void;
   }
 
   let {
@@ -86,22 +91,37 @@
     selectionPreflight,
     meetingSelection,
     exportSelection,
+    onReviewDeletion,
     commitNavigation,
+    commitSearch,
     commitWorkspace,
     commitGrouping,
     fixedSortNotice,
     focusGrid,
     openRow,
     drillGroup,
-    openFileItem,
-    openContextualFile,
     closeReadingPane,
     openRelationship,
     changeConversationAnchor,
     onOpenMeeting = undefined,
+    onSaveView,
   }: Props = $props();
 
   const api = createExploreAPI(untrack(() => client));
+
+  const countLabel = $derived.by(() => {
+    const result = loader.result;
+    if (loader.loading) return 'Counting…';
+    if (!result || loader.error || loader.unavailable) return '';
+    if (result.candidatePoolSaturated) {
+      const shown = loader.rows.length;
+      return `${shown.toLocaleString()} ${shown === 1 ? 'result' : 'results'} shown`;
+    }
+    if (result.totalCount === undefined) return '';
+    const count = result.totalCount;
+    const [one, many] = exploreState.current.groupingChain.length > 0 ? ['group', 'groups'] : ['item', 'items'];
+    return `${count.toLocaleString()} ${count === 1 ? one : many}`;
+  });
 
   function storedPreviewPosition(): 'below' | 'right' {
     try {
@@ -330,6 +350,13 @@
       });
   });
 
+  // The meeting context API rejects any selection that contains a non-meeting row.
+  const canExportMeetings = $derived.by(() => {
+    if (selection.mode === 'all_matching') return restrictsToMeetingTranscripts(exploreState.predicate());
+    const selected = loader.rows.filter((row) => selection.isSelected(row.key));
+    return selected.length > 0 && selected.every(isMeetingTranscript);
+  });
+
   let meetingReloadRequestedAt: number | undefined;
   const meetingPredicateFingerprint = $derived(predicateFingerprint(exploreState.predicate()));
   const meetingScope = $derived(session.meetingOverview?.fingerprint === meetingPredicateFingerprint
@@ -342,8 +369,7 @@
     const loading = loader.loading;
     const generation = loader.resultGeneration;
     const resultFingerprint = loader.resultFingerprint;
-    const isMeetingView = exploreState.current.workspace === 'everything' &&
-      predicate.filters?.some((filter) => filter.dimension === 'message_type' && filter.values.includes('meeting_transcript'));
+    const isMeetingView = exploreState.current.workspace === 'everything' && filtersToMeetingTranscripts(predicate);
     untrack(() => {
       if (!isMeetingView || session.meetingOverview?.fingerprint !== fingerprint) session.meetingOverview = undefined;
       if (!isMeetingView || !result || loading || resultFingerprint !== fingerprint) return;
@@ -433,7 +459,6 @@
     }
     if (
       !currentResult ||
-      exploreState.current.presentation === 'files' ||
       !predicate.query ||
       (predicate.search_mode !== 'full_text' && predicate.search_mode !== 'hybrid') ||
       loader.resultFingerprint !== predicateFingerprint(predicate) ||
@@ -577,47 +602,8 @@
 
 <main class="everything-workspace" aria-label="Everything">
   <PageHeader title="Everything">
-    {#snippet actions()}
-      {#if canPreviewRight}
-        <div class="preview-position">
-          <span>Preview position</span>
-          <SegmentedControl
-            ariaLabel="Preview position"
-            options={[{ value: 'below', label: 'Below' }, { value: 'right', label: 'Right' }]}
-            value={previewPosition}
-            onchange={setPreviewPosition}
-          />
-        </div>
-      {/if}
-      <p class="result-count" aria-live="polite" data-mono>
-        {#if loader.result?.candidatePoolSaturated}
-          {loader.rows.length.toLocaleString()} {loader.rows.length === 1 ? 'result' : 'results'} shown
-        {:else if loader.result?.totalCount !== undefined}
-          {loader.result.totalCount.toLocaleString()} items
-        {:else}
-          Modality-neutral archive
-        {/if}
-      </p>
-    {/snippet}
+    {#snippet actions()}<Button surface="outline" label="Save view…" onclick={onSaveView} />{/snippet}
   </PageHeader>
-
-  {#if loader.result?.candidatePoolSaturated}
-    <div class="search-limit" role="status">
-      <p>
-        <span class="search-limit__title">More results may match.</span>
-        Narrow with from:alice@example.com, after:2025-01-01, or label:important.
-      </p>
-      <Button label="Refine search" size="sm" surface="soft" onclick={() => searchInput?.focus()} />
-    </div>
-  {/if}
-
-  {#if session.coverage}
-    <SearchCoverage
-      requestedMode={exploreState.current.searchMode}
-      coverage={session.coverage}
-      onaction={handleCoverageAction}
-    />
-  {/if}
 
   <ContextBar
     {client}
@@ -625,10 +611,17 @@
     searchMode={exploreState.current.searchMode}
     filters={exploreState.current.filters}
     groupingChain={exploreState.current.groupingChain}
-    totalCount={loader.result?.totalCount}
+    {countLabel}
+    sort={exploreState.current.groupingChain.length > 0 ? undefined : {
+      options: [{ value: 'newest', label: 'Newest first' }],
+      value: 'newest',
+      note: 'Other orders aren’t available yet',
+      onchange: fixedSortNotice,
+    }}
     presentation={exploreState.current.presentation}
     onPresentationChange={(presentation) =>
       commitNavigation({
+        ...(presentation === 'files' ? { workspace: 'files' as const } : {}),
         presentation,
         activeRow: null,
         selectedRow: null,
@@ -649,9 +642,51 @@
         selectedRow: null,
         scrollAnchor: null,
       })}
-    onSort={fixedSortNotice}
-  />
+    onRemoveQuery={() => commitSearch('', exploreState.current.searchMode)}
+    onRemoveFilter={(index) =>
+      commitNavigation({
+        filters: exploreState.current.filters.filter((_, position) => position !== index),
+        activeRow: null,
+        selectedRow: null,
+        scrollAnchor: null,
+      })}
+  >
+    {#snippet extra()}
+      {#if exploreState.current.presentation === 'table' && exploreState.current.groupingChain.length === 0}
+        <ColumnsMenu
+          columns={exploreState.current.columns}
+          onchange={(columns) => exploreState.replaceTransient({ columns })}
+        />
+      {/if}
+      {#if canPreviewRight}
+        <SegmentedControl
+          ariaLabel="Preview position"
+          options={[{ value: 'below', label: 'Below' }, { value: 'right', label: 'Right' }]}
+          value={previewPosition}
+          onchange={setPreviewPosition}
+        />
+      {/if}
+    {/snippet}
+  </ContextBar>
   <span class="kit-sr-only" role="status" aria-label="Sort status" aria-live="polite">{sortNotice}</span>
+
+  {#if loader.result?.candidatePoolSaturated}
+    <div class="search-limit" role="status">
+      <p>
+        <span class="search-limit__title">More results may match.</span>
+        Narrow with from:alice@example.com, after:2025-01-01, or label:important.
+      </p>
+      <Button label="Refine search" size="sm" surface="soft" onclick={() => searchInput?.focus()} />
+    </div>
+  {/if}
+
+  {#if session.coverage}
+    <SearchCoverage
+      requestedMode={exploreState.current.searchMode}
+      coverage={session.coverage}
+      onaction={handleCoverageAction}
+    />
+  {/if}
 
   {#if loader.result?.searchDeletionScope === 'active'}
     <p class="scope-note" role="status">Semantic search covers active messages only.</p>
@@ -701,37 +736,7 @@
               onScrollAnchor={(key, offset) => exploreState.replaceTransient({ scrollAnchor: { key, offset } })}
               onRetry={loader.retry}
             />
-          {:else if exploreState.current.presentation === 'files'}
-            <FilesPresentation
-              files={loader.fileFacts}
-              loading={loader.loading}
-              loadingMore={loader.loadingMore}
-              hasMore={Boolean(loader.nextCursor)}
-              totalCount={loader.result?.totalCount}
-              generation={loader.resultGeneration}
-              error={loader.error}
-              pageError={loader.pageError}
-              unavailable={loader.unavailable}
-              focusedKey={exploreState.current.activeRow}
-              scrollAnchor={exploreState.current.scrollAnchor}
-              restoring={loader.restoring}
-              onOpenFile={openContextualFile}
-              onOpenItem={openFileItem}
-              onActiveKey={(activeRow) => exploreState.replaceTransient({ activeRow })}
-              onScrollAnchor={(key, offset) => exploreState.replaceTransient({ scrollAnchor: { key, offset } })}
-              onLoadMore={loader.loadMore}
-              onRetry={loader.retry}
-            />
           {:else}
-            <SelectionBar
-              {selection}
-              totalCount={loader.result?.totalCount}
-              allMatching={allMatchingSelection}
-              preflight={selectionPreflight}
-              {client}
-              {meetingSelection}
-              onExport={exportSelection}
-            />
             {#if exploreState.current.presentation === 'timeline'}
               <PersonTimeline
                 rows={loader.rows}
@@ -777,7 +782,6 @@
                 error={loader.error}
                 pageError={loader.pageError}
                 onOpen={openRow}
-                onColumnsChange={(columns: ExploreColumn[]) => exploreState.replaceTransient({ columns })}
                 onScrollAnchor={(key, offset) => exploreState.replaceTransient({ scrollAnchor: { key, offset } })}
                 onLoadMore={loader.loadMore}
                 onLoadThroughEnd={loader.loadThroughEnd}
@@ -788,6 +792,18 @@
                 onRetry={loader.retry}
               />
             {/if}
+            <SelectionBar
+              {selection}
+              totalCount={loader.result?.totalCount}
+              allMatching={allMatchingSelection}
+              preflight={selectionPreflight}
+              {client}
+              {meetingSelection}
+              {canExportMeetings}
+              onExport={exportSelection}
+              {onReviewDeletion}
+              onClear={focusGrid}
+            />
           {/if}
         </div>
       {/snippet}
@@ -824,25 +840,10 @@
     flex: 1;
     flex-direction: column;
     gap: var(--space-4);
-    padding: var(--space-5) var(--space-6) var(--space-4);
+    padding: var(--space-5) var(--page-gutter) var(--space-4);
   }
 
   .meeting-overview { max-height: 42vh; overflow: auto; flex: none; border: 1px solid var(--border-muted); }
-
-  .preview-position {
-    display: flex;
-    align-items: center;
-    gap: var(--space-4);
-    color: var(--text-muted);
-    font-size: var(--font-size-xs);
-  }
-
-  .result-count {
-    margin: 0;
-    color: var(--text-muted);
-    font-size: var(--font-size-xs);
-    font-variant-numeric: tabular-nums;
-  }
 
   .scope-note {
     margin: 0;
@@ -908,11 +909,5 @@
     border-top: 1px solid var(--border-default);
     border-left: 0;
     border-radius: 0 var(--radius-md) var(--radius-md) 0;
-  }
-
-  @media (max-width: 760px) {
-    .everything-workspace {
-      padding-inline: var(--space-4);
-    }
   }
 </style>

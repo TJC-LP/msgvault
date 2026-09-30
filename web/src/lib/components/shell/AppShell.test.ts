@@ -331,6 +331,164 @@ describe('AppShell', () => {
   });
 
 
+  it.each([['everything', 'Everything', 'Cancel'], ['files', 'Files', 'Escape']] as const)(
+    'offers Save view… in the %s header (%s); closing with %s returns focus to it',
+    async (workspace, title, closeWith) => {
+      window.history.replaceState(null, '', `/?explore=${encodeURIComponent(JSON.stringify({ workspace }))}`);
+      const state = new ExploreState(window);
+      const rendered = render(AppShell, {
+        client: createAPIClient(vi.fn<typeof fetch>(async () => Response.json(exploreResponse()))), state, enabled: false
+      });
+      const header = (await screen.findByRole('heading', { level: 1, name: title })).closest('header')!;
+      const open = within(header).getByRole('button', { name: 'Save view…' });
+      open.focus();
+      await fireEvent.click(open);
+      expect(screen.getByRole('dialog', { name: 'Save view' })).toBeDefined();
+      if (closeWith === 'Cancel') await fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+      else await fireEvent.keyDown(document.activeElement!, { key: 'Escape' });
+      await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Save view' })).toBeNull());
+      expect(document.activeElement).toBe(open);
+      rendered.unmount();
+      state.destroy();
+    }
+  );
+
+  it('saves a Files view from its header and reopens it in Files from Saved views', async () => {
+    window.history.replaceState(null, '', `/?explore=${encodeURIComponent(JSON.stringify({ workspace: 'files' }))}`);
+    const stored: Record<string, unknown>[] = [];
+    const fetchFn = vi.fn<typeof fetch>(async (input) => {
+      const request = input instanceof Request ? input : new Request(input);
+      const path = new URL(request.url).pathname;
+      if (path.endsWith('/saved-views') && request.method === 'POST') {
+        const body = await request.json();
+        const view = {
+          ...body, id: 5, revision: 1,
+          created_at: '2026-07-19T10:00:00Z', updated_at: '2026-07-19T10:00:00Z'
+        };
+        stored.push(view);
+        return Response.json(view, { status: 201 });
+      }
+      if (path.endsWith('/saved-views')) return Response.json({ saved_views: stored });
+      return Response.json(exploreResponse());
+    });
+    const state = new ExploreState(window);
+    const rendered = render(AppShell, { client: createAPIClient(fetchFn), state, enabled: false });
+
+    await fireEvent.click(await screen.findByRole('button', { name: 'Save view…' }));
+    const dialog = screen.getByRole('dialog', { name: 'Save view' });
+    expect(within(dialog).getByText('Filename, type, and file sort aren’t saved with the view.')).toBeDefined();
+    await fireEvent.input(within(dialog).getByLabelText('Name'), { target: { value: 'Demo view' } });
+    await fireEvent.click(within(dialog).getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Save view' })).toBeNull());
+    expect(screen.getByRole('status', { name: 'Operation status' }).textContent).toContain('Saved view Demo view.');
+
+    await fireEvent.click(within(screen.getByRole('navigation', { name: 'Primary' })).getByRole('button', { name: 'Saved views' }));
+    await fireEvent.click(await screen.findByRole('button', { name: 'Open Demo view' }));
+    await waitFor(() => expect(state.current.workspace).toBe('files'));
+    expect(await screen.findByRole('main', { name: 'Files' })).toBeDefined();
+
+    rendered.unmount();
+    state.destroy();
+  });
+
+  function savedFilesViewFetch(fileSearches: Request[]) {
+    return vi.fn<typeof fetch>(async (input) => {
+      const request = input instanceof Request ? input : new Request(input);
+      const path = new URL(request.url).pathname;
+      if (path.endsWith('/saved-views')) return Response.json({ saved_views: [{
+        id: 5, name: 'Demo view', canonical_state: { presentation: 'files' },
+        schema_version: 1, revision: 1,
+        created_at: '2026-07-19T10:00:00Z', updated_at: '2026-07-19T10:00:00Z'
+      }] });
+      if (path.endsWith('/files/search')) {
+        fileSearches.push(request);
+        return Response.json({
+          files: [], total_count: 0, cache_revision: 'cache-1', search_provenance: {}
+        });
+      }
+      return Response.json(exploreResponse());
+    });
+  }
+
+  async function openDemoView(): Promise<void> {
+    const primary = screen.getByRole('navigation', { name: 'Primary' });
+    await fireEvent.click(within(primary).getByRole('button', { name: 'Saved views' }));
+    await fireEvent.click(await screen.findByRole('button', { name: 'Open Demo view' }));
+  }
+
+  it('opens a saved view without the Files filename, type, and sort set earlier', async () => {
+    window.history.replaceState(null, '', '/?workspace=files');
+    const fileSearches: Request[] = [];
+    const state = new ExploreState(window);
+    state.replaceTransient({
+      workspace: 'files', fileFilenameQuery: 'invoice', fileMIMEFamilies: ['pdf'],
+      fileSort: { field: 'filename', direction: 'asc' }
+    });
+    const client = createAPIClient(savedFilesViewFetch(fileSearches));
+    const rendered = render(AppShell, { client, state });
+    try {
+      const filter = await screen.findByLabelText<HTMLInputElement>('Filter filename');
+      expect(filter.value).toBe('invoice');
+      await openDemoView();
+      await screen.findByRole('grid', { name: 'Files results' });
+      expect(screen.getByLabelText<HTMLInputElement>('Filter filename').value).toBe('');
+      await waitFor(async () => {
+        const body = await fileSearches.at(-1)!.clone().json();
+        expect(body).not.toHaveProperty('filename_query');
+        expect(body).not.toHaveProperty('mime_families');
+        expect(body.sort).toEqual({ field: 'occurred_at', direction: 'desc' });
+      });
+    } finally {
+      rendered.unmount();
+      state.destroy();
+    }
+  });
+
+  it('focuses the Files grid after opening a saved Files view', async () => {
+    window.history.replaceState(null, '', '/?workspace=everything');
+    const state = new ExploreState(window);
+    const rendered = render(AppShell, { client: createAPIClient(savedFilesViewFetch([])), state });
+    try {
+      await openDemoView();
+      const grid = await screen.findByRole('grid', { name: 'Files results' });
+      await waitFor(() => expect(document.activeElement).toBe(grid));
+    } finally {
+      rendered.unmount();
+      state.destroy();
+    }
+  });
+
+  it('focuses the Files grid when Escape removes a Files grouping level', async () => {
+    window.history.replaceState(null, '', '/?workspace=files');
+    const fetchFn = vi.fn<typeof fetch>(async (input) => {
+      const path = new URL(input instanceof Request ? input.url : String(input)).pathname;
+      if (path.endsWith('/files/groups')) return Response.json({
+        rows: [{
+          key: '7', label: 'Example source', count: 1, estimated_bytes: 1,
+          latest_at: '2026-07-18T12:00:00Z'
+        }],
+        total_count: 1, cache_revision: 'cache-1', search_provenance: {}
+      });
+      return Response.json(exploreResponse());
+    });
+    const state = new ExploreState(window);
+    state.replaceTransient({ workspace: 'files', groupingChain: ['source', 'year'] });
+    const rendered = render(AppShell, { client: createAPIClient(fetchFn), state });
+    try {
+      await screen.findByRole('grid', { name: 'Files grouped by source' });
+      await screen.findByText('Example source');
+      (document.activeElement as HTMLElement | null)?.blur();
+      const escape = { key: 'Escape', bubbles: true, cancelable: true };
+      window.dispatchEvent(new KeyboardEvent('keydown', escape));
+      await waitFor(() => expect(state.current.groupingChain).toEqual(['source']));
+      const grid = screen.getByRole('grid', { name: 'Files grouped by source' });
+      await waitFor(() => expect(document.activeElement).toBe(grid));
+    } finally {
+      rendered.unmount();
+      state.destroy();
+    }
+  });
+
   describe('shell chrome', () => {
     const states: ExploreState[] = [];
 
@@ -424,7 +582,7 @@ describe('AppShell', () => {
       expect(banners).toHaveLength(1);
     });
 
-    it('shows the file count beside the Files title without a second heading', async () => {
+    it('shows the file count once, in the toolbar, without a second heading', async () => {
       const fetchFn = vi.fn<typeof fetch>(async (input) => {
         const path = new URL(input instanceof Request ? input.url : String(input)).pathname;
         if (path.endsWith('/files/search')) {
@@ -433,8 +591,158 @@ describe('AppShell', () => {
         return Response.json(exploreResponse());
       });
       render(AppShell, { client: createAPIClient(fetchFn), state: shellState('files'), enabled: false });
-      expect(await screen.findByText('7 files')).toBeDefined();
+      const bar = screen.getByRole('region', { name: 'Active analytical context' });
+      expect(await within(bar).findByText('7 files')).toBeDefined();
+      expect(screen.getAllByText('7 files')).toHaveLength(1);
+      expect(screen.queryByText('Count pending')).toBeNull();
       expect(screen.getAllByRole('heading', { level: 1 })).toHaveLength(1);
+    });
+
+    it('changes the Files order from the Sort menu and points r at it', async () => {
+      const state = shellState('files');
+      render(AppShell, { client: exploreClient(), state, enabled: false });
+      await chooseSelectOption(screen.getByRole('combobox', { name: 'Sort: Newest first' }), 'Largest first');
+      expect(state.current.fileSort).toEqual({ field: 'size', direction: 'desc' });
+      expect(screen.getByRole('combobox', { name: 'Sort: Largest first' })).toBeDefined();
+
+      await fireEvent.keyDown(window, { key: 'r' });
+      expect(screen.getByRole('status', { name: 'Sort status' }).textContent)
+        .toBe('Use the Sort menu to change the order.');
+    });
+
+    it('hides the Everything Sort menu while grouped and says why sorting is unavailable', async () => {
+      const state = shellState('everything');
+      state.replaceTransient({ groupingChain: ['source'] });
+      render(AppShell, { client: exploreClient(), state, enabled: false });
+      await screen.findByRole('region', { name: 'Active analytical context' });
+      expect(screen.queryByRole('combobox', { name: /^Sort:/ })).toBeNull();
+
+      await fireEvent.keyDown(window, { key: 's' });
+      expect(screen.queryByRole('listbox')).toBeNull();
+      await fireEvent.keyDown(window, { key: 'r' });
+      expect(screen.getByRole('status', { name: 'Sort status' }).textContent)
+        .toBe('Sorting isn’t available while grouped.');
+    });
+
+    it('hides the Files Sort menu while grouped, where file order does not apply', async () => {
+      const state = shellState('files');
+      state.replaceTransient({ groupingChain: ['source'] });
+      render(AppShell, { client: exploreClient(), state, enabled: false });
+      await screen.findByRole('region', { name: 'Active analytical context' });
+      expect(screen.queryByRole('combobox', { name: /^Sort:/ })).toBeNull();
+      expect(screen.getByRole('combobox', { name: 'Add grouping' })).toBeDefined();
+    });
+
+    it('lists every file order in the Files Sort menu', async () => {
+      render(AppShell, { client: exploreClient(), state: shellState('files'), enabled: false });
+      await fireEvent.click(screen.getByRole('combobox', { name: 'Sort: Newest first' }));
+      const options = await screen.findAllByRole('option');
+      expect(options.map((option) => option.textContent?.trim())).toEqual([
+        'Newest first', 'Oldest first', 'Filename A–Z', 'Filename Z–A', 'Largest first', 'Smallest first'
+      ]);
+    });
+
+    it('moves between Everything and Files with Show as, keeping the query and filters', async () => {
+      const state = shellState('everything');
+      state.commitNavigation({ query: 'pasta', filters: [{ dimension: 'source', values: ['1'] }] });
+      render(AppShell, { client: exploreClient(), state, enabled: false });
+
+      await chooseSelectOption(screen.getByRole('combobox', { name: /^Show as:/ }), 'Files');
+      expect(await screen.findByRole('main', { name: 'Files' })).toBeDefined();
+      expect(state.current).toMatchObject({
+        workspace: 'files', presentation: 'files', query: 'pasta',
+        filters: [{ dimension: 'source', values: ['1'] }],
+        activeRow: null, selectedRow: null, scrollAnchor: null
+      });
+      expect(screen.queryByRole('grid', { name: 'Files in current context' })).toBeNull();
+
+      await chooseSelectOption(screen.getByRole('combobox', { name: /^Show as:/ }), 'Table');
+      expect(await screen.findByRole('main', { name: 'Everything' })).toBeDefined();
+      expect(state.current).toMatchObject({
+        workspace: 'everything', presentation: 'table', query: 'pasta',
+        filters: [{ dimension: 'source', values: ['1'] }]
+      });
+    });
+
+    it('searches Files live as the global search is typed', async () => {
+      const searches: Request[] = [];
+      const fetchFn = vi.fn<typeof fetch>(async (input) => {
+        const request = input instanceof Request ? input : new Request(input);
+        if (new URL(request.url).pathname.endsWith('/files/search')) {
+          searches.push(request);
+          return Response.json({ files: [], total_count: 0, cache_revision: 'cache-1', search_provenance: {} });
+        }
+        return Response.json(exploreResponse());
+      });
+      render(AppShell, { client: createAPIClient(fetchFn), state: shellState('files'), enabled: false });
+      await screen.findByRole('grid', { name: 'Files results' });
+
+      await fireEvent.input(screen.getByRole('searchbox', { name: 'Search everything' }), { target: { value: 'invoice' } });
+
+      await waitFor(async () => {
+        const body = await searches.at(-1)!.clone().json() as { predicate: { query?: string } };
+        expect(body.predicate.query).toBe('invoice');
+      });
+    });
+
+    it('does not flash the previous file count when returning to Files', async () => {
+      let resolveSearch = true;
+      const fetchFn = vi.fn<typeof fetch>(async (input) => {
+        const path = new URL(input instanceof Request ? input.url : String(input)).pathname;
+        if (path.endsWith('/files/search')) {
+          if (!resolveSearch) return new Promise<Response>(() => {});
+          return Response.json({ files: [], total_count: 7, cache_revision: 'cache-1', search_provenance: {} });
+        }
+        return Response.json(exploreResponse());
+      });
+      const state = shellState('files');
+      render(AppShell, { client: createAPIClient(fetchFn), state, enabled: false });
+      expect(await screen.findByText('7 files')).toBeDefined();
+      const nav = screen.getByRole('navigation', { name: 'Primary' });
+      await fireEvent.click(within(nav).getByRole('button', { name: 'Everything' }));
+      await screen.findByRole('main', { name: 'Everything' });
+
+      resolveSearch = false;
+      const shown: string[] = [];
+      const observer = new MutationObserver((records) => {
+        for (const record of records) if (record.oldValue) shown.push(record.oldValue);
+      });
+      observer.observe(document.body, { subtree: true, characterData: true, characterDataOldValue: true });
+      await fireEvent.click(within(nav).getByRole('button', { name: 'Files' }));
+      const bar = await screen.findByRole('region', { name: 'Active analytical context' });
+      await waitFor(() => expect(within(bar).getByText('Counting…')).toBeDefined());
+      observer.disconnect();
+      expect(shown.filter((text) => /\d+ files?$/.test(text))).toEqual([]);
+      expect(within(bar).queryByText('7 files')).toBeNull();
+    });
+
+    it.each([
+      ['everything', '/api/v1/explore'],
+      ['files', '/api/v1/files/search']
+    ])('leaves the %s count empty instead of Counting… when the request fails', async (workspace, failingPath) => {
+      const fetchFn = vi.fn<typeof fetch>(async (input) => {
+        const path = new URL(input instanceof Request ? input.url : String(input)).pathname;
+        if (path === failingPath) return Response.json({ error: 'internal', message: 'Synthetic failure' }, { status: 500 });
+        return Response.json(exploreResponse());
+      });
+      render(AppShell, { client: createAPIClient(fetchFn), state: shellState(workspace), enabled: true });
+      await screen.findByText(/Synthetic failure/);
+      const bar = screen.getByRole('region', { name: 'Active analytical context' });
+      expect(within(bar).queryByText('Counting…')).toBeNull();
+    });
+
+    it('shows the Size column after turning it on in the Columns menu', async () => {
+      const fetchFn = vi.fn<typeof fetch>(async () => Response.json(exploreResponse({
+        rows: [entry(1)], total_count: 1
+      })));
+      render(AppShell, { client: createAPIClient(fetchFn), state: shellState('everything') });
+      await screen.findByText('Synthetic subject 1');
+      expect(screen.queryByRole('columnheader', { name: 'Size' })).toBeNull();
+
+      await fireEvent.click(screen.getByRole('button', { name: 'Columns' }));
+      await fireEvent.click(screen.getByRole('button', { name: 'Size' }));
+
+      expect(await screen.findByRole('columnheader', { name: 'Size' })).toBeDefined();
     });
 
     it('opens Everything with the query when searching from another workspace', async () => {
@@ -866,7 +1174,7 @@ describe('AppShell', () => {
     expect(row).not.toBeNull();
     await fireEvent.click(row!);
     await screen.findByRole('complementary', { name: 'Reading pane: Synthetic subject 1' });
-    await fireEvent.click(await screen.findByLabelText('Tasks for this message'));
+    await fireEvent.click(await screen.findByRole('button', { name: 'Tasks for this message' }));
     await fireEvent.click(await screen.findByRole('button', { name: 'Open Settings' }));
 
     expect(await screen.findByRole('main', { name: 'Settings target fixture' })).toBeDefined();
@@ -1454,6 +1762,213 @@ describe('AppShell', () => {
   });
 
 
+  it('opens an old Everything-as-Files link in Files with its attachment viewer', async () => {
+    window.history.replaceState(null, '', `/?workspace=everything&explore=${encodeURIComponent(JSON.stringify({
+      presentation: 'files', selectedRow: 'attachment:5'
+    }))}`);
+    const fetchFn = vi.fn<typeof fetch>(async (input) => {
+      const path = new URL(input instanceof Request ? input.url : String(input)).pathname;
+      if (path.endsWith('/files/5')) return Response.json({
+        id: 5, message_id: 1, conversation_id: 11, filename: 'legacy-report.pdf',
+        mime_type: 'application/pdf', size_bytes: 2048,
+        content_state: 'missing_blob', content_available: false
+      });
+      return Response.json(exploreResponse());
+    });
+    const state = new ExploreState(window);
+    const rendered = render(AppShell, { client: createAPIClient(fetchFn), state });
+    try {
+      expect(await screen.findByRole('main', { name: 'Files' })).toBeDefined();
+      expect(await screen.findByRole('dialog', { name: 'View legacy-report.pdf' })).toBeDefined();
+      expect(state.current).toMatchObject({
+        workspace: 'files', presentation: 'files', selectedRow: 'attachment:5'
+      });
+      expect(window.location.search).toContain('workspace=files');
+    } finally {
+      rendered.unmount();
+      state.destroy();
+    }
+  });
+
+  it.each([
+    ['the Close button', async () => {
+      await fireEvent.click(screen.getByRole('button', { name: 'Close file viewer' }));
+    }],
+    ['Escape', async () => {
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+    }]
+  ])('clears a legacy attachment selection when its viewer closes with %s', async (_label, close) => {
+    window.history.replaceState(null, '', `/?workspace=everything&explore=${encodeURIComponent(JSON.stringify({
+      presentation: 'files', selectedRow: 'attachment:5'
+    }))}`);
+    const fetchFn = vi.fn<typeof fetch>(async (input) => {
+      const path = new URL(input instanceof Request ? input.url : String(input)).pathname;
+      if (path.endsWith('/files/5')) return Response.json({
+        id: 5, message_id: 1, conversation_id: 11, filename: 'legacy-report.pdf',
+        mime_type: 'application/pdf', size_bytes: 2048,
+        content_state: 'missing_blob', content_available: false
+      });
+      return Response.json(exploreResponse());
+    });
+    const state = new ExploreState(window);
+    const rendered = render(AppShell, { client: createAPIClient(fetchFn), state });
+    try {
+      expect(await screen.findByRole('dialog', { name: 'View legacy-report.pdf' })).toBeDefined();
+      await close();
+      await waitFor(() => expect(screen.queryByRole('dialog', { name: 'View legacy-report.pdf' })).toBeNull());
+      expect(state.current.selectedRow).toBeNull();
+      expect(new URLSearchParams(window.location.search).get('explore') ?? '').not.toContain('attachment:5');
+    } finally {
+      rendered.unmount();
+      state.destroy();
+    }
+  });
+
+  it.each([
+    ['the Close button', async () => {
+      await fireEvent.click(screen.getByRole('button', { name: 'Close file viewer' }));
+    }],
+    ['Escape', async () => {
+      const escape = { key: 'Escape', bubbles: true, cancelable: true };
+      window.dispatchEvent(new KeyboardEvent('keydown', escape));
+    }]
+  ])('focuses the Files grid when a legacy file viewer closes with %s', async (_label, close) => {
+    const explore = encodeURIComponent(JSON.stringify({ selectedRow: 'attachment:5' }));
+    window.history.replaceState(null, '', `/?workspace=files&explore=${explore}`);
+    const fetchFn = vi.fn<typeof fetch>(async (input) => {
+      const path = new URL(input instanceof Request ? input.url : String(input)).pathname;
+      if (path.endsWith('/files/5')) return Response.json({
+        id: 5, message_id: 1, conversation_id: 11, filename: 'legacy-report.pdf',
+        mime_type: 'application/pdf', size_bytes: 2048,
+        content_state: 'missing_blob', content_available: false
+      });
+      if (path.endsWith('/files/search')) return Response.json({
+        files: [], total_count: 0, cache_revision: 'cache-1', search_provenance: {}
+      });
+      return Response.json(exploreResponse());
+    });
+    const state = new ExploreState(window);
+    const rendered = render(AppShell, { client: createAPIClient(fetchFn), state });
+    try {
+      const viewer = await screen.findByRole('dialog', { name: 'View legacy-report.pdf' });
+      const grid = await screen.findByRole('grid', { name: 'Files results' });
+      // Let the Files list finish restoring so its settle-time focus cannot mask the close.
+      await waitFor(() => expect(state.peekRestorationEpoch()).toBeUndefined());
+      await close();
+      await waitFor(() => expect(viewer.isConnected).toBe(false));
+      await waitFor(() => expect(document.activeElement).toBe(grid));
+    } finally {
+      rendered.unmount();
+      state.destroy();
+    }
+  });
+
+  it('opens an old attachment link with one Files page instead of paging to find it', async () => {
+    window.history.replaceState(null, '', `/?workspace=files&explore=${encodeURIComponent(JSON.stringify({
+      selectedRow: 'attachment:5'
+    }))}`);
+    let filePages = 0;
+    const fetchFn = vi.fn<typeof fetch>(async (input) => {
+      const path = new URL(input instanceof Request ? input.url : String(input)).pathname;
+      if (path.endsWith('/files/5')) return Response.json({
+        id: 5, message_id: 1, conversation_id: 11, filename: 'legacy-report.pdf',
+        mime_type: 'application/pdf', size_bytes: 2048,
+        content_state: 'missing_blob', content_available: false
+      });
+      if (path.endsWith('/files/search')) {
+        filePages += 1;
+        return Response.json({
+          files: [{
+            id: 100 + filePages, key: `file:${100 + filePages}`, entry_key: `message:${filePages}`,
+            message_id: filePages, conversation_id: filePages, occurred_at: '2026-07-18T12:00:00Z',
+            source_id: 1, source_type: 'synthetic', source_identifier: 'archive@example.com',
+            containing_title: 'Containing item', filename: `page-${filePages}.pdf`,
+            mime_type: 'application/pdf', mime_family: 'pdf', size_bytes: 1,
+            content_state: 'missing_blob', content_available: false
+          }],
+          total_count: 5, cache_revision: 'cache-1', search_provenance: {},
+          ...(filePages < 5 ? { next_cursor: `page-${filePages}` } : {})
+        });
+      }
+      return Response.json(exploreResponse());
+    });
+    const state = new ExploreState(window);
+    const rendered = render(AppShell, { client: createAPIClient(fetchFn), state });
+    try {
+      expect(await screen.findByRole('dialog', { name: 'View legacy-report.pdf' })).toBeDefined();
+      const grid = await screen.findByRole('grid', { name: 'Files results' });
+      expect(await screen.findByText('page-1.pdf')).toBeDefined();
+      await waitFor(() => expect(grid.getAttribute('aria-busy')).toBe('false'));
+      expect(filePages).toBe(1);
+    } finally {
+      rendered.unmount();
+      state.destroy();
+    }
+  });
+
+  it('focuses the Files grid once a restored Files list settles on its fallback row', async () => {
+    window.history.replaceState(null, '', `/?workspace=files&explore=${encodeURIComponent(JSON.stringify({
+      activeRow: 'source:1:message:m9:file:9'
+    }))}`);
+    const fetchFn = vi.fn<typeof fetch>(async (input) => {
+      const path = new URL(input instanceof Request ? input.url : String(input)).pathname;
+      if (path.endsWith('/files/search')) return Response.json({
+        files: [{
+          id: 1, key: 'source:1:message:m1:file:1', entry_key: 'source:1:message:m1', message_id: 1,
+          conversation_id: 1, occurred_at: '2026-07-18T12:00:00Z', source_id: 1, source_type: 'synthetic',
+          source_identifier: 'archive@example.com', containing_title: 'Containing item',
+          filename: 'fallback.pdf', mime_type: 'application/pdf', mime_family: 'pdf', size_bytes: 1,
+          content_state: 'missing_blob', content_available: false
+        }],
+        total_count: 1, cache_revision: 'cache-1', search_provenance: {}
+      });
+      return Response.json(exploreResponse());
+    });
+    const state = new ExploreState(window);
+    const rendered = render(AppShell, { client: createAPIClient(fetchFn), state });
+    try {
+      const grid = await screen.findByRole('grid', { name: 'Files results' });
+      expect(await screen.findByText('fallback.pdf')).toBeDefined();
+      await waitFor(() => expect(document.activeElement).toBe(grid));
+    } finally {
+      rendered.unmount();
+      state.destroy();
+    }
+  });
+
+  it('focuses the Files grid when Back returns to Files from the reading pane', async () => {
+    window.history.replaceState(null, '', '/?workspace=files');
+    const fetchFn = vi.fn<typeof fetch>(async (input) => {
+      const path = new URL(input instanceof Request ? input.url : String(input)).pathname;
+      if (path.endsWith('/files/search')) return Response.json({
+        files: [{
+          id: 1, key: 'source:1:message:m1:file:1', entry_key: 'message:1', message_id: 1,
+          conversation_id: 1, occurred_at: '2026-07-18T12:00:00Z', source_id: 1, source_type: 'synthetic',
+          source_identifier: 'archive@example.com', containing_title: 'Containing item',
+          filename: 'returned.pdf', mime_type: 'application/pdf', mime_family: 'pdf', size_bytes: 1,
+          content_state: 'missing_blob', content_available: false
+        }],
+        total_count: 1, cache_revision: 'cache-1', search_provenance: {}
+      });
+      return Response.json(exploreResponse());
+    });
+    const state = new ExploreState(window);
+    const rendered = render(AppShell, { client: createAPIClient(fetchFn), state });
+    try {
+      expect(await screen.findByText('returned.pdf')).toBeDefined();
+      await fireEvent.click(screen.getByRole('button', { name: 'Open containing item Containing item' }));
+      expect(await screen.findByRole('main', { name: 'Everything' })).toBeDefined();
+      const returned = new Promise((resolve) => window.addEventListener('popstate', resolve, { once: true }));
+      window.history.back();
+      await returned;
+      const grid = await screen.findByRole('grid', { name: 'Files results' });
+      await waitFor(() => expect(document.activeElement).toBe(grid));
+    } finally {
+      rendered.unmount();
+      state.destroy();
+    }
+  });
+
   it('keeps Relationships and shows its degraded state when the URL explicitly names it', async () => {
     window.history.replaceState(null, '', `/?explore=${encodeURIComponent(JSON.stringify({ workspace: 'relationships' }))}`);
     const fetchFn = vi.fn<typeof fetch>(async () => Response.json({
@@ -2019,13 +2534,14 @@ describe('AppShell', () => {
     const rendered = render(AppShell, { client: createAPIClient(fetchFn), state });
     try {
       const input = await screen.findByLabelText('Filter filename');
-      const pdfCheckbox = await screen.findByRole('checkbox', { name: 'pdf' });
       await screen.findByRole('grid', { name: 'Files results' });
+      await fireEvent.click(screen.getByRole('button', { name: 'Type' }));
+      const pdfs = await screen.findByRole('button', { name: 'PDFs' });
       const initialRequestCount = searchRequests.length;
       // Start a debounced filename-search patch (queued for 250ms) and then,
       // still inside that window, commit a navigation.
       await fireEvent.input(input, { target: { value: 'invoice' } });
-      await fireEvent.click(pdfCheckbox);
+      await fireEvent.click(pdfs);
       // The pending patch flushes immediately so the typed text is not lost;
       // the navigation commit applies on top and wins for fileMIMEFamilies.
       expect(state.current.fileFilenameQuery).toBe('invoice');
@@ -2125,6 +2641,69 @@ describe('AppShell', () => {
     state.destroy();
   });
 
+  it('shows grouped Files filename and type filters as removable chips', async () => {
+    window.history.replaceState(null, '', `/?explore=${encodeURIComponent(JSON.stringify({ workspace: 'everything' }))}`);
+    const groupRequests: Request[] = [];
+    const fetchFn = vi.fn<typeof fetch>(async (input) => {
+      const request = input instanceof Request ? input : new Request(input);
+      const path = new URL(request.url).pathname;
+      if (path.endsWith('/groups')) {
+        groupRequests.push(request);
+        return Response.json({
+          rows: [{ key: '7', label: 'Example source', count: 12, estimated_bytes: 42, latest_at: '2026-07-18T12:00:00Z' }],
+          total_count: 1, cache_revision: 'cache-1', search_provenance: {}
+        });
+      }
+      return Response.json(exploreResponse());
+    });
+    const state = new ExploreState(window);
+    state.replaceTransient({
+      workspace: 'files', groupingChain: ['source'], fileFilenameQuery: 'invoice', fileMIMEFamilies: ['pdf', 'image']
+    });
+    const rendered = render(AppShell, { client: createAPIClient(fetchFn), state });
+
+    await screen.findByText('Example source');
+    const chips = screen.getByRole('region', { name: 'Active analytical context' });
+    expect(within(chips).getByText('Filename: “invoice”').textContent).toContain('invoice');
+    expect(within(chips).getByText('Type: PDFs, Images').textContent).toContain('PDFs');
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Remove filename filter' }));
+    await waitFor(() => expect(groupRequests).toHaveLength(2));
+    expect(state.current.fileFilenameQuery).toBe('');
+    const afterFilename = await groupRequests[1]!.clone().json();
+    expect(afterFilename).not.toHaveProperty('filename_query');
+    expect(afterFilename).toMatchObject({ mime_families: ['pdf', 'image'] });
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Remove type filter' }));
+    await waitFor(() => expect(groupRequests).toHaveLength(3));
+    expect(state.current.fileMIMEFamilies).toEqual([]);
+    await expect(groupRequests[2]!.clone().json()).resolves.not.toHaveProperty('mime_families');
+    expect(screen.queryByText(/^Filename:|^Type:/)).toBeNull();
+    rendered.unmount();
+    state.destroy();
+  });
+
+  it('shows no file filter chips beside the ungrouped Files controls', async () => {
+    window.history.replaceState(null, '', `/?explore=${encodeURIComponent(JSON.stringify({ workspace: 'everything' }))}`);
+    const fetchFn = vi.fn<typeof fetch>(async (input) => {
+      const request = input instanceof Request ? input : new Request(input);
+      if (new URL(request.url).pathname === '/api/v1/files/search') return Response.json({
+        files: [], total_count: 0, cache_revision: 'cache-1', search_provenance: {}
+      });
+      return Response.json(exploreResponse());
+    });
+    const state = new ExploreState(window);
+    state.replaceTransient({ workspace: 'files', fileFilenameQuery: 'invoice', fileMIMEFamilies: ['pdf'] });
+    const rendered = render(AppShell, { client: createAPIClient(fetchFn), state });
+
+    await screen.findByRole('grid', { name: 'Files results' });
+    expect((screen.getByRole('searchbox', { name: 'Filter filename' }) as HTMLInputElement).value).toBe('invoice');
+    expect(screen.queryByRole('button', { name: 'Remove filename filter' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Remove type filter' })).toBeNull();
+    rendered.unmount();
+    state.destroy();
+  });
+
 
   it('clears a stale Everything sortNotice when the workspace changes', async () => {
     window.history.replaceState(null, '', `/?explore=${encodeURIComponent(JSON.stringify({ workspace: 'everything' }))}`);
@@ -2142,11 +2721,38 @@ describe('AppShell', () => {
 
     await fireEvent.keyDown(window, { key: 'r' });
     expect(screen.getByRole('status', { name: 'Sort status' }).textContent)
-      .toContain('reverse order is not supported');
+      .toBe('Everything is always shown newest first.');
 
     await fireEvent.click(screen.getByRole('button', { name: 'Files' }));
     expect(screen.getByRole('status', { name: 'Sort status' }).textContent)
       .toBe('Newest first is the canonical Everything order.');
+    rendered.unmount();
+    state.destroy();
+  });
+
+
+  it('opens the Sort menu with s, announces the fixed order with r, and shows the count once', async () => {
+    window.history.replaceState(null, '', `/?explore=${encodeURIComponent(JSON.stringify({ workspace: 'everything' }))}`);
+    const fetchFn = vi.fn<typeof fetch>(async () => Response.json(exploreResponse({
+      rows: [entry(1), entry(2)], total_count: 2
+    })));
+    const state = new ExploreState(window);
+    const rendered = render(AppShell, { client: createAPIClient(fetchFn), state });
+    await screen.findByText('Synthetic subject 1');
+
+    await fireEvent.keyDown(window, { key: 's' });
+    const sort = screen.getByRole('combobox', { name: /^Sort: Newest first/ });
+    expect(document.activeElement).toBe(sort);
+    const listbox = screen.getByRole('listbox');
+    const note = within(listbox).getByRole('option', { name: 'Other orders aren’t available yet' });
+    expect((note as HTMLButtonElement).disabled).toBe(true);
+
+    await fireEvent.keyDown(window, { key: 'r' });
+    expect(screen.getByRole('status', { name: 'Sort status' }).textContent)
+      .toBe('Everything is always shown newest first.');
+
+    const main = screen.getByRole('main', { name: 'Everything' });
+    expect(within(main).getAllByText('2 items')).toHaveLength(1);
     rendered.unmount();
     state.destroy();
   });
@@ -2246,13 +2852,14 @@ describe('AppShell', () => {
     await fireEvent.keyDown(window, { key: 'g' });
     await fireEvent.click(screen.getByRole('option', { name: 'Year' }));
     expect(state.current.groupingChain).toEqual(['participant', 'year']);
-    expect(screen.getByLabelText('Active analytical context').textContent).toContain('Group People');
+    expect(screen.getByLabelText('Active analytical context').textContent).toContain('Grouped by Person');
     expect(screen.getByLabelText('Active analytical context').textContent).toContain('Year');
 
     await fireEvent.keyDown(window, { key: 'k', ctrlKey: true });
     const palette = screen.getByRole('dialog', { name: 'Everything commands' });
     expect(palette).toBeDefined();
-    expect(within(palette).getByRole('option', { name: /Labels — unavailable/ }).getAttribute('aria-disabled'))
+    expect(within(palette).getByRole('option', { name: /Group by Labels \(not available yet\)/ })
+      .getAttribute('aria-disabled'))
       .toBe('true');
     const paletteInput = within(palette).getByRole('combobox');
     paletteInput.focus();
@@ -2269,7 +2876,8 @@ describe('AppShell', () => {
     await fireEvent.keyDown(window, { key: 'f' });
     expect(screen.getByRole('button', { name: 'Filters' }).getAttribute('aria-expanded')).toBe('true');
     await fireEvent.keyDown(window, { key: 'r' });
-    expect(screen.getByRole('status', { name: 'Sort status' }).textContent).toContain('newest first');
+    expect(screen.getByRole('status', { name: 'Sort status' }).textContent)
+      .toBe('Sorting isn’t available while grouped.');
     rendered.unmount();
     state.destroy();
   });
@@ -2295,13 +2903,68 @@ describe('AppShell', () => {
     await fireEvent.keyDown(grid, { key: ' ' });
     await fireEvent.keyDown(grid, { key: 'j' });
     await fireEvent.keyDown(grid, { key: 'j' });
-    await waitFor(() => expect(screen.getByText('1 selected')).toBeTruthy());
+    await waitFor(() => expect(selectionStatus().textContent).toBe('1 selected'));
     grid.blur();
     expect(document.activeElement).toBe(document.body);
 
     await fireEvent.keyDown(document.body, { key: ' ', shiftKey: true });
 
-    await waitFor(() => expect(screen.getByText('3 selected')).toBeTruthy());
+    await waitFor(() => expect(selectionStatus().textContent).toBe('3 selected'));
+    rendered.unmount();
+    state.destroy();
+  });
+
+  it('returns focus to the results grid after Clear selection', async () => {
+    window.history.replaceState(null, '', `/?explore=${encodeURIComponent(JSON.stringify({ workspace: 'everything' }))}`);
+    const state = new ExploreState(window);
+    const fetchFn = vi.fn<typeof fetch>(async () =>
+      Response.json(exploreResponse({ rows: [entry(0), entry(1)], total_count: 2 })));
+    const rendered = render(AppShell, { client: createAPIClient(fetchFn), state });
+    const grid = await screen.findByRole('grid', { name: 'Everything results' });
+    await screen.findByText('Synthetic subject 0');
+    grid.focus();
+    await fireEvent.keyDown(grid, { key: ' ' });
+    await waitFor(() => expect(selectionStatus().textContent).toBe('1 selected'));
+
+    const clear = screen.getByRole('button', { name: 'Clear selection' });
+    clear.focus();
+    await fireEvent.click(clear);
+
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Clear selection' })).toBeNull());
+    expect(document.activeElement).toBe(screen.getByRole('grid', { name: 'Everything results' }));
+    rendered.unmount();
+    state.destroy();
+  });
+
+  it('opens deletion review from the selection bar like the d shortcut', async () => {
+    window.history.replaceState(null, '', `/?explore=${encodeURIComponent(JSON.stringify({ workspace: 'everything' }))}`);
+    const state = new ExploreState(window);
+    let preflights = 0;
+    const fetchFn = vi.fn<typeof fetch>(async (input) => {
+      const path = new URL(input instanceof Request ? input.url : String(input)).pathname;
+      if (path.endsWith('/explore/preflight')) {
+        preflights += 1;
+        return Response.json({
+          count: 1, deletable_count: 1, estimated_bytes: 10, cache_revision: 'cache-1',
+          search_provenance: {}, unavailable_actions: [], action_targets: [],
+          operation_token: 'operation-1', expires_at: '2026-07-19T10:05:00Z'
+        });
+      }
+      if (path.endsWith('/deletions')) return Response.json({ manifests: [] });
+      return Response.json(exploreResponse({ rows: [entry(1)], total_count: 1 }));
+    });
+    const rendered = render(AppShell, { client: createAPIClient(fetchFn), state });
+    const grid = await screen.findByRole('grid', { name: 'Everything results' });
+    await screen.findByText('Synthetic subject 1');
+    expect(screen.queryByRole('button', { name: 'Review for deletion…' })).toBeNull();
+    grid.focus();
+    await fireEvent.keyDown(grid, { key: ' ' });
+    await waitFor(() => expect(preflights).toBe(1));
+
+    await fireEvent.click(await screen.findByRole('button', { name: 'Review for deletion…' }));
+
+    await waitFor(() => expect(state.current.workspace).toBe('deletions'));
+    await waitFor(() => expect(preflights).toBe(2));
     rendered.unmount();
     state.destroy();
   });
@@ -2328,7 +2991,7 @@ describe('AppShell', () => {
 
     await fireEvent.keyDown(document.body, { key: 'a' });
 
-    await waitFor(() => expect(screen.getByText('3 selected')).toBeTruthy());
+    await waitFor(() => expect(selectionStatus().textContent).toBe('3 selected'));
     expect(gridKeys).toEqual(['A']);
 
     gridKeys.length = 0;
@@ -2338,4 +3001,114 @@ describe('AppShell', () => {
     rendered.unmount();
     state.destroy();
   });
+
+  describe('Escape over an open reading pane', () => {
+    const states: ExploreState[] = [];
+
+    afterEach(() => {
+      cleanup();
+      for (const state of states.splice(0)) state.destroy();
+      window.innerWidth = 1024;
+    });
+
+    async function openReadingPane(): Promise<ExploreState> {
+      window.history.replaceState(null, '', `/?explore=${encodeURIComponent(JSON.stringify({ workspace: 'everything' }))}`);
+      const state = new ExploreState(window);
+      states.push(state);
+      const fetchFn = vi.fn<typeof fetch>(async (input) => {
+        const path = new URL(input instanceof Request ? input.url : String(input)).pathname;
+        if (path.endsWith('/explore/preflight')) {
+          return Response.json({
+            count: 1, deletable_count: 1, estimated_bytes: 10, cache_revision: 'cache-1', search_provenance: {},
+            unavailable_actions: [{ action: 'open_in_source', reason: 'trusted_source_link_unavailable' }],
+            action_targets: []
+          });
+        }
+        return Response.json(exploreResponse({ rows: [entry(1), entry(2)], total_count: 2 }));
+      });
+      render(AppShell, { client: createAPIClient(fetchFn), state });
+      const grid = await screen.findByRole('grid', { name: 'Everything results' });
+      await screen.findByText('Synthetic subject 1');
+      grid.focus();
+      await fireEvent.keyDown(grid, { key: 'Enter' });
+      await screen.findByRole('complementary', { name: 'Reading pane: Synthetic subject 1' });
+      return state;
+    }
+
+    async function clickFocused(button: HTMLElement): Promise<void> {
+      button.focus();
+      await fireEvent.click(button);
+    }
+
+    it.each([
+      {
+        layer: 'Columns',
+        open: () => clickFocused(screen.getByRole('button', { name: 'Columns' })),
+        isOpen: () => screen.queryByRole('button', { name: 'Size' }) !== null
+      },
+      {
+        layer: 'Sort',
+        open: () => clickFocused(screen.getByRole('combobox', { name: /^Sort:/ })),
+        isOpen: () => screen.queryByRole('listbox') !== null
+      },
+      {
+        layer: 'More selection actions',
+        open: async () => {
+          await fireEvent.keyDown(screen.getByRole('grid', { name: 'Everything results' }), { key: ' ' });
+          await clickFocused(await screen.findByRole('button', { name: 'More selection actions' }));
+          await waitFor(() => expect(document.activeElement?.getAttribute('role')).toBe('menuitem'));
+        },
+        isOpen: () => screen.queryByRole('menu', { name: 'More selection actions' }) !== null
+      },
+      {
+        layer: 'Display',
+        open: async () => {
+          await clickFocused(screen.getByRole('button', { name: 'Display' }));
+          await waitFor(() => expect(document.activeElement?.getAttribute('role')).toBe('menuitemradio'));
+        },
+        isOpen: () => screen.queryByRole('menu', { name: 'Display' }) !== null
+      },
+      {
+        layer: 'Save view',
+        open: async () => {
+          await clickFocused(screen.getByRole('button', { name: 'Save view…' }));
+          screen.getByRole('button', { name: 'Cancel' }).focus();
+        },
+        isOpen: () => screen.queryByRole('dialog', { name: 'Save view' }) !== null
+      }
+    ])('closes $layer first and leaves the reading pane for the next Escape', async ({ open, isOpen }) => {
+      const state = await openReadingPane();
+      await open();
+      expect(isOpen()).toBe(true);
+
+      await fireEvent.keyDown(document.activeElement!, { key: 'Escape' });
+
+      await waitFor(() => expect(isOpen()).toBe(false));
+      expect(state.current.selectedRow).toBe('message:1');
+      expect(screen.getByRole('complementary', { name: 'Reading pane: Synthetic subject 1' })).toBeDefined();
+
+      await fireEvent.keyDown(document.activeElement ?? document.body, { key: 'Escape' });
+      await waitFor(() => expect(state.current.selectedRow).toBeNull());
+    });
+
+    it('closes the reading pane again once the narrow navigation menu is gone', async () => {
+      window.innerWidth = 480;
+      const state = await openReadingPane();
+      const opener = screen.getByRole('button', { name: 'Open navigation' });
+      await clickFocused(opener);
+      await screen.findByRole('dialog', { name: 'Navigation' });
+
+      await fireEvent.keyDown(document.activeElement!, { key: 'Escape' });
+      await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Navigation' })).toBeNull());
+      expect(state.current.selectedRow).toBe('message:1');
+      expect(appShortcuts.activeScope()).toBe('root');
+
+      await fireEvent.keyDown(opener, { key: 'Escape' });
+      await waitFor(() => expect(state.current.selectedRow).toBeNull());
+    });
+  });
 });
+
+function selectionStatus(): HTMLElement {
+  return screen.getByRole('status', { name: 'Selection status' });
+}

@@ -318,7 +318,7 @@ describe('Explore URL state', () => {
         { dimension: 'after', values: ['2025-01-01'] }
       ],
       groupingChain: ['participant', 'year'],
-      presentation: 'table',
+      presentation: 'files',
       sort: [{ field: 'occurred_at', direction: 'desc' }],
       fileSort: { field: 'filename', direction: 'asc' },
       fileFilenameQuery: 'invoice',
@@ -332,6 +332,140 @@ describe('Explore URL state', () => {
     };
 
     expect(parseExploreURLState(serializeExploreURLState(state))).toEqual(state);
+  });
+
+  it('sends an Everything-as-Files link to the Files workspace with its context', () => {
+    const restored = parseExploreURLState(
+      `?workspace=everything&mode=hybrid&explore=${encodeURIComponent(JSON.stringify({
+        presentation: 'files', query: 'invoice', filters: [{ dimension: 'source', values: ['7'] }],
+        groupingChain: ['year'], columns: ['kind', 'title']
+      }))}`
+    );
+    expect(restored).toMatchObject({
+      workspace: 'files', presentation: 'files', searchMode: 'hybrid', query: 'invoice',
+      filters: [{ dimension: 'source', values: ['7'] }], groupingChain: ['year'], columns: ['kind', 'title']
+    });
+  });
+
+  it('shares the Files workspace without repeating its implied presentation', () => {
+    const search = serializeExploreURLState({ ...defaultExploreURLState, workspace: 'files', presentation: 'files' });
+
+    expect(search).toBe('?workspace=files&mode=full_text');
+    expect(parseExploreURLState(search)).toMatchObject({ workspace: 'files', presentation: 'files' });
+  });
+
+  it('keeps Files presentation in the Files workspace', () => {
+    const restored = parseExploreURLState(
+      `?workspace=files&explore=${encodeURIComponent(JSON.stringify({ presentation: 'table' }))}`
+    );
+    expect(restored.presentation).toBe('files');
+  });
+
+  it('restores Files for an old Everything-as-Files history entry', async () => {
+    window.history.replaceState(null, '', '/?workspace=sources');
+    const state = new ExploreState(window);
+    try {
+      window.history.pushState(
+        {
+          exploreSearch: '?workspace=everything',
+          exploreState: { workspace: 'everything', presentation: 'files', query: 'budget' }
+        },
+        '',
+        '/?workspace=everything'
+      );
+      window.history.pushState(null, '', '/?workspace=sources');
+      const restored = new Promise((resolve) => window.addEventListener('popstate', resolve, { once: true }));
+      window.history.back();
+      await restored;
+      expect(state.current).toMatchObject({ workspace: 'files', presentation: 'files', query: 'budget' });
+    } finally {
+      state.destroy();
+    }
+  });
+
+  it('keeps a mode-less Everything-as-Files link on the configured default mode', () => {
+    window.history.replaceState(null, '', `/?workspace=everything&explore=${encodeURIComponent(
+      JSON.stringify({ presentation: 'files', query: 'budget' })
+    )}`);
+    const state = new ExploreState(window, null);
+    try {
+      expect(new URLSearchParams(window.location.search).get('workspace')).toBe('files');
+      expect(new URLSearchParams(window.location.search).has('mode')).toBe(false);
+
+      state.setConfiguredDefaultSearchMode('hybrid');
+
+      expect(state.current).toMatchObject({ workspace: 'files', query: 'budget', searchMode: 'hybrid' });
+    } finally {
+      state.destroy();
+    }
+  });
+
+  it('keeps a legacy Everything-as-Files link\'s search mode from its explore data', () => {
+    window.history.replaceState(null, '', `/?workspace=everything&explore=${encodeURIComponent(
+      JSON.stringify({ presentation: 'files', searchMode: 'semantic', query: 'budget' })
+    )}`);
+    const state = new ExploreState(window, null);
+    try {
+      expect(new URLSearchParams(window.location.search).get('mode')).toBe('semantic');
+      expect(state.current).toMatchObject({ workspace: 'files', searchMode: 'semantic' });
+
+      state.setConfiguredDefaultSearchMode('hybrid');
+
+      expect(state.current.searchMode).toBe('semantic');
+    } finally {
+      state.destroy();
+    }
+  });
+
+  it('restores the active row and scroll anchor from an old Everything-as-Files history entry', async () => {
+    window.history.replaceState(null, '', '/?workspace=sources');
+    const state = new ExploreState(window);
+    try {
+      window.history.pushState(
+        {
+          exploreSearch: '?workspace=everything',
+          exploreState: {
+            workspace: 'everything', presentation: 'files',
+            activeRow: 'attachment:9', scrollAnchor: { key: 'attachment:9', offset: 24 }
+          }
+        },
+        '',
+        '/?workspace=everything'
+      );
+      window.history.pushState(null, '', '/?workspace=sources');
+      const back = new Promise((resolve) => window.addEventListener('popstate', resolve, { once: true }));
+      window.history.back();
+      await back;
+      expect(state.current).toMatchObject({
+        workspace: 'files', activeRow: 'attachment:9', scrollAnchor: { key: 'attachment:9', offset: 24 }
+      });
+
+      const away = new Promise((resolve) => window.addEventListener('popstate', resolve, { once: true }));
+      window.history.forward();
+      await away;
+      expect(state.current.workspace).toBe('sources');
+      const forward = new Promise((resolve) => window.addEventListener('popstate', resolve, { once: true }));
+      window.history.back();
+      await forward;
+      expect(state.current).toMatchObject({
+        workspace: 'files', activeRow: 'attachment:9', scrollAnchor: { key: 'attachment:9', offset: 24 }
+      });
+    } finally {
+      state.destroy();
+    }
+  });
+
+  it('leaves Files for Everything without carrying the Files presentation', () => {
+    window.history.replaceState(null, '', '/?workspace=files');
+    const state = new ExploreState(window);
+    try {
+      state.commitWorkspace('everything');
+      expect(state.current).toMatchObject({ workspace: 'everything', presentation: 'table' });
+      state.commitNavigation({ presentation: 'files' });
+      expect(state.current).toMatchObject({ workspace: 'files', presentation: 'files' });
+    } finally {
+      state.destroy();
+    }
   });
 
   it('restores an identity facet tuple from the URL', () => {

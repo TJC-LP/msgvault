@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onDestroy, untrack } from 'svelte';
   import type { MeetingRef } from '../../api/generated/models';
   import MeetingPanel from '../meetings/MeetingPanel.svelte';
   import type { APIClient } from '../../api/client';
@@ -17,6 +18,8 @@
   import PersonBriefCard from './PersonBriefCard.svelte';
   import PersonAgenda from './PersonAgenda.svelte';
   import CardDAVPublicationControl from './CardDAVPublicationControl.svelte';
+  import type { FileMIMEFamily, FileSearchSort } from '../../explore/models';
+  import { bufferedCallback } from '../../util/buffered-callback';
   import type { PersonSplitCommittedContext } from '../../directory/person-merge-history-controller.svelte';
 
   interface Props {
@@ -49,6 +52,21 @@
     onOpenMeeting = undefined
   }: Props = $props();
   let activeTab = $state<DetailTab>('overview');
+  let fileSort = $state<FileSearchSort>({ field: 'occurred_at', direction: 'desc' });
+  let fileFilenameQuery = $state('');
+  let fileMIMEFamilies = $state<FileMIMEFamily[]>([]);
+  const FILENAME_DEBOUNCE_MS = 250;
+  const debouncedFilenameQuery = bufferedCallback((value: string) => { fileFilenameQuery = value; }, FILENAME_DEBOUNCE_MS);
+  onDestroy(debouncedFilenameQuery.cancel);
+  let filesPersonID = untrack(() => personID);
+  $effect(() => {
+    if (personID === filesPersonID) return;
+    filesPersonID = personID;
+    debouncedFilenameQuery.cancel();
+    fileSort = { field: 'occurred_at', direction: 'desc' };
+    fileFilenameQuery = '';
+    fileMIMEFamilies = [];
+  });
   let organizationRequest = $state<{ id: number; key: number }>();
   let organizationRequestKey = 0;
   let overviewTab = $state<HTMLButtonElement>();
@@ -155,7 +173,12 @@
         {client}
         identityScope={{ kind: 'durable-person', id: personID }}
         predicate={{ filters: [], presentation: 'files' }}
-        sort={{ field: 'occurred_at', direction: 'desc' }}
+        sort={fileSort}
+        filenameQuery={fileFilenameQuery}
+        mimeFamilies={fileMIMEFamilies}
+        onSortChange={(value) => (fileSort = value)}
+        onFilenameQueryChange={debouncedFilenameQuery}
+        onMIMEFamiliesChange={(value) => (fileMIMEFamilies = value)}
         embedded
       />
     </div>

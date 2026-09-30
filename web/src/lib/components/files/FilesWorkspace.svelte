@@ -29,7 +29,7 @@
   }
   function availability(row: FileSearchRow): string {
     if (row.content_state === 'local_content') return 'Local content';
-    if (row.content_state === 'missing_blob') return 'Missing blob';
+    if (row.content_state === 'missing_blob') return 'File missing';
     if (row.content_state === 'url_only') return 'URL only';
     return 'Metadata only';
   }
@@ -42,10 +42,19 @@
     searchParticipantFiles as generatedSearchParticipantFiles,
     searchPersonFiles as generatedSearchPersonFiles,
   } from '../../api/generated/exploration/exploration';
-  import { Button, Checkbox, SearchInput, SegmentedControl, Toggle, virtualSlice } from '@kenn-io/kit-ui';
+  import {
+    Button,
+    Checkbox,
+    FilterDropdown,
+    SearchInput,
+    SegmentedControl,
+    Toggle,
+    virtualSlice,
+  } from '@kenn-io/kit-ui';
   import { onDestroy, tick, untrack } from 'svelte';
   import type { APIClient } from '../../api/client';
   import { analyticalAuthority } from '../../explore/authority';
+  import { FILE_FAMILY_LABELS, fileTypeLabel } from '../../explore/labels';
   import type {
     ExploreCacheUnavailable,
     ExplorePredicate,
@@ -105,6 +114,7 @@
     embedded?: boolean;
     showHeader?: boolean;
     fileCount?: number | null;
+    fileCountLoading?: boolean;
     sort: FileSearchSort;
     filenameQuery?: string;
     mimeFamilies?: FileMIMEFamily[];
@@ -132,6 +142,7 @@
     embedded = false,
     showHeader = true,
     fileCount = $bindable(null),
+    fileCountLoading = $bindable(false),
     sort,
     filenameQuery = '',
     mimeFamilies = [],
@@ -158,9 +169,10 @@
   let totalCount = $state(0);
   $effect(() => {
     fileCount = loading || error || unavailable ? null : totalCount;
+    fileCountLoading = loading;
   });
   let nextCursor = $state<string>();
-  let loading = $state(false);
+  let loading = $state(true);
   let loadingMore = $state(false);
   let error = $state('');
   let pageError = $state('');
@@ -217,6 +229,25 @@
     const selected = mimeFamilies.filter((family) => visibleMIMEFamilies.includes(family));
     return selected.length > 0 ? selected : visibleMIMEFamilies;
   });
+  const selectedTypeCount = $derived(mimeFamilies.filter((family) => visibleMIMEFamilies.includes(family)).length);
+  const typeSections = $derived([
+    {
+      items: visibleMIMEFamilies.map((family) => {
+        const included = effectiveMIMEFamilies.includes(family);
+        return {
+          // The kit derives the description element id from item.id, so keep it unique on the page.
+          id: `file-type-${family}`,
+          label: FILE_FAMILY_LABELS[family],
+          active: included,
+          // Without a type filter every type is shown, so no item is "not included".
+          description: selectedTypeCount === 0 ? undefined : included ? 'Included' : 'Not included',
+          disabled: personScoped && included && effectiveMIMEFamilies.length === 1,
+          closeOnSelect: false,
+          onSelect: () => toggleMIME(family),
+        };
+      }),
+    },
+  ]);
   const mediaRows = $derived(rows as PersonFileSearchRow[]);
   $effect(() => {
     personPresentation = providedPersonPresentation;
@@ -681,10 +712,27 @@
     element.scrollTop = rebased;
     scrollTop = element.scrollTop;
   }
+  function pageRowCount(height: number): number {
+    const visibleHeight = grid && headerElement ? measuredViewport(grid, headerElement) : viewport;
+    return Math.max(1, Math.floor(visibleHeight / height));
+  }
+  async function moveAcrossLoadedBoundary(index: number): Promise<void> {
+    if (index < rows.length || !nextCursor || loadingMore) {
+      move(index);
+      return;
+    }
+    const loadedCount = rows.length;
+    await loadMore();
+    await tick();
+    if (rows.length > loadedCount) move(index);
+  }
   function handleKeydown(event: KeyboardEvent): void {
-    if (event.target !== grid || rows.length === 0 || rowHeight === undefined) return;
+    const height = rowHeight;
+    if (event.target !== grid || rows.length === 0 || height === undefined) return;
     if (event.key === 'ArrowDown' || event.key === 'j') move(activeIndex + 1);
     else if (event.key === 'ArrowUp' || event.key === 'k') move(activeIndex - 1);
+    else if (event.key === 'PageDown') void moveAcrossLoadedBoundary(activeIndex + pageRowCount(height));
+    else if (event.key === 'PageUp') move(activeIndex - pageRowCount(height));
     else if (event.key === 'Home') move(0);
     else if (event.key === 'End') move(rows.length - 1);
     else if (event.key === 'Enter') open(rows[Math.max(0, activeIndex)]!, event.currentTarget as HTMLElement);
@@ -726,7 +774,11 @@
   }
 </script>
 
-<svelte:element this={embedded ? 'section' : 'main'} class="files-workspace" aria-label="Files">
+<svelte:element
+  this={embedded ? (showHeader ? 'section' : 'div') : 'main'}
+  class="files-workspace"
+  aria-label={embedded && !showHeader ? undefined : 'Files'}
+>
   {#if showHeader}
     <header class="workspace-header">
       <div><h1>{personScoped ? 'Attachments' : 'Files'}</h1></div>
@@ -773,7 +825,13 @@
         oninput={(value) => onFilenameQueryChange?.(value)}
       />
     </label>
-    <Toggle bind:checked={hostedVisualSearch} label="Hosted visual search" />
+    <FilterDropdown
+      label="Type"
+      detail={selectedTypeCount === 0 ? 'All types' : undefined}
+      badgeCount={selectedTypeCount}
+      sections={typeSections}
+    />
+    <Toggle bind:checked={hostedVisualSearch} label="Visual search" />
     {#if hostedVisualSearch}
       <label>
         Visual query
@@ -798,11 +856,6 @@
       {/if}
       <span class="hosted-disclosure">The query is sent to the configured visual embedding provider.</span>
     {/if}
-    <div class="mime-controls" aria-label="MIME families">
-      {#each visibleMIMEFamilies as family}
-        <Checkbox checked={effectiveMIMEFamilies.includes(family)} label={family} onchange={() => toggleMIME(family)} />
-      {/each}
-    </div>
   </div>
 
   {#if personScoped && personPresentation === 'media'}
@@ -929,16 +982,32 @@
                     <span role="gridcell"
                       ><time datetime={row.occurred_at} data-mono>{formatDate(row.occurred_at)}</time></span
                     >
-                    <span role="gridcell">
+                    <span
+                      role="gridcell"
+                      title={row.search_explain ? `Match score ${row.search_explain.rrf.toFixed(4)}` : undefined}
+                    >
                       <strong>{row.filename || '(unnamed)'}</strong>
-                      {#if row.search_explain}<small>RRF {row.search_explain.rrf.toFixed(4)}</small>{/if}
                     </span>
-                    <span role="gridcell">{row.mime_type || row.mime_family}</span>
+                    <span role="gridcell" title={row.mime_type || row.mime_family}
+                      >{fileTypeLabel(row.mime_type, row.mime_family)}</span
+                    >
                     <span role="gridcell" data-mono>{formatBytes(row.size_bytes)}</span>
                     {#if personScoped}<span role="gridcell">{relationship(row)}</span>{/if}
                     <span role="gridcell">{people(row)}</span>
                     <span role="gridcell">{row.source_identifier}</span>
-                    <span role="gridcell">{row.containing_title || row.entry_key}</span>
+                    <span role="gridcell">
+                      {#if onOpenItem}
+                        {@const openItem = onOpenItem}
+                        <button
+                          type="button"
+                          class="containing-link"
+                          aria-label={`Open containing item ${row.containing_title || row.entry_key}`}
+                          onclick={() => openItem(row.entry_key)}>{row.containing_title || row.entry_key}</button
+                        >
+                      {:else}
+                        {row.containing_title || row.entry_key}
+                      {/if}
+                    </span>
                     <span role="gridcell">{availability(row)}</span>
                   </div>
                 {/each}
@@ -1038,7 +1107,6 @@
     font-size: var(--font-size-xs);
   }
   .file-controls,
-  .mime-controls,
   .direction-controls {
     display: flex;
     align-items: center;
@@ -1055,11 +1123,6 @@
     font-size: var(--font-size-xs);
   }
   .hosted-disclosure {
-    color: var(--text-muted);
-    font-size: var(--font-size-2xs);
-  }
-  .data-row small {
-    display: block;
     color: var(--text-muted);
     font-size: var(--font-size-2xs);
   }
@@ -1133,6 +1196,22 @@
     font: inherit;
     text-align: left;
     text-transform: inherit;
+  }
+  .containing-link {
+    max-width: 100%;
+    padding: 0;
+    overflow: hidden;
+    border: 0;
+    background: transparent;
+    color: var(--accent-blue);
+    cursor: pointer;
+    font: inherit;
+    text-align: left;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .containing-link:hover {
+    text-decoration: underline;
   }
   .table-body {
     position: relative;

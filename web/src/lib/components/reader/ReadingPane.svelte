@@ -26,12 +26,14 @@
 </script>
 
 <script lang="ts">
-  import { Button, EmptyState } from '@kenn-io/kit-ui';
+  import { Button, EmptyState, IconButton } from '@kenn-io/kit-ui';
+  import X from '@lucide/svelte/icons/x';
   import { onDestroy, untrack } from 'svelte';
 
   import type { APIClient } from '../../api/client';
   import type { MeetingActionsRequest, MeetingContextRequest, MeetingRef } from '../../api/generated/models';
   import { createExploreAPI } from '../../explore/api';
+  import { entryKindPresentation } from '../../explore/labels';
   import { filtersForGroup } from '../../explore/group-context';
   import type { ExploreCacheUnavailable, ExploreFileFact, ExploreFilter } from '../../explore/models';
   import { isEmailMessageType } from '../../explore/models';
@@ -135,10 +137,10 @@
 
   const metaStrip = $derived.by((): string => {
     if (!selection) return '';
-    if (selection.kind === 'archive') return `${selection.message.message_type} · ${formatDate(selection.message.sent_at)}`;
+    if (selection.kind === 'archive') return `${entryKindPresentation('', selection.message.message_type).name} · ${formatDate(selection.message.sent_at)}`;
     if (selection.kind === 'entry') {
       const row = selection.row;
-      const parts = [row.message_type, row.source_identifier, formatDate(row.occurred_at)];
+      const parts = [entryKindPresentation(row.kind, row.message_type).name, row.source_identifier, formatDate(row.occurred_at)];
       if (row.message_count > 1) parts.push(`${row.message_count.toLocaleString()} items`);
       if (row.attachment_count > 0) {
         parts.push(`${row.attachment_count.toLocaleString()} ${row.attachment_count === 1 ? 'file' : 'files'}`);
@@ -250,9 +252,14 @@
     </div>
     <div class="pane-actions">
       {#if showTasks}
-        <details class="tasks-disclosure" bind:open={tasksOpen}>
-          <summary aria-label="Tasks for this message">Tasks</summary>
-        </details>
+        <Button
+          size="sm"
+          surface="outline"
+          label="Tasks"
+          ariaLabel="Tasks for this message"
+          ariaExpanded={tasksOpen}
+          onclick={() => (tasksOpen = !tasksOpen)}
+        />
       {/if}
       {#if onOpenRelationship && counterpartParticipantId !== undefined}
         <Button
@@ -263,7 +270,9 @@
           onclick={handleOpenRelationship}
         />
       {/if}
-      <Button size="sm" surface="outline" label="Close" ariaLabel="Close reading pane" onclick={() => onClose?.()} />
+      <IconButton size="sm" ariaLabel="Close reading pane" onclick={() => onClose?.()}>
+        <X size={14} />
+      </IconButton>
     </div>
   </header>
 
@@ -373,21 +382,25 @@
     min-height: 40px;
     flex: none;
     align-items: center;
+    flex-wrap: wrap;
     justify-content: space-between;
-    gap: var(--space-4);
+    gap: var(--space-2) var(--space-4);
     padding: var(--space-2) var(--space-4);
     border-bottom: 1px solid var(--border-muted);
     box-shadow: 0 1px 0 var(--hairline-sheen);
   }
 
+  /* A narrow pane wraps the actions below the heading instead of squeezing the title away. */
   .pane-heading {
     display: flex;
     min-width: 0;
+    flex: 1 1 12rem;
     align-items: baseline;
     gap: var(--space-4);
   }
 
   .pane-title {
+    min-width: min(8rem, 100%);
     overflow: hidden;
     color: var(--text-primary);
     font-size: var(--font-size-sm);
@@ -396,7 +409,8 @@
   }
 
   .pane-meta {
-    flex: none;
+    min-width: 0;
+    flex: 0 1 auto;
     overflow: hidden;
     color: var(--text-muted);
     font-size: var(--font-size-2xs);
@@ -409,28 +423,6 @@
     flex: none;
     align-items: center;
     gap: var(--space-2);
-  }
-
-  .tasks-disclosure summary {
-    display: inline-flex;
-    align-items: center;
-    padding: 3px 10px;
-    border: 1px solid var(--control-border);
-    border-radius: var(--radius-md);
-    color: var(--text-secondary);
-    cursor: pointer;
-    font-size: var(--font-size-xs);
-    list-style: none;
-  }
-
-  .tasks-disclosure summary::-webkit-details-marker {
-    display: none;
-  }
-
-  .tasks-disclosure[open] summary,
-  .tasks-disclosure summary:hover {
-    background: var(--bg-surface-hover);
-    color: var(--text-primary);
   }
 
   .tasks-sheet {

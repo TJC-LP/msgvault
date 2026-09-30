@@ -415,8 +415,9 @@ describe('EverythingWorkspace', () => {
     grid.focus();
     await fireEvent.keyDown(grid, { key: ' ' });
 
-    expect(await screen.findByText('Export: selection_contains_items_without_exportable_files')).toBeDefined();
-    expect(screen.getByText('Open in source: trusted_source_link_unavailable')).toBeDefined();
+    expect(await screen.findByText('Export unavailable: Selection contains items without exportable files.')).toBeDefined();
+    await fireEvent.click(screen.getByRole('button', { name: 'More selection actions' }));
+    expect(screen.getByText('Your sources don’t provide links to open these items.')).toBeDefined();
     expect(screen.queryByRole('button', { name: 'Export selection' })).toBeNull();
     const body = await preflightRequests[0]!.clone().json();
     expect(body.selection).toMatchObject({
@@ -470,6 +471,50 @@ describe('EverythingWorkspace', () => {
   });
 
 
+  it('offers meeting export only when every selected row is a meeting', async () => {
+    window.history.replaceState(null, '', `/?explore=${encodeURIComponent(JSON.stringify({ workspace: 'everything' }))}`);
+    const fetchFn = vi.fn<typeof fetch>(async (input) => {
+      const request = input instanceof Request ? input : new Request(input);
+      const path = new URL(request.url).pathname;
+      if (path.endsWith('/explore/preflight')) {
+        return Response.json({
+          count: 1, deletable_count: 1, estimated_bytes: 10, cache_revision: 'cache-1', search_provenance: {},
+          unavailable_actions: [], action_targets: [],
+          operation_token: 'operation-1', expires_at: '2026-09-12T17:00:00Z',
+        });
+      }
+      return Response.json(exploreResponse({
+        rows: [
+          { ...entry(1), message_type: 'email', anchor_message_id: 101 },
+          { ...entry(2), message_type: 'meeting_transcript', anchor_message_id: 102 },
+        ],
+        total_count: 2,
+      }));
+    });
+    const state = new ExploreState(window);
+    const rendered = render(AppShell, { client: createAPIClient(fetchFn), state });
+    const grid = await screen.findByRole('grid', { name: 'Everything results' });
+    await screen.findByText('Synthetic subject 2');
+    grid.focus();
+    await fireEvent.keyDown(grid, { key: ' ' });
+    await waitFor(() => expect(selectionStatus().textContent).toBe('1 selected'));
+    expect(screen.queryByRole('button', { name: 'Meeting context…' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Export meeting context' })).toBeNull();
+
+    await fireEvent.keyDown(grid, { key: 'j' });
+    await fireEvent.keyDown(grid, { key: ' ' });
+    await waitFor(() => expect(selectionStatus().textContent).toBe('2 selected'));
+    expect(screen.queryByRole('button', { name: 'Meeting context…' })).toBeNull();
+
+    await fireEvent.keyDown(grid, { key: 'k' });
+    await fireEvent.keyDown(grid, { key: ' ' });
+    await waitFor(() => expect(selectionStatus().textContent).toBe('1 selected'));
+    await fireEvent.click(screen.getByRole('button', { name: 'Meeting context…' }));
+    expect(screen.getByRole('button', { name: 'Export meeting context' })).toBeDefined();
+    rendered.unmount();
+    state.destroy();
+  });
+
   it('exports exact explicit meeting row keys retained while later pages load', async () => {
     window.history.replaceState(null, '', `/?explore=${encodeURIComponent(JSON.stringify({ workspace: 'everything' }))}`);
     const contextRequests: Request[] = [];
@@ -518,7 +563,7 @@ describe('EverythingWorkspace', () => {
     await screen.findByText('Synthetic subject 7');
     grid.focus();
     await fireEvent.keyDown(grid, { key: ' ' });
-    expect(await screen.findByText('1 selected')).toBeDefined();
+    await waitFor(() => expect(selectionStatus().textContent).toBe('1 selected'));
     const end = fireEvent.keyDown(grid, { key: 'End' });
     await waitFor(() => expect(resolveNext).toBeTypeOf('function'));
 
@@ -533,7 +578,8 @@ describe('EverythingWorkspace', () => {
     const secondRow = (await screen.findByText('Synthetic subject 91')).closest('[role="row"]')!;
     await fireEvent.pointerDown(secondRow);
     await fireEvent.keyDown(grid, { key: ' ' });
-    expect(await screen.findByText('2 selected')).toBeDefined();
+    await waitFor(() => expect(selectionStatus().textContent).toBe('2 selected'));
+    await fireEvent.click(screen.getByRole('button', { name: 'Meeting context…' }));
     await fireEvent.click(screen.getByRole('button', { name: 'Export meeting context' }));
 
     await waitFor(() => expect(contextRequests).toHaveLength(1));
@@ -574,6 +620,8 @@ describe('EverythingWorkspace', () => {
           { status: 400 },
         );
       }
+      const meetingResponse = meetingFixtureResponse(path);
+      if (meetingResponse) return meetingResponse;
       return Response.json(exploreResponse({
         rows: [
           { ...entry(7), message_type: 'meeting_transcript', anchor_message_id: 107 },
@@ -586,7 +634,10 @@ describe('EverythingWorkspace', () => {
       }));
     });
     const state = new ExploreState(window);
-    state.replaceTransient({ query: 'planning', searchMode: 'hybrid' });
+    state.replaceTransient({
+      query: 'planning', searchMode: 'hybrid',
+      filters: [{ dimension: 'message_type', values: ['meeting_transcript'] }]
+    });
     const rendered = render(AppShell, { client: createAPIClient(fetchFn), state });
     const grid = await screen.findByRole('grid', { name: 'Everything results' });
     await screen.findByText('Synthetic subject 8');
@@ -594,6 +645,7 @@ describe('EverythingWorkspace', () => {
     await fireEvent.keyDown(grid, { key: 'A' });
     await fireEvent.click(screen.getByRole('button', { name: 'Select all 5 matching items' }));
     await fireEvent.keyDown(grid, { key: ' ' });
+    await fireEvent.click(screen.getByRole('button', { name: 'Meeting context…' }));
     await fireEvent.click(screen.getByRole('button', { name: 'Export meeting context' }));
 
     expect((await screen.findByRole('alert')).textContent).toContain('Select meetings only');
@@ -878,27 +930,13 @@ describe('EverythingWorkspace', () => {
   });
 
 
-  it('uses one analytical context for grouped, timeline, and files presentations', async () => {
+  it('uses one analytical context for grouped and timeline presentations', async () => {
     window.history.replaceState(null, '', `/?explore=${encodeURIComponent(JSON.stringify({ workspace: 'everything' }))}`);
     const requests: Request[] = [];
     const fetchFn = vi.fn<typeof fetch>(async (input) => {
       const request = input instanceof Request ? input : new Request(input);
       requests.push(request);
       const path = new URL(request.url).pathname;
-      if (path.endsWith('/files/7')) return Response.json({
-        id: 7, message_id: 1, conversation_id: 11, filename: 'analysis.pdf',
-        mime_type: 'application/pdf', size_bytes: 2048,
-        content_state: 'missing_blob', content_available: false
-      });
-      if (path.endsWith('/explore/files')) return Response.json({
-        files: [{
-          id: 7, key: 'message:1:file:7', entry_key: 'message:1', message_id: 1, conversation_id: 11,
-          occurred_at: '2026-07-18T12:00:00Z', source_id: 1,
-          source_identifier: 'archive@example.com', title: 'Synthetic subject 1',
-          filename: 'analysis.pdf', mime_type: 'application/pdf', size: 2048
-        }],
-        total_count: 1, cache_revision: 'cache-1', search_provenance: {}
-      });
       return Response.json(exploreResponse({ rows: [entry(1)], total_count: 1 }));
     });
     const state = new ExploreState(window);
@@ -914,41 +952,9 @@ describe('EverythingWorkspace', () => {
     expect(new URL(requests.at(-1)!.url).pathname).toBe('/api/v1/explore');
 
     state.commitNavigation({ presentation: 'files' });
-    expect(await screen.findByRole('grid', { name: 'Files in current context' })).toBeDefined();
-    expect(await screen.findByText('analysis.pdf')).toBeDefined();
-    const filesRequest = requests.at(-1)!;
-    expect(new URL(filesRequest.url).pathname).toBe('/api/v1/explore/files');
-    await expect(filesRequest.clone().json()).resolves.toMatchObject({
-      predicate: { presentation: 'files' }
-    });
-    state.replaceTransient({
-      activeRow: 'message:1:file:7',
-      scrollAnchor: { key: 'message:1:file:7', offset: 4 }
-    });
-    const filesGrid = screen.getByRole('grid', { name: 'Files in current context' });
-    filesGrid.focus();
-    await fireEvent.keyDown(filesGrid, { key: 'Enter' });
-    await waitFor(() => expect(state.current.selectedRow).toBe('attachment:7'));
-    expect(await screen.findByRole('dialog', { name: 'View analysis.pdf' })).toBeDefined();
-    expect(state.current.selectedRow).toBe('attachment:7');
-    expect(parseExploreURLState(window.location.search).selectedRow).toBe('attachment:7');
-    await fireEvent.click(screen.getByRole('button', { name: 'Close file viewer' }));
-    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'View analysis.pdf' })).toBeNull());
-    expect(state.current.selectedRow).toBeNull();
-    expect(document.activeElement).toBe(filesGrid);
-
-    await screen.findByText('analysis.pdf');
-    const restoredFilesGrid = screen.getByRole('grid', { name: 'Files in current context' });
-    await waitFor(() => expect(restoredFilesGrid.getAttribute('aria-activedescendant')).toContain('message-3a-1'));
-    restoredFilesGrid.focus();
-    await fireEvent.keyDown(restoredFilesGrid, { key: 'Enter' });
-    await waitFor(() => expect(state.current.selectedRow).toBe('attachment:7'));
-    expect(await screen.findByRole('dialog', { name: 'View analysis.pdf' })).toBeDefined();
-    await fireEvent.click(screen.getByRole('button', { name: 'Open containing item' }));
-    expect(state.current.presentation).toBe('table');
-    expect(state.current.selectedRow).toBe('message:1');
-    expect(state.current.activeRow).toBeNull();
-    expect(state.current.scrollAnchor).toBeNull();
+    expect(state.current).toMatchObject({ workspace: 'files', presentation: 'files' });
+    expect(await screen.findByRole('main', { name: 'Files' })).toBeDefined();
+    expect(screen.queryByRole('grid', { name: 'Files in current context' })).toBeNull();
     rendered.unmount();
     state.destroy();
   });
@@ -2477,7 +2483,7 @@ describe('EverythingWorkspace', () => {
     state.destroy();
   });
 
-  it.each(['semantic', 'hybrid'] as const)('discloses active-only scope for %s entry, group, and file results', async (searchMode) => {
+  it.each(['semantic', 'hybrid'] as const)('discloses active-only scope for %s entry and group results', async (searchMode) => {
     window.history.replaceState(null, '', `/?explore=${encodeURIComponent(JSON.stringify({ workspace: 'everything' }))}`);
     const fetchFn = vi.fn<typeof fetch>(async (input) => {
       const request = input instanceof Request ? input : new Request(input);
@@ -2485,11 +2491,6 @@ describe('EverythingWorkspace', () => {
       if (path.endsWith('/search/coverage')) return Response.json({
         status: 'ready', eligible_count: 2, embedded_count: 2, percentage: 100,
         vector_generation: 7, cache_revision: 'cache-1', actions: []
-      });
-      if (path.endsWith('/explore/files')) return Response.json({
-        files: [], total_count: 0, cache_revision: 'cache-1',
-        search_provenance: { vector_generation: 7 },
-        candidate_snapshot_id: 'snapshot-files', search_deletion_scope: 'active'
       });
       if (path.endsWith('/explore/groups')) return Response.json({
         rows: [{ key: '7', label: 'Example source', count: 2, estimated_bytes: 42, latest_at: '2026-07-18T12:00:00Z' }],
@@ -2514,9 +2515,6 @@ describe('EverythingWorkspace', () => {
     state.commitNavigation({ groupingChain: ['source'] });
     await screen.findByText('Example source');
     expect(screen.getByText('Semantic search covers active messages only.')).toBeDefined();
-    state.commitNavigation({ groupingChain: [], presentation: 'files' });
-    await screen.findByText('No files match this view.');
-    expect(await screen.findByText('Semantic search covers active messages only.')).toBeDefined();
     rendered.unmount();
     state.destroy();
   });
@@ -2545,3 +2543,7 @@ describe('EverythingWorkspace', () => {
     state.destroy();
   });
 });
+
+function selectionStatus(): HTMLElement {
+  return screen.getByRole('status', { name: 'Selection status' });
+}
