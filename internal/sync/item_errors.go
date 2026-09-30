@@ -38,6 +38,10 @@ type rawBatchWithErrors interface {
 	GetMessagesRawBatchWithErrors(ctx context.Context, messageIDs []string) ([]gmail.RawMessageBatchResult, error)
 }
 
+type rawBatchWithIdentityValidation interface {
+	GetMessagesRawBatchWithIdentityValidation(ctx context.Context, messageIDs []string) ([]gmail.RawMessageBatchResult, error)
+}
+
 func (s *Syncer) getMessagesRawBatchWithDiagnostics(ctx context.Context, messageIDs []string) ([]gmail.RawMessageBatchResult, error) {
 	if client, ok := s.client.(rawBatchWithErrors); ok {
 		return client.GetMessagesRawBatchWithErrors(ctx, messageIDs)
@@ -61,6 +65,52 @@ func (s *Syncer) getMessagesRawBatchWithDiagnostics(ctx context.Context, message
 		if raw == nil {
 			results[i].Err = errRawBatchMissing
 		}
+	}
+	return results, nil
+}
+
+// getMessagesRawBatchWithIdentityValidation fetches validationIDs first with
+// full raw MIME so their Message-IDs turn later ordinary copies into dedup
+// stubs. Results keep the order of messageIDs.
+func (s *Syncer) getMessagesRawBatchWithIdentityValidation(
+	ctx context.Context,
+	messageIDs []string,
+	validationIDs map[string]inconclusiveLabelRefresh,
+) ([]gmail.RawMessageBatchResult, error) {
+	client, ok := s.client.(rawBatchWithIdentityValidation)
+	if !ok || len(validationIDs) == 0 {
+		return s.getMessagesRawBatchWithDiagnostics(ctx, messageIDs)
+	}
+
+	var requiredIDs, ordinaryIDs []string
+	var requiredIdx, ordinaryIdx []int
+	for i, id := range messageIDs {
+		if _, needsValidation := validationIDs[id]; needsValidation {
+			requiredIDs = append(requiredIDs, id)
+			requiredIdx = append(requiredIdx, i)
+		} else {
+			ordinaryIDs = append(ordinaryIDs, id)
+			ordinaryIdx = append(ordinaryIdx, i)
+		}
+	}
+
+	results := make([]gmail.RawMessageBatchResult, len(messageIDs))
+	required, err := client.GetMessagesRawBatchWithIdentityValidation(ctx, requiredIDs)
+	if err != nil {
+		return nil, err
+	}
+	for i, result := range required {
+		results[requiredIdx[i]] = result
+	}
+	if len(ordinaryIDs) == 0 {
+		return results, nil
+	}
+	ordinary, err := s.getMessagesRawBatchWithDiagnostics(ctx, ordinaryIDs)
+	if err != nil {
+		return nil, err
+	}
+	for i, result := range ordinary {
+		results[ordinaryIdx[i]] = result
 	}
 	return results, nil
 }
