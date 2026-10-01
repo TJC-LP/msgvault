@@ -54,8 +54,7 @@ describe('DirectoryWorkspace', () => {
 
     await vi.advanceTimersByTimeAsync(250);
     expect(commits).toEqual([[{
-      directoryQuery: 'alice', directoryCategory: '', directoryOrganization: '',
-      directoryLastContactAfter: '', directoryLastContactBefore: ''
+      directoryQuery: 'alice', directoryCategory: '', directoryOrganization: ''
     }, 'replace']]);
     expect(requests).toHaveLength(2);
     expect(new URL(requests[1]!.url).searchParams.get('q')).toBe('alice');
@@ -75,6 +74,7 @@ describe('DirectoryWorkspace', () => {
     render(DirectoryWorkspace, { client, controller, state });
     await vi.advanceTimersByTimeAsync(0);
 
+    await fireEvent.click(screen.getByRole('button', { name: 'Filters' }));
     await fireEvent.input(screen.getByRole('textbox', { name: 'Organization filter' }), { target: { value: 'Example Org' } });
     await chooseSelectOption(screen.getByRole('combobox', { name: /^Contact state:/ }), 'Active');
     await vi.advanceTimersByTimeAsync(0);
@@ -98,6 +98,7 @@ describe('DirectoryWorkspace', () => {
     render(DirectoryWorkspace, { client, controller, state });
     await screen.findByRole('row', { name: /Synthetic Person/ });
 
+    await fireEvent.click(screen.getByRole('button', { name: 'Filters' }));
     await chooseSelectOption(screen.getByRole('combobox', { name: /^Contact state:/ }), 'Active');
     await waitFor(() => expect(resolveFiltered).toBeDefined());
     expect(screen.getByRole('row', { name: /Synthetic Person/ })).toBeDefined();
@@ -110,25 +111,107 @@ describe('DirectoryWorkspace', () => {
     expect(screen.queryByRole('status')).toBeNull();
   });
 
-  it('offers free-text category and organization filters when no server facet catalog exists', () => {
+  it('offers free-text category and organization filters when no server facet catalog exists', async () => {
     const client = createAPIClient(vi.fn<typeof fetch>(async () => directoryResponse()));
     const controller = new DirectoryController(client);
 
     render(DirectoryWorkspace, { client, controller, state });
+    expect(screen.queryByRole('textbox', { name: 'Category filter' })).toBeNull();
+    await fireEvent.click(screen.getByRole('button', { name: 'Filters' }));
 
     expect(screen.getByRole('textbox', { name: 'Category filter' })).toBeDefined();
     expect(screen.getByRole('textbox', { name: 'Organization filter' })).toBeDefined();
   });
 
-  it('offers last-contact range and ordering controls', () => {
+  it('offers last-contact range and ordering controls', async () => {
     const client = createAPIClient(vi.fn<typeof fetch>(async () => directoryResponse()));
     const controller = new DirectoryController(client);
 
     render(DirectoryWorkspace, { client, controller, state });
+    await fireEvent.click(screen.getByRole('button', { name: 'Filters' }));
 
-    expect(screen.getByRole('textbox', { name: 'Last contacted after' })).toBeDefined();
-    expect(screen.getByRole('textbox', { name: 'Last contacted before' })).toBeDefined();
+    expect((screen.getByLabelText('Last contacted after') as HTMLInputElement).type).toBe('date');
+    expect((screen.getByLabelText('Last contacted before') as HTMLInputElement).type).toBe('date');
     expect(screen.getByRole('combobox', { name: /^Directory order:/ })).toBeDefined();
+  });
+
+  it('sets and clears each last-contacted boundary on its own', async () => {
+    const requests: Request[] = [];
+    const client = createAPIClient(vi.fn<typeof fetch>(async (input) => {
+      const request = input instanceof Request ? input : new Request(input);
+      requests.push(request);
+      return directoryResponse();
+    }));
+    const controller = new DirectoryController(client);
+    render(DirectoryWorkspace, { client, controller, state });
+    await fireEvent.click(screen.getByRole('button', { name: 'Filters' }));
+
+    await fireEvent.change(screen.getByLabelText('Last contacted after'), { target: { value: '2024-01-05' } });
+    expect(controller.lastContactAfter).toBe('2024-01-05');
+    expect(controller.lastContactBefore).toBe('');
+    expect(screen.getByText('Last contacted after Jan 5, 2024')).toBeDefined();
+    await waitFor(() => {
+      const params = new URL(requests.at(-1)!.url).searchParams;
+      expect(params.get('last_contact_after')).toBe('2024-01-05T00:00:00Z');
+      expect(params.has('last_contact_before')).toBe(false);
+    });
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Remove Last contacted after Jan 5, 2024 filter' }));
+    expect(controller.lastContactAfter).toBe('');
+    expect(screen.queryByText('Last contacted after Jan 5, 2024')).toBeNull();
+  });
+
+  it('clears a boundary from the clear button beside its date field', async () => {
+    const client = createAPIClient(vi.fn<typeof fetch>(async () => directoryResponse()));
+    const controller = new DirectoryController(client);
+    render(DirectoryWorkspace, { client, controller, state: { ...state, directoryLastContactBefore: '2024-03-01' } });
+    await fireEvent.click(screen.getByRole('button', { name: 'Filters' }));
+
+    expect(screen.getByText('Last contacted before Mar 1, 2024')).toBeDefined();
+    await fireEvent.click(screen.getByRole('button', { name: 'Clear last contacted before' }));
+    expect(controller.lastContactBefore).toBe('');
+    expect((screen.getByLabelText('Last contacted before') as HTMLInputElement).value).toBe('');
+  });
+
+  it('removes only the chip that was cleared', async () => {
+    const client = createAPIClient(vi.fn<typeof fetch>(async () => directoryResponse()));
+    const controller = new DirectoryController(client);
+    render(DirectoryWorkspace, {
+      client, controller,
+      state: { ...state, directoryContactState: 'active', directoryOrganization: 'Example Co', directoryPrimaryChannel: 'email' }
+    });
+
+    expect(screen.getByText('Primary channel: Email')).toBeDefined();
+    await fireEvent.click(screen.getByRole('button', { name: 'Remove Contact state: Active filter' }));
+    expect(controller.contactState).toBe('');
+    expect(controller.organization).toBe('Example Co');
+    expect(controller.primaryChannel).toBe('email');
+    expect(screen.getByText('Organization: Example Co')).toBeDefined();
+    expect(screen.queryByText('Contact state: Active')).toBeNull();
+  });
+
+  it('names primary channels and sorts with a visible label', async () => {
+    const client = createAPIClient(vi.fn<typeof fetch>(async () => directoryResponse()));
+    const controller = new DirectoryController(client);
+    render(DirectoryWorkspace, { client, controller, state });
+
+    expect(screen.getByRole('combobox', { name: /^Directory order:/ }).textContent).toContain('Sort: Name');
+    await fireEvent.click(screen.getByRole('button', { name: 'Filters' }));
+    await fireEvent.click(screen.getByRole('combobox', { name: /^Primary channel/ }));
+    expect(screen.getByRole('option', { name: 'Email' })).toBeDefined();
+    expect(screen.getByRole('option', { name: 'Phone' })).toBeDefined();
+    expect(screen.getByRole('option', { name: 'Chat' })).toBeDefined();
+  });
+
+  it('counts people and marks more pages with a plus', async () => {
+    const client = createAPIClient(vi.fn<typeof fetch>(async () => Response.json({
+      people: [{ id: 7, revision: 2, display_name: 'Synthetic Person', contact_state: 'active', categories: [], organizations: [] }],
+      next_cursor: 'more'
+    })));
+    const controller = new DirectoryController(client);
+    render(DirectoryWorkspace, { client, controller, state });
+
+    expect(await screen.findByText('1+ people')).toBeDefined();
   });
 
   it('offers only contact states accepted by the Directory handler contract', async () => {
@@ -141,6 +224,7 @@ describe('DirectoryWorkspace', () => {
     const controller = new DirectoryController(client);
     render(DirectoryWorkspace, { client, controller, state });
 
+    await fireEvent.click(screen.getByRole('button', { name: 'Filters' }));
     const contactState = screen.getByRole('combobox', { name: /^Contact state:/ });
     await chooseSelectOption(contactState, 'Active');
     await waitFor(() => expect(new URL(requests.at(-1)!.url).searchParams.get('contact_state')).toBe('active'));
@@ -160,6 +244,7 @@ describe('DirectoryWorkspace', () => {
       if (path.endsWith('/files/search')) return Response.json({ files: [], total_count: 0, cache_revision: 'synthetic', search_provenance: {} });
       const meetingResponse = meetingFixtureResponse(path);
       if (meetingResponse) return meetingResponse;
+      if (path.endsWith('/contact-state')) return Response.json({ person_id: 42, cadence_status: 'active', interaction_count: 0, computed_at: '2026-01-01T00:00:00Z', stale: false });
       return Response.json({ id: 42, revision: 1, participant_ids: [], vcard_uid: '', created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z' });
     });
     const client = createAPIClient(fetchFn);
@@ -272,6 +357,7 @@ describe('DirectoryWorkspace', () => {
 
     render(DirectoryWorkspace, { client, controller, state: selectedState });
 
+    await fireEvent.click(await screen.findByRole('tab', { name: 'Profile' }));
     expect(await screen.findByRole('heading', { name: 'Structured profile' })).toBeDefined();
     expect(screen.getByRole('button', { name: 'Add name' })).toHaveProperty('disabled', false);
     expect(controller.profile).not.toBeNull();
@@ -308,7 +394,8 @@ describe('DirectoryWorkspace', () => {
     const controller = new DirectoryController(createAPIClient(fetchFn), (patch) => commits.push(patch));
     render(DirectoryWorkspace, { client: createAPIClient(fetchFn), controller, state: selectedState });
 
-    await fireEvent.click(await screen.findByRole('button', { name: 'Delete person' }));
+    await fireEvent.click(await screen.findByRole('button', { name: 'More actions' }));
+    await fireEvent.click(screen.getByRole('menuitem', { name: 'Delete person' }));
     await fireEvent.click(screen.getByRole('button', { name: 'Confirm delete person' }));
 
     await waitFor(() => expect(controller.selectedPersonID).toBeNull());
@@ -363,6 +450,7 @@ describe('DirectoryWorkspace', () => {
     const controller = new DirectoryController(client);
     render(DirectoryWorkspace, { client, controller, state: selectedState });
 
+    await fireEvent.click(await screen.findByRole('tab', { name: 'Profile' }));
     await fireEvent.click(await screen.findByRole('button', { name: 'Add category' }));
     await fireEvent.input(screen.getByRole('textbox', { name: 'Category' }), { target: { value: 'VIP' } });
     await fireEvent.click(screen.getByRole('button', { name: 'Save category' }));
@@ -420,6 +508,7 @@ describe('DirectoryWorkspace', () => {
     const controller = new DirectoryController(client);
     render(DirectoryWorkspace, { client, controller, state: selectedState });
 
+    await fireEvent.click(await screen.findByRole('tab', { name: 'Profile' }));
     await fireEvent.click(await screen.findByRole('button', { name: 'Add category' }));
     await fireEvent.input(screen.getByRole('textbox', { name: 'Category' }), { target: { value: 'Straße' } });
     await fireEvent.click(screen.getByRole('button', { name: 'Save category' }));
@@ -489,6 +578,7 @@ describe('DirectoryWorkspace', () => {
     render(DirectoryWorkspace, { client, controller, state: selectedState });
 
     const row = await screen.findByRole('row', { name: /Synthetic Person/ });
+    await fireEvent.click(await screen.findByRole('tab', { name: 'Profile' }));
     await fireEvent.click(await screen.findByRole('button', { name: 'Add category' }));
     await fireEvent.input(screen.getByRole('textbox', { name: 'Category' }), { target: { value: 'Straße' } });
     await fireEvent.click(screen.getByRole('button', { name: 'Save category' }));
@@ -570,6 +660,7 @@ describe('DirectoryWorkspace', () => {
     const controller = new DirectoryController(client);
     render(DirectoryWorkspace, { client, controller, state: selectedState });
 
+    await fireEvent.click(await screen.findByRole('tab', { name: 'Profile' }));
     await fireEvent.click(await screen.findByRole('button', { name: 'Edit Primary channel value 1' }));
     await fireEvent.change(screen.getByRole('combobox', { name: 'Primary channel' }), { target: { value: 'chat' } });
     await fireEvent.click(screen.getByRole('button', { name: 'Save attribute' }));
@@ -578,13 +669,13 @@ describe('DirectoryWorkspace', () => {
     await waitFor(() => expect(
       controller.profile?.attributes?.attributes?.[0]?.current?.[0]?.value
     ).toEqual({ type: 'text', text: 'chat' }));
-    expect(row.textContent).toContain('email · active');
+    expect(row.textContent).toContain('Email · Active');
     expect(requests.filter((request) => pathOf(request) === '/api/v1/people/directory')).toHaveLength(1);
 
     await fireEvent.click(screen.getByRole('button', { name: 'Close Primary channel value 1' }));
     await fireEvent.click(screen.getByRole('button', { name: 'Confirm close attribute' }));
     await waitFor(() => expect(controller.profile?.attributes?.attributes?.[0]?.current).toEqual([]));
-    expect(row.textContent).toContain('email · active');
+    expect(row.textContent).toContain('Email · Active');
     expect(requests.filter((request) => pathOf(request) === '/api/v1/people/directory')).toHaveLength(1);
   });
 
@@ -631,6 +722,7 @@ describe('DirectoryWorkspace', () => {
         publicationSignal = request.signal;
         return new Promise<Response>((resolve) => { resolvePublication = resolve; });
       }
+      if (path.endsWith('/contact-state')) return Response.json({ person_id: 7, cadence_status: 'active', interaction_count: 0, computed_at: '2026-01-01T00:00:00Z', stale: false });
       return Response.json({
         id: 7, revision: 1, participant_ids: [], vcard_uid: '',
         created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z'
@@ -642,6 +734,7 @@ describe('DirectoryWorkspace', () => {
 
     await fireEvent.click(await screen.findByRole('row', { name: /Synthetic Person/ }));
     expect(await screen.findByRole('dialog', { name: 'Person detail' })).toBeDefined();
+    await fireEvent.click(await screen.findByRole('tab', { name: 'Maintenance' }));
     await waitFor(() => expect(publicationSignal).toBeDefined());
     await fireEvent.click(screen.getByRole('button', { name: 'Close' }));
     expect(publicationSignal?.aborted).toBe(true);
