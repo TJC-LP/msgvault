@@ -23,7 +23,6 @@
     ExploreGroupDimension,
     ExploreGroupRow,
     ExploreSearchMode,
-    OperationStatusAuthority,
     ExploreURLState,
     ExploreWorkspace,
     FileViewerTarget,
@@ -42,11 +41,11 @@
   import { RelationshipReviewController } from '../../directory/relationship-review-controller.svelte';
   import { FactLedgerController } from '../../directory/fact-ledger-controller.svelte';
   import { OperationsController } from '../../operations/controller.svelte';
+  import type { OperationSettingsTarget } from '../../operations/labels';
   import type { OperationRunDetail, OperationsURLState } from '../../operations/models';
   import {
     settingsNavigationTarget as targetForSettingsAuthority,
     type CardDAVSettingsRequest,
-    type SettingsNavigationAuthority,
     type SettingsNavigationTarget
   } from '../../carddav/navigation';
   import { createCommandRegistry, type AppCommand, type CommandHandlers } from '../../commands/registry';
@@ -89,7 +88,9 @@
     settings?: Snippet<[
       CardDAVSettingsRequest | undefined,
       (key: number) => void,
-      SettingsNavigationTarget | undefined
+      SettingsNavigationTarget | undefined,
+      string,
+      (categoryID: string) => void
     ]>;
     appearanceDefaults?: AppearanceDefaults;
     searchModeDefault?: ExploreSearchMode;
@@ -280,11 +281,16 @@
     cardDAVSettingsRequest = { conflictID, key: ++cardDAVSettingsRequestKey };
     announceOperation(`Opening CardDAV conflict ${conflictID} in Settings.`);
     commitWorkspace('settings');
+    replaceCommittedNavigation({ settingsCategory: 'carddav' });
+  }
+  function selectSettingsCategory(categoryID: string): void {
+    commitNavigation({ settingsCategory: categoryID, settingsAuthority: '' });
   }
   function openCardDAVSettings(): void {
     cardDAVSettingsRequest = { key: ++cardDAVSettingsRequestKey };
     announceOperation('Opening CardDAV settings.');
     commitWorkspace('settings');
+    replaceCommittedNavigation({ settingsCategory: 'carddav' });
   }
   function openOperations(
     operationLane: OperationsURLState['operationLane'],
@@ -327,13 +333,14 @@
     commitNavigation({ workspace: 'operations', operationStatus: target });
   }
 
-  function openOperationConfiguration(target: OperationStatusAuthority): void {
-    const settingsTargets: Record<OperationStatusAuthority, SettingsNavigationAuthority> = {
-      getDocumentIndexStatus: 'document_index',
-      getDocumentVectorStatus: 'document_vector',
-      getVisualAttachmentStatus: 'visual_attachments'
-    };
-    commitNavigation({ workspace: 'settings', settingsAuthority: settingsTargets[target] });
+  function openVisualAttachmentSettings(): void {
+    commitNavigation({
+      workspace: 'settings', settingsCategory: 'search', settingsAuthority: 'visual_attachments'
+    });
+  }
+
+  function setUpOperation(target: OperationSettingsTarget): void {
+    commitNavigation({ workspace: 'settings', ...target });
   }
 
   setContext('msgvault:open-carddav-operations', () => openOperations('contacts', 'carddav_sync'));
@@ -1301,7 +1308,13 @@
     </header>
     <div class="app-main">
       {#if exploreState.current.workspace === 'settings'}
-        {#if settings}{@render settings(cardDAVSettingsRequest, consumeCardDAVSettingsRequest, settingsNavigationTarget)}{/if}
+        {#if settings}{@render settings(
+          cardDAVSettingsRequest,
+          consumeCardDAVSettingsRequest,
+          settingsNavigationTarget,
+          exploreState.current.settingsCategory,
+          selectSettingsCategory
+        )}{/if}
       {:else if exploreState.current.workspace === 'saved_views'}
         <SavedViewsWorkspace
           {client}
@@ -1326,7 +1339,8 @@
           }}
           onStateChange={(patch) => commitNavigation(patch)}
           onNavigate={openOperationAuthority}
-          onConfigure={openOperationConfiguration}
+          onConfigure={openVisualAttachmentSettings}
+          onSetUp={setUpOperation}
           onAnnounce={announceOperation}
         />
       {:else if exploreState.current.workspace === 'deletions'}

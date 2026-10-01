@@ -1,12 +1,18 @@
 import { getHealth as generatedGetHealth } from './lib/api/generated/api/api';
-import { fireEvent, render, screen, waitFor } from '@testing-library/svelte';
-import { describe, expect, it, vi } from 'vitest';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/svelte';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import App from './App.svelte';
 import { createAPIClient } from './lib/api/client';
 import { createSessionController } from './lib/api/session.svelte';
-import { SEARCH_MODE_PREFERENCE_KEY } from './lib/search/modes';
+import { resolveInitialSearchMode, SEARCH_MODE_PREFERENCE_KEY } from './lib/search/modes';
 import { chooseSelectOption } from './test/kit-ui';
 describe('application foundation', () => {
+  afterEach(() => {
+    localStorage.removeItem(SEARCH_MODE_PREFERENCE_KEY);
+    sessionStorage.removeItem('msgvault.appearance.override');
+    document.documentElement.classList.remove('dark');
+    window.history.replaceState(null, '', '/');
+  });
   it('mounts the Relationships landmark once bootstrap succeeds', async () => {
     const session = createSessionController(async () =>
       Response.json({ auth_mode: 'loopback', https: false, plain_http_warning: true }),
@@ -31,6 +37,30 @@ describe('application foundation', () => {
     render(App, { session });
     expect(screen.getByRole('main', { name: 'Connecting' })).toBeDefined();
     expect(document.title).toBe('msgvault');
+  });
+  it('shows the OAuth callback in the same layout as connecting', () => {
+    vi.stubGlobal(
+      'BroadcastChannel',
+      class {
+        postMessage(): void {}
+        close(): void {}
+      },
+    );
+    const close = vi.spyOn(window, 'close').mockImplementation(() => undefined);
+    window.history.replaceState(null, '', '/?state=msgvault-carddav-synthetic&code=synthetic');
+    try {
+      render(App, { session: createSessionController(vi.fn<typeof fetch>()) });
+      const main = screen.getByRole('main');
+      expect(main.className).toContain('boot-screen');
+      expect(within(main).getByText('msgvault').className).toContain('boot-screen__brand');
+      expect(
+        within(main).getByText('Return to CardDAV settings to finish connecting. You can close this window.'),
+      ).toBeDefined();
+    } finally {
+      close.mockRestore();
+      vi.unstubAllGlobals();
+      window.history.replaceState(null, '', '/');
+    }
   });
   it('shows a bootstrap error with retry instead of the shell, and recovers on retry', async () => {
     let sessionCalls = 0;
@@ -112,13 +142,14 @@ describe('application foundation', () => {
     await session.bootstrap();
     await fireEvent.click(await screen.findByRole('button', { name: 'Settings' }));
     await chooseSelectOption(await screen.findByLabelText('Theme'), 'Dark');
-    await fireEvent.click(screen.getByRole('button', { name: 'Save settings' }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Save changes' }));
     await waitFor(() => expect(requests.some((request) => request.method === 'PATCH')).toBe(true));
     const patch = requests.find((request) => request.method === 'PATCH');
     expect(patch?.headers.get('X-CSRF-Token')).toBe('csrf-token');
     expect(patch?.headers.get('If-Match')).toBe('"etag-a"');
   });
   it('returns to login when a settings mutation is unauthorized', async () => {
+    window.history.replaceState(null, '', '/?workspace=settings');
     const fetchFn = vi.fn<typeof fetch>(async (input) => {
       const request = input instanceof Request ? input : new Request(input);
       const path = new URL(request.url).pathname;
@@ -138,7 +169,7 @@ describe('application foundation', () => {
     await session.bootstrap();
     await fireEvent.click(await screen.findByRole('button', { name: 'Settings' }));
     await chooseSelectOption(await screen.findByLabelText('Theme'), 'Dark');
-    await fireEvent.click(screen.getByRole('button', { name: 'Save settings' }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Save changes' }));
     expect(await screen.findByRole('form', { name: 'Log in' })).toBeDefined();
   });
   it('loads appearance once after interactive login while a session override wins', async () => {
@@ -230,6 +261,93 @@ describe('application foundation', () => {
       window.history.replaceState(null, '', '/');
     },
   );
+  it('applies a saved theme and density to the open tab', async () => {
+    sessionStorage.removeItem('msgvault.appearance.override');
+    await openAppearance(appearanceDaemon());
+    await chooseSelectOption(screen.getByLabelText('Theme'), 'Dark');
+    await chooseSelectOption(screen.getByLabelText('Density'), 'Comfortable');
+    await fireEvent.click(screen.getByRole('button', { name: 'Save changes' }));
+    await waitFor(() => expect(document.documentElement.classList.contains('dark')).toBe(true));
+    expect(document.documentElement.dataset.density).toBe('comfortable');
+  });
+  it('keeps a saved theme when the browser-defaults load finishes after the save', async () => {
+    sessionStorage.removeItem('msgvault.appearance.override');
+    const daemon = appearanceDaemon();
+    let releaseFirstLoad: (() => void) | undefined;
+    let settingsReads = 0;
+    const fetchFn = vi.fn<typeof fetch>(async (input, init) => {
+      const request = input instanceof Request ? input : new Request(input, init);
+      const path = new URL(request.url).pathname;
+      if (path === '/api/v1/settings' && request.method === 'GET' && ++settingsReads === 2) {
+        // The browser-defaults load reads the daemon before the save, then stalls.
+        const stale = await daemon(request.clone());
+        const body = await stale.json();
+        body.settings.find((setting: { key: string }) => setting.key === 'web.density').value = { string: 'comfortable' };
+        await new Promise<void>((resolve) => { releaseFirstLoad = resolve; });
+        return Response.json(body);
+      }
+      return daemon(request);
+    });
+    await openAppearance(fetchFn);
+    await chooseSelectOption(screen.getByLabelText('Theme'), 'Dark');
+    await fireEvent.click(screen.getByRole('button', { name: 'Save changes' }));
+    await waitFor(() => expect(document.documentElement.classList.contains('dark')).toBe(true));
+    await waitFor(() => expect(releaseFirstLoad).toBeDefined());
+    releaseFirstLoad?.();
+    await waitFor(() => expect(document.documentElement.dataset.density).toBe('comfortable'));
+    expect(document.documentElement.classList.contains('dark')).toBe(true);
+  });
+  it('keeps the open view mode when the browser-defaults load finishes after a saved search mode', async () => {
+    localStorage.removeItem(SEARCH_MODE_PREFERENCE_KEY);
+    const daemon = appearanceDaemon();
+    let releaseDefaultsLoad: (() => void) | undefined;
+    let settingsReads = 0;
+    const fetchFn = vi.fn<typeof fetch>(async (input, init) => {
+      const request = input instanceof Request ? input : new Request(input, init);
+      const path = new URL(request.url).pathname;
+      if (path === '/api/v1/settings' && request.method === 'GET' && ++settingsReads === 2) {
+        // The browser-defaults load reads an older daemon default, then stalls past the save.
+        const stale = await daemon(request.clone());
+        const body = await stale.json();
+        body.settings.find((setting: { key: string }) => setting.key === 'web.default_search_mode').value = { string: 'semantic' };
+        // An unsaved density change shows when the late load has been applied.
+        body.settings.find((setting: { key: string }) => setting.key === 'web.density').value = { string: 'comfortable' };
+        await new Promise<void>((resolve) => { releaseDefaultsLoad = resolve; });
+        return Response.json(body);
+      }
+      return daemon(request);
+    });
+    await openAppearance(fetchFn);
+    const before = window.location.search;
+    await chooseSelectOption(screen.getByLabelText('Default search mode'), 'Hybrid');
+    await fireEvent.click(screen.getByRole('button', { name: 'Save changes' }));
+    await waitFor(() => expect(localStorage.getItem(SEARCH_MODE_PREFERENCE_KEY)).toBe('hybrid'));
+    await waitFor(() => expect(releaseDefaultsLoad).toBeDefined());
+    releaseDefaultsLoad?.();
+    await waitFor(() => expect(document.documentElement.dataset.density).toBe('comfortable'));
+    expect(screen.getByRole('radio', { name: 'Full text' }).getAttribute('aria-checked')).toBe('true');
+    expect(window.location.search).toBe(before);
+    expect(localStorage.getItem(SEARCH_MODE_PREFERENCE_KEY)).toBe('hybrid');
+  });
+  it('keeps a Display menu theme override ahead of a saved theme', async () => {
+    sessionStorage.setItem('msgvault.appearance.override', JSON.stringify({ theme: 'light' }));
+    await openAppearance(appearanceDaemon());
+    await chooseSelectOption(screen.getByLabelText('Theme'), 'Dark');
+    await fireEvent.click(screen.getByRole('button', { name: 'Save changes' }));
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Save changes' })).toBeNull());
+    expect(document.documentElement.classList.contains('dark')).toBe(false);
+  });
+  it('remembers a saved default search mode without changing the open view', async () => {
+    localStorage.removeItem(SEARCH_MODE_PREFERENCE_KEY);
+    await openAppearance(appearanceDaemon());
+    const before = window.location.search;
+    await chooseSelectOption(screen.getByLabelText('Default search mode'), 'Hybrid');
+    await fireEvent.click(screen.getByRole('button', { name: 'Save changes' }));
+    await waitFor(() => expect(localStorage.getItem(SEARCH_MODE_PREFERENCE_KEY)).toBe('hybrid'));
+    expect(window.location.search).toBe(before);
+    expect(screen.getByRole('radio', { name: 'Full text' }).getAttribute('aria-checked')).toBe('true');
+    expect(resolveInitialSearchMode(undefined, localStorage, 'full_text')).toBe('hybrid');
+  });
   it('threads repeated same-conflict handoffs through AppShell as distinct exactly-once live events', async () => {
     window.history.replaceState(
       null,
@@ -391,4 +509,72 @@ function settingsResponse(theme: string, etag: string, pendingRestart = false): 
     },
     { headers: { ETag: etag } },
   );
+}
+function appearanceDaemon() {
+  const current = { theme: 'system', density: 'compact', mode: 'full_text' };
+  const document = () =>
+    Response.json(
+      {
+        groups: [{ id: 'browser', label: 'Appearance', description: 'How the web app looks.' }],
+        settings: [
+          {
+            key: 'web.theme',
+            group: 'browser',
+            label: 'Theme',
+            kind: 'string',
+            value: { string: current.theme },
+            options: ['system', 'light', 'dark'],
+            restart_required: false,
+          },
+          {
+            key: 'web.density',
+            group: 'browser',
+            label: 'Density',
+            kind: 'string',
+            value: { string: current.density },
+            options: ['compact', 'comfortable'],
+            restart_required: false,
+          },
+          {
+            key: 'web.default_search_mode',
+            group: 'browser',
+            label: 'Default search mode',
+            kind: 'string',
+            value: { string: current.mode },
+            options: ['full_text', 'semantic', 'hybrid'],
+            restart_required: false,
+          },
+        ],
+        pending_restart: false,
+      },
+      { headers: { ETag: '"appearance"' } },
+    );
+  return vi.fn<typeof fetch>(async (input) => {
+    const request = input instanceof Request ? input : new Request(input);
+    const path = new URL(request.url).pathname;
+    if (path === '/api/session') {
+      return Response.json({ auth_mode: 'loopback', https: false, plain_http_warning: false });
+    }
+    if (path === '/api/v1/settings' && request.method === 'PATCH') {
+      const body = (await request.json()) as { updates: Array<{ key: string; value: { string: string } }> };
+      for (const { key, value } of body.updates) {
+        if (key === 'web.theme') current.theme = value.string;
+        if (key === 'web.density') current.density = value.string;
+        if (key === 'web.default_search_mode') current.mode = value.string;
+      }
+      return document();
+    }
+    if (path === '/api/v1/settings') return document();
+    if (path === '/api/v1/explore') {
+      return Response.json({ rows: [], total_count: 0, cache_revision: 'appearance', search_provenance: {} });
+    }
+    return Response.json({}, { status: 404 });
+  });
+}
+async function openAppearance(fetchFn: ReturnType<typeof appearanceDaemon>) {
+  window.history.replaceState(null, '', '/?workspace=settings');
+  const session = createSessionController(fetchFn);
+  render(App, { session });
+  await session.bootstrap();
+  await screen.findByRole('heading', { level: 2, name: 'Appearance' });
 }

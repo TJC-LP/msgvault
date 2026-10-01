@@ -2,6 +2,7 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { createAPIClient } from '../../api/client';
+import { formatDateTime } from '../../util/format';
 import SourcesWorkspace from './SourcesWorkspace.svelte';
 
 function source(overrides: Record<string, unknown> = {}) {
@@ -21,20 +22,125 @@ function run(status: string, processed: number, overrides: Record<string, unknow
   };
 }
 
+const NOT_OBSERVED = "The sync was requested, but it hasn't started yet. Refresh to check again.";
+
 afterEach(() => {
   vi.useRealTimers();
   vi.restoreAllMocks();
 });
 
 describe('SourcesWorkspace', () => {
-  it('opens normalized source-sync operation history through its shell callback', async () => {
+  it('opens source-sync history from Sync history', async () => {
     const onOpenOperations = vi.fn();
-    const fetchFn = vi.fn<typeof fetch>(async () => Response.json({ sources: [] }));
-    render(SourcesWorkspace, { client: createAPIClient(fetchFn), onOpenOperations });
-
-    await fireEvent.click(screen.getByRole('button', { name: 'View source operations' }));
-
+    render(SourcesWorkspace, {
+      client: createAPIClient(vi.fn<typeof fetch>(async () => Response.json({ sources: [] }))),
+      onOpenOperations
+    });
+    await fireEvent.click(screen.getByRole('button', { name: 'Sync history' }));
     expect(onOpenOperations).toHaveBeenCalledOnce();
+  });
+
+  it('shows a readable type and a muted reason with the raw code in its tooltip', async () => {
+    const unavailable = (id: number, identifier: string, display_name: string, reason: string, extra = {}) =>
+      source({ id, identifier, display_name, can_sync: false, sync_unavailable_reason: reason, ...extra });
+    const fetchFn = vi.fn<typeof fetch>(async () => Response.json({ sources: [
+      unavailable(1, 'import@example.com', 'Imported', 'source_not_schedulable', { source_type: 'mbox' }),
+      unavailable(2, 'busy@example.com', 'Busy', 'sync_already_running'),
+      unavailable(3, 'down@example.com', 'Down', 'scheduler_unavailable'),
+      unavailable(4, 'unset@example.com', 'Unset', 'sync_not_configured'),
+      unavailable(5, 'other@example.com', 'Other', 'future_reason')
+    ] }));
+    render(SourcesWorkspace, { client: createAPIClient(fetchFn) });
+
+    expect(await screen.findByText('Mbox import · import@example.com')).toBeDefined();
+    for (const [text, code] of [
+      ['Imported file — nothing to sync', 'source_not_schedulable'],
+      ['Sync in progress', 'sync_already_running'],
+      ['Scheduler unavailable', 'scheduler_unavailable'],
+      ['Sync not set up', 'sync_not_configured'],
+      ['Sync unavailable', 'future_reason']
+    ]) {
+      expect(screen.getByText(text).getAttribute('title')).toBe(code);
+    }
+    expect(screen.queryByText('source_not_schedulable')).toBeNull();
+    expect(screen.getByRole('columnheader', { name: 'Status' })).toBeDefined();
+  });
+
+  it('shows one status chip per latest result', async () => {
+    const fetchFn = vi.fn<typeof fetch>(async () => Response.json({ sources: [
+      source({ id: 1, display_name: 'Active', active_sync: run('running', 5) }),
+      source({ id: 2, identifier: 'b@example.com', display_name: 'Done',
+        latest_sync: run('completed', 3, { completed_at: '2026-07-19T11:00:00Z' }) }),
+      source({ id: 3, identifier: 'c@example.com', display_name: 'Partial',
+        latest_sync: run('completed', 3, { errors_count: 2 }) }),
+      source({ id: 4, identifier: 'd@example.com', display_name: 'Broken', latest_sync: run('failed', 0) }),
+      source({ id: 5, identifier: 'e@example.com', display_name: 'New' })
+    ] }));
+    render(SourcesWorkspace, {
+      client: createAPIClient(fetchFn), now: () => new Date('2026-07-19T12:00:00Z')
+    });
+
+    expect(await screen.findByText('Syncing')).toBeDefined();
+    expect(screen.getByText('5 processed')).toBeDefined();
+    for (const label of ['Completed', 'Completed with errors', 'Failed', 'Never synced']) {
+      expect(screen.getByText(label)).toBeDefined();
+    }
+  });
+
+  it('expands error details only for rows that have them', async () => {
+    const failed = run('failed', 10, {
+      completed_at: '2026-07-19T11:30:00Z', error_message: 'Mailbox unavailable', errors_count: 1,
+      item_errors: [{ source_message_id: 'm-1', phase: 'ingest', error_kind: 'mime_error',
+        error_message: 'Malformed MIME header', created_at: '2026-07-19T11:30:00Z' }]
+    });
+    const fetchFn = vi.fn<typeof fetch>(async () => Response.json({ sources: [
+      source({ display_name: 'Archive', latest_sync: failed, scheduler_last_error: 'Lock timeout' }),
+      source({ id: 2, identifier: 'clean@example.com', display_name: 'Clean', latest_sync: run('completed', 1) })
+    ] }));
+    render(SourcesWorkspace, {
+      client: createAPIClient(fetchFn), now: () => new Date('2026-07-19T12:00:00Z')
+    });
+
+    const toggle = await screen.findByRole('button', { name: 'Show details for Archive' });
+    expect(screen.queryByRole('button', { name: 'Show details for Clean' })).toBeNull();
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    expect(screen.queryByText('Malformed MIME header')).toBeNull();
+    await fireEvent.click(toggle);
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
+    expect(screen.getByText('Mailbox unavailable')).toBeDefined();
+    expect(screen.getByText('Scheduler: Lock timeout')).toBeDefined();
+    expect(screen.getByText('1 item error')).toBeDefined();
+    expect(screen.getByText('Malformed MIME header')).toBeDefined();
+    await fireEvent.click(toggle);
+    expect(screen.queryByText('Malformed MIME header')).toBeNull();
+  });
+
+  it('drops an open detail row when a refresh clears the errors', async () => {
+    const failed = run('failed', 1, { completed_at: '2026-07-19T11:30:00Z', error_message: 'Mailbox unavailable' });
+    let current = source({ latest_sync: failed });
+    const fetchFn = vi.fn<typeof fetch>(async () => Response.json({ sources: [current] }));
+    const { container } = render(SourcesWorkspace, {
+      client: createAPIClient(fetchFn), now: () => new Date('2026-07-19T12:00:00Z')
+    });
+    await fireEvent.click(await screen.findByRole('button', { name: 'Show details for Archive' }));
+    expect(screen.getByText('Mailbox unavailable')).toBeDefined();
+
+    current = source({ latest_sync: run('completed', 1, { completed_at: '2026-07-19T11:45:00Z' }) });
+    document.dispatchEvent(new Event('visibilitychange'));
+
+    await waitFor(() => expect(screen.queryByText('Mailbox unavailable')).toBeNull());
+    expect(screen.queryByRole('button', { name: 'Show details for Archive' })).toBeNull();
+    expect(container.querySelector('#source-1-details')).toBeNull();
+  });
+
+  it('keeps the cron text in the schedule tooltip only', async () => {
+    const fetchFn = vi.fn<typeof fetch>(async () => Response.json({ sources: [source({
+      scheduled: true, schedule: '0 */6 * * *', next_sync_at: '2026-07-19T18:00:00Z'
+    })] }));
+    render(SourcesWorkspace, { client: createAPIClient(fetchFn) });
+    const summary = await screen.findByText('At :00 past every 6th hour');
+    expect(summary.getAttribute('title')).toBe('0 */6 * * *');
+    expect(screen.queryByText('0 */6 * * *')).toBeNull();
   });
 
   it('shows status and only exposes Sync now from server capability truth', async () => {
@@ -50,10 +156,11 @@ describe('SourcesWorkspace', () => {
     expect(screen.getByRole('columnheader', { name: 'Last successful sync' })).toBeDefined();
     expect(screen.getByRole('button', { name: 'Sync now Archive' })).toBeDefined();
     expect(screen.queryByRole('button', { name: 'Sync now readonly@example.com' })).toBeNull();
-    expect(screen.getByText('sync_not_configured')).toBeDefined();
+    expect(screen.getByText('Sync not set up')).toBeDefined();
     expect(screen.getAllByText('Not scheduled')).toHaveLength(2);
-    expect(screen.getAllByText('No prior sync result')).toHaveLength(2);
-    expect(screen.getAllByTitle('2026-07-19T10:00:00Z')).toHaveLength(2);
+    expect(screen.getAllByText('Never synced')).toHaveLength(2);
+    expect(screen.getAllByTitle(formatDateTime('2026-07-19T10:00:00Z', 'long'))).toHaveLength(2);
+    expect(screen.queryAllByTitle('2026-07-19T10:00:00Z')).toHaveLength(0);
   });
 
   it('presents generic meeting imports as on-demand API sources', async () => {
@@ -90,11 +197,23 @@ describe('SourcesWorkspace', () => {
     });
 
     expect(await screen.findByText('At :00 past every 6th hour')).toBeDefined();
-    expect(screen.getByText('0 */6 * * *')).toBeDefined();
-    expect(screen.getByTitle('2026-07-19T18:00:00Z')).toBeDefined();
-    expect(screen.queryByText('stale_last_result')).toBeNull();
+    expect(screen.getByTitle(formatDateTime('2026-07-19T18:00:00Z', 'long'))).toBeDefined();
+    expect(screen.getByTitle(formatDateTime('2026-07-19T11:30:00Z', 'long'))).toBeDefined();
+    expect(screen.queryByTitle(/T\d\d:\d\d:\d\dZ$/)).toBeNull();
+    expect(screen.queryByText('This result may be out of date.')).toBeNull();
+    await fireEvent.click(screen.getByRole('button', { name: 'Show details for Archive' }));
     expect(screen.getByText('1 item error')).toBeDefined();
     expect(screen.getByText('Malformed MIME header')).toBeDefined();
+  });
+
+  it('shows the last successful sync with a readable full date in its tooltip', async () => {
+    const fetchFn = vi.fn<typeof fetch>(async () => Response.json({ sources: [source({
+      last_successful_sync: run('completed', 4, { completed_at: '2026-07-18T08:15:00Z' })
+    })] }));
+    render(SourcesWorkspace, { client: createAPIClient(fetchFn) });
+
+    expect(await screen.findByTitle(formatDateTime('2026-07-18T08:15:00Z', 'long'))).toBeDefined();
+    expect(screen.queryByTitle('2026-07-18T08:15:00Z')).toBeNull();
   });
 
   it('names a terminal result older than the documented threshold as stale', async () => {
@@ -105,7 +224,7 @@ describe('SourcesWorkspace', () => {
       client: createAPIClient(fetchFn), now: () => new Date('2026-07-19T12:00:00Z')
     });
 
-    expect(await screen.findByText('stale_last_result')).toBeDefined();
+    expect(await screen.findByText('This result may be out of date.')).toBeDefined();
   });
 
   it('keeps polling through idle status races until the accepted run appears and completes', async () => {
@@ -167,7 +286,7 @@ describe('SourcesWorkspace', () => {
     await screen.findByText('5 processed');
     await vi.advanceTimersByTimeAsync(500);
     await waitFor(() => expect(statusReads).toBe(2));
-    expect(screen.getByText('sync_already_running')).toBeDefined();
+    expect(screen.getByText('Sync in progress')).toBeDefined();
     expect(screen.queryByRole('button', { name: 'Sync now Archive' })).toBeNull();
 
     // Polling continues (with backoff) while the lock is held...
@@ -208,7 +327,7 @@ describe('SourcesWorkspace', () => {
 
     expect(screen.getByText('Completed')).toBeDefined();
     await waitFor(() => expect(screen.queryByText('Awaiting accepted sync run…')).toBeNull());
-    expect(screen.queryByText('sync_start_not_observed')).toBeNull();
+    expect(screen.queryByText(NOT_OBSERVED)).toBeNull();
     rendered.unmount();
   });
 
@@ -229,7 +348,7 @@ describe('SourcesWorkspace', () => {
     await vi.advanceTimersByTimeAsync(500);
     await vi.advanceTimersByTimeAsync(1_000);
 
-    expect(await screen.findByText('sync_start_not_observed')).toBeDefined();
+    expect(await screen.findByText(NOT_OBSERVED)).toBeDefined();
     expect(reads).toBe(4);
     await vi.advanceTimersByTimeAsync(8_000);
     expect(reads).toBe(4);
@@ -539,7 +658,7 @@ describe('SourcesWorkspace', () => {
       client: createAPIClient(fetchFn), maxLockHoldPolls: 3
     });
 
-    await screen.findByText('sync_already_running');
+    await screen.findByText('Sync in progress');
     await vi.advanceTimersByTimeAsync(30_000);
     expect(reads).toBe(4);
     expect(screen.getByText(/Automatic refresh paused/)).toBeDefined();
@@ -565,7 +684,7 @@ describe('SourcesWorkspace', () => {
       client: createAPIClient(fetchFn), maxLockHoldPolls: 2
     });
 
-    await screen.findByText('sync_already_running');
+    await screen.findByText('Sync in progress');
     await vi.advanceTimersByTimeAsync(30_000);
     expect(reads).toBe(6);
     expect(screen.getByText(/Automatic refresh paused/)).toBeDefined();
@@ -586,7 +705,7 @@ describe('SourcesWorkspace', () => {
       client: createAPIClient(fetchFn), maxLockHoldPolls: 1
     });
 
-    expect(await screen.findByText('sync_already_running')).toBeDefined();
+    expect(await screen.findByText('Sync in progress')).toBeDefined();
     await vi.advanceTimersByTimeAsync(30_000);
     expect(reads).toBe(2);
     expect(screen.getByRole('alert').textContent).toContain('status unavailable');
@@ -612,7 +731,7 @@ describe('SourcesWorkspace', () => {
       client: createAPIClient(fetchFn), requestTimeoutMs: 20, maxLockHoldPolls: 3
     });
 
-    expect(await screen.findByText('sync_already_running')).toBeDefined();
+    expect(await screen.findByText('Sync in progress')).toBeDefined();
     for (let expectedReads = 2; expectedReads <= 4; expectedReads += 1) {
       await vi.advanceTimersByTimeAsync(10_000);
       expect(reads).toBe(expectedReads);

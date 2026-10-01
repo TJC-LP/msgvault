@@ -9,8 +9,13 @@
   import AppShell from './lib/components/shell/AppShell.svelte';
   import MessagePage from './lib/components/reader/MessagePage.svelte';
   import type { ExploreSearchMode } from './lib/explore/models';
-  import { parseSearchMode } from './lib/search/modes';
-  import { createAppearancePreferences, type AppearanceDefaults } from './lib/theme/preferences.svelte';
+  import { availableSearchModeStorage, parseSearchMode, rememberSearchMode } from './lib/search/modes';
+  import {
+    createAppearancePreferences,
+    mergeSavedAppearance,
+    type AppearanceDefaults,
+    type SavedAppearance,
+  } from './lib/theme/preferences.svelte';
   let {
     session = createSessionController(),
   }: {
@@ -24,6 +29,10 @@
   let searchModeDefault = $state<ExploreSearchMode | undefined>();
   let authenticated = false;
   let browserDefaultsRequestGeneration = 0;
+  // Appearance saved while the browser-defaults load is in flight. That load
+  // read the daemon before the save, so these values win over its result,
+  // and a saved search mode keeps it from reconfiguring the open view.
+  let savedSinceDefaultsLoad: SavedAppearance = {};
   onMount(() => {
     oauthCallback = receiveGoogleContactsCallback();
     if (!oauthCallback) void session.bootstrap();
@@ -45,6 +54,7 @@
     if (authenticated) return;
     authenticated = true;
     const generation = ++browserDefaultsRequestGeneration;
+    savedSinceDefaultsLoad = {};
     void loadBrowserDefaults(generation);
   });
   async function loadBrowserDefaults(generation: number): Promise<void> {
@@ -53,16 +63,32 @@
       if (generation !== browserDefaultsRequestGeneration || session.authMode === 'required') return;
       const theme = settingString(data?.settings.find(({ key }) => key === 'web.theme'));
       const density = settingString(data?.settings.find(({ key }) => key === 'web.density'));
-      appearanceDefaults = {
-        theme: theme === 'light' || theme === 'dark' || theme === 'system' ? theme : 'system',
-        density: density === 'comfortable' ? density : 'compact',
-      };
-      searchModeDefault = parseSearchMode(
-        settingString(data?.settings.find(({ key }) => key === 'web.default_search_mode')),
+      appearanceDefaults = mergeSavedAppearance(
+        {
+          theme: theme === 'light' || theme === 'dark' || theme === 'system' ? theme : 'system',
+          density: density === 'comfortable' ? density : 'compact',
+        },
+        savedSinceDefaultsLoad,
       );
+      // A mode saved during this load is already this browser's remembered mode
+      // for later tabs; applying the older daemon value here would re-resolve
+      // the open view, which saving promises to leave alone.
+      if (savedSinceDefaultsLoad.defaultSearchMode === undefined) {
+        searchModeDefault = parseSearchMode(
+          settingString(data?.settings.find(({ key }) => key === 'web.default_search_mode')),
+        );
+      }
     } catch {
       // Keep the safe fallback when settings authority is temporarily unavailable.
     }
+  }
+  function appearanceSaved(saved: SavedAppearance): void {
+    savedSinceDefaultsLoad = { ...savedSinceDefaultsLoad, ...saved };
+    appearanceDefaults = mergeSavedAppearance(appearanceDefaults, saved);
+    const mode = parseSearchMode(saved.defaultSearchMode);
+    // The open view keeps its mode and URL; tabs opened later without a mode
+    // in their link read this browser's remembered mode first.
+    if (mode) rememberSearchMode(mode, availableSearchModeStorage());
   }
   function settingString(
     setting:
@@ -85,7 +111,7 @@
 </svelte:head>
 
 {#if oauthCallback}
-  <main class="boot"><p>Return to CardDAV settings to finish connecting. You can close this window.</p></main>
+  <main class="boot-screen"><p class="boot-screen__brand">msgvault</p><p>Return to CardDAV settings to finish connecting. You can close this window.</p></main>
 {:else if session.authMode === 'required'}
   <Login {session} />
 {:else if shellMounted}
@@ -93,64 +119,30 @@
     <MessagePage client={session.client} {messageID} />
   {:else}
   <AppShell client={session.client} {appearanceDefaults} {searchModeDefault}>
-    {#snippet settings(cardDAVRequest, onCardDAVRequestConsumed, navigationTarget)}
+    {#snippet settings(cardDAVRequest, onCardDAVRequestConsumed, navigationTarget, category, onCategoryChange)}
       <SettingsWorkspace
         client={session.client}
         plainHTTPWarning={session.status?.plain_http_warning ?? false}
         {cardDAVRequest}
         {onCardDAVRequestConsumed}
         {navigationTarget}
+        {category}
+        {onCategoryChange}
+        onAppearanceSaved={appearanceSaved}
       />
     {/snippet}
   </AppShell>
   {/if}
 {:else if session.error !== undefined}
-  <main class="boot" aria-label="Connection error">
-    <p class="boot__brand">msgvault</p>
+  <main class="boot-screen" aria-label="Connection error">
+    <p class="boot-screen__brand">msgvault</p>
     <h1>Can't reach the msgvault daemon</h1>
     <p role="alert">{session.error}</p>
     <Button tone="info" surface="solid" label="Retry" onclick={() => void session.bootstrap()} />
   </main>
 {:else}
-  <main class="boot" aria-label="Connecting">
-    <p class="boot__brand">msgvault</p>
+  <main class="boot-screen" aria-label="Connecting">
+    <p class="boot-screen__brand">msgvault</p>
     <p>Connecting…</p>
   </main>
 {/if}
-
-<style>
-  .boot {
-    display: flex;
-    flex-direction: column;
-    align-items: flex-start;
-    gap: var(--space-5);
-    max-width: 28rem;
-    margin: 0 auto;
-    padding: var(--space-8) var(--space-6);
-    font-size: var(--font-size-md);
-  }
-
-  .boot p,
-  .boot h1 {
-    margin: 0;
-  }
-
-  .boot h1 {
-    font-size: var(--font-size-xl);
-    font-weight: 650;
-  }
-
-  .boot__brand {
-    color: var(--text-primary);
-    font-size: var(--font-size-md);
-    font-weight: 650;
-  }
-
-  .boot p:not(.boot__brand) {
-    color: var(--text-muted);
-  }
-
-  .boot p[role='alert'] {
-    color: var(--text-danger);
-  }
-</style>
