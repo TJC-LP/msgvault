@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"go.kenn.io/msgvault/internal/gmail"
+	"go.kenn.io/msgvault/internal/msgraph"
 	"go.kenn.io/msgvault/internal/store"
 )
 
@@ -34,6 +35,9 @@ func isNotFoundError(err error) bool {
 func isInsufficientScopeError(err error) bool {
 	if err == nil {
 		return false
+	}
+	if errors.Is(err, msgraph.ErrForbidden) { // Graph mail without Mail.ReadWrite
+		return true
 	}
 	msg := err.Error()
 	return strings.Contains(msg, "ACCESS_TOKEN_SCOPE_INSUFFICIENT") ||
@@ -59,7 +63,7 @@ func (NullProgress) OnComplete(succeeded, failed int)            {}
 type Executor struct {
 	manager  *Manager
 	store    *store.Store
-	client   gmail.API
+	client   gmail.MessageDeleter
 	logger   *slog.Logger
 	progress Progress
 	sourceID int64
@@ -73,7 +77,7 @@ func (e *Executor) WithSourceID(sourceID int64) *Executor {
 }
 
 // NewExecutor creates a deletion executor.
-func NewExecutor(manager *Manager, store *store.Store, client gmail.API) *Executor {
+func NewExecutor(manager *Manager, store *store.Store, client gmail.MessageDeleter) *Executor {
 	return &Executor{
 		manager:  manager,
 		store:    store,
@@ -652,7 +656,9 @@ func (e *Executor) ExecuteBatch(ctx context.Context, manifestID string) error {
 				e.saveCheckpoint(manifest, manifestID, i, succeeded, failed, failedIDs)
 				return fmt.Errorf("batch delete: %w", err)
 			}
-			e.logger.Warn("batch delete failed, falling back to individual deletes", "start_index", i, "error", err)
+			if !errors.Is(err, gmail.ErrBatchUnsupported) {
+				e.logger.Warn("batch delete failed, falling back to individual deletes", "start_index", i, "error", err)
+			}
 			// Fall back to individual deletes
 			for j, gmailID := range batch {
 				select {
