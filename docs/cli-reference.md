@@ -107,8 +107,9 @@ Commands that access archive state keep their usual stdout/stderr output while u
 2. Otherwise, archive-access commands discover or start the local background daemon and talk to it over HTTP. With `[server].daemon_auto_start = false`, they use a daemon that is already running or starting and never start one.
 3. `--local` selects the local daemon even when `[remote].url` is configured; it is not a request to open SQLite in the CLI process.
 4. With both `--agent-url` and `--agent-token-file`, the CLI connects to a
-   remote daemon as a restricted caller. `draft-reply`, `draft-compose`, and
-   `draft-recover` are available in this mode. The CLI rejects owner
+   remote daemon as a restricted caller. `draft-reply`, `draft-compose`,
+   `draft-get`, `draft-edit`, `draft-delete`, and `draft-recover` are
+   available in this mode. The CLI rejects owner
    configuration (`--config`, `--home`, `--local`) and never writes the token
    to logs or argv. It sends the token in the `X-Msgvault-Agent-Token` header;
    generated OpenAPI clients do not model this transport detail.
@@ -345,9 +346,29 @@ has a draft during an edit retry, the command returns `provider_absent` and
 keeps the candidate content. Use `draft-delete` to finish discarding it.
 
 Recovery applies to IMAP drafts only. `draft-recover` refuses a Gmail draft ID
-with `not_supported`; Gmail reconciliation uses edit and delete retries.
+with `not_supported` for the owner and `not_permitted` for delegated tokens.
+The delegated refusal does not reveal whether the draft exists. Gmail
+reconciliation uses edit and delete retries.
 Delegated tokens with `draft.create` can create Gmail reply drafts.
-`draft-get`, `draft-edit`, `draft-delete`, and `draft-send-as` remain owner-only.
+For a Gmail or IMAP draft, delegated `draft-get` accepts `draft.create`,
+`draft.edit`, or `draft.delete`. `draft-edit` requires `draft.edit`, and
+`draft-delete` requires `draft.delete`. Each command requires the source's exact
+type and identifier and the draft's archived From sender in the grant. The
+frozen sender selection applies to get, edit, and delete, including when the
+owner issued the token with `--sender`. If Gmail reports an external edit,
+the daemon checks the adopted draft's sender again before returning it.
+
+A grant with only `draft.delete` receives lifecycle metadata, including the
+revision, from get and delete responses. These responses omit `content`,
+`raw_mime`, and `candidate_content` in JSON and human-readable output, including
+pending and refused deletes. A matching `draft.create` or `draft.edit` grant
+allows content reads. Delegated recovery continues to return metadata only.
+
+A missing command permission returns
+HTTP 400 `command_not_allowed`. A permitted command targeting another source or
+an unknown draft ID streams `not_permitted` before revision checks, draft
+policy, source locking, or any provider request. `draft-send-as` remains
+owner-only.
 For IMAP drafts, recovery resumes a pending operation from recorded receipts. It can publish a known replacement or finish
 confirmed removal without APPEND. Delegated recovery requires
 `draft.edit` for an edit or active repeat and `draft.delete` for a delete or
@@ -3731,7 +3752,7 @@ msgvault agent-token issue --label <name> \
 | Flag | Description |
 |---|---|
 | `--label <name>` | (required) Human-readable name for the grant |
-| `--permissions <perms>` | Comma-separated permissions: `draft.create` for `draft-reply` and `draft-compose`; `draft.edit` and `draft.delete` for `draft-recover` only (see [draft recovery](#draft-get-draft-edit-draft-delete-and-draft-recover)) |
+| `--permissions <perms>` | Comma-separated permissions: `draft.create` for `draft-reply`, `draft-compose`, and `draft-get`; `draft.edit` for `draft-get`, `draft-edit`, and `draft-recover`; `draft.delete` for `draft-get`, `draft-delete`, and `draft-recover` (see [managed drafts](#draft-get-draft-edit-draft-delete-and-draft-recover)) |
 | `--source-ids <ids>` | Comma-separated source IDs that the permissions apply to |
 | `--sender <source-id>=<address>` | Restrict a source to one confirmed sender identity; repeat for multiple choices |
 
