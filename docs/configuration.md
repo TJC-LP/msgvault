@@ -1362,6 +1362,19 @@ deterministic source of "when did we last talk" for every person and runs
 hourly by default inside `msgvault serve`. `msgvault activity build` runs it
 by hand; `--backstop` rescans the whole archive.
 
+Scheduled projection commits at most ten batches per pass. When other
+scheduled work has waited for a minute, it stops after its current batch. A
+pass always stops at two minutes. A pass with committed progress releases the
+operation gate and resumes behind queued work without waiting for the next
+cron tick. Reaching the two-minute limit before any batch commits records an
+error and waits for the next scheduled or manual trigger, avoiding repeated
+retries of the same batch.
+
+Identity reconciliation and timezone or `max_direct_counterparts` changes save
+their progress in the archive. A new identity revision restarts identity
+reconciliation; completed batches remain committed. Manual builds are not
+limited to ten batches or two minutes.
+
 | Key | Default | Description |
 |---|---|---|
 | `schedule` | `17 * * * *` | 5-field cron used by `msgvault serve`. Empty disables the scheduled job. |
