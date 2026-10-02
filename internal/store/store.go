@@ -73,6 +73,10 @@ type Store struct {
 	cardDAVPersonOperationsMu sync.Mutex
 	cardDAVPersonOperations   map[int64]*cardDAVPersonOperation
 
+	// The daemon owns one Store. Consent changes wait for in-flight provider
+	// requests, without holding an archive transaction during network I/O.
+	personMatchConsentMu sync.RWMutex
+
 	sqliteOptimizeMu sync.Mutex
 	// syncOptimizeMu guards lastSyncOptimize, which throttles the planner
 	// maintenance a successful sync triggers (see optimizeAfterSync).
@@ -108,9 +112,11 @@ type Store struct {
 	cardDAVCollisionIdentityLockHook      func()
 	cardDAVPublicationStateReadHook       func()
 	identityMatchAcceptBeforeDecisionHook func()
+	identityMatchReviewAfterDecisionHook  func()
 	senderRepairMessageLockHook           func()
 	personOperationBeforeIdentityLockHook func()
 	personMergeAfterSnapshotHook          func()
+	personMatchBlockingBeforeLockHook     func()
 	personEnrichmentClock                 func() time.Time
 	personEnrichmentBudgetBarrier         func()
 	personEnrichmentRunBarrier            func(phase string)
@@ -1060,6 +1066,7 @@ func (s *Store) buildLargeIndexesConcurrently(ctx context.Context) {
 		{rfc822CanonicalIndexName, s.dialect.RFC822CanonicalIDIndexDefinition()},
 		{"idx_participants_email_lower", "ON participants(LOWER(email_address))"},
 		{"idx_participant_identifiers_value_lower", "ON participant_identifiers(LOWER(identifier_value))"},
+		{"idx_person_match_scoring_contact_lookup", "ON participant_contact_observations(address_kind, normalized_value, participant_id) WHERE active_until IS NULL AND superseded_at IS NULL"},
 	}
 	for _, index := range concurrentIndexes {
 		if dropErr := dropInvalidIndexConcurrently(ctx, conn, index.name); dropErr != nil {
