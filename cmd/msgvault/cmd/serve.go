@@ -177,6 +177,7 @@ type serveRuntimeOperationGate interface {
 }
 
 func init() {
+	addServeConfigFlags(serveCmd)
 	rootCmd.AddCommand(serveCmd)
 	rootCmd.AddCommand(daemonCmd)
 	addServeLifecycleCommands(serveCmd)
@@ -189,12 +190,10 @@ func runServe(cmd *cobra.Command, args []string) error {
 	}
 	cfg := state.cfg
 	logger := state.logger
-	// Validate security posture before doing any work
-	if err := cfg.Server.ValidateSecure(); err != nil {
+	// Resolve the interface before reserving a listener. Credential creation
+	// waits until this process owns the daemon lock.
+	if _, err := cfg.ResolveServerBindAddress(); err != nil {
 		return err
-	}
-	if cfg.Server.APIKey != "" && len(cfg.Server.APIKey) < 16 {
-		logger.Warn("api_key is very short — use a randomly generated key of at least 32 characters")
 	}
 
 	// Missing provider credentials should not prevent the daemon from serving
@@ -218,6 +217,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	logger.Info("Server listener bound", "address", apiListener.Addr().String(), "bind_source", cfg.BindAddressSource())
 	listenerReserved := true
 	defer func() {
 		if listenerReserved {
@@ -236,6 +236,12 @@ func runServe(cmd *cobra.Command, args []string) error {
 	ownership, err := claimServeOwnership(cmd.Context(), cfg, bindAddr, boundPort, Version)
 	if err != nil {
 		return fmt.Errorf("claim daemon ownership: %w", err)
+	}
+	if !cfg.Server.HasCredentialSource() && !cfg.Server.AllowInsecure && cfg.Server.AuthenticationKey() != "" {
+		logger.Info("Server API credential is persisted", "path", cfg.ServerKeyFilePath())
+	}
+	if cfg.Server.AuthenticationKey() != "" && len(cfg.Server.AuthenticationKey()) < 16 {
+		logger.Warn("api_key is very short — use a randomly generated key of at least 32 characters")
 	}
 	heartbeatCtx, stopHeartbeat := context.WithCancel(cmd.Context())
 	heartbeatDone := make(chan struct{})
@@ -1062,6 +1068,11 @@ func applyServerRuntimeConfig(options *api.ServerOptions, cfg *config.Config) {
 }
 
 func listenServeAPI(bindAddr string, port int) (net.Listener, error) {
+	resolved, err := resolveServeBind(bindAddr)
+	if err != nil {
+		return nil, err
+	}
+	bindAddr = resolved
 	if bindAddr == "" {
 		bindAddr = defaultDaemonBindAddr
 	}
