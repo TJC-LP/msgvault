@@ -67,6 +67,15 @@ func (s *Store) CreatePersonFromParticipant(participantID int64) (*Person, bool,
 func (s *Store) CreatePersonFromParticipantContext(
 	ctx context.Context, participantID int64,
 ) (*Person, bool, error) {
+	return s.CreatePersonFromParticipantWithDisplayNameContext(ctx, participantID, nil)
+}
+
+// CreatePersonFromParticipantWithDisplayNameContext promotes a cluster with
+// an optional initial name. A nil name seeds the first observed cluster name;
+// an explicit blank stores no name. Existing profiles retain their saved name.
+func (s *Store) CreatePersonFromParticipantWithDisplayNameContext(
+	ctx context.Context, participantID int64, displayName *string,
+) (*Person, bool, error) {
 	if participantID <= 0 {
 		return nil, false, fmt.Errorf("promote participant %d: %w", participantID, ErrInvalidParticipantID)
 	}
@@ -102,12 +111,19 @@ func (s *Store) CreatePersonFromParticipantContext(
 		}
 		created = len(personIDs) == 0
 		if created {
+			if displayName == nil {
+				displayName, err = observedPersonDisplayNameTx(ctx, tx, members)
+				if err != nil {
+					return err
+				}
+			}
+			displayName = normalizePersonDisplayName(displayName)
 			uid, err := newVCardUID()
 			if err != nil {
 				return err
 			}
 			if err := tx.QueryRowContext(ctx,
-				`INSERT INTO persons (vcard_uid) VALUES (?) RETURNING id`, uid,
+				`INSERT INTO persons (vcard_uid, display_name) VALUES (?, ?) RETURNING id`, uid, displayName,
 			).Scan(&personID); err != nil {
 				return fmt.Errorf("create person: %w", err)
 			}
@@ -144,6 +160,35 @@ func (s *Store) CreatePersonFromParticipantContext(
 		return nil, false, err
 	}
 	return person, created, nil
+}
+
+// observedPersonDisplayNameTx follows the observed cluster label's name tier:
+// the first named participant by ID wins. Normalize before selection so a
+// whitespace-only member cannot hide a named alias.
+func observedPersonDisplayNameTx(ctx context.Context, tx *loggedTx, members []int64) (*string, error) {
+	placeholders, args := sortedIDPlaceholders(members)
+	rows, err := tx.QueryContext(ctx, fmt.Sprintf(`
+		SELECT display_name FROM participants WHERE id IN (%s) ORDER BY id
+	`, placeholders), args...)
+	if err != nil {
+		return nil, fmt.Errorf("look up observed person display name: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var name sql.NullString
+		if err := rows.Scan(&name); err != nil {
+			return nil, fmt.Errorf("scan observed person display name: %w", err)
+		}
+		if name.Valid {
+			if normalized := normalizePersonDisplayName(&name.String); normalized != nil {
+				return normalized, nil
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate observed person display names: %w", err)
+	}
+	return nil, nil //nolint:nilnil // A cluster without an observed name has no default.
 }
 
 // bindPersonParticipantsTx binds every member to the person, ignoring
@@ -457,6 +502,43 @@ func (s *Store) GetPersonContext(ctx context.Context, id int64) (*Person, error)
 		return nil, err
 	}
 	return person, nil
+}
+
+// ListPersonUIDsContext returns the person's canonical vCard UID followed by
+// every retired UID that currently resolves to that person. Cross-system
+// links can keep using an old UID across a merge and split reversal.
+func (s *Store) ListPersonUIDsContext(ctx context.Context, id int64) ([]string, error) {
+	var result []string
+	err := s.withTxContext(ctx, func(tx *loggedTx) error {
+		person, err := s.getPersonTx(ctx, tx, id)
+		if err != nil {
+			return err
+		}
+		result = append(result, person.VCardUID)
+		rows, err := tx.QueryContext(ctx, `SELECT retired_uid
+			FROM person_uid_aliases
+			WHERE surviving_person_id = ?
+			ORDER BY retired_uid`, id)
+		if err != nil {
+			return fmt.Errorf("list retired UIDs for person %d: %w", id, err)
+		}
+		defer func() { _ = rows.Close() }()
+		for rows.Next() {
+			var uid string
+			if err := rows.Scan(&uid); err != nil {
+				return fmt.Errorf("scan retired UID for person %d: %w", id, err)
+			}
+			result = append(result, uid)
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("iterate retired UIDs for person %d: %w", id, err)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 func (s *Store) ListPersons() ([]Person, error) {

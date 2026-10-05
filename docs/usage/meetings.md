@@ -1,7 +1,7 @@
 ---
-last_edited: "2026-09-08"
+last_edited: "2026-10-02"
 title: Meeting Transcripts
-description: Archive AI meeting notes and transcripts from Granola, Circleback, and Notion into your searchable local archive.
+description: Archive AI meeting notes and transcripts from Granola, Plaud, Circleback, Notion, and Muesli into your searchable local archive.
 ---
 
 Find meeting decisions and transcripts in the same archive as your email and
@@ -15,11 +15,13 @@ emails connect meetings to the people you already know in msgvault.
 |---|---|---|
 | [Granola](#granola) | API key | Requires access to Granola's public API |
 | [Notion AI Meeting Notes](#notion-ai-meeting-notes) | Notion integration token | At most 50 attendee-visible meetings per discovery query |
+| [Plaud](#plaud) | Browser authorization to its hosted MCP server | Requires Cloud Sync and existing Plaud transcription |
 | [Circleback](#circleback) | Browser authorization to its MCP server | Older note edits require a full refresh |
+| [Muesli](#muesli) | Local database on the same Mac | msgvault must run on the Mac where Muesli records |
 | [Another meeting source](#import-from-any-meeting-source) | Authenticated JSON import | Your integration supplies each meeting and its updates |
 
 Provider sync reads meeting data without changing the source service. Recording
-media is not downloaded by the Notion or Circleback integrations.
+media is not downloaded by the Notion, Plaud, Circleback, or Muesli integrations.
 
 ## Browse and search
 
@@ -39,22 +41,101 @@ matches. Meetings mode does not offer selection or deletion.
 Unscoped search includes meetings and chats. Email-specific CLI and TUI
 aggregates remain email-only unless you choose another message type.
 
+## Export context and read follow-ups
+
+In Everything, select meeting rows and choose **Export meeting context**. You
+can select explicit rows or **Select all matching items** for the current
+search and filters. The export includes exactly that selection. Mixed selections
+fail with **Select meetings only**; narrow selections larger than 100 meetings.
+Choose JSON or Markdown. **Include transcript** is off by default.
+
+The downloaded file contains the server's context packet, including meeting
+references, participants, summary, notes, recorded actions, and coverage states.
+The default content budget is 131072 UTF-8 bytes. CLI and API clients can set
+4096 through 1048576 bytes. Packets report truncation and omitted meeting IDs;
+check those fields before treating an export as complete. A missing summary
+stays missing. msgvault does not generate a replacement from the transcript.
+
+**Meeting activity and follow-ups** appears in a meeting-filtered Everything
+view, participant and domain reading panes, Directory profiles, and
+Relationships. It follows the current scope. Filter action items by source
+status or exact assignee email, then use **Open archived meeting** to read the
+source evidence. Back returns to the same workspace and scope.
+
+Action status is the last archived source status, not a local task list.
+msgvault does not infer assignees, create follow-ups, or mark source tasks done.
+Supported empty action lists, unsupported sources, unavailable evidence, and
+partial evidence remain distinct. Granola has no structured action support;
+Circleback and generic imports preserve explicit actions; Notion exposes
+checkboxes from archived summary and notes blocks. A Notion checkbox does not
+supply an assignee merely because a name appears in its text.
+
+Use the daemon-backed CLI for the same evidence:
+
+```bash
+msgvault meetings context --id 42 --id 43 --format json --output meeting-context.json
+msgvault meetings actions --domain example.com --status pending --assignee alex@example.com
+msgvault meetings metrics --person-id 7 --after 2026-01-01 --before 2026-03-01 --json
+```
+
+The three MCP read tools are `get_meeting_context`, `list_meeting_action_items`,
+and `get_meeting_metrics`. They require no AI provider call or profile-write
+permission. CLI dates use `YYYY-MM-DD`; HTTP and MCP scope dates use full
+RFC3339 timestamps. See the [CLI flags](../cli-reference.md#meetings),
+[HTTP contract](../api-server.md#meeting-intelligence), and
+[MCP examples](chat.md#meeting-evidence).
+
+## Understand meeting time and coverage
+
+Meeting metrics show the number of meetings, known and unknown durations,
+total known time, average known duration, and monthly activity. Unknown
+durations are excluded from averages. When no duration is known, the average
+is unavailable (`null` in JSON), not zero.
+
+| Duration basis | Evidence |
+|---|---|
+| Provider | Explicit provider duration, Notion recording start/end, or generic meeting start/end |
+| Scheduled | Calendar start and end |
+| Transcript span | Earliest through latest usable transcript timing |
+| Unknown duration | No usable duration evidence; no duration basis is assigned |
+
+JSON names these bases `provider`, `scheduled`, and `transcript_span`.
+Scheduled time and transcript span are estimates of different things. The
+basis breakdown keeps those differences visible. Months without meetings are
+omitted; undated meetings appear in a separate count.
+
+Meeting reads include source-deleted records by default while their archive
+content remains present. Use `--deletion active` or `--deletion deleted` to
+narrow actions and metrics. Locally deleted records are excluded. This does not
+change the [garbage collection workflow](../cli-reference.md#gc).
+
+Explore scopes preserve the full search predicate and its cache/search
+identity. Their transfer ceiling is 10000 matching message IDs; narrow a scope
+that exceeds it. A changed or expired result requires a reload. Errors remain
+visible instead of silently dropping filters or sampling visible rows.
+
+Existing archives gain meeting projections from their stored raw evidence on
+upgrade, without a provider resync. Evidence absent from an older raw snapshot
+still appears as unavailable or partial. Upgrade the daemon as well as clients;
+meeting operations need daemon API schema 2.27.0 or newer.
+
 ## Source labels and account identity
 
 Each meeting source has two distinct values:
 
 - `identifier` is a stable label used in commands, source metadata, schedules,
-  and (for Circleback) the token filename. It can be an arbitrary name such as
+  and (for Circleback and Plaud) the token filename. It can be an arbitrary name such as
   `work`.
 - `account_email` is the normalized primary email used to determine whether
   the meeting organizer is you (`is_from_me`).
 
 `account_email` is required independently of `identifier`. Config loading
 rejects a missing or invalid value with guidance to preserve the source label
-and add the account email separately.
+and add the account email separately. Plaud validates this against the live
+account; it does not assume the account owner organized every recording.
 
-`add-granola`, `add-circleback`, and `add-notion-meetings` always confirm the primary email for their
-source. Add other confirmed aliases with the identity command:
+`add-granola`, `add-plaud`, `add-circleback`, `add-notion-meetings`, and
+`add-muesli` always confirm the primary email for their source. Add other confirmed aliases with the identity command:
 
 ```bash
 msgvault identity add work you+meetings@example.com
@@ -63,11 +144,49 @@ msgvault identity add work you+meetings@example.com
 Adding a new confirmed identity immediately repairs `is_from_me` on matching
 messages already stored for that source. No provider resync is required.
 
+## How meetings connect to people
+
+A meeting shows up on a person when one of its attendees is an email or phone
+number that already belongs to that person, for example from mail, chat, or a
+promoted profile. The attendee becomes a participant, and the next activity
+update (hourly, or `msgvault activity build`) adds the meeting to the person's
+timeline, relationships, and last-contact information.
+
+Some sources also know that several emails and phone numbers are the same
+human. msgvault links those identities through the source's stable identifier,
+so a meeting reaches the person even when it only names an address the person
+has never used with you:
+
+| Source | Identities per attendee | Linked through |
+|---|---|---|
+| Granola, Circleback | One email | Not needed |
+| Plaud | Speaker display labels only | Names do not create identities |
+| Notion AI Meeting Notes | The user's verified email | The Notion user ID, so a user whose email changes keeps one person |
+| Muesli | Email, or the emails and phones on the attendee's Apple Contacts card | The Contacts card, excluding addresses shared by unlinked cards |
+| Import API | `email` and `phone` | The person's `id` within the import source |
+
+These links follow the same rules as other automatic identity links:
+
+- Only a shared stable identifier links identities. Matching names never do.
+- Muesli excludes addresses shared by unlinked Contacts cards from automatic
+  linking, even when only one card appears in a meeting. The addresses remain
+  in the meeting evidence.
+- If the identities already belong to two different people, msgvault leaves
+  them apart and records a conflict. So does an address that another card or
+  `id` from the same source already claims in archived observations.
+  Review conflicts in the Web [Directory review queues](/docs/web-ui/#directory-and-reviews).
+- Rejecting a proposed link keeps that pair apart. The same identities can
+  still connect through another identity of the same person.
+
+Attendees known only by name appear in the meeting body but do not link to a
+person. A profile imported from CardDAV links meetings once its email or phone
+participant is promoted or linked to it; see [people](/docs/usage/people/).
+
 ## Import from any meeting source
 
 The provider-neutral import API archives one meeting at a time and requires no
-`[[granola]]`, `[[circleback]]`, or other provider configuration. Configure an
-API key, start `msgvault serve`, then send authenticated JSON to
+`[[granola]]`, `[[plaud]]`, `[[circleback]]`, or other provider configuration.
+Configure an API key, start `msgvault serve`, then send authenticated JSON to
 `POST /api/v1/import/meeting`:
 
 ```bash
@@ -85,11 +204,23 @@ curl http://localhost:8080/api/v1/import/meeting \
       "title": "Weekly planning",
       "started_at": "2026-07-29T09:00:00-04:00",
       "summary_markdown": "## Decisions\n\nShip the new importer.",
+      "action_items": [
+        {"title": "Send the recap", "assignee_email": "alex@example.com", "status": "pending"}
+      ],
       "transcript_segments": [
         {"speaker": "Alex", "text": "Let's ship it.", "offset_seconds": 4}
       ]
     }
   }'
+```
+
+Each organizer or attendee needs an `email`, a `phone`, or both. A phone must be
+international (a leading `+` or `00`) and is stored in E.164 form; national
+numbers are rejected rather than guessed. Add a stable `id` for the person in
+your source to link their email and phone, including across meetings:
+
+```json
+{"name": "Alex Example", "email": "alex@example.com", "phone": "+1 604 555 0100", "id": "crm-42"}
 ```
 
 Choose a stable `source.identifier` for the upstream dataset and preserve the
@@ -98,6 +229,13 @@ the first import returns `201` with status `created`; unchanged retries and
 replacements return `200` with status `updated` without creating duplicates.
 `source.account_email` identifies you for sender attribution and becomes a
 confirmed identity for the whole source.
+
+Use `"action_items": []` when the source supports actions and recorded none.
+Omit `action_items` when it does not provide structured actions. These states
+are different: omission is unsupported, while an explicit empty list is
+available evidence with zero actions. `null` is invalid. Each action needs a
+nonblank `title`; optional fields are `source_id`, `description`,
+`assignee_name`, `assignee_email`, `status`, and `due_date`.
 
 Each meeting needs at least one summary, a plain transcript, or segmented
 transcript. Plain and segmented transcripts are mutually exclusive. Timestamps
@@ -284,6 +422,77 @@ msgvault remove-account notion-personal --type notion_meetings --yes
 A configured schedule will then refuse to recreate it until
 `add-notion-meetings` is run again.
 
+## Plaud
+
+Archive cloud recordings from an ordinary active Plaud account as searchable
+meetings. Enable Cloud Sync and transcribe recordings in Plaud first. msgvault
+reads the full transcripts, speaker labels, recording dates, duration, and every
+note tab through Plaud's hosted MCP service. It does not download audio or
+change recordings in Plaud.
+
+### Authorize your account
+
+Add an entry to `config.toml` on the daemon host:
+
+```toml
+[[plaud]]
+identifier = "work"
+account_email = "you@example.com"
+enabled = true
+schedule = "30 */6 * * *"
+```
+
+Run `msgvault add-plaud work` on that host and approve the browser request.
+Plaud redirects to `localhost:8091/callback/plaud`. For a headless host,
+forward that port with SSH and open the authorization URL in your local
+browser. A configured remote refuses `add-plaud` before proxying; run
+`msgvault --local add-plaud work` in the remote shell instead.
+
+msgvault checks the live account email before registration and on every sync.
+It must match `account_email`. The identifier is a stable label, not an email
+or organizer identity. A registered source retains its confirmed owner. Use a
+new identifier for another account. Credentials are stored in
+`tokens/plaud_<identifier>.json`; changing the MCP endpoint requires fresh
+authorization before those credentials can be used there.
+
+### Sync recordings
+
+```bash
+msgvault sync-plaud work
+msgvault sync-plaud work --limit 20
+msgvault sync-plaud work --full --after 2025-01-01
+msgvault sync-plaud work --probe
+```
+
+Every normal run enumerates the recording inventory and checks complete
+transcripts and notes for edits, including speaker corrections and later
+transcript pages. Unchanged content skips archive writes. `--full` repairs
+existing records while preserving stable file IDs. `--after` filters by
+recording date locally and implies `--full`.
+
+`--limit` bounds the recordings hydrated per run. New recordings come first;
+then runs rotate through the least recently attempted recordings. Failed and
+date-scoped runs save this rotation state too. A failed recording remains
+eligible on its next turn, so it cannot block later recordings in limited runs.
+Rotation state is stored once per source; run history retains outcomes and counts.
+Plaud pagination is eventually consistent, so changes during a run may be
+reconciled on a later run.
+
+A recording awaiting transcription can still archive its metadata and notes.
+Later runs retry pending content. Temporarily missing transcripts or note tabs
+preserve the previously archived content. Recordings deleted from Plaud remain
+in the archive. A failed or canceled run remains marked failed and refreshes
+search and cache for additions or updates already committed.
+
+`--probe` prints tool names, input schemas, and a first-page recording count.
+It prints no meeting titles, file IDs, transcripts, or note bodies. It helps
+diagnose provider contract changes without modifying the archive.
+
+`msgvault serve` runs enabled entries with a schedule. Removing the registered
+source stops sync from recreating it; run `add-plaud` to register it again.
+See the [configuration reference](../configuration.md#plaud-sources) and
+[CLI reference](../cli-reference.md#sync-plaud) for exact fields and flags.
+
 ## Circleback
 
 Circleback exposes no REST API — msgvault pulls data through its MCP server
@@ -367,3 +576,110 @@ status), insights, and tags land in the message metadata and body; the
 meeting recording URL and `recording_url_fetched_at` remain in the archived
 provider metadata. msgvault does not expose recording URLs as durable
 attachments, and downloading or archiving recording media is not supported.
+
+## Muesli
+
+[Muesli](https://github.com/Muesli-HQ/muesli) records and transcribes meetings
+on a Mac and keeps them in a local SQLite database. msgvault reads that
+database directly and read-only. It never changes Muesli's meetings or schema,
+and it does not call `muesli-cli`, which updates the database whenever it runs.
+
+### Prerequisites
+
+The msgvault daemon reads the database on its own host, so run msgvault on the
+Mac where Muesli records. If your archive lives on another machine, send each
+meeting to that daemon with the [import API](#import-from-any-meeting-source)
+from a Muesli post-meeting hook instead.
+
+If macOS blocks the read, grant the process that runs `msgvault serve` Full
+Disk Access in System Settings.
+
+### Configure and register
+
+```toml
+[[muesli]]
+identifier = "mac"
+account_email = "you@example.com"   # you, the person who records
+# db_path = "~/Library/Application Support/Muesli/muesli.db"  # default
+schedule = "*/30 * * * *"           # optional daemon schedule
+enabled = true
+```
+
+`db_path` defaults to the stable app's database. Development builds of Muesli
+use a different support folder, such as `MuesliDev`; set `db_path` for those.
+
+### Attendees from Apple Contacts
+
+People you tag in Muesli usually come from Apple Contacts. msgvault reads the
+Mac's Contacts stores read-only, finds each attendee's card by its Contacts ID
+or exact email, and links its unshared emails and phones. An address on multiple
+unlinked Contacts cards stays in the meeting evidence but does not create an
+identity link. A contact tagged
+with only a phone number therefore reaches the person you already chat with at
+that number.
+
+- Reading Contacts needs Full Disk Access for the process that runs
+  `msgvault serve`. Without it, meetings still sync, and `sync-muesli` reports
+  `Contacts: unavailable`.
+- Phone numbers typed with `+` or `00` always work. Set `phone_country_code`
+  (for example `"1"` or `"44"`) to also use numbers typed without a country
+  code.
+- When only some Contacts accounts can be read, msgvault still uses Contacts
+  IDs to retain meeting evidence, but stops matching by email and creating
+  automatic identity links. An unreadable account could hold another card
+  with the same address. Linking resumes when every account is readable.
+- When Contacts is unreadable or a card disappears, an attendee still present
+  in Muesli keeps the identities archived for that meeting. Those retained
+  addresses do not assert current Contacts ownership. Removing the attendee
+  in Muesli removes its meeting association.
+- Set `contacts = false` to turn the lookup off.
+
+```bash
+msgvault add-muesli mac
+```
+
+`add-muesli` checks that the file opens read-only as a Muesli database, then
+registers the source.
+
+### Sync
+
+```bash
+msgvault sync-muesli                     # all configured databases
+msgvault sync-muesli mac --limit 5
+msgvault sync-muesli --after 2026-01-01
+msgvault sync-muesli --full
+```
+
+Every run reads the whole database and updates meetings that changed in place,
+including title, notes, transcript, participant, and folder edits. Unchanged
+meetings are skipped.
+
+- Meetings still recording or processing wait for a later run.
+- Meetings deleted in Muesli stay in the archive unchanged.
+- `--after` keeps meetings that start on or after the date, read as UTC.
+- `--limit` caps the meetings processed in one run.
+- `--full` rewrites every archived meeting, which refreshes attribution after
+  you add an identity.
+
+### What gets stored (Muesli)
+
+Each meeting becomes one `meeting_transcript` message in a `meeting`
+conversation. The body holds the title, time, participant names, Muesli's AI
+notes, the notes you typed, and the transcript. When Muesli skipped or failed
+the summary, the body omits that notice instead of showing it as a summary.
+
+Muesli does not record an organizer. msgvault attributes each meeting to
+`account_email` as its organizer. Participants with an email address become
+recipients and connect to your existing people. Participants without one,
+such as a contact picked by name, appear only by name.
+
+The raw archive (`muesli_json`) keeps the meeting's text, times, status,
+template name, calendar event ID, folder path, and participant names, emails,
+phones, and sources. It never stores audio or audio file paths, screen text,
+template prompts, or Apple Contacts identifiers.
+
+Remove the archive source with:
+
+```bash
+msgvault remove-account mac --type muesli --yes
+```

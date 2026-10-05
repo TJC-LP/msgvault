@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"go.kenn.io/msgvault/internal/search"
+	"go.kenn.io/msgvault/internal/sqliteutil"
 )
 
 // participantDisplaySQL formats a participant joined as `p` (with the
@@ -174,6 +175,22 @@ func (s *Store) ListMessagesContext(ctx context.Context, offset, limit int) ([]A
 // matches the given ID. Wrapped via fmt.Errorf("...: %w", ...) so
 // callers can use errors.Is to distinguish absence from real DB errors.
 var ErrMessageNotFound = errors.New("message not found")
+
+// GetMessageSourceContext resolves only the source attached to one message.
+// Callers use it to authorize access before reading message content.
+func (s *Store) GetMessageSourceContext(ctx context.Context, messageID int64) (*Source, error) {
+	var sourceID int64
+	err := s.db.QueryRowContext(ctx,
+		s.Rebind(`SELECT source_id FROM messages WHERE id = ?`), messageID,
+	).Scan(&sourceID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("message %d: %w", messageID, ErrMessageNotFound)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get message %d source: %w", messageID, err)
+	}
+	return s.GetSourceByIDContext(ctx, sourceID)
+}
 
 // GetMessage returns a single message with full details.
 // Only this method accesses message_bodies (single PK lookup).
@@ -463,13 +480,18 @@ func (s *Store) SearchMessagesQueryContext(
 	return s.searchMessagesQueryImpl(ctx, q, offset, limit, s.fts5Available)
 }
 
-// searchMessagesQueryImpl runs the actual query. The ftsAvailable flag is
-// taken as an explicit parameter so the runtime FTS-error fallback
-// (searchMessagesQueryNoFTS) can force the LIKE path even when
-// s.fts5Available was true at startup.
-func (s *Store) searchMessagesQueryImpl(
-	ctx context.Context, q *search.Query, offset, limit int, ftsAvailable bool,
-) ([]APIMessage, int64, error) {
+type messageSearchSQL struct {
+	join      string
+	where     string
+	orderBy   string
+	args      []any
+	orderArgs []any
+	fts       bool
+}
+
+// buildMessageSearchSQL keeps candidate-only and full-message searches on the
+// same filters and ranking, including the subject/snippet fallback without FTS.
+func (s *Store) buildMessageSearchSQL(q *search.Query, ftsAvailable bool) messageSearchSQL {
 	var conditions []string
 	var args []any
 
@@ -755,7 +777,26 @@ func (s *Store) searchMessagesQueryImpl(
 		args = append(args, q.BeforeDate.UTC())
 	}
 
-	whereClause := strings.Join(conditions, " AND ")
+	orderBy := "COALESCE(m.sent_at, m.received_at, m.internal_date) DESC, m.id DESC"
+	var orderArgs []any
+	if ftsEnabled {
+		orderBy = ftsOrder + ", " + orderBy
+		for range ftsOrderArgCount {
+			orderArgs = append(orderArgs, ftsExpr)
+		}
+	}
+	return messageSearchSQL{
+		join: ftsJoin, where: strings.Join(conditions, " AND "), orderBy: orderBy,
+		args: args, orderArgs: orderArgs, fts: ftsEnabled,
+	}
+}
+
+// searchMessagesQueryImpl runs the actual query. The ftsAvailable flag lets
+// the existing runtime FTS-error fallback retry through subject and snippet.
+func (s *Store) searchMessagesQueryImpl(
+	ctx context.Context, q *search.Query, offset, limit int, ftsAvailable bool,
+) ([]APIMessage, int64, error) {
+	plan := s.buildMessageSearchSQL(q, ftsAvailable)
 
 	// Count query.
 	countSQL := fmt.Sprintf(`
@@ -763,21 +804,17 @@ func (s *Store) searchMessagesQueryImpl(
 		FROM messages m
 		%s
 		WHERE %s
-	`, ftsJoin, whereClause)
+	`, plan.join, plan.where)
 
 	var total int64
-	if err := s.db.QueryRowContext(ctx, countSQL, args...).Scan(&total); err != nil {
-		if ftsEnabled && ctx.Err() == nil {
+	if err := s.db.QueryRowContext(ctx, countSQL, plan.args...).Scan(&total); err != nil {
+		if plan.fts && ctx.Err() == nil {
 			return s.searchMessagesQueryNoFTS(ctx, q, offset, limit)
 		}
 		return nil, 0, fmt.Errorf("count search results: %w", err)
 	}
 
 	// Results query.
-	orderBy := "COALESCE(m.sent_at, m.received_at, m.internal_date) DESC, m.id DESC"
-	if ftsEnabled {
-		orderBy = ftsOrder + ", " + orderBy
-	}
 	searchSQL := fmt.Sprintf(`
 		SELECT
 			m.id,
@@ -804,23 +841,21 @@ func (s *Store) searchMessagesQueryImpl(
 		WHERE %s
 		ORDER BY %s
 		LIMIT ? OFFSET ?
-	`, participantSummarySenderSQL, ftsJoin, whereClause, orderBy)
+	`, participantSummarySenderSQL, plan.join, plan.where, plan.orderBy)
 
 	// If the dialect's order-by fragment has ? placeholders, bind the FTS
 	// expression that many extra times — right after the WHERE args and
 	// before LIMIT/OFFSET so Rebind assigns them the correct positions.
-	resultArgs := make([]any, 0, len(args)+ftsOrderArgCount+2)
-	resultArgs = append(resultArgs, args...)
-	for range ftsOrderArgCount {
-		resultArgs = append(resultArgs, ftsExpr)
-	}
+	resultArgs := make([]any, 0, len(plan.args)+len(plan.orderArgs)+2)
+	resultArgs = append(resultArgs, plan.args...)
+	resultArgs = append(resultArgs, plan.orderArgs...)
 	resultArgs = append(resultArgs, limit, offset)
 	rows, err := s.db.QueryContext(ctx, searchSQL, resultArgs...)
 	if err != nil {
 		// FTS5 not available -- fall back if we used it. Skip the fallback
 		// when the context was cancelled: the error is the abort we asked
 		// for, not an FTS capability problem, and re-running would ignore it.
-		if ftsEnabled && ctx.Err() == nil {
+		if plan.fts && ctx.Err() == nil {
 			return s.searchMessagesQueryNoFTS(ctx, q, offset, limit)
 		}
 		return nil, 0, err
@@ -1033,30 +1068,8 @@ func scanMessageRows(rows *loggedRows) ([]APIMessage, []int64, error) {
 	return messages, ids, nil
 }
 
-// parseSQLiteTime parses a datetime string from SQLite into time.Time.
-// Uses the same comprehensive format list as dbTimeLayouts in sync.go.
-func parseSQLiteTime(s string) time.Time {
-	// Same formats as dbTimeLayouts - order matters: more specific first
-	layouts := []string{
-		"2006-01-02 15:04:05.999999999-07:00", // space-separated with fractional seconds and TZ
-		"2006-01-02T15:04:05.999999999-07:00", // T-separated with fractional seconds and TZ
-		"2006-01-02 15:04:05.999999999",       // space-separated with fractional seconds
-		"2006-01-02T15:04:05.999999999",       // T-separated with fractional seconds
-		"2006-01-02 15:04:05",                 // SQLite datetime('now') format
-		"2006-01-02T15:04:05",                 // T-separated basic
-		"2006-01-02 15:04",                    // space-separated without seconds
-		"2006-01-02T15:04",                    // T-separated without seconds
-		"2006-01-02",                          // date only
-		time.RFC3339,                          // e.g., "2006-01-02T15:04:05Z"
-		time.RFC3339Nano,                      // e.g., "2006-01-02T15:04:05.999999999Z07:00"
-	}
-	for _, layout := range layouts {
-		if t, err := time.Parse(layout, s); err == nil {
-			return t
-		}
-	}
-	return time.Time{}
-}
+// parseSQLiteTime shares the parser used by SQLite's exact instant key.
+func parseSQLiteTime(s string) time.Time { return sqliteutil.ParseTime(s) }
 
 // batchPopulate batch-loads recipients and labels for a slice of messages.
 func (s *Store) batchPopulate(messages []APIMessage, ids []int64) error {
@@ -1094,12 +1107,37 @@ func (s *Store) batchPopulateContext(ctx context.Context, messages []APIMessage,
 	return nil
 }
 
-// batchGetRecipients loads recipients for multiple messages in a single query.
+// batchQueryIDChunk caps how many message ids batchGetRecipients and
+// batchGetLabels bind into a single IN-list statement. SQLite refuses a
+// statement carrying more than 32766 bound parameters by default, and one id
+// is one parameter here; eval's FTS mode over-fetches a ranked page well past
+// that at a large -n (the same over-fetch plan documented on rankedKeys).
+// Mirrors messageSummaryIDChunk in internal/query — same limit, same cause,
+// a different package's copy of the batch-hydration pattern.
+const batchQueryIDChunk = 500
+
+// batchGetRecipients loads recipients for multiple messages, chunked to stay
+// under the SQLite bound-parameter ceiling.
 func (s *Store) batchGetRecipients(ctx context.Context, messageIDs []int64, recipientType string) (map[int64][]string, error) {
 	if len(messageIDs) == 0 {
 		return map[int64][]string{}, nil
 	}
+	result := make(map[int64][]string, len(messageIDs))
+	for start := 0; start < len(messageIDs); start += batchQueryIDChunk {
+		end := min(start+batchQueryIDChunk, len(messageIDs))
+		if err := s.fetchRecipientsInto(ctx, messageIDs[start:end], recipientType, result); err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
+}
 
+// fetchRecipientsInto runs one chunk's IN-list query and merges its rows
+// into result, keyed by message id. Every id belongs to exactly one chunk,
+// so no key is ever written by more than one call.
+func (s *Store) fetchRecipientsInto(
+	ctx context.Context, messageIDs []int64, recipientType string, result map[int64][]string,
+) error {
 	placeholders := make([]string, len(messageIDs))
 	args := make([]any, 0, len(messageIDs)+1)
 	for i, id := range messageIDs {
@@ -1117,33 +1155,45 @@ func (s *Store) batchGetRecipients(ctx context.Context, messageIDs []int64, reci
 
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("batch get recipients: %w", err)
+		return fmt.Errorf("batch get recipients: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 
-	result := make(map[int64][]string, len(messageIDs))
 	for rows.Next() {
 		var msgID int64
 		var display string
 		if err := rows.Scan(&msgID, &display); err != nil {
-			return nil, fmt.Errorf("scan recipient: %w", err)
+			return fmt.Errorf("scan recipient: %w", err)
 		}
 		if display != "" {
 			result[msgID] = append(result[msgID], display)
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate recipients: %w", err)
+		return fmt.Errorf("iterate recipients: %w", err)
 	}
-	return result, nil
+	return nil
 }
 
-// batchGetLabels loads labels for multiple messages in a single query.
+// batchGetLabels loads labels for multiple messages, chunked to stay under
+// the SQLite bound-parameter ceiling.
 func (s *Store) batchGetLabels(ctx context.Context, messageIDs []int64) (map[int64][]string, error) {
 	if len(messageIDs) == 0 {
 		return map[int64][]string{}, nil
 	}
+	result := make(map[int64][]string, len(messageIDs))
+	for start := 0; start < len(messageIDs); start += batchQueryIDChunk {
+		end := min(start+batchQueryIDChunk, len(messageIDs))
+		if err := s.fetchLabelsInto(ctx, messageIDs[start:end], result); err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
+}
 
+// fetchLabelsInto runs one chunk's IN-list query and merges its rows into
+// result, keyed by message id.
+func (s *Store) fetchLabelsInto(ctx context.Context, messageIDs []int64, result map[int64][]string) error {
 	placeholders := make([]string, len(messageIDs))
 	args := make([]any, 0, len(messageIDs))
 	for i, id := range messageIDs {
@@ -1160,23 +1210,22 @@ func (s *Store) batchGetLabels(ctx context.Context, messageIDs []int64) (map[int
 
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("batch get labels: %w", err)
+		return fmt.Errorf("batch get labels: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 
-	result := make(map[int64][]string, len(messageIDs))
 	for rows.Next() {
 		var msgID int64
 		var name string
 		if err := rows.Scan(&msgID, &name); err != nil {
-			return nil, fmt.Errorf("scan label: %w", err)
+			return fmt.Errorf("scan label: %w", err)
 		}
 		result[msgID] = append(result[msgID], name)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate labels: %w", err)
+		return fmt.Errorf("iterate labels: %w", err)
 	}
-	return result, nil
+	return nil
 }
 
 // Single-message helpers (still used by GetMessage for single PK lookups)

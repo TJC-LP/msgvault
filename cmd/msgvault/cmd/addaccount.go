@@ -164,10 +164,16 @@ func resolveAddAccountBinding(flagApp string, flagExplicit bool, storedApp sql.N
 // list is derived from the grant on disk, so probing after deletion would find
 // nothing to preserve and quietly discard the account's Calendar/Drive access
 // along with the Gmail scopes --force meant to reset.
-func newAddAccountOAuthManager(clientSecretsPath, email string) (*oauth.Manager, error) {
+func newAddAccountOAuthManager(clientSecretsPath, email string, state *invocation) (*oauth.Manager, error) {
+	state = invocationState(context.Background(), state)
+	if state == nil || state.cfg == nil || state.logger == nil {
+		return nil, errors.New("configuration is unavailable")
+	}
+	cfg := state.cfg
+	logger := state.logger
 	scopeProbe, err := oauth.NewManager(clientSecretsPath, cfg.TokensDir(), logger)
 	if err != nil {
-		return nil, wrapOAuthError(fmt.Errorf("create oauth manager: %w", err))
+		return nil, wrapOAuthError(fmt.Errorf("create oauth manager: %w", err), cfg)
 	}
 	oauthScopes := addAccountOAuthScopesForToken(
 		scopeProbe.HasScopeMetadata(email),
@@ -176,7 +182,7 @@ func newAddAccountOAuthManager(clientSecretsPath, email string) (*oauth.Manager,
 	)
 	mgr, err := oauth.NewManagerWithScopes(clientSecretsPath, cfg.TokensDir(), logger, oauthScopes)
 	if err != nil {
-		return nil, wrapOAuthError(fmt.Errorf("create oauth manager: %w", err))
+		return nil, wrapOAuthError(fmt.Errorf("create oauth manager: %w", err), cfg)
 	}
 	return mgr, nil
 }
@@ -302,7 +308,12 @@ func runAddAccountHTTP(cmd *cobra.Command, args []string) error {
 }
 
 func preflightAddAccountAuthorize(cmd *cobra.Command, email string) (bool, error) {
-	if IsRemoteMode() {
+	state := invocationFromCommand(cmd)
+	if state == nil || state.cfg == nil {
+		return false, errors.New("configuration is unavailable")
+	}
+	cfg := state.cfg
+	if IsRemoteMode(state) {
 		// Tokens live on the remote host; authorization must happen there.
 		return false, nil
 	}
@@ -320,7 +331,7 @@ func preflightAddAccountAuthorize(cmd *cobra.Command, email string) (bool, error
 		// Let the subprocess report the configuration error.
 		return false, nil //nolint:nilerr // deliberate: config errors surface daemon-side
 	}
-	mgr, err := newAddAccountOAuthManager(clientSecretsPath, email)
+	mgr, err := newAddAccountOAuthManager(clientSecretsPath, email, state)
 	if err != nil {
 		return false, err
 	}
@@ -388,6 +399,11 @@ func lookupGmailAccountBinding(ctx context.Context, email string) (sql.NullStrin
 }
 
 func runAddAccountLocal(cmd *cobra.Command, args []string) error {
+	state := invocationFromCommand(cmd)
+	if state == nil || state.cfg == nil {
+		return errors.New("configuration is unavailable")
+	}
+	cfg := state.cfg
 	email := args[0]
 
 	if headless && forceReauth {
@@ -398,7 +414,7 @@ func runAddAccountLocal(cmd *cobra.Command, args []string) error {
 	var clientSecretsPath string
 
 	// Initialize database (in case it's new)
-	s, cleanup, err := openWritableStoreAndInitForIngest()
+	s, cleanup, err := openWritableStoreAndInitForIngestInvocation(state)
 	if err != nil {
 		return err
 	}
@@ -496,6 +512,10 @@ func runAddAccountLocal(cmd *cobra.Command, args []string) error {
 			}
 		}
 
+		if err := setDefaultIdentityOptOut(cmd, s, source, noDefaultIdentityAddAccount); err != nil {
+			return err
+		}
+
 		fmt.Printf("Account %s authorized via service account.\n", email)
 		fmt.Println("Next step: msgvault sync-full", email)
 		return nil
@@ -505,7 +525,7 @@ func runAddAccountLocal(cmd *cobra.Command, args []string) error {
 	clientSecretsPath, err = cfg.OAuth.ClientSecretsFor(resolvedApp)
 	if err != nil {
 		if !cfg.OAuth.HasAnyConfig() {
-			return errOAuthNotConfigured()
+			return errOAuthNotConfigured(cfg)
 		}
 		return err
 	}
@@ -513,7 +533,7 @@ func runAddAccountLocal(cmd *cobra.Command, args []string) error {
 	// Create OAuth manager. If a scoped token already exists, preserve those
 	// grants when reauthorizing for Gmail; Google replacement consent would
 	// otherwise drop Calendar/Drive scopes from the shared token file.
-	oauthMgr, err := newAddAccountOAuthManager(clientSecretsPath, email)
+	oauthMgr, err := newAddAccountOAuthManager(clientSecretsPath, email, state)
 	if err != nil {
 		return err
 	}
@@ -585,10 +605,13 @@ func runAddAccountLocal(cmd *cobra.Command, args []string) error {
 		// [identity] block contains the same address. Reverse order
 		// would leave the source without its own account identifier
 		// because confirmDefaultIdentity skips on any existing rows.
-		if !noDefaultIdentityAddAccount {
-			confirmDefaultIdentity(cmd.OutOrStdout(), s, source.ID, email, email, "account-identifier")
+		if err := setDefaultIdentityOptOut(cmd, s, source, noDefaultIdentityAddAccount); err != nil {
+			return err
 		}
-		if err := runPostSourceCreateMigrations(s); err != nil {
+		if !noDefaultIdentityAddAccount {
+			confirmDefaultIdentity(cmd.OutOrStdout(), s, source.ID, email, email, "account-identifier", state.logger)
+		}
+		if err := runPostSourceCreateMigrationsForInvocation(s, state); err != nil {
 			return fmt.Errorf("post-source-create migrations: %w", err)
 		}
 		if bindingChanged {
@@ -641,10 +664,13 @@ func runAddAccountLocal(cmd *cobra.Command, args []string) error {
 	}
 	// Auto-default-identity must run BEFORE the legacy migration
 	// retry — see comment on the token-reusable path above.
-	if !noDefaultIdentityAddAccount {
-		confirmDefaultIdentity(cmd.OutOrStdout(), s, source.ID, email, email, "account-identifier")
+	if err := setDefaultIdentityOptOut(cmd, s, source, noDefaultIdentityAddAccount); err != nil {
+		return err
 	}
-	if err := runPostSourceCreateMigrations(s); err != nil {
+	if !noDefaultIdentityAddAccount {
+		confirmDefaultIdentity(cmd.OutOrStdout(), s, source.ID, email, email, "account-identifier", state.logger)
+	}
+	if err := runPostSourceCreateMigrationsForInvocation(s, state); err != nil {
 		return fmt.Errorf("post-source-create migrations: %w", err)
 	}
 
@@ -924,6 +950,12 @@ func gmailScopesIn(scopes []string) []string {
 // OAuth credentials are not configured. A read-only run with an exact or
 // equivalent stored token fails closed, because its client cannot be verified.
 func applyHeadlessGrantDecision(cmd *cobra.Command, email, resolvedApp string) error {
+	state := invocationFromCommand(cmd)
+	if state == nil || state.cfg == nil {
+		return errors.New("configuration is unavailable")
+	}
+	cfg := state.cfg
+	logger := state.logger
 	clientSecretsPath, err := cfg.OAuth.ClientSecretsFor(resolvedApp)
 	if err != nil {
 		if !readonlyGrant {
@@ -943,7 +975,7 @@ func applyHeadlessGrantDecision(cmd *cobra.Command, email, resolvedApp string) e
 		// "no credentials configured" case above, and silently skipping the
 		// gate would print instructions that widen a narrowed account. Say so
 		// and print nothing rather than guess.
-		return wrapOAuthError(fmt.Errorf("create oauth manager: %w", err))
+		return wrapOAuthError(fmt.Errorf("create oauth manager: %w", err), cfg)
 	}
 	return applyAddAccountGrantDecision(cmd.OutOrStdout(), mgr, email, resolvedApp)
 }
@@ -1021,7 +1053,7 @@ func registerAddAccountFlags(cmd *cobra.Command) {
 	cmd.Flags().BoolVar(&forceReauth, "force", false, "Delete existing token and re-authorize")
 	cmd.Flags().StringVar(&accountDisplayName, "display-name", "", "Display name for the account (e.g., \"Work\", \"Personal\")")
 	cmd.Flags().StringVar(&oauthAppName, "oauth-app", "", "Named OAuth app from config (for Google Workspace orgs)")
-	cmd.Flags().BoolVar(&noDefaultIdentityAddAccount, "no-default-identity", false, noDefaultIdentityHelp)
+	cmd.Flags().BoolVar(&noDefaultIdentityAddAccount, "no-default-identity", false, savedDefaultIdentityHelp)
 	cmd.Flags().BoolVar(&readonlyGrant, "readonly", false, "Request Gmail read-only access instead of read+write (refused if the account already holds write access)")
 	cmd.Flags().Bool(addAccountGrantDecidedFlag, false, "Internal: the grant decision was already applied by the frontend CLI")
 	if err := cmd.Flags().MarkHidden(addAccountGrantDecidedFlag); err != nil {

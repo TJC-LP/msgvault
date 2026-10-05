@@ -10,7 +10,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
@@ -107,21 +109,6 @@ func overrideSetupVectorFeatures(t *testing.T, fn func(context.Context, *store.S
 	t.Cleanup(func() { setupVectorFeaturesForRun = prev })
 }
 
-func waitForVectorStatus(t *testing.T, srv *api.Server, want api.VectorStatus) string {
-	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		status, msg := srv.VectorStatus()
-		if status == want {
-			return msg
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	status, _ := srv.VectorStatus()
-	require.Equal(t, want, status, "vector status never reached %s", want)
-	return ""
-}
-
 func TestVectorInitHandleWaitContextReturnsTrueWhenFinished(t *testing.T) {
 	h := &vectorInitHandle{done: make(chan struct{})}
 	close(h.done)
@@ -156,9 +143,10 @@ func TestVectorInitHandleWaitContextPrefersDoneWhenBothReady(t *testing.T) {
 func TestStartVectorInitDisabledFinishesImmediately(t *testing.T) {
 	c := config.NewDefaultConfig()
 	c.Vector.Enabled = false
-	withTestConfig(t, c)
+	testCtx := withTestConfig(t, c)
+	_ = testCtx
 
-	h := startVectorInit(context.Background(), nil, "", nil, nil, nil)
+	h := startVectorInit(testCtx, nil, "", nil, nil, nil)
 	assert.True(t, h.WaitTimeout(time.Second))
 }
 
@@ -166,7 +154,8 @@ func TestStartVectorInitRunsForIndependentMultimodalLane(t *testing.T) {
 	c := config.NewDefaultConfig()
 	c.Vector.Enabled = false
 	c.Vector.Multimodal.Enabled = true
-	withTestConfig(t, c)
+	testCtx := withTestConfig(t, c)
+	_ = testCtx
 
 	called := false
 	prev := setupVectorFeaturesForRun
@@ -176,7 +165,7 @@ func TestStartVectorInitRunsForIndependentMultimodalLane(t *testing.T) {
 	}
 	t.Cleanup(func() { setupVectorFeaturesForRun = prev })
 
-	h := startVectorInit(context.Background(), nil, "/tmp/msgvault.db", nil,
+	h := startVectorInit(testCtx, nil, "/tmp/msgvault.db", nil,
 		newVectorInitTestServer(t), scheduler.New(nil))
 	require.True(t, h.WaitTimeout(5*time.Second))
 	assert.True(t, called, "multimodal-only enablement must initialize vector infrastructure")
@@ -187,7 +176,8 @@ func TestStartVectorInitInstallsFeaturesOnSuccess(t *testing.T) {
 	requirements := require.New(t)
 	c := config.NewDefaultConfig()
 	c.Vector.Enabled = true
-	withTestConfig(t, c)
+	testCtx := withTestConfig(t, c)
+	_ = testCtx
 
 	closed := false
 	backend := &vectorInitPersonBackend{fakeCmdVectorBackend: &fakeCmdVectorBackend{
@@ -206,10 +196,11 @@ func TestStartVectorInitInstallsFeaturesOnSuccess(t *testing.T) {
 
 	srv := newVectorInitTestServer(t)
 	sched := scheduler.New(nil)
-	h := startVectorInit(context.Background(), nil, "/tmp/msgvault.db", nil, srv, sched)
+	h := startVectorInit(testCtx, nil, "/tmp/msgvault.db", nil, srv, sched)
 
 	requirements.True(h.WaitTimeout(5 * time.Second))
-	waitForVectorStatus(t, srv, api.VectorStatusReady)
+	status, _ := srv.VectorStatus()
+	requirements.Equal(api.VectorStatusReady, status)
 	request := httptest.NewRequest(http.MethodPost, "/api/v1/people/search",
 		strings.NewReader(`{"query":"synthetic"}`))
 	request.Header.Set("Content-Type", "application/json")
@@ -220,7 +211,7 @@ func TestStartVectorInitInstallsFeaturesOnSuccess(t *testing.T) {
 		"ready status must publish the person engine in the same installation")
 	assertions.NotContains(response.Body.String(), "vector_not_enabled",
 		"ready status must never precede person engine installation")
-	h.CloseFeatures()
+	h.CloseFeatures(testDiscardLogger())
 	assertions.True(closed, "CloseFeatures must close the opened backend")
 }
 
@@ -303,16 +294,18 @@ func TestRegisterDocumentVectorJobRequiresDocumentEmbeddingsAndBackend(t *testin
 	c := config.NewDefaultConfig()
 	c.Vector.Embed.Schedule.Cron = "*/7 * * * *"
 	c.Vector.Embed.Schedule.RunAfterSync = true
-	withTestConfig(t, c)
+	testCtx := withTestConfig(t, c)
+	state := invocationFromContext(testCtx)
+	state.logger = testDiscardLogger()
 	available := &vectorFeatures{DocumentBackend: startupDocumentBackend{}, Cfg: c.Vector}
 
 	disabled := &registeredDocumentVectorJobCapture{}
-	requirements.NoError(registerDocumentVectorJob(disabled, available, nil))
+	requirements.NoError(registerDocumentVectorJob(disabled, available, nil, state))
 	assertions.Zero(disabled.calls)
 
 	c.Attachments.Documents.Index.Embeddings.Enabled = true
 	capture := &registeredDocumentVectorJobCapture{}
-	requirements.NoError(registerDocumentVectorJob(capture, available, nil))
+	requirements.NoError(registerDocumentVectorJob(capture, available, nil, state))
 	assertions.Equal(1, capture.calls)
 	assertions.NotNil(capture.job)
 	assertions.Equal("*/7 * * * *", capture.schedule)
@@ -324,7 +317,9 @@ func TestRegisterDocumentVectorJobRequiresDocumentEmbeddingsAndBackend(t *testin
 	} {
 		t.Run(name, func(t *testing.T) {
 			unregistered := &registeredDocumentVectorJobCapture{}
-			require.NoError(t, registerDocumentVectorJob(unregistered, features, nil))
+			testState := invocationFromContext(withTestConfig(t, c))
+			testState.logger = testDiscardLogger()
+			require.NoError(t, registerDocumentVectorJob(unregistered, features, nil, testState))
 			assert.Zero(t, unregistered.calls)
 		})
 	}
@@ -345,7 +340,7 @@ func TestStartVectorInitInstallsOnlyConsentedDocumentSearch(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			c := config.NewDefaultConfig()
 			c.Vector.Enabled = true
-			withTestConfig(t, c)
+			testCtx := withTestConfig(t, c)
 			overrideSetupVectorFeatures(t, func(context.Context, *store.Store, string, bool) (*vectorFeatures, error) {
 				return &vectorFeatures{
 					Backend: &fakeCmdVectorBackend{}, DocumentSearch: test.service,
@@ -358,7 +353,7 @@ func TestStartVectorInitInstallsOnlyConsentedDocumentSearch(t *testing.T) {
 				Config: c, Store: &storeAPIAdapter{store: mainStore}, Logger: slog.New(slog.DiscardHandler),
 				VectorStatus: api.VectorStatusInitializing,
 			})
-			h := startVectorInit(t.Context(), mainStore, "/tmp/msgvault.db", nil, srv, scheduler.New(nil))
+			h := startVectorInit(testCtx, mainStore, "/tmp/msgvault.db", nil, srv, scheduler.New(nil))
 			require.True(t, h.WaitTimeout(5*time.Second))
 
 			request := httptest.NewRequest(http.MethodGet, "/api/v1/documents/search?q=bounded&mode=semantic&candidate_limit=10", nil)
@@ -366,7 +361,7 @@ func TestStartVectorInitInstallsOnlyConsentedDocumentSearch(t *testing.T) {
 			srv.Router().ServeHTTP(response, request)
 			assert.Equal(t, test.wantStatus, response.Code, response.Body.String())
 			assert.Contains(t, response.Body.String(), test.wantPayload)
-			h.CloseFeatures()
+			h.CloseFeatures(testDiscardLogger())
 		})
 	}
 }
@@ -374,7 +369,8 @@ func TestStartVectorInitInstallsOnlyConsentedDocumentSearch(t *testing.T) {
 func TestStartVectorInitFlagsStaleIndex(t *testing.T) {
 	c := config.NewDefaultConfig()
 	c.Vector.Enabled = true
-	withTestConfig(t, c)
+	testCtx := withTestConfig(t, c)
+	_ = testCtx
 
 	// Active generation's fingerprint differs from the configured one, so
 	// the same check the query path runs (ResolveActiveForFingerprint)
@@ -390,10 +386,11 @@ func TestStartVectorInitFlagsStaleIndex(t *testing.T) {
 	})
 
 	srv := newVectorInitTestServer(t)
-	h := startVectorInit(context.Background(), nil, "/tmp/msgvault.db", nil, srv, scheduler.New(nil))
+	h := startVectorInit(testCtx, nil, "/tmp/msgvault.db", nil, srv, scheduler.New(nil))
 
 	require.True(t, h.WaitTimeout(5*time.Second))
-	detail := waitForVectorStatus(t, srv, api.VectorStatusStale)
+	status, detail := srv.VectorStatus()
+	require.Equal(t, api.VectorStatusStale, status)
 	assert := assert.New(t)
 	assert.Contains(detail, "old-model:384:c6000:e1", "detail names the stored fingerprint")
 	assert.Contains(detail, c.Vector.GenerationFingerprint(), "detail names the configured fingerprint")
@@ -403,60 +400,80 @@ func TestStartVectorInitFlagsStaleIndex(t *testing.T) {
 func TestStartVectorInitReportsError(t *testing.T) {
 	c := config.NewDefaultConfig()
 	c.Vector.Enabled = true
-	withTestConfig(t, c)
+	testCtx := withTestConfig(t, c)
+	_ = testCtx
 
 	overrideSetupVectorFeatures(t, func(context.Context, *store.Store, string, bool) (*vectorFeatures, error) {
 		return nil, errors.New("migration exploded")
 	})
 
 	srv := newVectorInitTestServer(t)
-	h := startVectorInit(context.Background(), nil, "/tmp/msgvault.db", nil, srv, scheduler.New(nil))
+	h := startVectorInit(testCtx, nil, "/tmp/msgvault.db", nil, srv, scheduler.New(nil))
 
 	require.True(t, h.WaitTimeout(5*time.Second))
-	msg := waitForVectorStatus(t, srv, api.VectorStatusError)
+	status, msg := srv.VectorStatus()
+	require.Equal(t, api.VectorStatusError, status)
 	assert.Contains(t, msg, "migration exploded")
 }
 
 func TestStartVectorInitHoldsWorkTracker(t *testing.T) {
-	c := config.NewDefaultConfig()
-	c.Vector.Enabled = true
-	withTestConfig(t, c)
+	synctest.Test(t, func(t *testing.T) {
+		require := require.New(t)
+		c := config.NewDefaultConfig()
+		c.Vector.Enabled = true
+		withTestConfig(t, c)
 
-	gate := api.NewSerialOperationGate()
-	release := make(chan struct{})
-	overrideSetupVectorFeatures(t, func(ctx context.Context, _ *store.Store, _ string, _ bool) (*vectorFeatures, error) {
-		<-release
-		return nil, ctx.Err()
-	})
+		gate := api.NewSerialOperationGate()
+		release := make(chan struct{})
+		var releaseOnce sync.Once
+		releaseWork := func() { releaseOnce.Do(func() { close(release) }) }
+		overrideSetupVectorFeatures(t, func(ctx context.Context, _ *store.Store, _ string, _ bool) (*vectorFeatures, error) {
+			<-release
+			return nil, ctx.Err()
+		})
 
-	srv := newVectorInitTestServer(t)
-	h := startVectorInit(context.Background(), nil, "/tmp/msgvault.db", gate, srv, scheduler.New(nil))
+		srv := newVectorInitTestServer(t)
+		testCtx := withTestConfig(t, c)
+		h := startVectorInit(testCtx, nil, "/tmp/msgvault.db", gate, srv, scheduler.New(nil))
+		t.Cleanup(func() {
+			releaseWork()
+			require.True(h.WaitTimeout(5 * time.Second))
+			require.NoError(srv.Shutdown(context.Background()), "shutdown")
+			synctest.Wait()
+		})
 
-	// While init runs, the gate must be held: BeginWorkContext with an
-	// already-cancelled context must fail rather than acquire.
-	assert.Eventually(t, func() bool {
-		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		synctest.Wait()
+		_, _, held := gate.Holder()
+		require.True(held, "gate should be held during init")
+		probeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
 		defer cancel()
-		done, ok := gate.BeginWorkContext(ctx)
-		if ok {
-			done()
-		}
-		return !ok
-	}, 2*time.Second, 10*time.Millisecond, "gate should be held during init")
+		probeDone := make(chan bool, 1)
+		go func() {
+			done, ok := gate.BeginWorkContext(probeCtx)
+			if ok {
+				done()
+			}
+			probeDone <- ok
+		}()
+		synctest.Sleep(6 * time.Millisecond)
+		synctest.Wait()
+		assert.False(t, <-probeDone, "live gate probe must time out while init holds the gate")
 
-	close(release)
-	require.True(t, h.WaitTimeout(5*time.Second))
-	done, ok := gate.BeginWork()
-	require.True(t, ok, "gate must be released after init")
-	done()
+		releaseWork()
+		require.True(h.WaitTimeout(5 * time.Second))
+		done, ok := gate.BeginWork()
+		require.True(ok, "gate must be released after init")
+		done()
+	})
 }
 
 func TestStartVectorInitAbortsQuietlyOnCancel(t *testing.T) {
 	c := config.NewDefaultConfig()
 	c.Vector.Enabled = true
-	withTestConfig(t, c)
+	testCtx := withTestConfig(t, c)
+	_ = testCtx
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(testCtx)
 	overrideSetupVectorFeatures(t, func(ctx context.Context, _ *store.Store, _ string, _ bool) (*vectorFeatures, error) {
 		<-ctx.Done()
 		return nil, ctx.Err()
@@ -480,7 +497,7 @@ func TestNewSchedulerEmbedJobThreadsGenerationRunnerAndConvergenceChecker(t *tes
 		Cfg: config.NewDefaultConfig().Vector,
 	}
 
-	job := newSchedulerEmbedJob(vf, nil)
+	job := newSchedulerEmbedJob(vf, nil, testDiscardLogger())
 	assert.Same(t, runner, job.Worker)
 	assert.Same(t, checker, job.Convergence)
 }
@@ -577,7 +594,8 @@ func runRegisteredContextJob(
 	vectorCfg := contextualSchedulerConfig()
 	testCfg := config.NewDefaultConfig()
 	testCfg.Vector = vectorCfg
-	withTestConfig(t, testCfg)
+	testCtx := withTestConfig(t, testCfg)
+	_ = testCtx
 	if buildingFingerprint == "" {
 		buildingFingerprint = vectorCfg.GenerationFingerprint()
 	}
@@ -591,9 +609,9 @@ func runRegisteredContextJob(
 		Backend: backend, Runner: runner,
 		Convergence: registeredConvergenceChecker{state: state}, Cfg: vectorCfg,
 	}
-	require.NoError(t, registerEmbedJob(capture, vf, nil, nil))
+	require.NoError(t, registerEmbedJob(capture, vf, nil, nil, testCfg, testDiscardLogger()))
 	require.NotNil(t, capture.job)
-	capture.job.Run(t.Context())
+	capture.job.Run(testCtx)
 	return backend, runner
 }
 
@@ -809,9 +827,10 @@ func TestVisualHTTPProductionRegistrationRecordsBuildResumeAndRetryPasses(t *tes
 	c.Vector.Multimodal.Enabled = true
 	c.Vector.Multimodal.Schedule.Cron = ""
 	c.Vector.Multimodal.Schedule.RunAfterSync = false
-	withTestConfig(t, c)
+	testCtx := withTestConfig(t, c)
+	_ = testCtx
 	st := testutil.NewSQLiteTestStore(t)
-	generation, err := st.EnsureVisualGeneration(t.Context(), store.VisualGenerationSpec{
+	generation, err := st.EnsureVisualGeneration(testCtx, store.VisualGenerationSpec{
 		Fingerprint: "visual-http-production-registration", Model: "visual-test", Dimension: 1024,
 	})
 	require.NoError(err)
@@ -834,9 +853,9 @@ func TestVisualHTTPProductionRegistrationRecordsBuildResumeAndRetryPasses(t *tes
 		Config: c, Store: &storeAPIAdapter{store: st}, Logger: slog.New(slog.DiscardHandler),
 		VectorStatus: api.VectorStatusInitializing,
 	})
-	handle := startVectorInit(t.Context(), st, "/tmp/msgvault.db", nil, srv, scheduler.New(nil))
+	handle := startVectorInit(testCtx, st, "/tmp/msgvault.db", nil, srv, scheduler.New(nil))
 	require.True(handle.WaitTimeout(5 * time.Second))
-	t.Cleanup(handle.CloseFeatures)
+	t.Cleanup(func() { handle.CloseFeatures(testDiscardLogger()) })
 	router := srv.Router()
 	privateRequestID := "private-http-operation-request-owner"
 	privateBlobHash := strings.Repeat("ab", 32)
@@ -889,9 +908,10 @@ func TestRegisterVisualJobSkipsUnconsentedScheduledPassWithoutRow(t *testing.T) 
 	c := config.NewDefaultConfig()
 	c.Vector.Multimodal.Schedule.Cron = "0 0 1 1 *"
 	c.Vector.Multimodal.Schedule.RunAfterSync = false
-	withTestConfig(t, c)
+	testCtx := withTestConfig(t, c)
+	_ = testCtx
 	st := testutil.NewSQLiteTestStore(t)
-	generation, err := st.EnsureVisualGeneration(t.Context(), store.VisualGenerationSpec{
+	generation, err := st.EnsureVisualGeneration(testCtx, store.VisualGenerationSpec{
 		Fingerprint: "visual-scheduled-unconsented", Model: "visual-test", Dimension: 1024,
 	})
 	require.NoError(err)
@@ -900,12 +920,12 @@ func TestRegisterVisualJobSkipsUnconsentedScheduledPassWithoutRow(t *testing.T) 
 		Reconciler: newVectorInitVisualReconciler(t, st, generation.ID, "visual-test/scheduled-unconsented"),
 	}
 	sched := scheduler.New(nil)
-	require.NoError(registerVisualJob(sched, vf))
+	require.NoError(registerVisualJob(sched, vf, c))
 
 	require.NoError(sched.TriggerJob("multimodal-attachments"))
 	assert.Empty(operationRunsForKind(t, st, operations.KindVisualEmbedding),
 		"the outer consent gate skips before runVisualPass owns a row")
-	_, err = st.GetAttachmentChangeConsumer(t.Context(), "visual-test/scheduled-unconsented")
+	_, err = st.GetAttachmentChangeConsumer(testCtx, "visual-test/scheduled-unconsented")
 	assert.ErrorIs(err, store.ErrAttachmentChangeConsumerMissing,
 		"the skipped callback must not enter reconciliation")
 }
@@ -957,7 +977,7 @@ func TestRegisterVisualJobGenerationStateGateSkipsBeforePass(t *testing.T) {
 				Reconciler:        newVectorInitVisualReconciler(t, st, generationID, consumerKey),
 			}
 			sched := scheduler.New(nil)
-			require.NoError(registerVisualJob(sched, vf))
+			require.NoError(registerVisualJob(sched, vf, c))
 
 			triggerErr := sched.TriggerJob("multimodal-attachments")
 			if test.wantTriggerErr {
@@ -984,29 +1004,30 @@ func TestRegisterVisualJobRecordsLaterPostActivationMaintenancePass(t *testing.T
 	c := config.NewDefaultConfig()
 	c.Vector.Multimodal.Schedule.Cron = "0 0 1 1 *"
 	c.Vector.Multimodal.Schedule.RunAfterSync = false
-	withTestConfig(t, c)
+	testCtx := withTestConfig(t, c)
+	_ = testCtx
 	st := testutil.NewSQLiteTestStore(t)
-	generation, err := st.EnsureVisualGeneration(t.Context(), store.VisualGenerationSpec{
+	generation, err := st.EnsureVisualGeneration(testCtx, store.VisualGenerationSpec{
 		Fingerprint: "visual-scheduled-post-activation", Model: "visual-test", Dimension: 1024,
 	})
 	require.NoError(err)
-	require.NoError(st.ConsentVisualGeneration(t.Context(), generation.ID, "private-policy-fingerprint"))
+	require.NoError(st.ConsentVisualGeneration(testCtx, generation.ID, "private-policy-fingerprint"))
 	vf := &visualFeatures{
 		Archive: st, Generation: generation, PolicyFingerprint: "private-policy-fingerprint",
 		Reconciler: newVectorInitVisualReconciler(t, st, generation.ID, "visual-test/post-activation"),
 	}
 	sched := scheduler.New(nil)
-	require.NoError(registerVisualJob(sched, vf))
+	require.NoError(registerVisualJob(sched, vf, c))
 
 	require.NoError(sched.TriggerJob("multimodal-attachments"))
-	activated, err := st.GetVisualGeneration(t.Context(), generation.ID)
+	activated, err := st.GetVisualGeneration(testCtx, generation.ID)
 	require.NoError(err)
 	require.Equal(store.VisualGenerationActive, activated.State)
 	firstRuns := operationRunsForKind(t, st, operations.KindVisualEmbedding)
 	require.Len(firstRuns, 1)
 
 	require.NoError(sched.TriggerJob("multimodal-attachments"))
-	afterMaintenance, err := st.GetVisualGeneration(t.Context(), generation.ID)
+	afterMaintenance, err := st.GetVisualGeneration(testCtx, generation.ID)
 	require.NoError(err)
 	assert.Equal(store.VisualGenerationActive, afterMaintenance.State,
 		"post-activation maintenance must preserve the active generation")

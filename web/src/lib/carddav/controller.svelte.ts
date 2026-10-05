@@ -19,7 +19,7 @@ type GeneratedBook = GeneratedCardDAVBookResponse;
 export type CardDAVBookRoles = GeneratedCardDAVBookRolesRequest;
 export type CardDAVBook = Pick<
   GeneratedBook,
-  'id' | 'name' | 'subscribed' | 'lookup_source' | 'write_target' | 'needs_full_reconcile'
+  'id' | 'name' | 'connection' | 'account_id' | 'subscribed' | 'lookup_source' | 'write_target' | 'needs_full_reconcile'
 >;
 interface VisibilityDocument {
   readonly hidden: boolean;
@@ -82,16 +82,26 @@ export class CardDAVController {
   constructor(
     client: APIClient,
     visibilityDocument: VisibilityDocument | undefined = typeof document === 'undefined' ? undefined : document,
+    private readonly connection?: string
   ) {
     this.client = client;
     this.visibilityDocument = visibilityDocument;
     visibilityDocument?.addEventListener('visibilitychange', this.visibilityChanged);
   }
   async load(): Promise<void> {
-    await Promise.all([this.readStatus(true), this.loadBooks(false), this.refreshRuns()]);
+    await Promise.all([this.retryStatus(), this.refreshRuns()]);
   }
   async retryStatus(): Promise<void> {
-    await this.readStatus(true);
+    const loaded = await this.readStatus(true);
+    if (loaded && this.status?.available) {
+      await this.loadBooks(false);
+    } else if (!this.disposed && !this.booksReadAbort) {
+      if (loaded) {
+        this.books = [];
+        this.booksError = null;
+      }
+      this.booksLoading = false;
+    }
   }
   async retryBooks(): Promise<void> {
     await this.loadBooks(this.books.length > 0 || this.booksUnknown);
@@ -114,7 +124,7 @@ export class CardDAVController {
     this.failedRunsCursor = undefined;
     try {
       const { data } = await generatedListCardDAVRuns(
-        { limit: FIRST_PAGE_LIMIT },
+        { connection: this.connection, limit: FIRST_PAGE_LIMIT },
         {
           ...this.client,
           signal: requestController.signal,
@@ -208,7 +218,7 @@ export class CardDAVController {
     }
     if (this.current(context)) this.bookPendingID = undefined;
   }
-  async sync(full: boolean): Promise<void> {
+  async sync(full: boolean, connection: string | undefined = this.connection): Promise<void> {
     if (!this.canSync || this.syncPending) return;
     const context = this.generation;
     this.syncAbort?.abort();
@@ -220,10 +230,11 @@ export class CardDAVController {
     this.pollDelay = MIN_POLL_MS;
     this.schedulePoll(MIN_POLL_MS);
     let succeeded = false;
+    let refreshBooks = false;
     let reconcile = false;
     try {
       const { data, response } = await generatedSyncCardDAV(
-        { full },
+        { full, connection },
         {
           ...this.client,
           signal: requestController.signal,
@@ -231,9 +242,18 @@ export class CardDAVController {
       );
       if (!this.current(context, requestController.signal)) return;
       if (data) {
-        succeeded = true;
+        succeeded = data.status === undefined || data.status === 'succeeded';
+        refreshBooks = succeeded || data.status === 'partial';
         reconcile = true;
-        this.syncStatus = full ? 'Full CardDAV sync completed.' : 'CardDAV sync completed.';
+        if (!succeeded) {
+          const names = (data.connections ?? [])
+            .filter((outcome) => outcome.status !== 'succeeded')
+            .map((outcome) => outcome.connection);
+          this.syncError = `CardDAV sync ${data.status}. Connections needing attention: ${names.join(', ')}.`;
+        }
+        if (succeeded) {
+          this.syncStatus = full ? 'Full CardDAV sync completed.' : 'CardDAV sync completed.';
+        }
       } else if (response.status === 409 || response.status >= 500) {
         reconcile = true;
         this.syncError = 'Unable to complete CardDAV sync. Current state was refreshed.';
@@ -255,7 +275,7 @@ export class CardDAVController {
       const [statusLoaded, runsLoaded] = await Promise.all([
         this.readStatus(false),
         this.refreshRuns(),
-        ...(succeeded ? [this.loadBooks(true)] : []),
+        ...(refreshBooks ? [this.loadBooks(true)] : []),
       ]);
       this.syncUnknown = !statusLoaded || !runsLoaded;
     }
@@ -329,10 +349,13 @@ export class CardDAVController {
     this.statusLoading = true;
     this.statusError = null;
     try {
-      const { data } = await generatedGetCardDAVStatus({
-        ...this.client,
-        signal: requestController.signal,
-      });
+      const { data } = await generatedGetCardDAVStatus(
+        this.connection ? { connection: this.connection } : undefined,
+        {
+          ...this.client,
+          signal: requestController.signal,
+        }
+      );
       if (!this.currentStatusCommit(context, statusCommit, requestController.signal)) return false;
       if (!data) {
         this.statusError = 'Unable to load CardDAV status.';
@@ -366,10 +389,13 @@ export class CardDAVController {
     this.booksLoading = this.books.length === 0;
     this.booksError = null;
     try {
-      const { data } = await generatedListCardDAVBooks({
-        ...this.client,
-        signal: requestController.signal,
-      });
+      const { data } = await generatedListCardDAVBooks(
+        this.connection ? { connection: this.connection } : undefined,
+        {
+          ...this.client,
+          signal: requestController.signal,
+        }
+      );
       if (!this.current(context, requestController.signal)) return false;
       if (!data) {
         this.booksError = 'Unable to load CardDAV address books.';
@@ -404,7 +430,7 @@ export class CardDAVController {
     this.failedRunsCursor = cursor;
     try {
       const { data } = await generatedListCardDAVRuns(
-        { limit: FIRST_PAGE_LIMIT, before_id: cursor },
+        { connection: this.connection, limit: FIRST_PAGE_LIMIT, before_id: cursor },
         {
           ...this.client,
           signal: requestController.signal,
@@ -450,10 +476,13 @@ export class CardDAVController {
     this.pollAbort = requestController;
     const priorActive = Boolean(this.status?.active);
     try {
-      const { data } = await generatedGetCardDAVStatus({
-        ...this.client,
-        signal: requestController.signal,
-      });
+      const { data } = await generatedGetCardDAVStatus(
+        this.connection ? { connection: this.connection } : undefined,
+        {
+          ...this.client,
+          signal: requestController.signal,
+        }
+      );
       if (
         !this.currentStatusCommit(context, statusCommit, requestController.signal) ||
         generation !== this.pollGeneration
@@ -466,6 +495,7 @@ export class CardDAVController {
         this.schedulePoll(this.pollDelay);
         return;
       }
+      const becameAvailable = !this.status?.available && data.available;
       const fingerprint = statusFingerprint(data);
       const advanced = fingerprint !== this.pollFingerprint;
       this.status = data;
@@ -474,13 +504,14 @@ export class CardDAVController {
       this.recordSuccessfulStatusCommit(statusCommit);
       if (priorActive && !data.active && !this.syncPending) {
         this.stopPolling(false);
-        await Promise.all([this.loadBooks(true), this.refreshRuns()]);
+        await Promise.all([...(data.available ? [this.loadBooks(true)] : []), this.refreshRuns()]);
         return;
       }
       if (this.shouldPoll()) {
         this.pollDelay = advanced ? MIN_POLL_MS : Math.min(MAX_POLL_MS, this.pollDelay * 2);
         this.schedulePoll(this.pollDelay);
       }
+      if (becameAvailable) await this.loadBooks(false);
     } catch {
       if (
         !this.currentStatusCommit(context, statusCommit, requestController.signal) ||
@@ -520,6 +551,8 @@ function safeBook(book: GeneratedBook): CardDAVBook {
   return {
     id: book.id,
     name: book.name,
+    connection: book.connection,
+    account_id: book.account_id,
     subscribed: book.subscribed,
     lookup_source: book.lookup_source,
     write_target: book.write_target,

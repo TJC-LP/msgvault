@@ -923,9 +923,10 @@ func TestWriteJSON_DoesNotClobberDestinationOnEncodeFailure(t *testing.T) {
 	payload, readErr := os.ReadFile(path)
 	require.NoError(t, readErr)
 	assert.Equal(t, "stable", string(payload))
-	matches, globErr := filepath.Glob(path + ".tmp-*")
-	require.NoError(t, globErr)
-	assert.Empty(t, matches)
+	entries, readErr := os.ReadDir(filepath.Dir(path))
+	require.NoError(t, readErr)
+	require.Len(t, entries, 1, "the staged report must not be left behind")
+	assert.Equal(t, "report.json", entries[0].Name())
 }
 
 func suffixPrefixRuneOverlap(left, right string) int {
@@ -1545,19 +1546,19 @@ func (c *countingEmbedder) EmbedQuery(_ context.Context, _ string) ([]float32, e
 }
 
 func TestWriteJSONStdoutMatchesFileFormatting(t *testing.T) {
- require := require.New(t)
- dir := t.TempDir()
- output, err := os.Create(filepath.Join(dir, "stdout.json"))
- require.NoError(err)
- previous := os.Stdout
- os.Stdout = output
- t.Cleanup(func() { os.Stdout = previous; _ = output.Close() })
- value := map[string]any{"nested": map[string]int{"value": 1}}
- require.NoError(writeJSON("-", value))
- require.NoError(writeJSON(filepath.Join(dir, "file.json"), value))
- stdout, err := os.ReadFile(output.Name())
- require.NoError(err)
- file, err := os.ReadFile(filepath.Join(dir, "file.json"))
- require.NoError(err)
- assert.Equal(t, string(file), string(stdout))
+	require := require.New(t)
+	dir := t.TempDir()
+	output, err := os.Create(filepath.Join(dir, "stdout.json"))
+	require.NoError(err)
+	previous := os.Stdout
+	os.Stdout = output
+	t.Cleanup(func() { os.Stdout = previous; _ = output.Close() })
+	value := map[string]any{"nested": map[string]int{"value": 1}}
+	require.NoError(writeJSON("-", value))
+	require.NoError(writeJSON(filepath.Join(dir, "file.json"), value))
+	stdout, err := os.ReadFile(output.Name())
+	require.NoError(err)
+	file, err := os.ReadFile(filepath.Join(dir, "file.json"))
+	require.NoError(err)
+	assert.Equal(t, string(file), string(stdout))
 }

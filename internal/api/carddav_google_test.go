@@ -48,6 +48,7 @@ func savedGoogleCardDAVFixture(t *testing.T) (*config.Config, *store.Store) {
 }
 
 func TestGoogleCardDAVRuntimeRecoversAfterCLIAuthorization(t *testing.T) {
+	t.Parallel()
 	assertions := assert.New(t)
 	required := require.New(t)
 	cfg, st := savedGoogleCardDAVFixture(t)
@@ -55,7 +56,7 @@ func TestGoogleCardDAVRuntimeRecoversAfterCLIAuthorization(t *testing.T) {
 	required.NoError(err)
 	service := controller.Current()
 	assertions.NotNil(service, "missing OAuth tokens must not prevent constructing the runtime")
-	status, err := controller.Status(t.Context())
+	status, err := controller.Status(t.Context(), "")
 	required.NoError(err)
 	assertions.Equal("google_authorization_required", status.RepairReason)
 	assertions.False(status.CredentialConfigured)
@@ -65,7 +66,7 @@ func TestGoogleCardDAVRuntimeRecoversAfterCLIAuthorization(t *testing.T) {
 	sharedPath := filepath.Join(cfg.TokensDir(), cfg.CardDAV.Username+".json")
 	token := fmt.Sprintf(`{"access_token":"synthetic-access","refresh_token":"synthetic-refresh","client_id":"synthetic-client","scopes":[%q]}`, oauth.ScopeCardDAV)
 	required.NoError(os.WriteFile(sharedPath, []byte(token), 0600))
-	status, err = controller.Status(t.Context())
+	status, err = controller.Status(t.Context(), "")
 	required.NoError(err)
 	assertions.Empty(status.RepairReason)
 	assertions.True(status.Available)
@@ -74,14 +75,14 @@ func TestGoogleCardDAVRuntimeRecoversAfterCLIAuthorization(t *testing.T) {
 
 	// Mail switches clients, so CLI Contacts authorization now uses its own directory.
 	required.NoError(os.WriteFile(sharedPath, []byte(strings.ReplaceAll(token, "synthetic-client", "mail-client")), 0600))
-	status, err = controller.Status(t.Context())
+	status, err = controller.Status(t.Context(), "")
 	required.NoError(err)
 	assertions.Equal("google_authorization_required", status.RepairReason)
 	mgr, err := carddav.NewGoogleOAuthManager(cfg.OAuth.ClientSecrets, cfg.TokensDir(), "", cfg.CardDAV.Username, testLogger())
 	required.NoError(err)
 	required.NoError(os.MkdirAll(filepath.Dir(mgr.TokenPath(cfg.CardDAV.Username)), 0700))
 	required.NoError(os.WriteFile(mgr.TokenPath(cfg.CardDAV.Username), []byte(token), 0600))
-	status, err = controller.Status(t.Context())
+	status, err = controller.Status(t.Context(), "")
 	required.NoError(err)
 	assertions.Empty(status.RepairReason)
 	assertions.True(status.Available)
@@ -90,6 +91,7 @@ func TestGoogleCardDAVRuntimeRecoversAfterCLIAuthorization(t *testing.T) {
 }
 
 func TestGoogleCardDAVScheduleSaveDoesNotRequireAuthorization(t *testing.T) {
+	t.Parallel()
 	assertions := assert.New(t)
 	required := require.New(t)
 	cfg, st := savedGoogleCardDAVFixture(t)
@@ -105,6 +107,7 @@ func TestGoogleCardDAVScheduleSaveDoesNotRequireAuthorization(t *testing.T) {
 }
 
 func TestGoogleCardDAVRefreshFailuresReachAPIAndSyncHistory(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name, body, retryAfter, wantRetryAfter, apiCode, runCode string
 		status, apiStatus                                        int
@@ -183,7 +186,7 @@ func TestGoogleCardDAVRefreshFailuresReachAPIAndSyncHistory(t *testing.T) {
 				assertions.Equal(2, tokenRequests, "token failures are account-wide")
 			}
 			assertions.Zero(davDials)
-			runs, err := st.ListCardDAVSyncRunsContext(t.Context(), 1, nil)
+			runs, err := st.ListCardDAVSyncRunsContext(t.Context(), 1, nil, store.AllCardDAVAccounts)
 			required.NoError(err)
 			required.Len(runs, 1)
 			assertions.Equal(tc.runCode, runs[0].ErrorCode)
@@ -195,7 +198,7 @@ func TestGoogleCardDAVRefreshFailuresReachAPIAndSyncHistory(t *testing.T) {
 			}
 			srv := &Server{cardDAV: controller}
 			response := httptest.NewRecorder()
-			srv.writeCardDAVOperationError(t.Context(), response, syncErr, "CardDAV sync failed")
+			srv.writeCardDAVOperationError(response, syncErr, "CardDAV sync failed")
 			assertions.Equal(tc.apiStatus, response.Code)
 			assertions.Contains(response.Body.String(), tc.apiCode)
 			assertions.Equal(tc.wantRetryAfter, response.Header().Get("Retry-After"))
@@ -204,6 +207,7 @@ func TestGoogleCardDAVRefreshFailuresReachAPIAndSyncHistory(t *testing.T) {
 }
 
 func TestCardDAVGoogleAccountSelection(t *testing.T) {
+	t.Parallel()
 	assertions := assert.New(t)
 	required := require.New(t)
 	req := normalizeCardDAVAccountRequest(CardDAVAccountRequest{Provider: "google", Username: "person@example.com", OAuthApp: "contacts", Enabled: new(true)})
@@ -227,6 +231,7 @@ func TestCardDAVGoogleAccountSelection(t *testing.T) {
 }
 
 func TestCardDAVGoogleAuthorizationConsumedOnceAndExpires(t *testing.T) {
+	t.Parallel()
 	assertions := assert.New(t)
 	required := require.New(t)
 	flow := &oauth.WebAuthorization{State: "synthetic-state"}
@@ -251,7 +256,7 @@ func (f googleAuthorizationTransport) RoundTrip(r *http.Request) (*http.Response
 	return f(r)
 }
 
-func TestGoogleAuthorizationCompletesWhileArchiveGateHeld(t *testing.T) {
+func TestGoogleAuthorizationCompletesWhileArchiveGateHeld(t *testing.T) { //nolint:paralleltest // swaps the package-level operationGateWaitLimit
 	assertions := assert.New(t)
 	required := require.New(t)
 	oldLimit := operationGateWaitLimit
@@ -338,6 +343,7 @@ func TestGoogleAuthorizationCompletesWhileArchiveGateHeld(t *testing.T) {
 }
 
 func TestGoogleAuthorizationCallbackReportsTransientProviderFailures(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name       string
 		failure    string

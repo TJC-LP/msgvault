@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -54,6 +55,9 @@ func TestFindGmailSource(t *testing.T) {
 // add-account without --oauth-app on a named-app account validates the
 // token's client_id against the inherited binding.
 func TestAddAccount_InheritedBindingValidatesToken(t *testing.T) {
+	cfg := testConfigValue()
+	logger := testLoggerValue()
+
 	for _, tc := range []struct {
 		name      string
 		clientID  string
@@ -103,6 +107,7 @@ func TestAddAccount_InheritedBindingValidatesToken(t *testing.T) {
 			logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
 
 			ctx := gmailProfileContext(t, "user@acme.com")
+			ctx = testInvocationContext(ctx, cfg, invocationOptions{})
 
 			testCmd := &cobra.Command{
 				Use: "add-account <email>", Args: cobra.ExactArgs(1),
@@ -130,6 +135,9 @@ func TestAddAccount_InheritedBindingValidatesToken(t *testing.T) {
 }
 
 func TestAddAccount_CalendarOnlyTokenRequiresGmailReauth(t *testing.T) {
+	cfg := testConfigValue()
+	logger := testLoggerValue()
+
 	require := require.New(t)
 	tmpDir := t.TempDir()
 
@@ -156,9 +164,11 @@ func TestAddAccount_CalendarOnlyTokenRequiresGmailReauth(t *testing.T) {
 		Data:    config.DataConfig{DataDir: tmpDir},
 		OAuth:   config.OAuthConfig{ClientSecrets: secretsPath},
 	}
+	testCtx := testInvocationContext(gmailProfileContext(t, "user@example.com"), cfg, invocationOptions{})
+	_ = testCtx
 	logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(testCtx)
 	cancel()
 
 	testCmd := &cobra.Command{
@@ -172,6 +182,7 @@ func TestAddAccount_CalendarOnlyTokenRequiresGmailReauth(t *testing.T) {
 	testCmd.Flags().BoolVar(&noDefaultIdentityAddAccount, "no-default-identity", false, "")
 
 	root := newTestRootCmd()
+	root.SetContext(testCtx)
 	root.AddCommand(testCmd)
 	root.SetArgs([]string{"add-account", "user@example.com"})
 
@@ -188,6 +199,9 @@ func TestAddAccount_CalendarOnlyTokenRequiresGmailReauth(t *testing.T) {
 }
 
 func TestAddAccount_FullGmailScopeTokenCanBeReused(t *testing.T) {
+	cfg := testConfigValue()
+	logger := testLoggerValue()
+
 	require := require.New(t)
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "msgvault.db")
@@ -225,9 +239,12 @@ func TestAddAccount_FullGmailScopeTokenCanBeReused(t *testing.T) {
 		Data:    config.DataConfig{DataDir: tmpDir},
 		OAuth:   config.OAuthConfig{ClientSecrets: secretsPath},
 	}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 	logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
 
 	ctx := gmailProfileContext(t, "user@example.com")
+	ctx = testInvocationContext(ctx, cfg, invocationOptions{})
 
 	testCmd := &cobra.Command{
 		Use: "add-account <email>", Args: cobra.ExactArgs(1),
@@ -240,6 +257,7 @@ func TestAddAccount_FullGmailScopeTokenCanBeReused(t *testing.T) {
 	testCmd.Flags().BoolVar(&noDefaultIdentityAddAccount, "no-default-identity", false, "")
 
 	root := newTestRootCmd()
+	root.SetContext(testCtx)
 	root.AddCommand(testCmd)
 	root.SetArgs([]string{"add-account", "user@example.com", "--no-default-identity"})
 
@@ -268,6 +286,9 @@ func TestAddAccountOAuthScopesForTokenPreservesExistingCalendarGrant(t *testing.
 // OAuth app binding with an existing token updates the binding
 // without re-authorizing (headless rebind scenario).
 func TestAddAccount_RebindWithExistingToken(t *testing.T) {
+	cfg := testConfigValue()
+	logger := testLoggerValue()
+
 	require := require.New(t)
 	assert := assert.New(t)
 	tmpDir := t.TempDir()
@@ -277,7 +298,7 @@ func TestAddAccount_RebindWithExistingToken(t *testing.T) {
 	s, err := store.Open(dbPath)
 	require.NoError(err, "open store")
 	require.NoError(s.InitSchema(), "init schema")
-	source, err := s.GetOrCreateSource("gmail", "user@acme.com")
+	source, err := s.GetOrCreateSource("gmail", "user-a@example.com")
 	require.NoError(err, "create source")
 	require.NoError(s.UpdateSourceOAuthApp(source.ID, sql.NullString{
 		String: "old-app", Valid: true,
@@ -296,7 +317,7 @@ func TestAddAccount_RebindWithExistingToken(t *testing.T) {
 		"client_id":     "test.apps.googleusercontent.com",
 	})
 	require.NoError(err, "marshal token")
-	tokenPath := filepath.Join(tokensDir, "user@acme.com.json")
+	tokenPath := filepath.Join(tokensDir, "user-a@example.com.json")
 	require.NoError(os.WriteFile(tokenPath, tokenData, 0600), "write token")
 
 	// Write fake client secrets
@@ -324,6 +345,8 @@ func TestAddAccount_RebindWithExistingToken(t *testing.T) {
 			},
 		},
 	}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 	logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
 
 	testCmd := &cobra.Command{
@@ -338,13 +361,14 @@ func TestAddAccount_RebindWithExistingToken(t *testing.T) {
 	testCmd.Flags().BoolVar(&noDefaultIdentityAddAccount, "no-default-identity", false, "")
 
 	root := newTestRootCmd()
+	root.SetContext(testCtx)
 	root.AddCommand(testCmd)
 	root.SetArgs([]string{
-		"add-account", "user@acme.com", "--oauth-app", "new-app",
+		"add-account", "user-a@example.com", "--oauth-app", "new-app",
 	})
 
 	// Should succeed without opening a browser — token exists
-	err = root.ExecuteContext(gmailProfileContext(t, "user@acme.com"))
+	err = root.ExecuteContext(testInvocationContext(gmailProfileContext(t, "user-a@example.com"), cfg, invocationOptions{}))
 	require.NoError(err)
 
 	// Token file should still exist
@@ -356,7 +380,7 @@ func TestAddAccount_RebindWithExistingToken(t *testing.T) {
 	require.NoError(err, "reopen store")
 	defer func() { _ = s2.Close() }()
 
-	src, err := findGmailSource(s2, "user@acme.com")
+	src, err := findGmailSource(s2, "user-a@example.com")
 	require.NoError(err, "find source")
 	require.NotNil(src, "source not found after rebind")
 	assert.True(src.OAuthApp.Valid && src.OAuthApp.String == "new-app",
@@ -369,6 +393,9 @@ func TestAddAccount_RebindWithExistingToken(t *testing.T) {
 // add-account --oauth-app with no existing source row rejects a token
 // minted by a different OAuth client (forces re-auth, not silent accept).
 func TestAddAccount_NewRegistrationRejectsMismatchedToken(t *testing.T) {
+	cfg := testConfigValue()
+	logger := testLoggerValue()
+
 	require := require.New(t)
 	tmpDir := t.TempDir()
 
@@ -410,10 +437,12 @@ func TestAddAccount_NewRegistrationRejectsMismatchedToken(t *testing.T) {
 			},
 		},
 	}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 	logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
 
 	// Pre-cancel so if it falls through to Authorize, it fails fast
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(testCtx)
 	cancel()
 
 	testCmd := &cobra.Command{
@@ -428,6 +457,7 @@ func TestAddAccount_NewRegistrationRejectsMismatchedToken(t *testing.T) {
 	testCmd.Flags().BoolVar(&noDefaultIdentityAddAccount, "no-default-identity", false, "")
 
 	root := newTestRootCmd()
+	root.SetContext(testCtx)
 	root.AddCommand(testCmd)
 	root.SetArgs([]string{
 		"add-account", "new@acme.com", "--oauth-app", "acme",
@@ -441,6 +471,9 @@ func TestAddAccount_NewRegistrationRejectsMismatchedToken(t *testing.T) {
 // TestAddAccount_ExplicitDefaultRejectsMismatchedToken verifies that
 // --oauth-app "" rejects a token minted by a different client.
 func TestAddAccount_ExplicitDefaultRejectsMismatchedToken(t *testing.T) {
+	cfg := testConfigValue()
+	logger := testLoggerValue()
+
 	require := require.New(t)
 	tmpDir := t.TempDir()
 
@@ -478,9 +511,11 @@ func TestAddAccount_ExplicitDefaultRejectsMismatchedToken(t *testing.T) {
 		Data:    config.DataConfig{DataDir: tmpDir},
 		OAuth:   config.OAuthConfig{ClientSecrets: secretsPath},
 	}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 	logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(testCtx)
 	cancel()
 
 	testCmd := &cobra.Command{
@@ -495,6 +530,7 @@ func TestAddAccount_ExplicitDefaultRejectsMismatchedToken(t *testing.T) {
 	testCmd.Flags().BoolVar(&noDefaultIdentityAddAccount, "no-default-identity", false, "")
 
 	root := newTestRootCmd()
+	root.SetContext(testCtx)
 	root.AddCommand(testCmd)
 	root.SetArgs([]string{
 		"add-account", "user@example.com", "--oauth-app", "",
@@ -507,6 +543,9 @@ func TestAddAccount_ExplicitDefaultRejectsMismatchedToken(t *testing.T) {
 // TestAddAccount_ExplicitDefaultAcceptsMatchingToken verifies that
 // --oauth-app "" accepts a token minted by the default client.
 func TestAddAccount_ExplicitDefaultAcceptsMatchingToken(t *testing.T) {
+	cfg := testConfigValue()
+	logger := testLoggerValue()
+
 	require := require.New(t)
 	tmpDir := t.TempDir()
 
@@ -544,6 +583,8 @@ func TestAddAccount_ExplicitDefaultAcceptsMatchingToken(t *testing.T) {
 		Data:    config.DataConfig{DataDir: tmpDir},
 		OAuth:   config.OAuthConfig{ClientSecrets: secretsPath},
 	}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 	logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
 
 	testCmd := &cobra.Command{
@@ -559,8 +600,10 @@ func TestAddAccount_ExplicitDefaultAcceptsMatchingToken(t *testing.T) {
 
 	// Verify the cached token against a synthetic Gmail profile.
 	ctx := gmailProfileContext(t, "user@example.com")
+	ctx = testInvocationContext(ctx, cfg, invocationOptions{})
 
 	root := newTestRootCmd()
+	root.SetContext(testCtx)
 	root.AddCommand(testCmd)
 	root.SetArgs([]string{
 		"add-account", "user@example.com", "--oauth-app", "",
@@ -572,6 +615,9 @@ func TestAddAccount_ExplicitDefaultAcceptsMatchingToken(t *testing.T) {
 }
 
 func TestAddAccount_ForceRebindPreservesBindingOnFailure(t *testing.T) {
+	cfg := testConfigValue()
+	logger := testLoggerValue()
+
 	require := require.New(t)
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "msgvault.db")
@@ -612,10 +658,12 @@ func TestAddAccount_ForceRebindPreservesBindingOnFailure(t *testing.T) {
 			},
 		},
 	}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 	logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
 
 	// Pre-cancel context so Authorize fails immediately
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(testCtx)
 	cancel()
 
 	testCmd := &cobra.Command{
@@ -630,6 +678,7 @@ func TestAddAccount_ForceRebindPreservesBindingOnFailure(t *testing.T) {
 	testCmd.Flags().BoolVar(&noDefaultIdentityAddAccount, "no-default-identity", false, "")
 
 	root := newTestRootCmd()
+	root.SetContext(testCtx)
 	root.AddCommand(testCmd)
 	root.SetArgs([]string{
 		"add-account", "user@acme.com",
@@ -654,6 +703,9 @@ func TestAddAccount_ForceRebindPreservesBindingOnFailure(t *testing.T) {
 // TestAddAccount_HeadlessExplicitEmptyOAuthApp verifies that
 // --headless --oauth-app "" does not re-inherit the stored binding.
 func TestAddAccount_HeadlessExplicitEmptyOAuthApp(t *testing.T) {
+	cfg := testConfigValue()
+	logger := testLoggerValue()
+
 	require := require.New(t)
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "msgvault.db")
@@ -687,6 +739,8 @@ func TestAddAccount_HeadlessExplicitEmptyOAuthApp(t *testing.T) {
 		HomeDir: tmpDir,
 		Data:    config.DataConfig{DataDir: tmpDir},
 	}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 	logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
 
 	// The RunE reads package-level flag vars, but uses
@@ -705,6 +759,7 @@ func TestAddAccount_HeadlessExplicitEmptyOAuthApp(t *testing.T) {
 	testCmd.Flags().BoolVar(&noDefaultIdentityAddAccount, "no-default-identity", false, "")
 
 	root := newTestRootCmd()
+	root.SetContext(testCtx)
 	root.AddCommand(testCmd)
 	root.SetArgs([]string{
 		"add-account", "user@acme.com",
@@ -726,6 +781,9 @@ func TestAddAccount_HeadlessExplicitEmptyOAuthApp(t *testing.T) {
 // TestAddAccount_AutoDefaultIdentityFires verifies that running add-account
 // with a reusable token writes an account-identifier identity row.
 func TestAddAccount_AutoDefaultIdentityFires(t *testing.T) {
+	cfg := testConfigValue()
+	logger := testLoggerValue()
+
 	require := require.New(t)
 	assert := assert.New(t)
 	tmpDir := t.TempDir()
@@ -761,6 +819,8 @@ func TestAddAccount_AutoDefaultIdentityFires(t *testing.T) {
 		Data:    config.DataConfig{DataDir: tmpDir},
 		OAuth:   config.OAuthConfig{ClientSecrets: secretsPath},
 	}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 	logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
 
 	testCmd := &cobra.Command{
@@ -775,10 +835,14 @@ func TestAddAccount_AutoDefaultIdentityFires(t *testing.T) {
 	testCmd.Flags().BoolVar(&noDefaultIdentityAddAccount, "no-default-identity", false, "")
 
 	root := newTestRootCmd()
+	root.SetContext(testCtx)
 	root.AddCommand(testCmd)
 	root.SetArgs([]string{"add-account", "user@example.com"})
 
-	require.NoError(root.ExecuteContext(gmailProfileContext(t, "user@example.com")))
+	execCtx := testInvocationContext(gmailProfileContext(t, "user@example.com"), cfg, invocationOptions{})
+	invocationFromContext(execCtx).logger = logger
+	root.SetContext(execCtx)
+	require.NoError(root.ExecuteContext(execCtx))
 
 	s, err := store.Open(dbPath)
 	require.NoError(err, "reopen store")
@@ -798,7 +862,10 @@ func TestAddAccount_AutoDefaultIdentityFires(t *testing.T) {
 // TestAddAccount_NoDefaultIdentitySuppresses verifies that --no-default-identity
 // prevents the auto-identity write.
 func TestAddAccount_NoDefaultIdentitySuppresses(t *testing.T) {
-	require := require.New(t)
+	cfg := testConfigValue()
+	logger := testLoggerValue()
+
+	assert, require := assert.New(t), require.New(t)
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "msgvault.db")
 
@@ -832,6 +899,8 @@ func TestAddAccount_NoDefaultIdentitySuppresses(t *testing.T) {
 		Data:    config.DataConfig{DataDir: tmpDir},
 		OAuth:   config.OAuthConfig{ClientSecrets: secretsPath},
 	}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 	logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
 
 	testCmd := &cobra.Command{
@@ -846,10 +915,11 @@ func TestAddAccount_NoDefaultIdentitySuppresses(t *testing.T) {
 	testCmd.Flags().BoolVar(&noDefaultIdentityAddAccount, "no-default-identity", false, "")
 
 	root := newTestRootCmd()
+	root.SetContext(testCtx)
 	root.AddCommand(testCmd)
 	root.SetArgs([]string{"add-account", "user@example.com", "--no-default-identity"})
 
-	require.NoError(root.ExecuteContext(gmailProfileContext(t, "user@example.com")))
+	require.NoError(root.ExecuteContext(testInvocationContext(gmailProfileContext(t, "user@example.com"), cfg, invocationOptions{})))
 
 	s, err := store.Open(dbPath)
 	require.NoError(err, "reopen store")
@@ -861,7 +931,29 @@ func TestAddAccount_NoDefaultIdentitySuppresses(t *testing.T) {
 
 	ids, err := s.ListAccountIdentities(src.ID)
 	require.NoError(err, "ListAccountIdentities")
-	assert.Empty(t, ids, "expected 0 identity rows with --no-default-identity")
+	assert.Empty(ids, "expected 0 identity rows with --no-default-identity")
+
+	// The daemon's shared helper must honor the choice after the store reopens.
+	confirmDefaultIdentity(io.Discard, s, src.ID, "user@example.com", "user@example.com", "account-identifier", logger)
+	ids, err = s.ListAccountIdentities(src.ID)
+	require.NoError(err)
+	assert.Empty(ids, "the shared identity helper must preserve the opt-out")
+
+	// Use a new command, as a separate re-authorization invocation would.
+	rerun := &cobra.Command{Use: addAccountUse, RunE: runAddAccountLocal}
+	registerAddAccountFlags(rerun)
+	rerun.SetArgs([]string{"user@example.com"})
+	require.NoError(rerun.ExecuteContext(testInvocationContext(gmailProfileContext(t, "user@example.com"), cfg, invocationOptions{})))
+	ids, err = s.ListAccountIdentities(src.ID)
+	require.NoError(err)
+	assert.Empty(ids, "omitting the flag must preserve the saved choice")
+
+	root.SetArgs([]string{"add-account", "user@example.com", "--no-default-identity=false"})
+	require.NoError(root.ExecuteContext(testInvocationContext(gmailProfileContext(t, "user@example.com"), cfg, invocationOptions{})))
+	ids, err = s.ListAccountIdentities(src.ID)
+	require.NoError(err)
+	require.Len(ids, 1, "explicit false restores the default")
+	assert.Equal("user@example.com", ids[0].Address)
 }
 
 // TestAddAccount_DeferredLegacyIdentityMigrationFires verifies that legacy
@@ -872,6 +964,9 @@ func TestAddAccount_NoDefaultIdentitySuppresses(t *testing.T) {
 // applied on the *next* command — leaving the new source without its
 // configured identities until then.
 func TestAddAccount_DeferredLegacyIdentityMigrationFires(t *testing.T) {
+	cfg := testConfigValue()
+	logger := testLoggerValue()
+
 	require := require.New(t)
 	assert := assert.New(t)
 	tmpDir := t.TempDir()
@@ -910,8 +1005,10 @@ func TestAddAccount_DeferredLegacyIdentityMigrationFires(t *testing.T) {
 			Addresses: []string{"alias@example.com", "alt@work.com"},
 		},
 	}
+	testCtx := testInvocationContext(gmailProfileContext(t, "user@example.com"), cfg, invocationOptions{})
 	var logBuf strings.Builder
 	logger = slog.New(slog.NewTextHandler(&logBuf, nil))
+	invocationFromContext(testCtx).logger = logger
 
 	testCmd := &cobra.Command{
 		Use:  "add-account <email>",
@@ -923,14 +1020,16 @@ func TestAddAccount_DeferredLegacyIdentityMigrationFires(t *testing.T) {
 	testCmd.Flags().BoolVar(&forceReauth, "force", false, "")
 	testCmd.Flags().StringVar(&accountDisplayName, "display-name", "", "")
 	testCmd.Flags().BoolVar(&noDefaultIdentityAddAccount, "no-default-identity", false, "")
+	testCmd.SetContext(testCtx)
 
 	root := newTestRootCmd()
+	root.SetContext(testCtx)
 	root.AddCommand(testCmd)
 	// --no-default-identity isolates the test to the legacy migration path:
 	// the auto-default would otherwise add a third identity row.
 	root.SetArgs([]string{"add-account", "user@example.com", "--no-default-identity"})
 
-	require.NoError(root.ExecuteContext(gmailProfileContext(t, "user@example.com")))
+	require.NoError(root.ExecuteContext(testCtx))
 
 	// The user-facing notice must only describe the applied path.
 	// Emitting the "deferred — will run on the next command" notice
@@ -976,6 +1075,9 @@ func TestAddAccount_DeferredLegacyIdentityMigrationFires(t *testing.T) {
 // account-identifier write entirely — leaving the source without its
 // own identifier and breaking dedup sent-copy detection.
 func TestAddAccount_LegacyMigrationDoesNotSuppressDefaultIdentity(t *testing.T) {
+	cfg := testConfigValue()
+	logger := testLoggerValue()
+
 	require := require.New(t)
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "msgvault.db")
@@ -1016,6 +1118,8 @@ func TestAddAccount_LegacyMigrationDoesNotSuppressDefaultIdentity(t *testing.T) 
 			Addresses: []string{"alias@example.com", "alt@work.com"},
 		},
 	}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 	logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
 
 	testCmd := &cobra.Command{
@@ -1030,12 +1134,13 @@ func TestAddAccount_LegacyMigrationDoesNotSuppressDefaultIdentity(t *testing.T) 
 	testCmd.Flags().BoolVar(&noDefaultIdentityAddAccount, "no-default-identity", false, "")
 
 	root := newTestRootCmd()
+	root.SetContext(testCtx)
 	root.AddCommand(testCmd)
 	// Note: NOT passing --no-default-identity. The bug only manifests
 	// when the auto-default write is supposed to fire.
 	root.SetArgs([]string{"add-account", "user@example.com"})
 
-	require.NoError(root.ExecuteContext(gmailProfileContext(t, "user@example.com")))
+	require.NoError(root.ExecuteContext(testInvocationContext(gmailProfileContext(t, "user@example.com"), cfg, invocationOptions{})))
 
 	s, err := store.Open(dbPath)
 	require.NoError(err, "reopen store")
@@ -1059,6 +1164,9 @@ func TestAddAccount_LegacyMigrationDoesNotSuppressDefaultIdentity(t *testing.T) 
 }
 
 func TestAddAccount_HeadlessServiceAccountReturnsActionableError(t *testing.T) {
+	cfg := testConfigValue()
+	logger := testLoggerValue()
+
 	tmpDir := t.TempDir()
 
 	savedCfg := cfg
@@ -1083,6 +1191,8 @@ func TestAddAccount_HeadlessServiceAccountReturnsActionableError(t *testing.T) {
 			},
 		},
 	}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 	logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
 
 	testCmd := &cobra.Command{
@@ -1096,6 +1206,7 @@ func TestAddAccount_HeadlessServiceAccountReturnsActionableError(t *testing.T) {
 	testCmd.Flags().StringVar(&accountDisplayName, "display-name", "", "")
 
 	root := newTestRootCmd()
+	root.SetContext(testCtx)
 	root.AddCommand(testCmd)
 	root.SetArgs([]string{
 		"add-account", "user@company.com",
@@ -1113,6 +1224,9 @@ func TestAddAccount_HeadlessServiceAccountReturnsActionableError(t *testing.T) {
 }
 
 func TestAddAccount_ForceServiceAccountReturnsActionableError(t *testing.T) {
+	cfg := testConfigValue()
+	logger := testLoggerValue()
+
 	tmpDir := t.TempDir()
 
 	savedCfg := cfg
@@ -1137,6 +1251,8 @@ func TestAddAccount_ForceServiceAccountReturnsActionableError(t *testing.T) {
 			},
 		},
 	}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 	logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
 
 	testCmd := &cobra.Command{
@@ -1150,6 +1266,7 @@ func TestAddAccount_ForceServiceAccountReturnsActionableError(t *testing.T) {
 	testCmd.Flags().StringVar(&accountDisplayName, "display-name", "", "")
 
 	root := newTestRootCmd()
+	root.SetContext(testCtx)
 	root.AddCommand(testCmd)
 	root.SetArgs([]string{
 		"add-account", "user@company.com",

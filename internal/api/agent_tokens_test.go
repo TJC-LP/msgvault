@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -16,12 +17,14 @@ import (
 	"go.kenn.io/msgvault/internal/apiprotocol"
 	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/vector"
 )
 
 // TestAgentTokensDoNotSurviveRestart tests proof matrix row 13 (second half).
 // Grants issued against one in-memory registry are not visible in a fresh
 // registry (simulating a daemon restart).
 func TestAgentTokensDoNotSurviveRestart(t *testing.T) {
+	t.Parallel()
 	// First "instance": issue a grant.
 	_, reg1 := newAgentTokenTestServer(t)
 	src := agentgrant.SourceRef{ID: 1, Type: "imap", Identifier: "alice@example.com"}
@@ -48,6 +51,7 @@ func TestAgentTokensDoNotSurviveRestart(t *testing.T) {
 // which includes the operation label. When the gate is held, the two bodies
 // differ on Operation.Label: delegated sees none, owner sees the label.
 func TestDelegatedHealthUsesPublicProjection(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 	gate := NewSerialOperationGate()
@@ -66,6 +70,8 @@ func TestDelegatedHealthUsesPublicProjection(t *testing.T) {
 		Logger:        testLogger(),
 		Scheduler:     newMockScheduler(),
 		OperationGate: gate,
+		VectorCfg:     vector.Config{Enabled: true},
+		VectorStatus:  VectorStatusReady,
 	})
 	reg := agentgrant.NewRegistry()
 	srv.agentGrants = reg
@@ -115,6 +121,17 @@ func TestDelegatedHealthUsesPublicProjection(t *testing.T) {
 	// Full projection: Operation.Label names the holder.
 	require.NotNil(ownerResp.Operation, "owner health must report operation busy when gate is held")
 	assert.Equal("test-operation", ownerResp.Operation.Label, "owner operation must expose label (full projection)")
+
+	// Lane facts are owner-only. Delegated callers keep the public VectorHealth
+	// status but receive neither configured capability.
+	require.NotNil(ownerResp.Vector, "owner health must report vector status")
+	require.NotNil(ownerResp.Vector.TextEnabled, "owner health must report text capability")
+	require.NotNil(ownerResp.Vector.VisualEnabled, "owner health must report visual capability")
+	assert.True(*ownerResp.Vector.TextEnabled, "owner health must report the configured text lane")
+	assert.False(*ownerResp.Vector.VisualEnabled, "owner health must report the disabled visual lane")
+	require.NotNil(delegatedResp.Vector, "delegated health must retain vector status")
+	assert.Nil(delegatedResp.Vector.TextEnabled, "delegated health must omit text capability")
+	assert.Nil(delegatedResp.Vector.VisualEnabled, "delegated health must omit visual capability")
 }
 
 const agentTokenTestAPIKey = "owner-api-key-for-agent-tests"
@@ -145,9 +162,82 @@ func newAgentTokenTestServer(t *testing.T) (*Server, *agentgrant.Registry) {
 	return srv, reg
 }
 
+type agentTokenIdentityStore struct {
+	*stubSourceStore
+
+	identities []store.AccountIdentity
+}
+
+func (s *agentTokenIdentityStore) ListAccountIdentitiesContext(_ context.Context, sourceID int64) ([]store.AccountIdentity, error) {
+	result := make([]store.AccountIdentity, 0, len(s.identities))
+	for _, identity := range s.identities {
+		if identity.SourceID == sourceID {
+			result = append(result, identity)
+		}
+	}
+	return result, nil
+}
+
+func TestAgentTokenSenderSelectionsSnapshotConfirmedIdentities(t *testing.T) {
+	assertions := assert.New(t)
+	requirements := require.New(t)
+	stub := &agentTokenIdentityStore{
+		stubSourceStore: &stubSourceStore{src: &store.Source{ID: 1, SourceType: "imap", Identifier: "alice@example.com"}},
+		identities: []store.AccountIdentity{
+			{SourceID: 1, Address: "Alice@example.com", ConfirmedAt: time.Now()},
+			{SourceID: 1, Address: "alias@example.com", ConfirmedAt: time.Now()},
+			{SourceID: 1, Address: "unconfirmed@example.com"},
+		},
+	}
+	cfg := &config.Config{Server: config.ServerConfig{APIKey: agentTokenTestAPIKey, AgentAccess: true}}
+	srv := NewServerWithOptions(ServerOptions{Config: cfg, Store: stub, Logger: testLogger(), Scheduler: newMockScheduler()})
+	reg := agentgrant.NewRegistry()
+	srv.agentGrants = reg
+
+	issue := func(selections map[string][]string) agentTokenIssueResponse {
+		body, err := json.Marshal(agentTokenIssueRequest{
+			Label: "sender-test", Permissions: []string{string(agentgrant.PermissionDraftCreate)},
+			SourceIDs: []int64{1}, SenderSelections: selections,
+		})
+		requirements.NoError(err)
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/agent-tokens", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Api-Key", agentTokenTestAPIKey)
+		resp := httptest.NewRecorder()
+		srv.Router().ServeHTTP(resp, req)
+		requirements.Equal(http.StatusCreated, resp.Code, resp.Body.String())
+		var result agentTokenIssueResponse
+		requirements.NoError(json.NewDecoder(resp.Body).Decode(&result))
+		return result
+	}
+
+	explicit := issue(map[string][]string{"1": {"Alice <ALICE@example.com>"}})
+	requirements.Len(explicit.Sources, 1)
+	assertions.Equal([]string{"alice@example.com"}, explicit.Sources[0].SenderKeys)
+	grant, ok := reg.Lookup(explicit.Secret)
+	requirements.True(ok)
+	assertions.True(grant.AllowsSender(agentgrant.PermissionDraftCreate, agentgrant.SourceRef{Type: "imap", Identifier: "alice@example.com"}, "alice@example.com"))
+
+	defaulted := issue(nil)
+	assertions.Equal([]string{"alice@example.com", "alias@example.com"}, defaulted.Sources[0].SenderKeys)
+
+	badBody, err := json.Marshal(agentTokenIssueRequest{
+		Label: "bad-sender", Permissions: []string{string(agentgrant.PermissionDraftCreate)},
+		SourceIDs: []int64{1}, SenderSelections: map[string][]string{"1": {"unknown@example.com"}},
+	})
+	requirements.NoError(err)
+	badReq := httptest.NewRequest(http.MethodPost, "/api/v1/agent-tokens", bytes.NewReader(badBody))
+	badReq.Header.Set("Content-Type", "application/json")
+	badReq.Header.Set("X-Api-Key", agentTokenTestAPIKey)
+	badResp := httptest.NewRecorder()
+	srv.Router().ServeHTTP(badResp, badReq)
+	assertions.Equal(http.StatusBadRequest, badResp.Code)
+}
+
 // TestAgentTokenIssueRequiresOwnerKey verifies proof matrix row 15:
 // issue/list/revoke require owner API key; browser session and delegated get 401.
 func TestAgentTokenIssueRequiresOwnerKey(t *testing.T) {
+	t.Parallel()
 	srv, reg := newAgentTokenTestServer(t)
 
 	reqBody := agentTokenIssueRequest{
@@ -192,6 +282,7 @@ func TestAgentTokenIssueRequiresOwnerKey(t *testing.T) {
 }
 
 func TestIssueAgentTokenUsesEffectiveRequestOrigin(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 	reg := agentgrant.NewRegistry()
@@ -237,6 +328,7 @@ func TestIssueAgentTokenUsesEffectiveRequestOrigin(t *testing.T) {
 
 // TestAgentTokenListRequiresOwnerKey verifies proof matrix row 15.
 func TestAgentTokenListRequiresOwnerKey(t *testing.T) {
+	t.Parallel()
 	srv, _ := newAgentTokenTestServer(t)
 
 	t.Run("no auth gets 401", func(t *testing.T) {
@@ -257,6 +349,7 @@ func TestAgentTokenListRequiresOwnerKey(t *testing.T) {
 
 // TestAgentTokenRevokeRequiresOwnerKey verifies proof matrix rows 15 and 16.
 func TestAgentTokenRevokeRequiresOwnerKey(t *testing.T) {
+	t.Parallel()
 	srv, _ := newAgentTokenTestServer(t)
 
 	t.Run("no auth gets 401", func(t *testing.T) {
@@ -278,6 +371,7 @@ func TestAgentTokenRevokeRequiresOwnerKey(t *testing.T) {
 // TestAgentTokenSecretNotInListResponse verifies proof matrix row 16:
 // secret appears once in issue response and never in list response.
 func TestAgentTokenSecretNotInListResponse(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 	srv, _ := newAgentTokenTestServer(t)
@@ -327,6 +421,7 @@ func TestAgentTokenSecretNotInListResponse(t *testing.T) {
 // revoked even during a multi-hour sync or import, and the revoked grant is
 // gone immediately.
 func TestAgentTokenRoutesExemptFromOperationGate(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	gate := NewSerialOperationGate()
 	stub := &stubSourceStore{
@@ -409,6 +504,7 @@ func TestAgentTokenRoutesExemptFromOperationGate(t *testing.T) {
 // independently, but these tests pin the HTTP error contract (status + code)
 // documented in docs/cli-reference.md.
 func TestHandleIssueAgentTokenValidation(t *testing.T) {
+	t.Parallel()
 	validBody := agentTokenIssueRequest{
 		Label:       "test-agent",
 		Permissions: []string{string(agentgrant.PermissionDraftCreate)},
@@ -597,6 +693,7 @@ func TestHandleIssueAgentTokenValidation(t *testing.T) {
 // endpoints (POST /api/v1/agent-tokens, GET /api/v1/health,
 // DELETE /api/v1/agent-tokens/{id}).
 func TestRevocationDeniesSubsequentAuthentication(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 	srv, _ := newAgentTokenTestServer(t)
@@ -644,6 +741,7 @@ func TestRevocationDeniesSubsequentAuthentication(t *testing.T) {
 }
 
 func TestAgentTokenManagementDisabled(t *testing.T) {
+	t.Parallel()
 	srv := NewServerWithOptions(ServerOptions{
 		Config: &config.Config{Server: config.ServerConfig{APIKey: agentTokenTestAPIKey}},
 		Store:  &mockStore{}, Logger: testLogger(), Scheduler: newMockScheduler(),

@@ -3,9 +3,13 @@ package microsoft
 import (
 	"context"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -14,7 +18,7 @@ import (
 
 func TestGraphTokenPath(t *testing.T) {
 	dir := filepath.Join("tmp", "tokens")
-	m := &GraphManager{tokensDir: dir}
+	m := NewGraphManager("", "", "", dir, nil)
 	assert.Equal(t, filepath.Join(dir, "teams_user@example.com.json"), m.TokenPath("user@example.com"))
 }
 
@@ -203,4 +207,120 @@ func TestGraphManager_TokenSource_Concurrent(t *testing.T) {
 		})
 	}
 	wg.Wait()
+}
+
+// Mail and Teams tokens live in separate files with separate scope sets, so a
+// Teams token never satisfies the mail manager and the reverse.
+func TestGraphMailManager_SeparateTokenAndScopes(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	dir := t.TempDir()
+	teamsMgr := NewGraphManager("test-client", "common", "", dir, slog.Default())
+	mailMgr := NewGraphMailManager("test-client", "common", "", dir, slog.Default())
+	assert.Equal(filepath.Join(dir, "msmail_user@company.com.json"), mailMgr.TokenPath("user@company.com"))
+
+	token := &oauth2.Token{AccessToken: "graph-access", RefreshToken: "graph-refresh", TokenType: "Bearer"}
+	require.NoError(teamsMgr.saveToken("user@company.com", token, GraphScopes(), "org-tid"))
+	_, err := teamsMgr.TokenSource(t.Context(), "user@company.com")
+	require.NoError(err)
+	assert.False(mailMgr.HasToken("user@company.com"))
+
+	withoutMail := []string{"https://graph.microsoft.com/User.Read", scopeOfflineAccess, "openid", scopeEmail}
+	require.NoError(mailMgr.saveToken("user@company.com", token, withoutMail, "org-tid"))
+	_, err = mailMgr.TokenSource(t.Context(), "user@company.com")
+	require.ErrorContains(err, "https://graph.microsoft.com/Mail.Read")
+	require.ErrorContains(err, "msgvault add-o365 user@company.com --graph")
+}
+
+// The write manager shares the mail token. It refuses a read-only grant, and
+// the sync manager still accepts the escalated one.
+func TestGraphMailWriteManager_Scopes(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	dir := t.TempDir()
+	readMgr := NewGraphMailManager("test-client", "common", "", dir, slog.Default())
+	writeMgr := NewGraphMailWriteManager("test-client", "common", "", dir, slog.Default())
+	assert.Equal(readMgr.TokenPath("user@company.com"), writeMgr.TokenPath("user@company.com"))
+
+	token := &oauth2.Token{AccessToken: "graph-access", RefreshToken: "graph-refresh", TokenType: "Bearer"}
+	require.NoError(readMgr.saveToken("user@company.com", token, GraphMailScopes(), "org-tid"))
+	ok, err := writeMgr.HasScopes("user@company.com")
+	require.NoError(err)
+	assert.False(ok)
+	_, err = writeMgr.TokenSource(t.Context(), "user@company.com")
+	require.ErrorContains(err, "Mail.ReadWrite")
+
+	require.NoError(writeMgr.saveToken("user@company.com", token, GraphMailWriteScopes(), "org-tid"))
+	ok, err = writeMgr.HasScopes("user@company.com")
+	require.NoError(err)
+	assert.True(ok)
+	_, err = writeMgr.TokenSource(t.Context(), "user@company.com")
+	require.NoError(err)
+	_, err = readMgr.TokenSource(t.Context(), "user@company.com")
+	require.NoError(err)
+}
+
+func TestRefreshingAccessTokenPersistsToEachManagerFileAndNamesProduct(t *testing.T) {
+	release := make(chan struct{})
+	var stall atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if stall.Load() {
+			select {
+			case <-release:
+			case <-r.Context().Done():
+			}
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"access_token":"fresh","token_type":"Bearer","expires_in":3600,"refresh_token":"r2"}`))
+	}))
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(release) })
+
+	imap := &Manager{clientID: "client", tenantID: DefaultTenant, tokensDir: t.TempDir(), logger: slog.Default(), authorityURL: srv.URL}
+	graph := NewGraphManager("client", "common", "", t.TempDir(), slog.Default())
+	graph.authorityURL = srv.URL
+	expired := &oauth2.Token{AccessToken: "stale", RefreshToken: "r1", TokenType: "Bearer", Expiry: time.Now().Add(-time.Hour)}
+	managers := []struct {
+		product string
+		path    string
+		save    func() error
+		source  func() (func(context.Context) (string, error), error)
+	}{
+		{"microsoft", imap.TokenPath("user@example.com"),
+			func() error { return imap.saveToken("user@example.com", expired, nil, "") },
+			func() (func(context.Context) (string, error), error) {
+				return imap.TokenSource(t.Context(), "user@example.com")
+			}},
+		{"microsoft graph", graph.TokenPath("user@example.com"),
+			func() error { return graph.saveToken("user@example.com", expired, GraphScopes(), "") },
+			func() (func(context.Context) (string, error), error) {
+				return graph.TokenSource(t.Context(), "user@example.com")
+			}},
+	}
+	for _, manager := range managers {
+		t.Run(manager.product, func(t *testing.T) {
+			require := require.New(t)
+			stall.Store(false)
+			require.NoError(manager.save())
+			tokenFn, err := manager.source()
+			require.NoError(err)
+			token, err := tokenFn(t.Context())
+			require.NoError(err)
+			assert.Equal(t, "fresh", token)
+			saved, err := readTokenFile(manager.path)
+			require.NoError(err)
+			assert.Equal(t, "fresh", saved.AccessToken)
+
+			stall.Store(true)
+			previous := tokenRefreshTimeout
+			tokenRefreshTimeout = 50 * time.Millisecond
+			t.Cleanup(func() { tokenRefreshTimeout = previous })
+			require.NoError(manager.save())
+			tokenFn, err = manager.source()
+			require.NoError(err)
+			_, err = tokenFn(t.Context())
+			require.ErrorContains(err, manager.product+" token refresh timed out")
+		})
+	}
 }

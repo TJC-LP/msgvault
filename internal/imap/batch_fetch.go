@@ -84,7 +84,14 @@ func rawMIMEMessageID(rawMIME []byte) string {
 	header := gomail.Header{Header: entity.Header}
 	msgID, err := header.MessageID()
 	if err != nil {
-		return ""
+		// Historical messages can carry bare IDs or other non-RFC syntax
+		// that the archive's MIME parser preserves. Use that same fallback
+		// for folder membership and deduplication, otherwise an archived
+		// message can become unidentifiable when its headers are refreshed.
+		msgID, _ = mime.ParseMessageIDs(rawMIME)
+	}
+	if msgID == "" {
+		msgID = mime.NormalizeLegacyMessageID(header.Get("Message-ID"))
 	}
 	return msgID
 }
@@ -95,6 +102,13 @@ func normalizeRFC822MessageID(value string) string {
 		return value[1 : len(value)-1]
 	}
 	return value
+}
+
+func legacyRFC822MessageIDsMatch(expected, actual string) bool {
+	// Normalize the original values: stripping a bracket pair first could
+	// turn a nested or whitespace-damaged ID into apparently valid evidence.
+	key := mime.LegacyMessageIDMatchKey(expected)
+	return key != "" && key == mime.LegacyMessageIDMatchKey(actual)
 }
 
 func (c *Client) labelsForMessage(mailbox, rfc822MessageID string) []string {
@@ -117,6 +131,7 @@ func (c *Client) applyFetchResults(
 	mailbox string,
 	chunk []batchFetchItem,
 	msgs []*imapclient.FetchMessageBuffer,
+	forceFullRaw bool,
 ) []batchFetchItem {
 	seenReturnedUIDs := make(map[imap.UID]bool, len(msgs))
 	// Only a message with no Message-ID header needs a durable alias, so the
@@ -200,9 +215,16 @@ func (c *Client) applyFetchResults(
 			results[idx].Err = nil
 			continue
 		}
-		if !forced && c.seenRFC822IDs != nil &&
-			rfc822MessageID != "" {
-			if c.seenRFC822IDs[rfc822MessageID] {
+		if !forced && c.seenRFC822IDs != nil && rfc822MessageID != "" {
+			if forceFullRaw {
+				// This copy must reach sync for raw-byte identity proof. Record
+				// its Message-ID first so ordinary copies in the following batch
+				// can still become dedup stubs.
+				c.seenRFC822IDs[rfc822MessageID] = true
+				if c.isSentPlacementMailboxLocked(mailbox) {
+					c.seenTrustedRFC822IDs[rfc822MessageID] = true
+				}
+			} else if c.seenRFC822IDs[rfc822MessageID] {
 				// A duplicate copy in Sent placement still gets its full
 				// raw — once per identity per run — because that copy may
 				// be the one that must refresh a stale archived snapshot;
@@ -305,9 +327,9 @@ func (c *Client) selectBatchMailbox(
 }
 
 // fetchChunk runs one UID FETCH, reconnecting and retrying once on network
-// errors. fatal reports that the connection could not be re-established and
-// the whole batch should be abandoned; otherwise a non-nil error is local
-// to this chunk.
+// errors. fatal reports that the connection or selected mailbox could not be
+// re-established and the whole batch should be abandoned; otherwise a non-nil
+// error is local to this chunk.
 func (c *Client) fetchChunk(
 	ctx context.Context,
 	mailbox string,
@@ -328,12 +350,61 @@ func (c *Client) fetchChunk(
 	}
 	if selErr := c.selectMailbox(mailbox); selErr != nil {
 		c.logger.Warn("mailbox reselect failed after reconnect", "mailbox", mailbox, "error", selErr)
-		return nil, false, selErr
+		return nil, true, selErr
 	}
 	msgs, err = c.conn.Fetch(uidSet, fetchOpts).Collect()
 	if err != nil {
 		c.logger.Warn("UID FETCH failed after reconnect", "mailbox", mailbox, "error", err)
 		return nil, false, fmt.Errorf("UID FETCH after reconnect in mailbox %q: %w", mailbox, err)
+	}
+	return msgs, false, nil
+}
+
+// fetchMessageIDChunk is fetchChunk for the Message-ID header. Some servers,
+// DavMail among them, answer BODY.PEEK[HEADER.FIELDS ("Message-ID")] with a
+// zero-length section: they keep the quotes around the field name, which the
+// client sends as a quoted string, and match no header. A conforming server
+// returns at least the blank line that ends the header even when the message
+// has no Message-ID, so an empty section is a server fault and not an absent
+// header. Those UIDs are fetched again with BODY.PEEK[HEADER], which takes no
+// field list.
+func (c *Client) fetchMessageIDChunk(
+	ctx context.Context,
+	mailbox string,
+	uidSet imap.UIDSet,
+) (msgs []*imapclient.FetchMessageBuffer, fatal bool, err error) {
+	msgs, fatal, err = c.fetchChunk(ctx, mailbox, uidSet, messageIDHeaderFetchOptions())
+	if err != nil {
+		return msgs, fatal, err
+	}
+
+	emptyByUID := make(map[imap.UID]*imapclient.FetchMessageBuffer)
+	var emptySet imap.UIDSet
+	for _, msg := range msgs {
+		if len(msg.BodySection) == 0 || len(msg.BodySection[0].Bytes) == 0 {
+			emptyByUID[msg.UID] = msg
+			emptySet.AddNum(msg.UID)
+		}
+	}
+	if len(emptyByUID) == 0 {
+		return msgs, false, nil
+	}
+
+	full, fatal, err := c.fetchChunk(ctx, mailbox, emptySet, fullHeaderFetchOptions())
+	if fatal {
+		return nil, true, err
+	}
+	if err != nil {
+		// The first response stands; its empty sections surface to the caller
+		// the same way they would have without the fallback.
+		c.logger.Warn("full-header fallback fetch failed",
+			"mailbox", mailbox, "uids", len(emptyByUID), "error", err)
+		return msgs, false, nil
+	}
+	for _, msg := range full {
+		if orig, ok := emptyByUID[msg.UID]; ok && len(msg.BodySection) > 0 {
+			orig.BodySection = msg.BodySection
+		}
 	}
 	return msgs, false, nil
 }
@@ -349,6 +420,7 @@ func (c *Client) fetchMailboxBatch(
 	items []batchFetchItem,
 	fetchOpts *imap.FetchOptions,
 	results []gmailapi.RawMessageBatchResult,
+	forceFullRaw bool,
 ) error {
 	uidToIdx := make(map[imap.UID]int, len(items))
 	for _, item := range items {
@@ -378,11 +450,12 @@ func (c *Client) fetchMailboxBatch(
 			return nil
 		}
 
-		omitted := c.applyFetchResults(results, uidToIdx, mailbox, chunk, msgs)
+		omitted := c.applyFetchResults(
+			results, uidToIdx, mailbox, chunk, msgs, forceFullRaw)
 		if len(omitted) > 0 {
 			var fatalErr error
 			omitted, fatalErr = c.recheckOmittedRaw(
-				ctx, results, uidToIdx, mailbox, omitted, fetchOpts)
+				ctx, results, uidToIdx, mailbox, omitted, fetchOpts, forceFullRaw)
 			if fatalErr != nil {
 				return fatalErr
 			}
@@ -414,6 +487,7 @@ func (c *Client) recheckOmittedRaw(
 	mailbox string,
 	omitted []batchFetchItem,
 	fetchOpts *imap.FetchOptions,
+	forceFullRaw bool,
 ) ([]batchFetchItem, error) {
 	var uidSet imap.UIDSet
 	for _, item := range omitted {
@@ -421,9 +495,7 @@ func (c *Client) recheckOmittedRaw(
 	}
 	msgs, fatal, err := c.fetchChunk(ctx, mailbox, uidSet, fetchOpts)
 	if fatal {
-		// The reconnect failed, so there is no connection left to run the next
-		// chunk on. The batch has to end here, exactly as it does when the
-		// first fetch of a chunk hits this.
+		// Without a connection and selected mailbox, later chunks cannot run.
 		return nil, err
 	}
 	if err != nil {
@@ -432,7 +504,8 @@ func (c *Client) recheckOmittedRaw(
 		markRawBatchError(results, omitted, err)
 		return nil, nil
 	}
-	return c.applyFetchResults(results, uidToIdx, mailbox, omitted, msgs), nil
+	return c.applyFetchResults(
+		results, uidToIdx, mailbox, omitted, msgs, forceFullRaw), nil
 }
 
 // confirmOmittedPresent asks the server which of the UIDs it left out of both
@@ -514,6 +587,25 @@ func (c *Client) markOmittedOutcome(
 // re-established and the failed chunk is retried once; if reconnect itself fails
 // the function returns immediately with whatever results were collected.
 func (c *Client) GetMessagesRawBatchWithErrors(ctx context.Context, messageIDs []string) ([]gmailapi.RawMessageBatchResult, error) {
+	return c.getMessagesRawBatchWithIdentityValidation(ctx, messageIDs, false)
+}
+
+// GetMessagesRawBatchWithIdentityValidation fetches the requested messages
+// with full raw MIME even when this run already fetched another mailbox copy
+// with the same RFC822 Message-ID. Sync uses this for existing source IDs that
+// need raw-byte identity proof before ordinary duplicate copies are deduped.
+func (c *Client) GetMessagesRawBatchWithIdentityValidation(
+	ctx context.Context,
+	messageIDs []string,
+) ([]gmailapi.RawMessageBatchResult, error) {
+	return c.getMessagesRawBatchWithIdentityValidation(ctx, messageIDs, true)
+}
+
+func (c *Client) getMessagesRawBatchWithIdentityValidation(
+	ctx context.Context,
+	messageIDs []string,
+	forceFullRaw bool,
+) ([]gmailapi.RawMessageBatchResult, error) {
 	results := newRawBatchResults(messageIDs)
 
 	byMailbox := make(map[string][]batchFetchItem, 4)
@@ -550,7 +642,7 @@ func (c *Client) GetMessagesRawBatchWithErrors(ctx context.Context, messageIDs [
 			continue
 		}
 
-		if err := c.fetchMailboxBatch(ctx, mailbox, items, fetchOpts, results); err != nil {
+		if err := c.fetchMailboxBatch(ctx, mailbox, items, fetchOpts, results, forceFullRaw); err != nil {
 			return results, err
 		}
 	}
@@ -641,7 +733,6 @@ func (c *Client) fetchMailboxLabelBatch(
 	ctx context.Context,
 	mailbox string,
 	items []batchFetchItem,
-	fetchOpts *imap.FetchOptions,
 	results []gmailapi.MessageLabelsBatchResult,
 ) error {
 	uidToIdx := make(map[imap.UID]int, len(items))
@@ -661,7 +752,7 @@ func (c *Client) fetchMailboxLabelBatch(
 			uidSet.AddNum(item.uid)
 		}
 
-		msgs, fatal, err := c.fetchChunk(ctx, mailbox, uidSet, fetchOpts)
+		msgs, fatal, err := c.fetchMessageIDChunk(ctx, mailbox, uidSet)
 		if fatal {
 			return err
 		}
@@ -674,7 +765,7 @@ func (c *Client) fetchMailboxLabelBatch(
 		if len(omitted) > 0 {
 			var fatalErr error
 			omitted, fatalErr = c.recheckOmittedLabels(
-				ctx, results, uidToIdx, mailbox, omitted, fetchOpts)
+				ctx, results, uidToIdx, mailbox, omitted)
 			if fatalErr != nil {
 				return fatalErr
 			}
@@ -693,13 +784,12 @@ func (c *Client) recheckOmittedLabels(
 	uidToIdx map[imap.UID]int,
 	mailbox string,
 	omitted []batchFetchItem,
-	fetchOpts *imap.FetchOptions,
 ) ([]batchFetchItem, error) {
 	var uidSet imap.UIDSet
 	for _, item := range omitted {
 		uidSet.AddNum(item.uid)
 	}
-	msgs, fatal, err := c.fetchChunk(ctx, mailbox, uidSet, fetchOpts)
+	msgs, fatal, err := c.fetchMessageIDChunk(ctx, mailbox, uidSet)
 	if fatal {
 		return nil, err
 	}
@@ -735,7 +825,6 @@ func (c *Client) GetMessageLabelsBatch(ctx context.Context, messageIDs []string)
 		return nil, err
 	}
 
-	fetchOpts := messageIDHeaderFetchOptions()
 	for _, mailbox := range batchMailboxOrder(byMailbox, c.allMailFolder) {
 		if ctx.Err() != nil {
 			return results, ctx.Err()
@@ -750,7 +839,7 @@ func (c *Client) GetMessageLabelsBatch(ctx context.Context, messageIDs []string)
 			continue
 		}
 
-		if err := c.fetchMailboxLabelBatch(ctx, mailbox, items, fetchOpts, results); err != nil {
+		if err := c.fetchMailboxLabelBatch(ctx, mailbox, items, results); err != nil {
 			return results, err
 		}
 	}
@@ -866,7 +955,16 @@ func (c *Client) FetchedSourceMessageMatches(
 	expected := normalizeRFC822MessageID(expectedRFC822MessageID)
 	actual := normalizeRFC822MessageID(actualRFC822MessageID)
 	if expected != "" && actual != "" {
-		return expected == actual, true, nil
+		if expected == actual {
+			return true, true, nil
+		}
+		if legacyRFC822MessageIDsMatch(expectedRFC822MessageID, actualRFC822MessageID) {
+			// An unchanged mailbox epoch proves the UID still names the
+			// archived message. Without one, a tolerant match cannot rule out
+			// UID reuse, so sync compares the fetched raw MIME instead.
+			return epochKnown, epochKnown, nil
+		}
+		return false, true, nil
 	}
 	if epochKnown {
 		return true, true, nil
@@ -899,8 +997,21 @@ func (c *Client) SourceMessageMatches(
 	if !exists {
 		return false, true, nil
 	}
-	return normalizeRFC822MessageID(actualRFC822MessageID) ==
-		normalizeRFC822MessageID(expectedRFC822MessageID), true, nil
+	if normalizeRFC822MessageID(actualRFC822MessageID) ==
+		normalizeRFC822MessageID(expectedRFC822MessageID) {
+		return true, true, nil
+	}
+	if !legacyRFC822MessageIDsMatch(expectedRFC822MessageID, actualRFC822MessageID) {
+		return false, true, nil
+	}
+	// A tolerant match is accepted only under an unchanged mailbox epoch.
+	// Without one, keep the conclusive mismatch: an inconclusive result would
+	// defer the copy unacknowledged and block the mailbox baseline.
+	epochMatches, epochKnown, err := c.sourceMessageIDEpochMatches(messageID)
+	if err != nil {
+		return false, false, err
+	}
+	return epochKnown && epochMatches, true, nil
 }
 
 // IsPreferredSourceMessageID reports whether messageID belongs to the

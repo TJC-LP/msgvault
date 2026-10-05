@@ -3,6 +3,8 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"sort"
@@ -26,6 +28,12 @@ const accountIdentityRevisionKey = "account_identity_revision"
 // identity-only refresh) is required.
 func (s *Store) AccountIdentityRevision() (int64, error) {
 	return readAccountIdentityRevision(s.db)
+}
+
+// AccountIdentityRevisionContext is the request-aware form of
+// AccountIdentityRevision.
+func (s *Store) AccountIdentityRevisionContext(ctx context.Context) (int64, error) {
+	return readArchiveMetadataRevisionContext(ctx, s.db, accountIdentityRevisionKey, "account identity")
 }
 
 // readAccountIdentityRevision reads the archive_metadata account-identity
@@ -540,6 +548,17 @@ func (s *Store) RemoveAccountIdentityContext(
 		if n == 0 {
 			return nil
 		}
+		var remaining int64
+		if err := tx.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM account_identities WHERE source_id = ?`, sourceID,
+		).Scan(&remaining); err != nil {
+			return fmt.Errorf("count remaining account identities: %w", err)
+		}
+		if remaining == 0 {
+			if err := s.persistDefaultIdentityOptOutAfterLastRemovalContext(ctx, tx, sourceID); err != nil {
+				return err
+			}
+		}
 		if _, err := s.bumpIdentityRevisionContext(ctx, tx); err != nil {
 			return err
 		}
@@ -552,6 +571,49 @@ func (s *Store) RemoveAccountIdentityContext(
 		return 0, err
 	}
 	return removed, nil
+}
+
+func (s *Store) persistDefaultIdentityOptOutAfterLastRemovalContext(
+	ctx context.Context,
+	tx *loggedTx,
+	sourceID int64,
+) error {
+	var syncConfig sql.NullString
+	if err := tx.QueryRowContext(ctx,
+		`SELECT sync_config FROM sources WHERE id = ?`, sourceID,
+	).Scan(&syncConfig); err != nil {
+		return fmt.Errorf("read sync config after final identity removal: %w", err)
+	}
+	config := make(map[string]jsontext.Value)
+	invalidConfig := false
+	if syncConfig.Valid && strings.TrimSpace(syncConfig.String) != "" {
+		invalidConfig = json.Unmarshal([]byte(syncConfig.String), &config) != nil
+	}
+	if invalidConfig {
+		// Invalid non-object configuration also makes default confirmation
+		// fail closed, so do not prevent identity removal over it.
+		return nil
+	}
+	if config == nil {
+		config = make(map[string]jsontext.Value)
+	}
+	if value, exists := config["no_default_identity"]; exists {
+		var alreadyOptedOut bool
+		if err := json.Unmarshal([]byte(value), &alreadyOptedOut); err == nil && alreadyOptedOut {
+			return nil
+		}
+	}
+	config["no_default_identity"] = jsontext.Value("true")
+	encoded, err := json.Marshal(config, json.Deterministic(true))
+	if err != nil {
+		return fmt.Errorf("encode default identity preference after final removal: %w", err)
+	}
+	query := fmt.Sprintf(`UPDATE sources SET sync_config = %s, updated_at = %s WHERE id = ?`,
+		s.dialect.JSONBindExpr(), s.dialect.Now())
+	if _, err := tx.ExecContext(ctx, query, string(encoded), sourceID); err != nil {
+		return fmt.Errorf("save default identity opt-out after final removal: %w", err)
+	}
+	return nil
 }
 
 // GetIdentitiesForScope returns the union of confirmed identifier addresses

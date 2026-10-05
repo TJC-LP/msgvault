@@ -2,17 +2,12 @@ package microsoft
 
 import (
 	"context"
-	"encoding/json/jsontext"
-	"encoding/json/v2"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
-	"time"
 
-	"go.kenn.io/msgvault/internal/fileutil"
 	"golang.org/x/oauth2"
 )
 
@@ -30,6 +25,8 @@ const (
 	// Private and shared channels carry their own membership, read via
 	// GET /teams/{id}/channels/{id}/members.
 	scopeGraphChannelMemberRead = "https://graph.microsoft.com/ChannelMember.Read.All"
+	scopeGraphMailRead          = "https://graph.microsoft.com/Mail.Read"
+	scopeGraphMailReadWrite     = "https://graph.microsoft.com/Mail.ReadWrite"
 )
 
 // GraphScopes returns the OAuth scopes requested for Microsoft Teams ingestion
@@ -44,9 +41,22 @@ func GraphScopes() []string {
 	}
 }
 
+// GraphMailScopes returns the OAuth scopes requested for mailbox ingestion via
+// the Graph API.
+func GraphMailScopes() []string {
+	return []string{scopeGraphMailRead, scopeGraphUserRead, scopeOfflineAccess, "openid", scopeEmail}
+}
+
+// GraphMailWriteScopes returns the mail scopes plus Mail.ReadWrite, which
+// deletion needs. It keeps Mail.Read, so the sync manager still accepts a
+// token granted with these scopes.
+func GraphMailWriteScopes() []string {
+	return append(GraphMailScopes(), scopeGraphMailReadWrite)
+}
+
 // GraphManager is a sibling of Manager that runs the same interactive browser
 // auth-code flow but requests Microsoft Graph scopes and persists tokens under
-// a "teams_" filename prefix. It deliberately omits the IMAP scope-validation
+// a "teams_" or "msmail_" filename prefix. It deliberately omits the IMAP scope-validation
 // and IMAP-host logic of Manager.
 //
 // The heavy browser-flow and ID-token verification machinery is reused via an
@@ -58,15 +68,46 @@ type GraphManager struct {
 	redirectURI string
 	tokensDir   string
 	logger      *slog.Logger
+	deviceCode  bool
+
+	// scopes, tokenPrefix and reauthCmd differ per capability: Teams or mail.
+	// reauthCmd is a format string that takes the account email.
+	scopes      []string
+	tokenPrefix string
+	reauthCmd   string
 
 	// Test hooks, mirrored onto the internal delegate. See Manager.
+	authorityURL    string
 	browserFlowFn   func(ctx context.Context, email string, scopes []string) (*oauth2.Token, string, error)
 	verifyIDTokenFn func(ctx context.Context, rawIDToken string) (*idTokenClaims, error)
 }
 
-// NewGraphManager constructs a GraphManager. An empty tenantID defaults to the
-// multi-tenant "common" endpoint; a nil logger defaults to slog.Default().
+// NewGraphManager constructs a GraphManager for Teams. An empty tenantID
+// defaults to the multi-tenant "common" endpoint; a nil logger defaults to
+// slog.Default().
 func NewGraphManager(clientID, tenantID, redirectURI, tokensDir string, logger *slog.Logger) *GraphManager {
+	m := newGraphManager(clientID, tenantID, redirectURI, tokensDir, logger)
+	m.scopes, m.tokenPrefix, m.reauthCmd = GraphScopes(), "teams_", "msgvault add-teams %s"
+	return m
+}
+
+// NewGraphMailManager constructs a GraphManager for mailbox ingestion. Its
+// tokens are saved under an "msmail_" prefix, apart from the Teams tokens.
+func NewGraphMailManager(clientID, tenantID, redirectURI, tokensDir string, logger *slog.Logger) *GraphManager {
+	m := newGraphManager(clientID, tenantID, redirectURI, tokensDir, logger)
+	m.scopes, m.tokenPrefix, m.reauthCmd = GraphMailScopes(), "msmail_", "msgvault add-o365 %s --graph"
+	return m
+}
+
+// NewGraphMailWriteManager is NewGraphMailManager with GraphMailWriteScopes.
+// It shares the "msmail_" token, so Authorize replaces the read-only grant.
+func NewGraphMailWriteManager(clientID, tenantID, redirectURI, tokensDir string, logger *slog.Logger) *GraphManager {
+	m := NewGraphMailManager(clientID, tenantID, redirectURI, tokensDir, logger)
+	m.scopes = GraphMailWriteScopes()
+	return m
+}
+
+func newGraphManager(clientID, tenantID, redirectURI, tokensDir string, logger *slog.Logger) *GraphManager {
 	if tenantID == "" {
 		tenantID = DefaultTenant
 	}
@@ -82,9 +123,15 @@ func NewGraphManager(clientID, tenantID, redirectURI, tokensDir string, logger *
 	}
 }
 
+// UseDeviceCode makes Authorize sign in with a device code. See
+// Manager.UseDeviceCode.
+func (m *GraphManager) UseDeviceCode() {
+	m.deviceCode = true
+}
+
 // delegate builds an internal *Manager used only for its reusable browser-flow
 // and ID-token verification logic. Token storage is handled by GraphManager
-// itself (with the teams_ prefix), so the delegate's tokensDir is irrelevant.
+// itself (with its own prefix), so the delegate's tokensDir is irrelevant.
 func (m *GraphManager) delegate() *Manager {
 	return &Manager{
 		clientID:        m.clientID,
@@ -92,16 +139,18 @@ func (m *GraphManager) delegate() *Manager {
 		redirectURI:     m.redirectURI,
 		tokensDir:       m.tokensDir,
 		logger:          m.logger,
+		deviceCode:      m.deviceCode,
+		authorityURL:    m.authorityURL,
 		browserFlowFn:   m.browserFlowFn,
 		verifyIDTokenFn: m.verifyIDTokenFn,
 	}
 }
 
 // TokenPath returns the on-disk location of the persisted Graph token for an
-// account, namespaced with a "teams_" prefix to keep it distinct from the IMAP
-// Manager's "microsoft_" tokens.
+// account, namespaced with a "teams_" or "msmail_" prefix to keep it distinct
+// from the IMAP Manager's "microsoft_" tokens.
 func (m *GraphManager) TokenPath(email string) string {
-	return filepath.Join(m.tokensDir, "teams_"+sanitizeEmail(email)+".json")
+	return filepath.Join(m.tokensDir, m.tokenPrefix+sanitizeEmail(email)+".json")
 }
 
 // Authorize runs the interactive browser auth-code flow requesting Graph
@@ -109,7 +158,7 @@ func (m *GraphManager) TokenPath(email string) string {
 // persists the token. Unlike Manager.Authorize there is no IMAP scope
 // correction step — Graph scopes are identical across account types.
 func (m *GraphManager) Authorize(ctx context.Context, email string) error {
-	scopes := GraphScopes()
+	scopes := m.scopes
 	d := m.delegate()
 	token, nonce, err := d.doBrowserFlow(ctx, email, scopes)
 	if err != nil {
@@ -141,11 +190,11 @@ func (m *GraphManager) TokenSource(ctx context.Context, email string) (func(cont
 
 	scopes := tf.Scopes
 	if len(scopes) == 0 {
-		scopes = GraphScopes()
-	} else if missing := missingGraphScopes(scopes); len(missing) > 0 {
+		scopes = m.scopes
+	} else if missing := missingScopes(scopes, m.scopes); len(missing) > 0 {
 		return nil, fmt.Errorf(
-			"token for %s is missing Microsoft Graph scopes %s — run 'msgvault add-teams %s' to re-authorize",
-			email, strings.Join(missing, ", "), email,
+			"token for %s is missing Microsoft Graph scopes %s — run '%s' to re-authorize",
+			email, strings.Join(missing, ", "), fmt.Sprintf(m.reauthCmd, email),
 		)
 	}
 
@@ -156,60 +205,19 @@ func (m *GraphManager) TokenSource(ctx context.Context, email string) (func(cont
 	oauthCfg := m.delegate().oauthConfigWithTenant(refreshTenant, scopes)
 	// context.Background so refreshes outlive the caller's (sync-scoped) ctx.
 	ts := oauthCfg.TokenSource(context.Background(), &tf.Token)
+	return refreshingAccessToken(ts, tf, email, "Microsoft Graph", func(tok *oauth2.Token) error {
+		return m.saveToken(email, tok, scopes, tf.TenantID)
+	}), nil
+}
 
-	var (
-		mu               sync.Mutex
-		lastAccessToken  = tf.AccessToken
-		lastRefreshToken = tf.RefreshToken
-		lastExpiry       = tf.Expiry
-	)
-
-	return func(callCtx context.Context) (string, error) {
-		type tokenResult struct {
-			tok *oauth2.Token
-			err error
-		}
-		ch := make(chan tokenResult, 1)
-		go func() {
-			tok, err := ts.Token()
-			ch <- tokenResult{tok, err}
-		}()
-
-		timer := time.NewTimer(tokenRefreshTimeout)
-		defer timer.Stop()
-
-		var tok *oauth2.Token
-		select {
-		case res := <-ch:
-			if res.err != nil {
-				return "", fmt.Errorf("refresh Microsoft Graph token: %w", res.err)
-			}
-			tok = res.tok
-		case <-timer.C:
-			return "", fmt.Errorf("microsoft graph token refresh timed out after %s — check network connectivity", tokenRefreshTimeout)
-		case <-callCtx.Done():
-			return "", fmt.Errorf("microsoft graph token refresh cancelled: %w", callCtx.Err())
-		}
-
-		mu.Lock()
-		changed := tok.AccessToken != lastAccessToken ||
-			tok.RefreshToken != lastRefreshToken ||
-			!tok.Expiry.Equal(lastExpiry)
-		if changed {
-			lastAccessToken = tok.AccessToken
-			lastRefreshToken = tok.RefreshToken
-			lastExpiry = tok.Expiry
-		}
-		mu.Unlock()
-
-		if changed {
-			if saveErr := m.saveToken(email, tok, scopes, tf.TenantID); saveErr != nil {
-				return "", fmt.Errorf("save refreshed microsoft graph token for %s: %w (token refreshed but not persisted — re-run may require re-authorization)", email, saveErr)
-			}
-		}
-
-		return tok.AccessToken, nil
-	}, nil
+// HasScopes reports whether the saved token was granted every scope this
+// manager requests.
+func (m *GraphManager) HasScopes(email string) (bool, error) {
+	tf, err := m.loadTokenFile(email)
+	if err != nil {
+		return false, err
+	}
+	return len(missingScopes(tf.Scopes, m.scopes)) == 0, nil
 }
 
 // HasToken reports whether a persisted Graph token exists for the account.
@@ -229,65 +237,22 @@ func (m *GraphManager) DeleteToken(email string) error {
 }
 
 // saveToken atomically persists the token in the same on-disk JSON format as
-// the IMAP Manager (tokenFile), under the teams_ filename.
+// the IMAP Manager (tokenFile), under the capability's filename prefix.
 func (m *GraphManager) saveToken(email string, token *oauth2.Token, scopes []string, tenantID string) error {
-	if err := fileutil.SecureMkdirAll(m.tokensDir, 0700); err != nil {
-		return err
-	}
-
-	tf := tokenFile{Token: *token, Scopes: scopes, TenantID: tenantID}
-	data, err := json.Marshal(tf, jsontext.WithIndent("  "), json.Deterministic(true))
-	if err != nil {
-		return err
-	}
-
-	path := m.TokenPath(email)
-	tmpFile, err := os.CreateTemp(m.tokensDir, ".teams-token-*.tmp")
-	if err != nil {
-		return fmt.Errorf("create temp token file: %w", err)
-	}
-	tmpPath := tmpFile.Name()
-
-	if _, err := tmpFile.Write(data); err != nil {
-		_ = tmpFile.Close()
-		_ = os.Remove(tmpPath)
-		return fmt.Errorf("write temp token file: %w", err)
-	}
-	if err := tmpFile.Close(); err != nil {
-		_ = os.Remove(tmpPath)
-		return fmt.Errorf("close temp token file: %w", err)
-	}
-	if err := fileutil.SecureChmod(tmpPath, 0600); err != nil {
-		_ = os.Remove(tmpPath)
-		return fmt.Errorf("chmod temp token file: %w", err)
-	}
-	if err := os.Rename(tmpPath, path); err != nil {
-		_ = os.Remove(tmpPath)
-		return fmt.Errorf("rename temp token file: %w", err)
-	}
-	return nil
+	return saveTokenFile(m.tokensDir, m.TokenPath(email), token, scopes, tenantID)
 }
 
 func (m *GraphManager) loadTokenFile(email string) (*tokenFile, error) {
-	path := m.TokenPath(email)
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	var tf tokenFile
-	if err := json.Unmarshal(data, &tf); err != nil {
-		return nil, err
-	}
-	return &tf, nil
+	return readTokenFile(m.TokenPath(email))
 }
 
-func missingGraphScopes(scopes []string) []string {
+func missingScopes(scopes, want []string) []string {
 	have := make(map[string]struct{}, len(scopes))
 	for _, scope := range scopes {
 		have[scope] = struct{}{}
 	}
 	var missing []string
-	for _, scope := range GraphScopes() {
+	for _, scope := range want {
 		if _, ok := have[scope]; !ok {
 			missing = append(missing, scope)
 		}

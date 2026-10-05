@@ -66,6 +66,18 @@ and copies the static marketing site to `/`. `make docs-check` runs source
 validation, builds that actual layout, and checks the output and redirects.
 Use `make docs-serve` to inspect it at `http://127.0.0.1:8000`.
 
+Every public page has a Markdown companion. The build copies documentation
+sources to matching paths such as `/docs/setup.md` and `/docs/usage/searching.md`;
+the documentation index is `/docs/index.md`. HTML pages link to their Markdown
+companions with `rel="alternate"`. Keep `website/llms.txt` linked to every public
+Markdown page. `make docs-check` verifies this coverage against the built site.
+
+Deploy with `make docs-deploy-staging` for a Vercel preview or
+`make docs-deploy` for production. Both targets pull the matching Vercel
+environment, build locally with access to `docs/` and `website/`, and upload
+the built site. Running `vercel` directly from `docs/` uploads only that
+directory, so the remote build cannot find the sibling `website/` sources.
+
 Check a representative rendered page after changing structure, navigation,
 tables, diagrams, or HTML. Inspect links, headings, and mobile line wrapping.
 For prose changes, run the existing docs checks; do not add tests that search
@@ -82,3 +94,16 @@ Follow the [diagram guide](diagrams/README.md) and the scripts in
 `docs/screenshots/` when changing media. The public Enron screenshot fixture
 has a narrow provenance and privacy-review exception in [AGENTS.md](../AGENTS.md);
 it does not authorize reuse in ordinary tests.
+
+Refresh the Web UI images with `make docs-web-screenshots`. The script imports
+the pinned fixture into a temporary archive, builds and starts its own daemon,
+and captures Everything and Relationships at 1920 × 1080. It keeps the normal
+build toolchain and caches. Set `MSGVAULT_DOCS_SCREENSHOT_OUTPUT_DIR` to retain
+captures outside the hydrated asset directory while reviewing them.
+
+The Web UI PNGs belong on `docs-assets`; the TUI SVGs and concept images belong
+on `docs-generated-assets`. Inspect every changed image before updating its
+branch. Capture `*-linux.png` with a Linux browser and `*-darwin.png` with a
+macOS browser. `MSGVAULT_DOCS_SCREENSHOT_PLATFORM` chooses the filenames only;
+it does not change the browser platform. Keep the fixture's provenance and
+review record on `docs-fixtures` unchanged unless the fixture itself changes.

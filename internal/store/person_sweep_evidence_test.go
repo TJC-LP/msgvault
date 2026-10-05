@@ -2,18 +2,23 @@ package store_test
 
 import (
 	"database/sql"
+	"encoding/csv"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/msgvault/internal/imazingcsv"
 	"go.kenn.io/msgvault/internal/peoplesweep"
 	"go.kenn.io/msgvault/internal/personfacts"
 	"go.kenn.io/msgvault/internal/personscope"
 	"go.kenn.io/msgvault/internal/personscope/resolver"
 	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/testutil"
 	"go.kenn.io/msgvault/internal/testutil/storetest"
 )
 
@@ -421,6 +426,58 @@ func TestPersonSweepAuthenticatedChatSenderCanBeDirectSelf(t *testing.T) {
 	}
 }
 
+func TestPersonSweepAttributesImazingCSVOutgoingMessagesToPerson(t *testing.T) {
+	checks := assert.New(t)
+	requirements := require.New(t)
+	st := testutil.NewTestStore(t)
+	// Import a real iMazing CSV export whose outgoing row was sent by the
+	// archive owner, then track the owner as a person.
+	exportRoot := t.TempDir()
+	csvDir := filepath.Join(exportRoot, "csv")
+	requirements.NoError(os.Mkdir(csvDir, 0o700))
+	csvFile, err := os.Create(filepath.Join(csvDir, "messages.csv"))
+	requirements.NoError(err)
+	writer := csv.NewWriter(csvFile)
+	requirements.NoError(writer.Write([]string{
+		"Chat Session", "Message Date", "Delivered Date", "Read Date", "Service", "Type",
+		"Sender ID", "Sender Name", "Status", "Replying to", "Subject", "Text", "Attachment", "Attachment type",
+	}))
+	requirements.NoError(writer.Write([]string{
+		"Alice", "2024-06-01 12:00:00", "", "", "iMessage", "Outgoing", "", "", "", "", "", "I prefer chat", "", "",
+	}))
+	writer.Flush()
+	requirements.NoError(writer.Error())
+	requirements.NoError(csvFile.Close())
+	_, err = imazingcsv.NewImporter(st, imazingcsv.Options{Owner: "+15550000001", Timezone: "UTC"}).
+		ImportPath(t.Context(), exportRoot)
+	requirements.NoError(err)
+	source, err := st.GetSourceByTypeAndIdentifier(imazingcsv.SourceType, "+15550000001")
+	requirements.NoError(err)
+	var ownerParticipantID, messageID int64
+	requirements.NoError(st.DB().QueryRow(`
+		SELECT id FROM participants WHERE phone_number = '+15550000001'`).Scan(&ownerParticipantID))
+	requirements.NoError(st.DB().QueryRow(st.Rebind(`
+		SELECT id FROM messages WHERE source_id = ?`), source.ID).Scan(&messageID))
+	person, _, err := st.CreatePersonFromParticipant(ownerParticipantID)
+	requirements.NoError(err)
+	_, err = st.SetPersonTrackingContext(t.Context(), person.ID, true)
+	requirements.NoError(err)
+
+	items, err := st.HydratePersonSweepMessages(t.Context(), person.ID, []int64{messageID}, 0)
+	requirements.NoError(err)
+	requirements.Len(items, 1)
+	requirements.NotNil(items[0].SubjectPersonID)
+	checks.Equal(person.ID, *items[0].SubjectPersonID)
+	checks.Equal(personfacts.DirectSelf, items[0].Directness)
+
+	candidates, err := st.ListPersonSweepHistoricalCandidates(t.Context(), peoplesweep.HistoricalCandidateRequest{
+		PersonID: person.ID, AuthoredByPerson: true, Limit: 10,
+	})
+	requirements.NoError(err)
+	checks.Equal([]int64{messageID}, candidates,
+		"outgoing imazing_csv messages must count as person authorship")
+}
+
 func TestPersonSweepEvidenceStatusChangesCoalesceToTerminalEffect(t *testing.T) {
 	f := newPersonSweepJournalFixture(t, true, false)
 	id := f.insertMessage(t, "status", "email", f.aliceID, time.Now().UTC())
@@ -767,6 +824,93 @@ func TestSearchPersonSweepDocumentsPreservesCoordinates(t *testing.T) {
 	checks.Equal(peoplesweep.TextSpan{Start: 6, End: 15}, got[0].Highlight)
 	checks.Equal([]personscope.Role{personscope.RoleFrom}, got[0].Provenance.Roles)
 	checks.False(got[0].EventTime.IsZero())
+}
+
+func TestPersonSweepDocumentsRejectOutOfScopeEvidence(t *testing.T) {
+	for _, scopeChange := range []string{"attachment role before reconciliation", "inline target narrowed"} {
+		t.Run(scopeChange, func(t *testing.T) {
+			checks := assert.New(t)
+			requirements := require.New(t)
+			f, personID := newPersonSweepDocumentFixture(t)
+			var attachmentID int64
+			var hash string
+			requirements.NoError(f.Store.DB().QueryRowContext(t.Context(),
+				`SELECT attachment_id, canonical_blob_hash FROM document_occurrences`).Scan(&attachmentID, &hash))
+			var original store.DocumentProviderConsent
+			if scopeChange == "inline target narrowed" {
+				requirements.NoError(f.Store.DB().QueryRowContext(t.Context(), `
+					SELECT profile_id, profile_fingerprint, retention_posture, training_posture
+					FROM document_provider_consents`).Scan(&original.ProfileID, &original.ProfileFingerprint,
+					&original.RetentionPosture, &original.TrainingPosture))
+				inline := store.DocumentExtractionProfile{
+					ID: "person-sweep-inline", Fingerprint: strings.Repeat("f", 64),
+					Provider: "mistral", Endpoint: "https://api.mistral.ai/v1/ocr",
+					Region: "eu", Model: "mistral-ocr-4-0", IncludeInline: true,
+					RetentionPosture: "standard", TrainingPosture: "opted-out",
+					AllowedMediaTypes: []string{"application/pdf"}, PolicyJSON: []byte(`{"include_inline":true}`),
+				}
+				_, err := f.Store.EnsureDocumentExtractionProfile(t.Context(), inline)
+				requirements.NoError(err)
+				requirements.NoError(f.Store.RecordDocumentProviderConsent(t.Context(), store.DocumentProviderConsent{
+					ProfileID: inline.ID, ProfileFingerprint: inline.Fingerprint,
+					RetentionPosture: inline.RetentionPosture, TrainingPosture: inline.TrainingPosture,
+				}))
+				_, err = f.Store.DB().ExecContext(t.Context(), f.Store.Rebind(
+					`UPDATE attachments SET attachment_role = 'inline' WHERE id = ?`), attachmentID)
+				requirements.NoError(err)
+				_, eligible, err := f.Store.ReconcileDocumentOccurrence(t.Context(), attachmentID, 2)
+				requirements.NoError(err)
+				requirements.True(eligible)
+				claim, err := f.Store.ClaimDocumentExtraction(t.Context(), store.DocumentExtractionClaimInput{
+					ExtractionID: "person-sweep-inline", ProfileID: inline.ID,
+					CanonicalBlobHash: hash, ExtractionInputKey: "original", OccurrenceAttachmentID: attachmentID,
+					OccurrenceMIMEType: "application/pdf", OccurrenceMessageType: "email",
+					LeaseOwner: "inline-worker", LeaseUntil: time.Now().Add(time.Hour), LocalBytes: 128, SourceSequence: 2,
+				})
+				requirements.NoError(err)
+				requirements.NoError(f.Store.PublishDocumentExtraction(t.Context(), publicationFor(t,
+					claim, "alpha synthetic role evidence", strings.Repeat("d", 64))))
+				_, err = f.Store.GarbageCollectDocumentDerivatives(t.Context(), time.Now().Add(time.Hour), 10)
+				requirements.NoError(err)
+			}
+
+			search := peoplesweep.DocumentContextRequest{PersonID: personID, Query: "synthetic", Limit: 10}
+			items, err := f.Store.SearchPersonSweepDocuments(t.Context(), search)
+			requirements.NoError(err)
+			requirements.Len(items, 1)
+			input := sweepEvidenceInput(t, items[0])
+			aligner := store.PersonSweepEvidenceAligner{Store: f.Store}
+			aligned, err := aligner.Align(t.Context(), input)
+			requirements.NoError(err)
+			requirements.True(aligned.Accepted)
+			history := peoplesweep.HistoricalCandidateRequest{
+				PersonID: personID, SourceClasses: []peoplesweep.SourceClass{peoplesweep.SourceDocumentText}, Limit: 10,
+			}
+			candidates, err := f.Store.ListPersonSweepHistoricalCandidates(t.Context(), history)
+			requirements.NoError(err)
+			requirements.Equal([]int64{items[0].Ref.MessageID}, candidates)
+
+			if scopeChange == "inline target narrowed" {
+				requirements.NoError(f.Store.RecordDocumentProviderConsent(t.Context(), original))
+			} else {
+				// Readers must reject the changed role before the occurrence is reconciled.
+				_, err = f.Store.DB().ExecContext(t.Context(), f.Store.Rebind(
+					`UPDATE attachments SET attachment_role = 'inline' WHERE id = ?`), attachmentID)
+				requirements.NoError(err)
+			}
+			items, err = f.Store.SearchPersonSweepDocuments(t.Context(), search)
+			requirements.NoError(err)
+			checks.Empty(items)
+			candidates, err = f.Store.ListPersonSweepHistoricalCandidates(t.Context(), history)
+			requirements.NoError(err)
+			checks.Empty(candidates)
+			aligned, err = aligner.Align(t.Context(), input)
+			requirements.NoError(err)
+			checks.False(aligned.Accepted)
+			requirements.NotNil(aligned.Failure)
+			checks.Equal(personfacts.ReasonUnalignedEvidence, aligned.Failure.Reason)
+		})
+	}
 }
 
 func TestPersonSweepEvidenceNonTextAttachmentsFailClosed(t *testing.T) {

@@ -69,6 +69,7 @@ func (s *Store) ScopedToSync(sourceID, syncRunID int64) *Store {
 		cardDAVConflictResolveSnapshotHook:    base.cardDAVConflictResolveSnapshotHook,
 		cardDAVTombstonePrepareSnapshotHook:   base.cardDAVTombstonePrepareSnapshotHook,
 		identityMatchAcceptBeforeDecisionHook: base.identityMatchAcceptBeforeDecisionHook,
+		identityMatchReviewAfterDecisionHook:  base.identityMatchReviewAfterDecisionHook,
 		personOperationBeforeIdentityLockHook: base.personOperationBeforeIdentityLockHook,
 		personMergeAfterSnapshotHook:          base.personMergeAfterSnapshotHook,
 
@@ -892,6 +893,11 @@ func (s *Store) RecordSyncRunItem(item SyncRunItem) error {
 // CountSyncRunItems returns the number of recorded per-item sync outcomes for
 // a run. If status is non-empty, only items with that status are counted.
 func (s *Store) CountSyncRunItems(syncRunID int64, status string) (int64, error) {
+	return s.CountSyncRunItemsContext(context.Background(), syncRunID, status)
+}
+
+// CountSyncRunItemsContext counts sync items while honoring request cancellation.
+func (s *Store) CountSyncRunItemsContext(ctx context.Context, syncRunID int64, status string) (int64, error) {
 	query := `SELECT COUNT(*) FROM sync_run_items WHERE sync_run_id = ?`
 	args := []any{syncRunID}
 	if status != "" {
@@ -899,7 +905,7 @@ func (s *Store) CountSyncRunItems(syncRunID int64, status string) (int64, error)
 		args = append(args, status)
 	}
 	var count int64
-	if err := s.db.QueryRow(query, args...).Scan(&count); err != nil {
+	if err := s.db.QueryRowContext(ctx, query, args...).Scan(&count); err != nil {
 		return 0, fmt.Errorf("count sync_run_items: %w", err)
 	}
 	return count, nil
@@ -908,6 +914,11 @@ func (s *Store) CountSyncRunItems(syncRunID int64, status string) (int64, error)
 // ListSyncRunItems returns the newest recorded per-item sync outcomes for a
 // run. If status is non-empty, only items with that status are returned.
 func (s *Store) ListSyncRunItems(syncRunID int64, status string, limit int) ([]SyncRunItem, error) {
+	return s.ListSyncRunItemsContext(context.Background(), syncRunID, status, limit)
+}
+
+// ListSyncRunItemsContext lists sync items while honoring request cancellation.
+func (s *Store) ListSyncRunItemsContext(ctx context.Context, syncRunID int64, status string, limit int) ([]SyncRunItem, error) {
 	if limit <= 0 {
 		return nil, nil
 	}
@@ -926,7 +937,7 @@ func (s *Store) ListSyncRunItems(syncRunID int64, status string, limit int) ([]S
 	query += ` ORDER BY created_at DESC, id DESC LIMIT ?`
 	args = append(args, limit)
 
-	rows, err := s.db.Query(query, args...)
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list sync_run_items: %w", err)
 	}
@@ -985,7 +996,7 @@ func (s *Store) CompleteSyncContext(ctx context.Context, syncID int64, finalHist
 		return nil
 	})
 	if err == nil {
-		completionStore.optimizeSQLiteBestEffort(ctx, "successful sync")
+		completionStore.optimizeAfterSync(ctx)
 	}
 	return completionStore.finalizeSyncExecution(syncID, err)
 }
@@ -1088,7 +1099,7 @@ func (s *Store) completeSyncAndUpdateSourceContext(
 		return nil
 	})
 	if err == nil {
-		completionStore.optimizeSQLiteBestEffort(ctx, "successful sync")
+		completionStore.optimizeAfterSync(ctx)
 	}
 	return completionStore.finalizeSyncExecution(syncID, err)
 }
@@ -1161,7 +1172,12 @@ func lockSyncSourceTx(ctx context.Context, tx *loggedTx, sourceID int64) error {
 
 // FailSync marks a sync as failed with an error message.
 func (s *Store) FailSync(syncID int64, errMsg string) error {
-	_, err := s.db.Exec(fmt.Sprintf(`
+	return s.FailSyncContext(context.Background(), syncID, errMsg)
+}
+
+// FailSyncContext marks a sync as failed using ctx for the terminal write.
+func (s *Store) FailSyncContext(ctx context.Context, syncID int64, errMsg string) error {
+	_, err := s.db.ExecContext(ctx, fmt.Sprintf(`
 		UPDATE sync_runs
 		SET status = 'failed',
 		    completed_at = %s,
@@ -1266,7 +1282,17 @@ func (s *Store) GetActiveSync(sourceID int64) (*SyncRun, error) {
 }
 
 func (s *Store) getActiveSync(sourceID int64) (*SyncRun, error) {
-	row := s.db.QueryRow(`
+	return s.getActiveSyncContext(context.Background(), sourceID)
+}
+
+// GetActiveSyncReadOnly returns a running sync without recovering abandoned runs.
+// Status GETs use this path so they never acquire the sync lock or write.
+func (s *Store) GetActiveSyncReadOnly(ctx context.Context, sourceID int64) (*SyncRun, error) {
+	return s.getActiveSyncContext(ctx, sourceID)
+}
+
+func (s *Store) getActiveSyncContext(ctx context.Context, sourceID int64) (*SyncRun, error) {
+	row := s.db.QueryRowContext(ctx, `
 		SELECT id, source_id, started_at, completed_at, status,
 		       messages_processed, messages_added, messages_updated, errors_count,
 		       error_message, cursor_before, cursor_after, request_fingerprint
@@ -1285,7 +1311,12 @@ func (s *Store) getActiveSync(sourceID int64) (*SyncRun, error) {
 
 // GetLatestSync returns the most recent sync run for a source, if any.
 func (s *Store) GetLatestSync(sourceID int64) (*SyncRun, error) {
-	row := s.db.QueryRow(`
+	return s.GetLatestSyncContext(context.Background(), sourceID)
+}
+
+// GetLatestSyncContext is the request-aware form of GetLatestSync.
+func (s *Store) GetLatestSyncContext(ctx context.Context, sourceID int64) (*SyncRun, error) {
+	row := s.db.QueryRowContext(ctx, `
 		SELECT id, source_id, started_at, completed_at, status,
 		       messages_processed, messages_added, messages_updated, errors_count,
 		       error_message, cursor_before, cursor_after, request_fingerprint
@@ -1458,24 +1489,29 @@ func (s *Store) HasAnyActiveSync() (bool, error) {
 
 // GetLastSuccessfulSync returns the most recent successful sync for a source.
 func (s *Store) GetLastSuccessfulSync(sourceID int64) (*SyncRun, error) {
-	return s.getLastSuccessfulSync(sourceID, "", false)
+	return s.GetLastSuccessfulSyncContext(context.Background(), sourceID)
+}
+
+// GetLastSuccessfulSyncContext is the request-aware form of GetLastSuccessfulSync.
+func (s *Store) GetLastSuccessfulSyncContext(ctx context.Context, sourceID int64) (*SyncRun, error) {
+	return s.getLastSuccessfulSyncContext(ctx, sourceID, "", false)
 }
 
 // GetLastSuccessfulSyncByType returns the most recent successful sync whose
 // sync_type exactly equals syncType, the legacy empty value included; only
 // GetLastSuccessfulSync queries without a type filter.
 func (s *Store) GetLastSuccessfulSyncByType(sourceID int64, syncType string) (*SyncRun, error) {
-	return s.getLastSuccessfulSync(sourceID, syncType, true)
+	return s.getLastSuccessfulSyncContext(context.Background(), sourceID, syncType, true)
 }
 
-func (s *Store) getLastSuccessfulSync(sourceID int64, syncType string, filterByType bool) (*SyncRun, error) {
+func (s *Store) getLastSuccessfulSyncContext(ctx context.Context, sourceID int64, syncType string, filterByType bool) (*SyncRun, error) {
 	whereType := ""
 	args := []any{sourceID}
 	if filterByType {
 		whereType = " AND sync_type = ?"
 		args = append(args, syncType)
 	}
-	row := s.db.QueryRow(`
+	row := s.db.QueryRowContext(ctx, `
 		SELECT id, source_id, started_at, completed_at, status,
 		       messages_processed, messages_added, messages_updated, errors_count,
 		       error_message, cursor_before, cursor_after, request_fingerprint
@@ -1568,6 +1604,19 @@ func (s *Store) UpdateSourceSyncCursor(sourceID int64, cursor string) error {
 		WHERE id = ?
 	`, now, now), cursor, sourceID)
 	return err
+}
+
+// UpdateSourceSyncState replaces adapter progress without marking a successful
+// sync. Unlike a run checkpoint, this retains only the source's current state.
+func (s *Store) UpdateSourceSyncState(sourceID int64, state string) error {
+	return s.withSyncSourceWriteContext(context.Background(), sourceID, func(q querier) error {
+		_, err := q.Exec(fmt.Sprintf(`
+			UPDATE sources
+			SET sync_cursor = ?, updated_at = %s
+			WHERE id = ?
+		`, s.dialect.Now()), state, sourceID)
+		return err
+	})
 }
 
 // TouchSourceLastSyncAt records that a source-level sync completed even when

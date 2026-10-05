@@ -327,16 +327,28 @@ func buildExploreConditions(request ExploreRequest) (string, []any) {
 			args = append(args, value, value, value)
 		}
 	}
-	if len(request.Context.Domains) > 0 {
-		parts := make([]string, len(request.Context.Domains))
-		for i := range parts {
-			parts[i] = "(lower(sender_domain) = lower(?) OR list_contains(participant_domains, lower(?)) OR list_contains(conversation_participant_domains, lower(?)))"
+	appendDomainGroup := func(values []string) {
+		if len(values) == 0 {
+			return
 		}
-		conditions = append(conditions, "("+strings.Join(parts, " OR ")+")")
-		for _, value := range request.Context.Domains {
+		parts := make([]string, len(values))
+		for i, value := range values {
+			// Test the same sender, recipient, and roster membership as the
+			// list columns without aggregating lists for the whole archive.
+			parts[i] = `(lower(sender_domain) = lower(?) OR message_id IN (
+				SELECT domain_recipient.message_id FROM message_recipients domain_recipient
+				JOIN participants domain_person ON domain_person.id = domain_recipient.participant_id
+				WHERE COALESCE(domain_person.domain, '') = lower(?)
+			) OR conversation_id IN (
+				SELECT domain_member.conversation_id FROM conversation_participants domain_member
+				JOIN participants domain_person ON domain_person.id = domain_member.participant_id
+				WHERE COALESCE(domain_person.domain, '') = lower(?)
+			))`
 			args = append(args, value, value, value)
 		}
+		conditions = append(conditions, "("+strings.Join(parts, " OR ")+")")
 	}
+	appendDomainGroup(request.Context.Domains)
 	appendMailingListGroup := func(values []string) {
 		if len(values) == 0 {
 			return
@@ -367,17 +379,7 @@ func buildExploreConditions(request ExploreRequest) (string, []any) {
 		}
 	}
 	for _, group := range request.Context.AdditionalDomainGroups {
-		if len(group) == 0 {
-			continue
-		}
-		parts := make([]string, len(group))
-		for i := range parts {
-			parts[i] = "(lower(sender_domain) = lower(?) OR list_contains(participant_domains, lower(?)) OR list_contains(conversation_participant_domains, lower(?)))"
-		}
-		conditions = append(conditions, "("+strings.Join(parts, " OR ")+")")
-		for _, value := range group {
-			args = append(args, value, value, value)
-		}
+		appendDomainGroup(group)
 	}
 	for _, group := range request.Context.AdditionalMailingListGroups {
 		appendMailingListGroup(group)
@@ -629,8 +631,8 @@ SELECT COUNT(*) FROM logical_entries`
 // path (which rescans the filtered population) would pay that cost twice; such
 // requests keep the single-pass legacy query.
 func exploreConditionsTouchParticipantLists(request ExploreRequest) bool {
-	return len(request.Context.ParticipantIDs) > 0 || len(request.Context.Domains) > 0 ||
-		len(request.Context.AdditionalParticipantGroups) > 0 || len(request.Context.AdditionalDomainGroups) > 0
+	return len(request.Context.ParticipantIDs) > 0 ||
+		len(request.Context.AdditionalParticipantGroups) > 0
 }
 
 // buildExploreFastListingSQL builds the two-phase entry-row page query used
@@ -771,12 +773,10 @@ func buildExploreLogicalSQL(conditions string) string {
 }
 
 // buildExploreLogicalSQLNoLists renders logical_entries without the
-// participant list columns. Queries that resolve participants or domains
-// through relationship_activity edge joins (person/domain grouping, the
-// filtered people search) must use this variant: projecting the list columns
-// forces analytical_entries to aggregate per-message participant lists for
-// the whole archive before any filter applies, which exceeds the interactive
-// engine's memory budget on production archives.
+// participant list columns. It retains the wide analytical_entries view for
+// filters that need those lists. Queries whose filters need only scalar
+// columns can use buildExploreNarrowFilteredClassifiedCTE to avoid building
+// the lists at all, including when DuckDB materializes a shared CTE.
 func buildExploreLogicalSQLNoLists(conditions string) string {
 	return buildExploreFilteredClassifiedCTE(conditions, "NULL::BIGINT") +
 		exploreLogicalEntriesCTE(false)
@@ -814,8 +814,9 @@ WITH filtered AS (
 )`
 }
 
-// buildExploreNarrowFilteredClassifiedCTE is the listing-only counterpart to
-// buildExploreFilteredClassifiedCTE. It shadows the wide convenience-view name
+// buildExploreNarrowFilteredClassifiedCTE is the scalar-only counterpart to
+// buildExploreFilteredClassifiedCTE, used by listings and indexed grouping.
+// It shadows the wide convenience-view name
 // while evaluating conditions so identity predicates keep their established
 // qualification without forcing participant-list aggregation.
 func buildExploreNarrowFilteredClassifiedCTE(conditions, candidateRankExpression string) string {
@@ -843,6 +844,11 @@ func buildExploreLogicalSQLWithCandidateRank(conditions, candidateRankExpression
 // Explore fast path omits them here and rebuilds them for the ≤limit page
 // rows only (see buildExploreFastListingSQL).
 func exploreLogicalEntriesCTE(withParticipantLists bool) string {
+	// These importers include attachment bytes in their message estimates.
+	// Known attachment bytes still bound an incomplete estimate from below.
+	estimatedBytes := `CASE WHEN lower(source_type) IN ('beeper', 'slack', 'teams')
+		THEN GREATEST(size_estimate, attachment_size)
+		ELSE size_estimate + attachment_size END`
 	messageLists := ""
 	conversationLists := ""
 	if withParticipantLists {
@@ -872,8 +878,8 @@ func exploreLogicalEntriesCTE(withParticipantLists bool) string {
         snippet AS preview,` + messageLists + `
 		CASE WHEN candidate_rank IS NOT NULL THEN message_id ELSE NULL END AS strongest_matched_message_id,
 		1::BIGINT AS message_count,
-		(size_estimate + attachment_size)::BIGINT AS estimated_bytes,
-		(entry_kind = 'email' AND lower(source_type) = 'gmail' AND NOT internally_deleted AND NOT deleted_from_source
+		(` + estimatedBytes + `)::BIGINT AS estimated_bytes,
+		(entry_kind = 'email' AND lower(source_type) IN ` + deletableSourceTypesSQL + ` AND NOT internally_deleted AND NOT deleted_from_source
 			AND COALESCE(source_message_id, '') <> '') AS deletable,
 		has_attachments,
 		is_from_me,
@@ -902,7 +908,7 @@ func exploreLogicalEntriesCTE(withParticipantLists bool) string {
 		arg_min(message_id, struct_pack(candidate_rank := candidate_rank, message_id := message_id))
 			FILTER (WHERE candidate_rank IS NOT NULL) AS strongest_matched_message_id,
 		COUNT(*)::BIGINT AS message_count,
-		SUM(size_estimate + attachment_size)::BIGINT AS estimated_bytes,
+		SUM(` + estimatedBytes + `)::BIGINT AS estimated_bytes,
 		false AS deletable,
 		bool_or(has_attachments) AS has_attachments,
 		arg_max(is_from_me, struct_pack(occurred_at := occurred_at, message_id := message_id)) AS is_from_me,

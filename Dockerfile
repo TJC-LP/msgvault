@@ -11,7 +11,7 @@ RUN cd web && bun run generate && bun run build
 
 # Go build stage.
 # Pin by digest for reproducibility; update periodically.
-FROM golang:1.27.0-bookworm@sha256:484ef6066fa69acb059fdfeda7ba2b8f7391f2ef6abc6f9b8411e669ebd56466 AS builder
+FROM golang:1.27.1-bookworm@sha256:69a7b9788769bec032d238959b61854e9ae87f57be9029ec04e9885fabf99195 AS builder
 
 # Install build dependencies for CGO (SQLite, DuckDB).
 # libsqlite3-dev provides sqlite3.h, required to compile the sqlite-vec
@@ -25,6 +25,9 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
+
+# Fall back to the module's source repo on any proxy error, not just 404/410.
+ENV GOPROXY=https://proxy.golang.org|direct
 
 # Download dependencies first (layer caching)
 COPY go.mod go.sum ./
@@ -42,13 +45,17 @@ ARG COMMIT=unknown
 ARG BUILD_DATE=unknown
 
 # Note: Module path must match go.mod (go.kenn.io/msgvault)
-RUN CGO_ENABLED=1 go build \
+RUN CGO_ENABLED=0 go build -trimpath -buildvcs=false \
+        -o /msgvault-codex-bridge ./cmd/msgvault-codex-bridge \
+    && bridge_digest=$(sha256sum /msgvault-codex-bridge | cut -d' ' -f1) \
+    && CGO_ENABLED=1 go build \
     -tags "fts5 sqlite_vec" \
     -trimpath \
     -ldflags="-s -w \
         -X go.kenn.io/msgvault/cmd/msgvault/cmd.Version=${VERSION} \
         -X go.kenn.io/msgvault/cmd/msgvault/cmd.Commit=${COMMIT} \
-        -X go.kenn.io/msgvault/cmd/msgvault/cmd.BuildDate=${BUILD_DATE}" \
+        -X go.kenn.io/msgvault/cmd/msgvault/cmd.BuildDate=${BUILD_DATE} \
+        -X go.kenn.io/msgvault/internal/peoplesweep.codexBridgeSHA256=${bridge_digest}" \
     -o /msgvault \
     ./cmd/msgvault
 
@@ -61,6 +68,7 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
     tzdata \
     wget \
     libstdc++6 \
+    bubblewrap \
     && rm -rf /var/lib/apt/lists/*
 
 # Create non-root user
@@ -69,6 +77,7 @@ RUN groupadd --gid 1000 msgvault \
 
 # Copy binary from builder
 COPY --from=builder /msgvault /usr/local/bin/msgvault
+COPY --from=builder --chown=msgvault:msgvault /msgvault-codex-bridge /usr/local/bin/msgvault-codex-bridge
 
 # Set up data directory with correct ownership
 ENV MSGVAULT_HOME=/data

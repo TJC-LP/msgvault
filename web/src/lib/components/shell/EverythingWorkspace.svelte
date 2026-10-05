@@ -1,15 +1,17 @@
 <script lang="ts">
-  import { Button, KbdBadge, SearchInput, SegmentedControl } from '@kenn-io/kit-ui';
+  import { Button, SegmentedControl } from '@kenn-io/kit-ui';
   import { onDestroy, untrack } from 'svelte';
 
   import type { APIClient } from '../../api/client';
-  import type { ExplorePreflightResponse as GeneratedExplorePreflightResponse } from '../../api/generated/models';
+  import type {
+    MeetingRef,
+    ExplorePreflightResponse as GeneratedExplorePreflightResponse,
+    ExploreSelection as GeneratedExploreSelection,
+  } from '../../api/generated/models';
   import type {
     EntryRow,
     AllMatchingExploreSelection,
     ExploreCacheUnavailable,
-    ExploreColumn,
-    ExploreFileFact,
     ExploreGroupDimension,
     ExploreGroupRow,
     ExploreSearchMode,
@@ -23,17 +25,24 @@
   import { groupingByDimension } from '../../grouping/catalog';
   import { canonicalFingerprint, createAllMatchingSelection, predicateFingerprint } from '../../explore/selection';
   import type { ExploreSelectionState, ExploreState } from '../../explore/state.svelte';
+  import ColumnsMenu from '../explore/ColumnsMenu.svelte';
   import ContextBar from '../explore/ContextBar.svelte';
   import EverythingTable from '../explore/EverythingTable.svelte';
-  import FilesPresentation from '../explore/FilesPresentation.svelte';
   import GroupTable from '../explore/GroupTable.svelte';
   import SelectionBar from '../explore/SelectionBar.svelte';
   import SplitPane from '../layout/SplitPane.svelte';
   import PersonTimeline from '../people/PersonTimeline.svelte';
   import SearchCoverage from '../search/SearchCoverage.svelte';
-  import SearchModeControl from '../search/SearchModeControl.svelte';
   import ReadingPane, { type ReadingPaneSelection, type ReadingPaneStatus } from '../reader/ReadingPane.svelte';
   import type { SearchCoverageAction } from '../../search/modes';
+  import MeetingPanel from '../meetings/MeetingPanel.svelte';
+  import PageHeader from './PageHeader.svelte';
+  import {
+    exploreMeetingScope,
+    filtersToMeetingTranscripts,
+    isMeetingTranscript,
+    restrictsToMeetingTranscripts,
+  } from '../../meetings/scopes';
   import type { EverythingSessionState } from './EverythingSessionState.svelte';
 
   type ExplorePreflight = GeneratedExplorePreflightResponse;
@@ -48,22 +57,24 @@
     readingTargetKey: string | null;
     conversationAnchorId: number | undefined;
     sortNotice: string;
-    searchInput?: HTMLInputElement;
+    searchInput: HTMLInputElement | undefined;
     selectionPreflight: ExplorePreflight | undefined;
+    meetingSelection: GeneratedExploreSelection | undefined;
     exportSelection: () => void;
+    onReviewDeletion: (mode: 'explicit' | 'all_matching') => void;
     commitNavigation: (patch: Partial<ExploreURLState>) => void;
+    commitSearch: (query: string, mode: ExploreSearchMode) => void;
     commitWorkspace: (workspace: ExploreWorkspace) => void;
     commitGrouping: (dimension: ExploreGroupDimension) => void;
-    commitSearch: (query: string, mode: ExploreSearchMode) => void;
     fixedSortNotice: () => void;
     focusGrid: () => void;
     openRow: (row: EntryRow) => void;
     drillGroup: (row: ExploreGroupRow) => void;
-    openFileItem: (entryKey: string) => void;
-    openContextualFile: (file: ExploreFileFact) => void;
     closeReadingPane: () => void;
     openRelationship: (participantID: number) => void;
     changeConversationAnchor: (anchorId: number) => void;
+    onOpenMeeting?: (meeting: MeetingRef) => void;
+    onSaveView: () => void;
   }
 
   let {
@@ -76,25 +87,41 @@
     readingTargetKey,
     conversationAnchorId,
     sortNotice,
-    searchInput = $bindable(undefined),
+    searchInput,
     selectionPreflight,
+    meetingSelection,
     exportSelection,
+    onReviewDeletion,
     commitNavigation,
+    commitSearch,
     commitWorkspace,
     commitGrouping,
-    commitSearch,
     fixedSortNotice,
     focusGrid,
     openRow,
     drillGroup,
-    openFileItem,
-    openContextualFile,
     closeReadingPane,
     openRelationship,
     changeConversationAnchor,
+    onOpenMeeting = undefined,
+    onSaveView,
   }: Props = $props();
 
   const api = createExploreAPI(untrack(() => client));
+
+  const countLabel = $derived.by(() => {
+    const result = loader.result;
+    if (loader.loading) return 'Counting…';
+    if (!result || loader.error || loader.unavailable) return '';
+    if (result.candidatePoolSaturated) {
+      const shown = loader.rows.length;
+      return `${shown.toLocaleString()} ${shown === 1 ? 'result' : 'results'} shown`;
+    }
+    if (result.totalCount === undefined) return '';
+    const count = result.totalCount;
+    const [one, many] = exploreState.current.groupingChain.length > 0 ? ['group', 'groups'] : ['item', 'items'];
+    return `${count.toLocaleString()} ${count === 1 ? one : many}`;
+  });
 
   function storedPreviewPosition(): 'below' | 'right' {
     try {
@@ -132,10 +159,12 @@
   let lexicalCountController: AbortController | undefined;
   let lexicalCountTimer: ReturnType<typeof setTimeout> | undefined;
   let lexicalCountRequestKey = '';
+  let readingDetailRetryRevision = $state(0);
   let readingDetailLoading = $state(false);
   let readingDetailError = $state('');
   let readingDetailUnavailable = $state<ExploreCacheUnavailable>();
   let readingDetailController: AbortController | undefined;
+  let readingDetailRequestIdentity = '';
 
   const allMatchingSelection = $derived.by((): AllMatchingExploreSelection | undefined => {
     if (!loader.result || loader.loading || loader.loadingMore) return undefined;
@@ -199,9 +228,25 @@
 
   const readingPredicateFingerprint = $derived(predicateFingerprint(exploreState.predicate()));
 
-  $effect(() => {
-    const target = parseGroupSelection(exploreState.current.selectedRow);
+  $effect.pre(() => {
+    const target = parseGroupSelection(readingTargetKey);
+    void readingDetailRetryRevision;
     const fingerprint = readingPredicateFingerprint;
+    const identity = `${fingerprint}|${readingTargetKey ?? ''}`;
+    if (identity !== readingDetailRequestIdentity) {
+      readingDetailRequestIdentity = identity;
+      // Cancel before waiting for the new outer result. A delayed old lookup
+      // must not publish group authority under the newly selected predicate.
+      session.readingDetailGeneration += 1;
+      readingDetailController?.abort();
+      readingDetailController = undefined;
+      const keepDetail = untrack(() => target && session.readingDetailFingerprint.startsWith(`${fingerprint}|`) &&
+        session.readingGroupDetail?.kind === 'group' && session.readingGroupDetail.dimension === target.dimension && session.readingGroupDetail.key === target.key);
+      if (!keepDetail) {
+        session.readingGroupDetail = undefined;
+        session.readingDetailFingerprint = '';
+      }
+    }
     // Tracked, not untracked like `predicate` below: a cache rebuild
     // invalidates a stale detail whether it happened before this mount
     // (`session` persisted the fingerprint across a prior workspace
@@ -213,14 +258,15 @@
     // "revision not yet known" (a fresh mount, before its own list request
     // has resolved even once) to whatever revision it turns out to be.
     const cacheRevision = loader.result?.cacheRevision;
+    const outerAuthority = canonicalFingerprint({ cacheRevision, searchProvenance: loader.result?.searchProvenance, candidateSnapshotId: loader.result?.candidateSnapshotId });
     const predicate = untrack(() => exploreState.predicate());
-    if (target && cacheRevision === undefined) {
+    if (target && (cacheRevision === undefined || loader.loading || loader.resultFingerprint !== fingerprint)) {
       readingDetailLoading = true;
       readingDetailError = '';
       readingDetailUnavailable = undefined;
       return;
     }
-    const loadedKey = target ? `${fingerprint}|${cacheRevision}|group:${target.dimension}:${target.key}` : '';
+    const loadedKey = target ? `${fingerprint}|${outerAuthority}|group:${target.dimension}:${target.key}` : '';
     // A workspace round-trip destroys and recreates this component, which
     // re-creates this effect and would otherwise unconditionally discard and
     // refetch the group detail below. If a previous mount already loaded
@@ -291,6 +337,7 @@
           count: lookup.row.count,
           estimatedBytes: lookup.row.estimated_bytes,
           latestAt: lookup.row.latest_at,
+          meetingScope: exploreMeetingScope(detailPredicate, lookup.authority).explore,
         };
         session.readingDetailFingerprint = loadedKey;
       })
@@ -302,6 +349,48 @@
         if (generation === session.readingDetailGeneration) readingDetailLoading = false;
       });
   });
+
+  // The meeting context API rejects any selection that contains a non-meeting row.
+  const canExportMeetings = $derived.by(() => {
+    if (selection.mode === 'all_matching') return restrictsToMeetingTranscripts(exploreState.predicate());
+    const selected = loader.rows.filter((row) => selection.isSelected(row.key));
+    return selected.length > 0 && selected.every(isMeetingTranscript);
+  });
+
+  let meetingReloadRequestedAt: number | undefined;
+  const meetingPredicateFingerprint = $derived(predicateFingerprint(exploreState.predicate()));
+  const meetingScope = $derived(session.meetingOverview?.fingerprint === meetingPredicateFingerprint
+    ? session.meetingOverview.scope : undefined);
+
+  $effect.pre(() => {
+    const fingerprint = meetingPredicateFingerprint;
+    const predicate = exploreState.predicate();
+    const result = loader.result;
+    const loading = loader.loading;
+    const generation = loader.resultGeneration;
+    const resultFingerprint = loader.resultFingerprint;
+    const isMeetingView = exploreState.current.workspace === 'everything' && filtersToMeetingTranscripts(predicate);
+    untrack(() => {
+      if (!isMeetingView || session.meetingOverview?.fingerprint !== fingerprint) session.meetingOverview = undefined;
+      if (!isMeetingView || !result || loading || resultFingerprint !== fingerprint) return;
+      const scope = exploreMeetingScope(predicate, result);
+      const explicitlyReloaded = meetingReloadRequestedAt !== undefined && generation !== meetingReloadRequestedAt;
+      if (explicitlyReloaded) meetingReloadRequestedAt = undefined;
+      if (!session.meetingOverview || explicitlyReloaded || canonicalFingerprint(scope) !== canonicalFingerprint(session.meetingOverview.scope)) {
+        session.meetingOverview = { fingerprint, scope, refreshKey: (session.meetingOverview?.refreshKey ?? 0) + (explicitlyReloaded ? 1 : 0) };
+      }
+    });
+  });
+
+  function reloadOverviewMeetings(): void {
+    meetingReloadRequestedAt = loader.resultGeneration;
+    loader.retry();
+  }
+
+  function reloadGroupMeetings(): void {
+    session.readingDetailFingerprint = '';
+    readingDetailRetryRevision += 1;
+  }
 
   const coverageFiltersFingerprint = $derived(canonicalFingerprint(exploreState.current.filters));
 
@@ -370,7 +459,6 @@
     }
     if (
       !currentResult ||
-      exploreState.current.presentation === 'files' ||
       !predicate.query ||
       (predicate.search_mode !== 'full_text' && predicate.search_mode !== 'hybrid') ||
       loader.resultFingerprint !== predicateFingerprint(predicate) ||
@@ -493,12 +581,6 @@
     }
   }
 
-  function submitSearch(event: SubmitEvent): void {
-    event.preventDefault();
-    commitSearch(exploreState.current.query.trim(), exploreState.current.searchMode);
-    focusGrid();
-  }
-
   function inspectGroup(row: ExploreGroupRow): void {
     const dimension = exploreState.current.groupingChain[0];
     if (dimension && groupingByDimension(dimension).drillable) {
@@ -507,6 +589,7 @@
   }
 
   onDestroy(() => {
+    session.meetingOverview = undefined;
     coverageRequestGeneration += 1;
     coverageController?.abort();
     if (coveragePollTimer !== undefined) clearTimeout(coveragePollTimer);
@@ -518,72 +601,9 @@
 </script>
 
 <main class="everything-workspace" aria-label="Everything">
-  <header class="workspace-header">
-    <div>
-      <h1>Everything</h1>
-    </div>
-    <div class="workspace-view-controls">
-      {#if canPreviewRight}
-        <div class="preview-position">
-          <span>Preview position</span>
-          <SegmentedControl
-            ariaLabel="Preview position"
-            options={[{ value: 'below', label: 'Below' }, { value: 'right', label: 'Right' }]}
-            value={previewPosition}
-            onchange={setPreviewPosition}
-          />
-        </div>
-      {/if}
-      <p class="result-count" aria-live="polite" data-mono>
-        {#if loader.result?.candidatePoolSaturated}
-          {loader.rows.length.toLocaleString()} {loader.rows.length === 1 ? 'result' : 'results'} shown
-        {:else if loader.result?.totalCount !== undefined}
-          {loader.result.totalCount.toLocaleString()} items
-        {:else}
-          Modality-neutral archive
-        {/if}
-      </p>
-    </div>
-  </header>
-
-  <form class="search-bar" role="search" aria-label="Search Everything" onsubmit={submitSearch}>
-    <div class="query-control">
-      <SearchInput
-        id="everything-search"
-        bind:inputEl={searchInput}
-        value={exploreState.current.query}
-        ariaLabel="Search everything"
-        placeholder="Search people, conversations, events, and files…"
-        block
-        oninput={(value) => exploreState.replaceSearchDraft(value, exploreState.current.searchMode)}
-      />
-    </div>
-    <SearchModeControl
-      requestedMode={exploreState.current.searchMode}
-      status={session.coverage?.status}
-      error={loader.error}
-      onchange={(mode: ExploreSearchMode) => exploreState.replaceSearchDraft(exploreState.current.query, mode)}
-    />
-    <Button type="submit" label="Search" tone="info" surface="solid" />
-  </form>
-
-  {#if loader.result?.candidatePoolSaturated}
-    <div class="search-limit" role="status">
-      <p>
-        <span class="search-limit__title">More results may match.</span>
-        Narrow with from:alice@example.com, after:2025-01-01, or label:important.
-      </p>
-      <Button label="Refine search" size="sm" surface="soft" onclick={() => searchInput?.focus()} />
-    </div>
-  {/if}
-
-  {#if session.coverage}
-    <SearchCoverage
-      requestedMode={exploreState.current.searchMode}
-      coverage={session.coverage}
-      onaction={handleCoverageAction}
-    />
-  {/if}
+  <PageHeader title="Everything">
+    {#snippet actions()}<Button surface="outline" label="Save view…" onclick={onSaveView} />{/snippet}
+  </PageHeader>
 
   <ContextBar
     {client}
@@ -591,10 +611,17 @@
     searchMode={exploreState.current.searchMode}
     filters={exploreState.current.filters}
     groupingChain={exploreState.current.groupingChain}
-    totalCount={loader.result?.totalCount}
+    {countLabel}
+    sort={exploreState.current.groupingChain.length > 0 ? undefined : {
+      options: [{ value: 'newest', label: 'Newest first' }],
+      value: 'newest',
+      note: 'Other orders aren’t available yet',
+      onchange: fixedSortNotice,
+    }}
     presentation={exploreState.current.presentation}
     onPresentationChange={(presentation) =>
       commitNavigation({
+        ...(presentation === 'files' ? { workspace: 'files' as const } : {}),
         presentation,
         activeRow: null,
         selectedRow: null,
@@ -615,15 +642,69 @@
         selectedRow: null,
         scrollAnchor: null,
       })}
-    onSort={fixedSortNotice}
-  />
+    onRemoveQuery={() => commitSearch('', exploreState.current.searchMode)}
+    onRemoveFilter={(index) =>
+      commitNavigation({
+        filters: exploreState.current.filters.filter((_, position) => position !== index),
+        activeRow: null,
+        selectedRow: null,
+        scrollAnchor: null,
+      })}
+  >
+    {#snippet extra()}
+      {#if exploreState.current.presentation === 'table' && exploreState.current.groupingChain.length === 0}
+        <ColumnsMenu
+          columns={exploreState.current.columns}
+          onchange={(columns) => exploreState.replaceTransient({ columns })}
+        />
+      {/if}
+      {#if canPreviewRight}
+        <SegmentedControl
+          ariaLabel="Preview position"
+          options={[{ value: 'below', label: 'Below' }, { value: 'right', label: 'Right' }]}
+          value={previewPosition}
+          onchange={setPreviewPosition}
+        />
+      {/if}
+    {/snippet}
+  </ContextBar>
   <span class="kit-sr-only" role="status" aria-label="Sort status" aria-live="polite">{sortNotice}</span>
+
+  {#if loader.result?.candidatePoolSaturated}
+    <div class="search-limit" role="status">
+      <p>
+        <span class="search-limit__title">More results may match.</span>
+        Narrow with from:alice@example.com, after:2025-01-01, or label:important.
+      </p>
+      <Button label="Refine search" size="sm" surface="soft" onclick={() => searchInput?.focus()} />
+    </div>
+  {/if}
+
+  {#if session.coverage}
+    <SearchCoverage
+      requestedMode={exploreState.current.searchMode}
+      coverage={session.coverage}
+      onaction={handleCoverageAction}
+    />
+  {/if}
 
   {#if loader.result?.searchDeletionScope === 'active'}
     <p class="scope-note" role="status">Semantic search covers active messages only.</p>
   {/if}
 
-  <div class="results-split" class:results-split--right={previewRight} bind:clientWidth={resultsWidth}>
+  {#if meetingScope}
+    <div class="meeting-overview" data-scroll>
+      <MeetingPanel {client} scope={meetingScope} refreshKey={String(session.meetingOverview?.refreshKey ?? 0)}
+        onReloadScope={reloadOverviewMeetings} {onOpenMeeting} />
+    </div>
+  {/if}
+
+  <div
+    class="results-split"
+    class:results-split--open={Boolean(readingTargetKey)}
+    class:results-split--right={previewRight}
+    bind:clientWidth={resultsWidth}
+  >
     <SplitPane
       ariaLabel="Resize reading pane"
       storageKey={previewRight ? 'msgvault.reading-pane.right-size' : 'msgvault.reading-pane.size'}
@@ -660,35 +741,7 @@
               onScrollAnchor={(key, offset) => exploreState.replaceTransient({ scrollAnchor: { key, offset } })}
               onRetry={loader.retry}
             />
-          {:else if exploreState.current.presentation === 'files'}
-            <FilesPresentation
-              files={loader.fileFacts}
-              loading={loader.loading}
-              loadingMore={loader.loadingMore}
-              hasMore={Boolean(loader.nextCursor)}
-              totalCount={loader.result?.totalCount}
-              generation={loader.resultGeneration}
-              error={loader.error}
-              pageError={loader.pageError}
-              unavailable={loader.unavailable}
-              focusedKey={exploreState.current.activeRow}
-              scrollAnchor={exploreState.current.scrollAnchor}
-              restoring={loader.restoring}
-              onOpenFile={openContextualFile}
-              onOpenItem={openFileItem}
-              onActiveKey={(activeRow) => exploreState.replaceTransient({ activeRow })}
-              onScrollAnchor={(key, offset) => exploreState.replaceTransient({ scrollAnchor: { key, offset } })}
-              onLoadMore={loader.loadMore}
-              onRetry={loader.retry}
-            />
           {:else}
-            <SelectionBar
-              {selection}
-              totalCount={loader.result?.totalCount}
-              allMatching={allMatchingSelection}
-              preflight={selectionPreflight}
-              onExport={exportSelection}
-            />
             {#if exploreState.current.presentation === 'timeline'}
               <PersonTimeline
                 rows={loader.rows}
@@ -734,7 +787,6 @@
                 error={loader.error}
                 pageError={loader.pageError}
                 onOpen={openRow}
-                onColumnsChange={(columns: ExploreColumn[]) => exploreState.replaceTransient({ columns })}
                 onScrollAnchor={(key, offset) => exploreState.replaceTransient({ scrollAnchor: { key, offset } })}
                 onLoadMore={loader.loadMore}
                 onLoadThroughEnd={loader.loadThroughEnd}
@@ -745,6 +797,18 @@
                 onRetry={loader.retry}
               />
             {/if}
+            <SelectionBar
+              {selection}
+              totalCount={loader.result?.totalCount}
+              allMatching={allMatchingSelection}
+              preflight={selectionPreflight}
+              {client}
+              {meetingSelection}
+              {canExportMeetings}
+              onExport={exportSelection}
+              {onReviewDeletion}
+              onClear={focusGrid}
+            />
           {/if}
         </div>
       {/snippet}
@@ -759,6 +823,8 @@
             unavailable={readingState.unavailable}
             predicate={exploreState.predicate()}
             onClose={closeReadingPane}
+            {onOpenMeeting}
+            onReloadMeetings={reloadGroupMeetings}
             onOpenSettings={() => commitWorkspace('settings')}
             onOpenRelationship={openRelationship}
             {conversationAnchorId}
@@ -769,75 +835,20 @@
     </SplitPane>
   </div>
 
-  <footer class="keyboard-help" aria-label="Keyboard shortcuts">
-    <span><KbdBadge keys={['J']} />/<KbdBadge keys={['K']} /> move</span>
-    <span><KbdBadge keys={['Enter']} /> open</span>
-    <span><KbdBadge keys={['Space']} /> select</span>
-    <span><KbdBadge keys={['Shift', 'Space']} /> range</span>
-    <span><KbdBadge keys={['A']} /> visible</span>
-    <span><KbdBadge keys={['X']} /> clear</span>
-    <span><KbdBadge keys={['/']} /> search</span>
-    <span><KbdBadge keys={['Esc']} /> back</span>
-  </footer>
 </main>
 
 <style>
   .everything-workspace {
     display: flex;
     width: 100%;
-    max-width: 1760px;
     min-height: 0;
     flex: 1;
     flex-direction: column;
     gap: var(--space-4);
-    margin-inline: auto;
-    padding: var(--space-6) var(--space-7) var(--space-4);
+    padding: var(--space-5) var(--page-gutter) var(--space-4);
   }
 
-  .workspace-header {
-    display: flex;
-    align-items: baseline;
-    justify-content: space-between;
-    gap: var(--space-6);
-  }
-
-  .workspace-view-controls,
-  .preview-position {
-    display: flex;
-    align-items: center;
-    gap: var(--space-4);
-  }
-
-  .preview-position {
-    color: var(--text-muted);
-    font-size: var(--font-size-xs);
-  }
-
-  h1 {
-    margin: 0;
-    font-family: var(--font-sans);
-    font-size: var(--font-size-xl);
-    font-weight: 650;
-    line-height: 1.2;
-  }
-
-  .result-count {
-    margin: 0;
-    color: var(--text-muted);
-    font-size: var(--font-size-xs);
-    font-variant-numeric: tabular-nums;
-  }
-
-  .search-bar {
-    display: flex;
-    align-items: center;
-    gap: var(--space-4);
-  }
-
-  .query-control {
-    min-width: 240px;
-    flex: 1;
-  }
+  .meeting-overview { max-height: 42vh; overflow: auto; flex: none; border: 1px solid var(--border-muted); }
 
   .scope-note {
     margin: 0;
@@ -888,11 +899,24 @@
   }
 
   /* The reading pane provides its own surface; the split's secondary pane
-   * only frames it with the hairline above the drag handle. */
+   * frames it on every edge except the one beside the drag handle. The
+   * handle is the divider, so neither frame draws a border on that edge. */
   .results-split :global([data-pane='secondary']) {
     border: 1px solid var(--border-default);
     border-top: 0;
     border-radius: 0 0 var(--radius-md) var(--radius-md);
+  }
+
+  .results-split--open:not(.results-split--right) :global(:is(.everything-table, .group-table)) {
+    border-bottom: 0;
+    border-bottom-left-radius: 0;
+    border-bottom-right-radius: 0;
+  }
+
+  .results-split--open.results-split--right :global(:is(.everything-table, .group-table)) {
+    border-right: 0;
+    border-top-right-radius: 0;
+    border-bottom-right-radius: 0;
   }
 
   .results-split--right :global([data-pane]) {
@@ -903,33 +927,5 @@
     border-top: 1px solid var(--border-default);
     border-left: 0;
     border-radius: 0 var(--radius-md) var(--radius-md) 0;
-  }
-
-  .keyboard-help {
-    display: flex;
-    min-height: 22px;
-    align-items: center;
-    gap: var(--space-5);
-    color: var(--text-muted);
-    font-size: var(--font-size-2xs);
-  }
-
-  @media (max-width: 760px) {
-    .everything-workspace {
-      padding-inline: var(--space-4);
-    }
-
-    .search-bar {
-      align-items: stretch;
-      flex-wrap: wrap;
-    }
-
-    .query-control {
-      min-width: 100%;
-    }
-
-    .keyboard-help {
-      overflow-x: auto;
-    }
   }
 </style>

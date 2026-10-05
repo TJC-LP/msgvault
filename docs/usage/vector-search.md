@@ -1,5 +1,5 @@
 ---
-last_edited: "2026-09-08"
+last_edited: "2026-09-25"
 title: Vector Search
 description: Find messages by meaning and set up separate people, visual, and document search indexes.
 ---
@@ -147,6 +147,10 @@ rrf_k = 60                               # RRF constant; higher flattens score d
 k_per_signal = 100                       # candidate pool size per signal (BM25 or vector)
 subject_boost = 2.0                      # score boost when a query term hits the subject
 max_page_size_hybrid = 50                # hard cap on vector/hybrid page_size
+sqlite_accelerator = "auto"              # use a ready SQLite ANN index
+ann_nprobe = 8                            # partitions searched per query
+ann_oversample = 8                        # candidates per result before exact reranking
+ann_threads = 8                           # native threads used by embeddings optimize
 
 [vector.embed.schedule]
 cron = "*/5 * * * *"                     # embed worker cron (5-field); empty disables cron
@@ -305,6 +309,12 @@ messages, embed it:
 msgvault embeddings build --full-rebuild --yes
 ```
 
+For message embeddings, enabling `[vector]` is the opt-in. The command does not
+create a separate stored provider-consent record; `--yes` only skips the full
+rebuild confirmation. If the endpoint is hosted, both indexed message text and
+semantic query text leave the archive as described above. People, visual, and
+document vectors use separate consent gates.
+
 This creates a new **building generation**, scans every non-deleted
 message in the configured scope, embeds missing rows in batches through your
 configured embedder, and atomically activates the generation once
@@ -327,6 +337,40 @@ throughput rate, milliseconds per message, microseconds per character,
 and an ETA once enough samples are available. If a failing batch is
 downshifted to smaller requests, the ETA window keeps those singleton
 retries from dominating the displayed rate.
+
+## Optimize SQLite Search
+
+Large SQLite archives should build the local search accelerator after the
+embedding generation is active:
+
+```bash
+msgvault embeddings optimize
+```
+
+The optimizer reads stored vectors only. It does not call the embedding
+provider. Copy progress is committed in batches, native training runs in a
+disposable child process, and publication happens only after integrity checks.
+The daemon pauses scheduled embedding and other gated writes for the whole
+operation; searches remain available. If the command is interrupted, run it
+again. Search stays exact until the accelerator is ready, then `sqlite_accelerator = "auto"` switches semantic and
+hybrid retrieval to bounded ANN candidates with exact reranking. New embedding
+writes update a ready accelerator in the same transaction.
+
+Use `msgvault embeddings list` to inspect `exact`, `building`, `ready`, or
+`stale` accelerator state, indexed row count, timestamps, and the last bounded
+error. Set `sqlite_accelerator = "exact"` for an immediate rollback to exhaustive
+search without deleting the accelerator. `search --explain` displays the retrieval
+path; JSON responses include it as `accelerator`. Accelerator errors also produce
+a warning before search retries with exact vectors.
+
+Use `msgvault embeddings optimize --drop <generation-id>` to remove an old or
+unwanted accelerator, including one for a retired generation. Exact vectors
+remain available. SQLite can reuse the freed pages; dropping the accelerator
+does not shrink the database file on disk.
+
+Run `msgvault embeddings optimize` again after substantial archive growth.
+The trained bucket count is fixed until the next optimization, so a much
+larger archive can reduce retrieval speed and recall.
 
 ## Keeping the Index Up to Date
 
@@ -385,9 +429,9 @@ trigger).
 |---|---|
 | Manual `sync-full` / `sync` (Gmail, IMAP) | No. Run `msgvault embeddings build` afterward |
 | Manual `sync-calendar` / `sync-teams` / `sync-discord` | No. Run `msgvault embeddings build` afterward |
-| Manual `sync-slack` / `sync-beeper` / `sync-granola` / `sync-circleback` / `sync-notion` | No. Run `msgvault embeddings build` afterward |
+| Manual `sync-slack` / `sync-beeper` / `sync-granola` / `sync-plaud` / `sync-circleback` / `sync-notion-meetings` / `sync-muesli` | No. Run `msgvault embeddings build` afterward |
 | Scheduled account syncs in `msgvault serve` (Gmail, IMAP, Teams, Discord) | Yes, when `[vector.embed.schedule].run_after_sync = true` |
-| Scheduled calendar, Slack, Beeper, Granola, Circleback, and Notion syncs in `msgvault serve` | No immediate post-sync run. Picked up by the embed worker's `[vector.embed.schedule].cron` schedule |
+| Scheduled calendar, Slack, Beeper, Granola, Plaud, Circleback, Notion, and Muesli syncs in `msgvault serve` | No immediate post-sync run. Picked up by the embed worker's `[vector.embed.schedule].cron` schedule |
 | Local email imports (`import-pst`, `import-emlx`, `import-eml`, `import-mbox`) | No. Run `msgvault embeddings build` afterward |
 | Local chat/text imports | No. Run `msgvault embeddings build` afterward |
 

@@ -25,10 +25,16 @@ import type {
   OperationState
 } from './models';
 import { DEFAULT_EXPLORE_COLUMNS, isValidSourceID } from './models';
+import { isCalendarDate } from '../directory/dates';
 import { isGroupingDimension, validateGroupingChain } from '../grouping/catalog';
 import { hasValidSearchAuthority, predicateFingerprint } from './selection';
 import { parseAttachmentSelection } from './attachment-authority';
-import { normalizeSettingsNavigationAuthority } from '../carddav/navigation';
+import { ARCHIVE_MEETING_HISTORY_KEY, parseArchiveMeetingHistory, type ArchiveMeetingHistory } from '../meetings/archive-selection';
+import {
+  normalizeSettingsNavigationAuthority,
+  settingsNavigationTarget,
+  type SettingsNavigationAuthority
+} from '../carddav/navigation';
 import {
   availableSearchModeStorage,
   explicitSearchModeFromURL,
@@ -93,7 +99,8 @@ const RESTORATION_INVALIDATING_FIELDS = new Set<keyof ExploreURLState>([
   'operationStartedFrom',
   'operationStartedBefore',
   'operationStatus',
-  'settingsAuthority'
+  'settingsAuthority',
+  'settingsCategory'
 ]);
 const FILE_MIME_FAMILIES = new Set<FileMIMEFamily>([
   'image', 'pdf', 'audio', 'video', 'text', 'document', 'archive', 'other'
@@ -176,6 +183,7 @@ export const defaultExploreURLState: ExploreURLState = {
   operationRunID: null,
   operationStatus: '',
   settingsAuthority: '',
+  settingsCategory: 'browser',
   columns: [...DEFAULT_EXPLORE_COLUMNS],
   columnWidths: {},
   activeRow: null,
@@ -187,7 +195,7 @@ export const defaultExploreURLState: ExploreURLState = {
 
 interface ExploreWindow {
   location: Pick<Location, 'href' | 'pathname' | 'search' | 'hash'>;
-  history: Pick<History, 'pushState' | 'replaceState'>;
+  history: Pick<History, 'state' | 'pushState' | 'replaceState'>;
   addEventListener(type: 'popstate', listener: () => void): void;
   removeEventListener(type: 'popstate', listener: () => void): void;
 }
@@ -321,6 +329,10 @@ function directoryPersonID(value: unknown): number | null {
   return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : null;
 }
 
+function directoryDay(value: unknown): string {
+  return typeof value === 'string' && isCalendarDate(value) ? value : '';
+}
+
 function operationDateBound(value: unknown): string {
   if (typeof value !== 'string' ||
     !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{0,8}[1-9])?Z$/.test(value)) return '';
@@ -352,6 +364,17 @@ function operationRunID(value: unknown): string | null {
     /^op2\.[a-f0-9]{32}\.[A-Za-z0-9_-]+$/.test(value)
     ? value
     : null;
+}
+
+const SETTINGS_CATEGORY_PATTERN = /^[a-z][a-z0-9_-]{0,63}$/;
+
+// A Settings authority link chooses its category; otherwise keep a
+// well-formed category id. Settings shows Appearance for ids the daemon
+// does not list.
+function settingsCategory(value: unknown, authority: SettingsNavigationAuthority | ''): string {
+  const target = settingsNavigationTarget(authority);
+  if (target) return target.categoryID;
+  return typeof value === 'string' && SETTINGS_CATEGORY_PATTERN.test(value) ? value : 'browser';
 }
 
 function legacyRelationshipTarget(
@@ -396,6 +419,11 @@ function normalize(value: unknown): ExploreURLState {
     value.workspace === 'deletions' || value.workspace === 'operations'
     ? value.workspace
     : 'relationships';
+  const filesView = workspace === 'files' || (workspace === 'everything' && presentation === 'files');
+  const normalizedWorkspace = filesView ? 'files' : workspace;
+  const normalizedPresentation = filesView
+    ? 'files'
+    : presentation === 'files' ? defaultExploreURLState.presentation : presentation;
   const analysisTarget = typeof value.analysisTarget === 'string' &&
     (/^person:[1-9][0-9]*$/.test(value.analysisTarget) || /^domain:[a-z0-9.-]+$/.test(value.analysisTarget))
     ? value.analysisTarget : null;
@@ -417,6 +445,7 @@ function normalize(value: unknown): ExploreURLState {
     value.relationshipReviewState === 'accepted' || value.relationshipReviewState === 'rejected'
       ? value.relationshipReviewState
       : 'pending';
+  const settingsAuthority = normalizeSettingsNavigationAuthority(value.settingsAuthority);
   const operationLane = typeof value.operationLane === 'string' &&
     OPERATION_LANES.has(value.operationLane as OperationLane)
     ? value.operationLane as OperationLane
@@ -448,14 +477,14 @@ function normalize(value: unknown): ExploreURLState {
       : typeof value.schemaVersion === 'number' && Number.isSafeInteger(value.schemaVersion)
         ? value.schemaVersion
         : defaultExploreURLState.schemaVersion,
-    workspace,
+    workspace: normalizedWorkspace,
     directoryQuery: typeof value.directoryQuery === 'string' ? value.directoryQuery : '',
     directoryContactState: typeof value.directoryContactState === 'string' ? value.directoryContactState : '',
     directoryCategory: typeof value.directoryCategory === 'string' ? value.directoryCategory : '',
     directoryOrganization: typeof value.directoryOrganization === 'string' ? value.directoryOrganization : '',
     directoryPrimaryChannel: typeof value.directoryPrimaryChannel === 'string' ? value.directoryPrimaryChannel : '',
-    directoryLastContactAfter: typeof value.directoryLastContactAfter === 'string' ? value.directoryLastContactAfter : '',
-    directoryLastContactBefore: typeof value.directoryLastContactBefore === 'string' ? value.directoryLastContactBefore : '',
+    directoryLastContactAfter: directoryDay(value.directoryLastContactAfter),
+    directoryLastContactBefore: directoryDay(value.directoryLastContactBefore),
     directorySort: value.directorySort === 'last_contact_desc' || value.directorySort === 'last_contact_asc' ? value.directorySort : 'name',
     directoryPersonID: directoryPersonID(value.directoryPersonID),
     reviewKind,
@@ -465,7 +494,7 @@ function normalize(value: unknown): ExploreURLState {
     searchMode,
     filters: filters(value.filters),
     groupingChain: groups(value.groupingChain),
-    presentation,
+    presentation: normalizedPresentation,
     sort: sorts(value.sort),
     fileSort: fileSort(value.fileSort),
     fileFilenameQuery: value.schemaVersion === 2 && typeof value.fileFilenameQuery === 'string'
@@ -496,7 +525,8 @@ function normalize(value: unknown): ExploreURLState {
       OPERATION_STATUS_AUTHORITIES.has(value.operationStatus as OperationStatusAuthority)
       ? value.operationStatus as OperationStatusAuthority
       : '',
-    settingsAuthority: normalizeSettingsNavigationAuthority(value.settingsAuthority),
+    settingsAuthority,
+    settingsCategory: settingsCategory(value.settingsCategory, settingsAuthority),
     columns: columns(value.columns),
     columnWidths: widths(value.columnWidths),
     activeRow:
@@ -513,21 +543,91 @@ function normalize(value: unknown): ExploreURLState {
   } as ExploreURLState;
 }
 
+// Fields that only describe one workspace stay out of the link when another
+// workspace is shared; browser history still carries them for Back/Forward.
+const WORKSPACE_FIELDS: Partial<Record<keyof ExploreURLState, ReadonlyArray<ExploreWorkspace>>> = {
+  directoryQuery: ['directory'],
+  directoryContactState: ['directory'],
+  directoryCategory: ['directory'],
+  directoryOrganization: ['directory'],
+  directoryPrimaryChannel: ['directory'],
+  directoryLastContactAfter: ['directory'],
+  directoryLastContactBefore: ['directory'],
+  directorySort: ['directory'],
+  directoryPersonID: ['directory', 'directory_review'],
+  reviewKind: ['directory_review'],
+  identityState: ['directory_review'],
+  relationshipReviewState: ['directory_review'],
+  fileSort: ['files'],
+  fileFilenameQuery: ['files'],
+  fileMIMEFamilies: ['files'],
+  personFilePresentation: ['relationships'],
+  personFileDirections: ['relationships'],
+  identityQuery: ['relationships'],
+  identitySort: ['relationships'],
+  analysisTarget: ['relationships'],
+  selectedIdentifier: ['relationships'],
+  relationshipFacet: ['relationships'],
+  relationshipTarget: ['relationships'],
+  relationshipShowAll: ['relationships'],
+  relationshipFiles: ['relationships'],
+  operationLane: ['operations'],
+  operationKind: ['operations'],
+  operationState: ['operations'],
+  operationStartedFrom: ['operations'],
+  operationStartedBefore: ['operations'],
+  operationRunID: ['operations'],
+  operationStatus: ['operations'],
+  settingsAuthority: ['settings'],
+  settingsCategory: ['settings']
+};
+// Keyboard focus and scroll position live only in browser history.
+const SESSION_ONLY_FIELDS = new Set<keyof ExploreURLState>(['activeRow', 'scrollAnchor']);
+
+function sharedDetails(state: ExploreURLState): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(state).filter(([key, value]) => {
+    const field = key as keyof ExploreURLState;
+    if (field === 'schemaVersion' || field === 'workspace' || field === 'searchMode') return false;
+    if (SESSION_ONLY_FIELDS.has(field)) return false;
+    // The Files workspace implies its presentation, so a Files link need not repeat it.
+    if (field === 'presentation' && state.workspace === 'files') return false;
+    const owners = WORKSPACE_FIELDS[field];
+    if (owners && !owners.includes(state.workspace)) return false;
+    return JSON.stringify(value) !== JSON.stringify(defaultExploreURLState[field]);
+  }));
+}
+
 export function serializeExploreURLState(state: ExploreURLState, baseSearch = ''): string {
   const parameters = new URLSearchParams(baseSearch.startsWith('?') ? baseSearch.slice(1) : baseSearch);
-  parameters.set(STATE_PARAMETER, JSON.stringify(normalize(state)));
+  const normalized = normalize(state);
+  parameters.set('workspace', normalized.workspace);
+  // An explicit mode keeps a shared link independent of browser preferences.
+  parameters.set('mode', normalized.searchMode);
+  const details = sharedDetails(normalized);
+  if (Object.keys(details).length === 0) parameters.delete(STATE_PARAMETER);
+  else parameters.set(STATE_PARAMETER, JSON.stringify({ schemaVersion: normalized.schemaVersion, ...details }));
   return `?${parameters.toString()}`;
+}
+
+function historyEntry(search: string, state: ExploreURLState): { exploreSearch: string; exploreState: unknown } {
+  // History entries must be structured-cloneable, so strip reactive proxies.
+  return { exploreSearch: search, exploreState: JSON.parse(JSON.stringify(state)) };
 }
 
 export function parseExploreURLState(search: string): ExploreURLState {
   const parameters = new URLSearchParams(search.startsWith('?') ? search.slice(1) : search);
   const encoded = parameters.get(STATE_PARAMETER);
-  if (encoded === null) return freshDefaults();
+  let details: unknown = {};
   try {
-    return normalize(JSON.parse(encoded));
+    if (encoded !== null) details = JSON.parse(encoded);
   } catch {
-    return freshDefaults();
+    // A malformed detail payload must not discard the selected workspace.
   }
+  return normalize({
+    ...(isRecord(details) ? details : {}),
+    ...(parameters.has('workspace') ? { workspace: parameters.get('workspace') } : {}),
+    ...(parameters.has('mode') ? { searchMode: parameters.get('mode') } : {}),
+  });
 }
 
 export class ExploreState {
@@ -557,7 +657,30 @@ export class ExploreState {
     this.preferenceStorage = preferenceStorage;
     this.current = this.readURLState();
     this.committed = normalize(this.current);
+    this.rewriteLegacyFilesURL();
     browser.addEventListener('popstate', this.handlePopState);
+  }
+
+  // An Everything-as-Files link normalizes to the Files workspace; show that in
+  // the address bar without adding a history entry.
+  private rewriteLegacyFilesURL(): void {
+    const { location, history } = this.browser;
+    if (this.current.workspace !== 'files' || new URLSearchParams(location.search).get('workspace') === 'files') return;
+    let search = serializeExploreURLState(this.current, location.search);
+    // Keep a mode-less link mode-less so the daemon's configured default still applies.
+    if (explicitSearchModeFromURL(location.search) === undefined) {
+      const parameters = new URLSearchParams(search);
+      parameters.delete('mode');
+      search = parameters.size > 0 ? `?${parameters.toString()}` : '';
+    }
+    history.replaceState(
+      {
+        ...(isRecord(history.state) ? history.state : {}),
+        ...historyEntry(search, this.current)
+      },
+      '',
+      `${location.pathname}${search}${location.hash}`
+    );
   }
 
   // The daemon-configured web.default_search_mode arrives asynchronously
@@ -640,6 +763,23 @@ export class ExploreState {
     }, 'push');
   }
 
+  commitSearchIn(workspace: ExploreWorkspace, query: string, searchMode: ExploreSearchMode): void {
+    rememberSearchMode(searchMode, this.preferenceStorage);
+    this.navigate({
+      workspace,
+      query,
+      searchMode,
+      analysisTarget: null,
+      selectedIdentifier: null,
+      activeRow: null,
+      selectedRow: null,
+      conversationAnchor: null,
+      scrollAnchor: null,
+      operationStatus: '',
+      settingsAuthority: ''
+    }, 'push');
+  }
+
   commitNavigation(patch: Partial<ExploreURLState>): void {
     const selectionChanged = 'selectedRow' in patch && patch.selectedRow !== this.current.selectedRow;
     this.navigate(selectionChanged && !('conversationAnchor' in patch)
@@ -696,7 +836,11 @@ export class ExploreState {
   }
 
   private readURLState(): ExploreURLState {
-    const parsed = parseExploreURLState(this.browser.location.search);
+    const history = this.browser.history.state;
+    const parsed = isRecord(history) && history.exploreSearch === this.browser.location.search &&
+      isRecord(history.exploreState)
+      ? normalize(history.exploreState)
+      : parseExploreURLState(this.browser.location.search);
     parsed.searchMode = resolveInitialSearchMode(
       explicitSearchModeFromURL(this.browser.location.search),
       this.preferenceStorage,
@@ -710,9 +854,14 @@ export class ExploreState {
     mode: 'push' | 'replace'
   ): void {
     let effectivePatch = patch;
+    // Files owns the 'files' presentation, so leaving it must not carry it into Everything.
+    if (this.current.workspace === 'files' && patch.workspace !== undefined &&
+      patch.workspace !== 'files' && !('presentation' in patch)) {
+      effectivePatch = { ...patch, presentation: defaultExploreURLState.presentation };
+    }
     if (mode === 'push' && OPERATION_FILTER_FIELDS.some((key) =>
       key in patch && normalize({ ...this.current, ...patch })[key] !== this.current[key])) {
-      effectivePatch = { ...patch, operationRunID: null };
+      effectivePatch = { ...effectivePatch, operationRunID: null };
     }
     if (
       mode === 'push' ||
@@ -729,8 +878,9 @@ export class ExploreState {
           .map((key) => [key, this.current[key]])
       ) as Partial<ExploreURLState>;
       const priorEntry = normalize({ ...this.committed, ...transient, ...priorFocus });
-      const committedURL = `${this.browser.location.pathname}${serializeExploreURLState(priorEntry, baseSearch)}${this.browser.location.hash}`;
-      this.browser.history.replaceState(null, '', committedURL);
+      const priorSearch = serializeExploreURLState(priorEntry, baseSearch);
+      const committedURL = `${this.browser.location.pathname}${priorSearch}${this.browser.location.hash}`;
+      this.browser.history.replaceState({ ...historyEntry(priorSearch, priorEntry), ...this.archiveHistoryState(priorEntry.selectedRow) }, '', committedURL);
     }
     const next = normalize({ ...this.current, ...effectivePatch });
     // Preserve per-field reactivity: transient scroll/column changes must not
@@ -739,15 +889,26 @@ export class ExploreState {
     const keysToApply = OPERATION_FILTER_FIELDS.some((key) => key in effectivePatch)
       ? [...new Set([...patchKeys, ...OPERATION_FILTER_FIELDS, 'operationRunID'])]
       : patchKeys;
+    // Workspace and presentation normalize together (Files owns the 'files' presentation).
+    if (patchKeys.includes('workspace') || patchKeys.includes('presentation')) {
+      keysToApply.push('workspace', 'presentation');
+    }
     for (const key of keysToApply) {
       if (key in next) this.current[key] = next[key];
     }
-    const url = `${this.browser.location.pathname}${serializeExploreURLState(this.current, baseSearch)}${this.browser.location.hash}`;
+    const search = serializeExploreURLState(this.current, baseSearch);
+    const url = `${this.browser.location.pathname}${search}${this.browser.location.hash}`;
+    const history = historyEntry(search, this.current);
     if (mode === 'push') {
-      this.browser.history.pushState(null, '', url);
+      this.browser.history.pushState(history, '', url);
       this.committed = normalize(this.current);
       this.pendingSearchPriorFocus = undefined;
-    } else this.browser.history.replaceState(null, '', url);
+    } else this.browser.history.replaceState({ ...history, ...this.archiveHistoryState(this.current.selectedRow) }, '', url);
+  }
+
+  private archiveHistoryState(selectedRow: string | null): { [ARCHIVE_MEETING_HISTORY_KEY]: ArchiveMeetingHistory } | null {
+    const marker = parseArchiveMeetingHistory(this.browser.history.state, selectedRow);
+    return marker ? { [ARCHIVE_MEETING_HISTORY_KEY]: marker } : null;
   }
 }
 

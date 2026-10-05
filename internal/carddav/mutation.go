@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"net/url"
 	"slices"
 	"strings"
 	"time"
@@ -43,7 +42,7 @@ func (s *Service) ReconcilePublications(ctx context.Context) error {
 // lost is not mistaken for a new remote edit. Settled desired publications
 // remain in the normal post-pull reconciliation phase.
 func (s *Service) recoverPendingPublications(ctx context.Context) (map[int64]bool, error) {
-	ids, err := s.store.ListCardDAVPublicationPersonIDsContext(ctx)
+	ids, err := s.scopedPublicationIDs(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -72,7 +71,7 @@ func (s *Service) recoverPendingPublications(ctx context.Context) (map[int64]boo
 }
 
 func (s *Service) reconcilePublications(ctx context.Context, skip map[int64]bool) error {
-	ids, err := s.store.ListCardDAVPublicationPersonIDsContext(ctx)
+	ids, err := s.scopedPublicationIDs(ctx)
 	if err != nil {
 		return err
 	}
@@ -128,16 +127,20 @@ func (s *Service) mutate(ctx context.Context, mutation Mutation) error {
 }
 
 func (s *Service) mutateUnlocked(ctx context.Context, mutation Mutation) error {
-	if s == nil || s.store == nil || s.client == nil || mutation.PersonID <= 0 {
+	if s == nil || s.store == nil || s.remote == nil || mutation.PersonID <= 0 {
 		return errors.New("CardDAV service is not configured")
 	}
-	operationCtx, cancel := context.WithTimeout(ctx, s.client.operationTimeout)
+	operationCtx, cancel := context.WithTimeout(ctx, s.operationTimeout())
 	defer cancel()
-	if err := s.store.CheckCardDAVRetryAfterContext(operationCtx); err != nil {
+	existing, publicationErr := s.store.GetCardDAVPublicationContext(operationCtx, mutation.PersonID)
+	if publicationErr == nil && existing.AddressBookID > 0 {
+		if err := s.requireOwnBook(operationCtx, existing.AddressBookID); err != nil {
+			return err
+		}
+	}
+	if err := s.checkRetry(operationCtx); err != nil {
 		return err
 	}
-
-	existing, publicationErr := s.store.GetCardDAVPublicationContext(operationCtx, mutation.PersonID)
 	if publicationErr == nil && existing.PendingOperation != "" {
 		if conflict, conflictErr := s.store.GetUnresolvedCardDAVConflictForMappingContext(
 			operationCtx, existing.AddressBookID, existing.Href,
@@ -166,14 +169,14 @@ func (s *Service) mutateUnlocked(ctx context.Context, mutation Mutation) error {
 		return s.publishCurrentUnlocked(operationCtx, mutation.PersonID, "")
 	}
 
-	account, err := s.store.GetCardDAVAccountContext(operationCtx)
+	account, err := s.scopedAccount(operationCtx)
 	if err != nil {
 		return err
 	}
 	if account == nil {
 		return store.ErrCardDAVNoWriteTarget
 	}
-	books, err := s.store.ListCardDAVAddressBooksContext(operationCtx)
+	books, err := s.scopedBooks(operationCtx)
 	if err != nil {
 		return err
 	}
@@ -311,27 +314,6 @@ func (s *Service) preparePublicationEnvelope(source *store.CardDAVPublicationRev
 	return prepared.PrepareWireRender(version)
 }
 
-func (s *Service) publicationHref(collectionURL, uid string) (string, error) {
-	if s == nil || s.client == nil || strings.TrimSpace(uid) == "" {
-		return "", ErrUnsafeTarget
-	}
-	collection, err := url.Parse(collectionURL)
-	if err != nil || !validHTTPURL(collection) || !sameOrigin(s.client.origin, collection) {
-		return "", fmt.Errorf("CardDAV publication collection: %w", ErrUnsafeTarget)
-	}
-	child := *collection
-	child.RawQuery = ""
-	child.ForceQuery = false
-	child.Fragment = ""
-	escapedBase := strings.TrimSuffix(collection.EscapedPath(), "/") + "/"
-	child.Path = strings.TrimSuffix(collection.Path, "/") + "/" + uid + ".vcf"
-	child.RawPath = escapedBase + url.PathEscape(uid) + ".vcf"
-	if !sameOrigin(collection, &child) || !sameOrigin(s.client.origin, &child) {
-		return "", fmt.Errorf("CardDAV publication href: %w", ErrUnsafeTarget)
-	}
-	return canonicalDAVURLIdentity(&child), nil
-}
-
 func publicationVersion(advertised []string) vcard.Version {
 	versions := slices.Clone(advertised)
 	slices.Sort(versions)
@@ -363,7 +345,10 @@ func stripServerOwnedProperties(body []byte, version vcard.Version) ([]byte, err
 }
 
 func (s *Service) executeMutation(ctx context.Context, pending *store.CardDAVPublication) error {
-	books, err := s.store.ListCardDAVAddressBooksContext(ctx)
+	if err := s.requireOwnBook(ctx, pending.AddressBookID); err != nil {
+		return err
+	}
+	books, err := s.scopedBooks(ctx)
 	if err != nil {
 		return err
 	}
@@ -405,18 +390,19 @@ func (s *Service) executeMutation(ctx context.Context, pending *store.CardDAVPub
 		return err
 	}
 
-	request := Request{URL: pending.Href, ETag: pending.RemoteETag}
+	var write func(context.Context) error
 	switch pending.PendingOperation {
-	case store.CardDAVMutationCreate:
-		request.Method, request.Body, request.Create = http.MethodPut, pending.OutgoingBody, true
-	case store.CardDAVMutationUpdate:
-		request.Method, request.Body = http.MethodPut, pending.OutgoingBody
+	case store.CardDAVMutationCreate, store.CardDAVMutationUpdate:
+		create := pending.PendingOperation == store.CardDAVMutationCreate
+		write = func(ctx context.Context) error {
+			return s.remote.Put(ctx, pending.Href, pending.OutgoingBody, pending.RemoteETag, create)
+		}
 	case store.CardDAVMutationDelete:
-		request.Method = http.MethodDelete
+		write = func(ctx context.Context) error { return s.remote.Delete(ctx, pending.Href, pending.RemoteETag) }
 	default:
 		return store.ErrCardDAVInvalidPlan
 	}
-	_, err = s.doRequest(ctx, request)
+	err = s.gate(ctx, write)
 	if err != nil {
 		if status := retryStatus(err); status != nil {
 			if pending.ConflictOwned {
@@ -498,9 +484,8 @@ func (s *Service) recoverCreate(ctx context.Context, pending *store.CardDAVPubli
 	// retry durably: a transient PUT failure or process exit would otherwise
 	// strand the pending publication forever. Concurrent attempts are still
 	// fenced by If-None-Match: * and the publication mutation revision.
-	_, err = s.doRequest(ctx, Request{
-		Method: http.MethodPut, URL: pending.Href,
-		Body: pending.OutgoingBody, Create: true,
+	err = s.gate(ctx, func(ctx context.Context) error {
+		return s.remote.Put(ctx, pending.Href, pending.OutgoingBody, "", true)
 	})
 	if err != nil && !isStatus(err, http.StatusPreconditionFailed) {
 		if status := retryStatus(err); status != nil {
@@ -614,41 +599,6 @@ func (s *Service) captureCardDAVMutationConflict(
 	return &ConflictError{ID: conflict.ID}
 }
 
-func (s *Service) fetchCanonical(ctx context.Context, href string) (store.CardDAVRemoteResource, bool, error) {
-	target, err := url.Parse(href)
-	if err != nil || !validHTTPURL(target) || !sameOrigin(s.client.origin, target) {
-		return store.CardDAVRemoteResource{}, false, ErrUnsafeTarget
-	}
-	href = canonicalDAVURLIdentity(target)
-	response, err := s.doRequest(ctx, Request{Method: http.MethodGet, URL: href})
-	if isAbsentStatus(err) {
-		return store.CardDAVRemoteResource{Href: href}, true, nil
-	}
-	if err != nil {
-		return store.CardDAVRemoteResource{}, false, err
-	}
-	etag := strings.TrimSpace(response.Header.Get("ETag"))
-	if etag == "" || len(response.Body) == 0 {
-		return store.CardDAVRemoteResource{}, false, ErrIncompleteMultiget
-	}
-	remote, err := parseRemoteResource(href, etag, response.Body)
-	return remote, false, err
-}
-
-func (s *Service) doRequest(ctx context.Context, request Request) (*Response, error) {
-	if err := s.store.CheckCardDAVRetryAfterContext(ctx); err != nil {
-		return nil, err
-	}
-	response, err := s.client.Do(ctx, request)
-	if status := retryStatus(err); status != nil {
-		gate := time.Now().Add(status.RetryAfter).UTC()
-		if gateErr := s.store.SetCardDAVRetryAfterContext(ctx, gate); gateErr != nil {
-			return response, errors.Join(err, gateErr)
-		}
-	}
-	return response, err
-}
-
 func isStatus(err error, code int) bool {
 	var status *StatusError
 	return errors.As(err, &status) && status.StatusCode == code
@@ -672,7 +622,7 @@ func isAbsentStatusCode(code int) bool {
 
 func (s *Service) recoverPendingConflictMutations(ctx context.Context) error {
 	var failures []error
-	conflicts, err := s.store.ListCardDAVConflictsContext(ctx, true)
+	conflicts, err := s.scopedConflicts(ctx)
 	if err != nil {
 		return err
 	}

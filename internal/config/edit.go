@@ -883,9 +883,8 @@ func syncConfigDirectory(path string, open func(string) (syncDirectoryHandle, er
 }
 
 func validateEditableCandidate(cfg *Config) error {
-	if err := cfg.Server.ValidateSecure(); err != nil {
-		return err
-	}
+	// Loading the candidate validates its configuration. Interfaces and secrets
+	// are checked when starting the server, not when editing unrelated fields.
 	if cfg.Vector.AnyLaneEnabled() {
 		if err := cfg.Vector.Validate(); err != nil {
 			return fmt.Errorf("vector config: %w", err)
@@ -910,11 +909,17 @@ func validateEditableCandidate(cfg *Config) error {
 	for index, source := range cfg.Granola {
 		schedules[fmt.Sprintf("granola[%d].schedule", index)] = source.Schedule
 	}
+	for index, source := range cfg.Plaud {
+		schedules[fmt.Sprintf("plaud[%d].schedule", index)] = source.Schedule
+	}
 	for index, source := range cfg.Circleback {
 		schedules[fmt.Sprintf("circleback[%d].schedule", index)] = source.Schedule
 	}
 	for index, source := range cfg.NotionMeetings {
 		schedules[fmt.Sprintf("notion_meetings[%d].schedule", index)] = source.Schedule
+	}
+	for index, source := range cfg.Muesli {
+		schedules[fmt.Sprintf("muesli[%d].schedule", index)] = source.Schedule
 	}
 	for key, expression := range schedules {
 		if expression == "" {

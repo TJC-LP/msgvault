@@ -5,14 +5,19 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/signal"
+	"slices"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
 	"go.kenn.io/msgvault/internal/beeper"
+	"go.kenn.io/msgvault/internal/config"
+	"go.kenn.io/msgvault/internal/jobctx"
 	"go.kenn.io/msgvault/internal/store"
 )
 
@@ -45,11 +50,16 @@ Examples:
   msgvault sync-beeper --full`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			state := invocationFromCommand(cmd)
+			if state == nil || state.cfg == nil {
+				return errors.New("configuration is unavailable")
+			}
+			cfg := state.cfg
 			if !isDaemonCLISubprocess() {
 				return runDaemonCLICommandHTTPFromCobra(cmd, args)
 			}
 
-			imp, accountIDs, dbPath, cleanup, err := openBeeperImporter(syncBeeperAccounts)
+			imp, accountIDs, dbPath, cleanup, err := openBeeperImporter(syncBeeperAccounts, state)
 			if err != nil {
 				return err
 			}
@@ -63,7 +73,7 @@ Examples:
 					break
 				}
 				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Syncing Beeper account %s\n", accountID)
-				opts := beeperImportOptions(accountID)
+				opts := beeperImportOptions(accountID, cfg)
 				opts.Limit = syncBeeperLimit
 				opts.Full = syncBeeperFull
 				opts.NoMedia = opts.NoMedia || syncBeeperNoMedia
@@ -84,7 +94,7 @@ Examples:
 
 			// Successful accounts' messages must reach the analytics cache
 			// regardless of interruptions or per-account failures.
-			cacheErr := rebuildCacheAfterWrite(dbPath)
+			cacheErr := rebuildCacheAfterManualSync(dbPath, state)
 			if ctx.Err() != nil {
 				_, _ = fmt.Fprintln(cmd.OutOrStdout(), "\nInterrupted — re-run sync-beeper to resume.")
 				return cacheErr
@@ -159,12 +169,15 @@ func writeBeeperMediaSkipSummary(out io.Writer, sum *beeper.ImportSummary) {
 	if otherSkipped > 0 {
 		_, _ = fmt.Fprintf(out, ", %d media skipped by policy", otherSkipped)
 	}
+	if sum.AttachmentsUnavailable > 0 {
+		_, _ = fmt.Fprintf(out, ", %d media no longer available at source", sum.AttachmentsUnavailable)
+	}
 }
 
 // resolveBeeperSyncAccounts returns the Beeper accountIDs to sync: the
 // explicit flag values, or every registered beeper source that passes the
 // config include/exclude filters.
-func resolveBeeperSyncAccounts(s *store.Store, flagAccounts []string) ([]string, error) {
+func resolveBeeperSyncAccounts(s *store.Store, flagAccounts []string, cfg *config.Config) ([]string, error) {
 	sources, err := s.ListSources(sourceTypeBeeper)
 	if err != nil {
 		return nil, fmt.Errorf("list beeper sources: %w", err)
@@ -189,6 +202,9 @@ func resolveBeeperSyncAccounts(s *store.Store, flagAccounts []string) ([]string,
 		return out, nil
 	}
 	var out []string
+	if cfg == nil {
+		return nil, errors.New("configuration is unavailable")
+	}
 	for _, src := range sources {
 		if cfg.Beeper.AccountIncluded(src.Identifier) {
 			out = append(out, src.Identifier)
@@ -200,9 +216,37 @@ func resolveBeeperSyncAccounts(s *store.Store, flagAccounts []string) ([]string,
 	return out, nil
 }
 
+// filterBeeperReanchorMarkedAccounts leaves accounts that scheduled sync may
+// safely import. A source marked by an anchor mismatch stays out of the
+// rotation until a manual import verifies it against the current installation.
+func filterBeeperReanchorMarkedAccounts(
+	ctx context.Context,
+	s *store.Store,
+	accountIDs []string,
+) ([]string, error) {
+	eligible := make([]string, 0, len(accountIDs))
+	for _, accountID := range accountIDs {
+		source, err := s.GetSourceByTypeAndIdentifier(sourceTypeBeeper, accountID)
+		if err != nil {
+			return nil, fmt.Errorf("resolve beeper source %q for anchor marker: %w", accountID, err)
+		}
+		reason, marked, err := s.GetArchiveMarker(ctx, store.BeeperReanchorMarkerKey(source.ID))
+		if err != nil {
+			return nil, err
+		}
+		if marked {
+			slog.Warn("skipping scheduled Beeper sync until manual anchor verification",
+				"account", accountID, "reason", reason)
+			continue
+		}
+		eligible = append(eligible, accountID)
+	}
+	return eligible, nil
+}
+
 // beeperImportOptions builds the config-derived import options shared by the
 // CLI and scheduler paths (flag overlays are applied by the CLI caller).
-func beeperImportOptions(accountID string) beeper.ImportOptions {
+func beeperImportOptions(accountID string, cfg *config.Config) beeper.ImportOptions {
 	policy := cfg.Beeper.MediaPolicy(accountID)
 	return beeper.ImportOptions{
 		AccountID:      accountID,
@@ -215,8 +259,12 @@ func beeperImportOptions(accountID string) beeper.ImportOptions {
 // openBeeperImporter performs the shared beeper-command prologue: open the
 // store, load the token, resolve the target accounts, and build the importer.
 // The returned cleanup closes the store.
-func openBeeperImporter(flagAccounts []string) (imp *beeper.Importer, accountIDs []string, dbPath string, cleanup func(), err error) {
-	s, cleanup, err := openWritableStoreAndInitForIngest()
+func openBeeperImporter(flagAccounts []string, state *invocation) (imp *beeper.Importer, accountIDs []string, dbPath string, cleanup func(), err error) {
+	if state == nil {
+		return nil, nil, "", nil, errors.New("configuration is unavailable")
+	}
+	cfg := state.cfg
+	s, cleanup, err := openWritableStoreAndInitForIngestInvocation(state)
 	if err != nil {
 		return nil, nil, "", nil, err
 	}
@@ -225,12 +273,12 @@ func openBeeperImporter(flagAccounts []string) (imp *beeper.Importer, accountIDs
 		cleanup()
 		return nil, nil, "", nil, err
 	}
-	accountIDs, err = resolveBeeperSyncAccounts(s, flagAccounts)
+	accountIDs, err = resolveBeeperSyncAccounts(s, flagAccounts, cfg)
 	if err != nil {
 		cleanup()
 		return nil, nil, "", nil, err
 	}
-	return beeper.NewImporter(s, beeperClient(token)), accountIDs, cfg.DatabaseDSN(), cleanup, nil
+	return beeper.NewImporter(s, beeperClient(cfg, token)), accountIDs, cfg.DatabaseDSN(), cleanup, nil
 }
 
 // withInterruptCancel derives a context canceled on SIGINT/SIGTERM, printing
@@ -255,39 +303,119 @@ func withInterruptCancel(cmd *cobra.Command, note string) (context.Context, func
 // so one broken account does not starve the others, and the analytics cache is
 // rebuilt after any attempt so partial writes become visible too.
 func runConfiguredBeeperSync(ctx context.Context, s *store.Store) error {
+	state := invocationFromContext(ctx)
+	if state == nil || state.cfg == nil {
+		return errors.New("configuration is unavailable")
+	}
+	cfg := state.cfg
+	accountIDs, err := resolveBeeperSyncAccounts(s, nil, cfg)
+	if err != nil {
+		return err
+	}
+	accountIDs, err = filterBeeperReanchorMarkedAccounts(ctx, s, accountIDs)
+	if err != nil {
+		return err
+	}
+	if len(accountIDs) == 0 {
+		return nil
+	}
 	token, err := beeper.LoadToken(cfg.TokensDir())
 	if err != nil {
 		return err
 	}
-	accountIDs, err := resolveBeeperSyncAccounts(s, nil)
-	if err != nil {
-		return err
+	imp := beeper.NewImporter(s, beeperClient(cfg, token))
+	deadline := time.Now().Add(scheduledBeeperBudget - 15*time.Second)
+	shouldStop := func() bool {
+		return time.Now().After(deadline) || jobctx.PreemptionRequested(ctx)
 	}
-	imp := beeper.NewImporter(s, beeperClient(token))
-	return runScheduledBeeperAttempts(ctx, accountIDs,
-		func(accountID string) error {
-			_, err := imp.Import(ctx, beeperImportOptions(accountID))
-			return err
+	return runScheduledBeeperAttempts(ctx, accountIDs, scheduledBeeperRotation, shouldStop,
+		func(accountID string) (bool, error) {
+			opts := beeperImportOptions(accountID, cfg)
+			opts.Scheduled = true
+			opts.ShouldStop = shouldStop
+			opts.StopAt = deadline
+			sum, err := imp.Import(ctx, opts)
+			return sum != nil && sum.Stopped, err
 		},
 		func() error { return rebuildCacheAfterScheduledSync(context.WithoutCancel(ctx), "beeper") },
 	)
 }
 
+// scheduledBeeperBudget bounds one scheduled Beeper job across all accounts.
+// Imports stop at the next chat or backfill-page boundary once it is spent
+// and resume from their cursors on the next run. Fifteen seconds are reserved
+// for bounded checkpoint and terminal sync writes after imports stop.
+const scheduledBeeperBudget = 3 * time.Minute
+
+// scheduledBeeperRotation remembers where the last budget-limited scheduled
+// run stopped, so accounts late in store order are not starved.
+var scheduledBeeperRotation = &beeperAccountRotation{}
+
+// beeperAccountRotation orders scheduled Beeper accounts starting from the
+// account after the previous run's last attempt.
+type beeperAccountRotation struct {
+	mu   sync.Mutex
+	next string
+}
+
+func (r *beeperAccountRotation) order(accountIDs []string) []string {
+	r.mu.Lock()
+	next := r.next
+	r.mu.Unlock()
+	start := slices.Index(accountIDs, next)
+	if start <= 0 {
+		return slices.Clone(accountIDs)
+	}
+	return append(slices.Clone(accountIDs[start:]), accountIDs[:start]...)
+}
+
+func (r *beeperAccountRotation) resumeAt(accountID string) {
+	r.mu.Lock()
+	r.next = accountID
+	r.mu.Unlock()
+}
+
 // runScheduledBeeperAttempts keeps per-account failures isolated while
 // rebuilding analytics after any import attempt, since even a failed or
-// canceled attempt may have committed messages from healthy chats.
-func runScheduledBeeperAttempts(ctx context.Context, accountIDs []string, attempt func(string) error, rebuild func() error) error {
+// canceled attempt may have committed messages from healthy chats. An
+// attempt that reports it stopped early, or a spent budget (shouldStop)
+// before the next account, ends the job; the rotation starts the next run
+// with the next account.
+func runScheduledBeeperAttempts(
+	ctx context.Context,
+	accountIDs []string,
+	rotation *beeperAccountRotation,
+	shouldStop func() bool,
+	attempt func(string) (bool, error),
+	rebuild func() error,
+) error {
 	var errs []error
 	attempted := 0
-	for _, accountID := range accountIDs {
+	resumeAt := ""
+	ordered := rotation.order(accountIDs)
+	for idx, accountID := range ordered {
 		if ctx.Err() != nil {
+			// Cancelled between accounts (a yield or shutdown): start here next.
+			resumeAt = accountID
+			break
+		}
+		if attempted > 0 && shouldStop != nil && shouldStop() {
+			resumeAt = accountID
 			break
 		}
 		attempted++
-		if err := attempt(accountID); err != nil {
+		stopped, err := attempt(accountID)
+		if err != nil {
 			errs = append(errs, fmt.Errorf("beeper %s: %w", accountID, err))
 		}
+		if stopped || ctx.Err() != nil {
+			// A large account must not consume every tick. Its own cursors
+			// preserve progress while the next account gets a turn.
+			resumeAt = ordered[(idx+1)%len(ordered)]
+			break
+		}
 	}
+	rotation.resumeAt(resumeAt)
 	if attempted > 0 {
 		if err := rebuild(); err != nil {
 			errs = append(errs, err)
@@ -300,5 +428,5 @@ func runScheduledBeeperAttempts(ctx context.Context, accountIDs []string, attemp
 }
 
 func init() {
-	rootCmd.AddCommand(newSyncBeeperCmd())
+	rootCmd.AddCommand(addManualSyncCacheFlags(newSyncBeeperCmd()))
 }

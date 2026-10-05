@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 
 	"go.kenn.io/msgvault/internal/attachmentpolicy"
 )
@@ -151,6 +152,53 @@ func (s *Store) UpsertAttachmentRecord(
 	return s.upsertAttachmentRecord(boundQuerier{ctx: ctx, q: s.db}, messageID, write)
 }
 
+// UpsertAttachmentRecordPreservingStored updates one keyed attachment occurrence
+// while retaining a previously stored blob when a later source snapshot cannot
+// provide the file. A later successful snapshot still replaces changed bytes.
+func (s *Store) UpsertAttachmentRecordPreservingStored(
+	ctx context.Context,
+	messageID int64,
+	write AttachmentWrite,
+) error {
+	write = write.normalized()
+	if err := write.validate(); err != nil {
+		return err
+	}
+	if write.SourcePartKey == "" {
+		return errors.New("preserving a stored attachment requires a source-part key")
+	}
+	return s.withTxContext(ctx, func(tx *loggedTx) error {
+		if s.syncGeneration != nil {
+			if err := s.requireSyncMessageSourceTx(tx, messageID); err != nil {
+				return err
+			}
+		}
+		if write.StoragePath == "" && write.ContentHash == "" {
+			var storagePath, contentHash, state, skipReason string
+			var size int64
+			err := tx.QueryRow(`
+				SELECT storage_path, COALESCE(content_hash, ''), COALESCE(size, 0),
+				       COALESCE(attachment_state, ''), COALESCE(attachment_skip_reason, '')
+				FROM attachments WHERE message_id = ? AND source_part_key = ?
+			`, messageID, write.SourcePartKey).Scan(
+				&storagePath, &contentHash, &size, &state, &skipReason,
+			)
+			switch {
+			case err == nil && storagePath != "" && contentHash != "":
+				write.StoragePath = storagePath
+				write.ContentHash = contentHash
+				write.Size = size
+				write.State = attachmentpolicy.DownloadState(state)
+				write.SkipReason = attachmentpolicy.SkipReason(skipReason)
+			case err == nil, errors.Is(err, sql.ErrNoRows):
+			default:
+				return fmt.Errorf("load stored attachment occurrence: %w", err)
+			}
+		}
+		return s.upsertAttachmentRecord(tx, messageID, write)
+	})
+}
+
 // UpsertAttachmentRecordWithStats atomically updates an attachment and its message
 // stats. Callers skip unchanged records and request cache invalidation unless the
 // message is new and its attachments will be included in an incremental export.
@@ -205,6 +253,45 @@ func (s *Store) DeleteLegacyHashlessAttachmentsContext(ctx context.Context, mess
 			  AND (content_hash IS NULL OR content_hash = '')
 			  AND storage_path = ''
 		`, messageID)
+		return err
+	})
+}
+
+// DeleteKeyedAttachmentsExceptContext removes source-owned attachment
+// occurrences that are no longer present in the current source snapshot. An
+// empty keep key removes every occurrence under the prefix; attachments owned
+// by other importers are left untouched.
+func (s *Store) DeleteKeyedAttachmentsExceptContext(
+	ctx context.Context, messageID int64, sourcePartKeyPrefix, keepSourcePartKey string,
+) error {
+	return s.withSyncMessageWriteContext(ctx, messageID, func(q querier) error {
+		_, err := q.Exec(`
+			DELETE FROM attachments
+			WHERE message_id = ?
+			  AND SUBSTR(source_part_key, 1, LENGTH(?)) = ?
+			  AND (? = '' OR source_part_key <> ?)
+		`, messageID, sourcePartKeyPrefix, sourcePartKeyPrefix, keepSourcePartKey, keepSourcePartKey)
+		return err
+	})
+}
+
+// DeleteMIMEAttachmentsExceptContext removes the MIME-owned attachment rows of
+// a message whose source part key is not in keep. A connector that stores a
+// newer MIME for the same message calls it after the new rows are written, so
+// a failed write never loses the old rows.
+func (s *Store) DeleteMIMEAttachmentsExceptContext(
+	ctx context.Context, messageID int64, keep []string,
+) error {
+	query := `DELETE FROM attachments WHERE message_id = ? AND source_attachment_id IS NULL`
+	args := []any{messageID}
+	if len(keep) > 0 {
+		query += ` AND COALESCE(source_part_key, '') NOT IN (?` + strings.Repeat(`, ?`, len(keep)-1) + `)`
+		for _, k := range keep {
+			args = append(args, k)
+		}
+	}
+	return s.withSyncMessageWriteContext(ctx, messageID, func(q querier) error {
+		_, err := q.Exec(query, args...)
 		return err
 	})
 }
@@ -335,6 +422,12 @@ func (s *Store) upsertAttachmentRecordWithPolicy(
 				mime_type = EXCLUDED.mime_type,
 				storage_path = EXCLUDED.storage_path,
 				content_hash = EXCLUDED.content_hash,
+				thumbnail_hash = CASE
+					WHEN COALESCE(attachments.content_hash, '') = EXCLUDED.content_hash
+					THEN attachments.thumbnail_hash ELSE NULL END,
+				thumbnail_path = CASE
+					WHEN COALESCE(attachments.content_hash, '') = EXCLUDED.content_hash
+					THEN attachments.thumbnail_path ELSE NULL END,
 				size = EXCLUDED.size,
 				source_attachment_id = EXCLUDED.source_attachment_id,
 				media_type = EXCLUDED.media_type,
@@ -448,4 +541,30 @@ func (s *Store) replaceMIMEAttachmentsWith(
 		}
 	}
 	return nil
+}
+
+// AttachmentPartsStoredContext reports whether every part key and content hash
+// pair has a stored row for the message. An empty key matches NULL or empty keys.
+func (s *Store) AttachmentPartsStoredContext(ctx context.Context, messageID int64, parts []AttachmentRef) (bool, error) {
+	want := make(map[[2]string]struct{}, len(parts))
+	for _, p := range parts {
+		want[[2]string{p.SourcePartKey, p.ContentHash}] = struct{}{}
+	}
+	if len(want) == 0 {
+		return true, nil
+	}
+	args := []any{messageID}
+	match := make([]string, 0, len(want))
+	for kh := range want {
+		match = append(match, "(COALESCE(source_part_key, '') = ? AND content_hash = ?)")
+		args = append(args, kh[0], kh[1])
+	}
+	var n int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(DISTINCT COALESCE(source_part_key, '') || ':' || content_hash) FROM attachments
+		WHERE message_id = ? AND (`+strings.Join(match, " OR ")+`)`, args...).Scan(&n)
+	if err != nil {
+		return false, fmt.Errorf("check stored attachment parts: %w", err)
+	}
+	return n == len(want), nil
 }

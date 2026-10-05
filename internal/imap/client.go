@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/cenkalti/backoff/v7"
 	imap "github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapclient"
 	gmailapi "go.kenn.io/msgvault/internal/gmail"
@@ -165,25 +166,20 @@ type Client struct {
 	// done == total). found is the running message-ID count and
 	// unchanged the running count of mailboxes skipped via saved
 	// folder state.
-	listProgress func(done, total int, mailbox string, found, unchanged int)
-	sleep        func(context.Context, time.Duration) error
-	tlsConfig    *tls.Config
-}
-
-var connectRetryDelays = [...]time.Duration{
-	5 * time.Second,
-	15 * time.Second,
-	45 * time.Second,
+	listProgress                func(done, total int, mailbox string, found, unchanged int)
+	connectRetryInitialInterval time.Duration
+	connectRetryNotify          backoff.Notify
+	tlsConfig                   *tls.Config
 }
 
 // NewClient creates a new IMAP client.
 func NewClient(cfg *Config, password string, opts ...Option) *Client {
 	c := &Client{
-		config:           cfg,
-		password:         password,
-		logger:           slog.Default(),
-		labelMapComplete: true,
-		sleep:            sleepContext,
+		config:                      cfg,
+		password:                    password,
+		logger:                      slog.Default(),
+		labelMapComplete:            true,
+		connectRetryInitialInterval: 5 * time.Second,
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -223,17 +219,6 @@ func (c *Client) labelsSnapshotFilteredLocked() bool {
 			len(c.config.Folders) > 0 ||
 			len(c.folderFilterInclude) > 0 ||
 			len(c.folderFilterExclude) > 0)
-}
-
-func sleepContext(ctx context.Context, delay time.Duration) error {
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
-	select {
-	case <-timer.C:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
 }
 
 // transportProbe records the first zero-byte transport error seen on the
@@ -375,27 +360,39 @@ func (c *Client) connect(ctx context.Context) error {
 }
 
 func (c *Client) connectTransport(ctx context.Context) (*imapclient.Client, error) {
-	for attempt := 0; ; attempt++ {
+	policy := backoff.NewExponentialBackOff()
+	policy.InitialInterval = c.connectRetryInitialInterval
+	policy.MaxInterval = 45 * time.Second
+	policy.Multiplier = 3
+	attempt := 0
+	conn, err := backoff.Retry(ctx, func() (*imapclient.Client, error) {
+		attempt++
 		conn, retry, err := c.connectTransportOnce(ctx)
-		if err == nil {
-			return conn, nil
+		if err != nil && (!retry || ctx.Err() != nil) {
+			return conn, backoff.Permanent(err)
 		}
-		if !retry || ctx.Err() != nil || attempt == len(connectRetryDelays) {
-			return nil, err
+		return conn, err
+	}, backoff.WithBackOff(policy), backoff.WithMaxTries(4), backoff.WithMaxElapsedTime(0),
+		backoff.WithNotify(func(err error, delay time.Duration) {
+			c.logger.Warn("retrying IMAP connection",
+				"addr", c.config.Addr(),
+				"attempt", attempt+1,
+				"limit", 4,
+				"delay", delay,
+				"error", err,
+			)
+			if c.connectRetryNotify != nil {
+				c.connectRetryNotify(err, delay)
+			}
+		}))
+	if err != nil {
+		retryErr := backoff.AsRetryError(err)
+		if errors.Is(retryErr.Cause, backoff.ErrPermanent) || errors.Is(retryErr.Cause, backoff.ErrExhausted) {
+			return nil, retryErr.LastErr
 		}
-
-		delay := connectRetryDelays[attempt]
-		c.logger.Warn("retrying IMAP connection",
-			"addr", c.config.Addr(),
-			"attempt", attempt+2,
-			"limit", len(connectRetryDelays)+1,
-			"delay", delay,
-			"error", err,
-		)
-		if err := c.sleep(ctx, delay); err != nil {
-			return nil, err
-		}
+		return nil, ctx.Err()
 	}
+	return conn, nil
 }
 
 func (c *Client) connectTransportOnce(ctx context.Context) (*imapclient.Client, bool, error) {
@@ -550,16 +547,45 @@ func (c *Client) withConn(ctx context.Context, fn func(*imapclient.Client) error
 	}
 	err := fn(c.conn)
 	if err != nil && isNetworkError(err) {
-		if c.conn != nil {
-			_ = c.conn.Close()
-		}
-		c.conn = nil
-		c.selectedMailbox = ""
-		c.selectedUIDValidity = 0
-		c.qresyncEnabled = false
-		c.clearQresyncCapture()
+		c.invalidateConnLocked(c.conn)
 	}
 	return err
+}
+
+// withDraftConn keeps a draft operation's transport tied to its context.
+// The callback may wait for a server response, so cancellation closes the
+// captured connection and prevents it from being reused.
+func (c *Client) withDraftConn(ctx context.Context, fn func(*imapclient.Client) error) error {
+	return c.withConn(ctx, func(conn *imapclient.Client) error {
+		cancelDone := make(chan struct{})
+		stopCancel := context.AfterFunc(ctx, func() {
+			_ = conn.Close()
+			close(cancelDone)
+		})
+		defer func() {
+			if !stopCancel() {
+				<-cancelDone
+				c.invalidateConnLocked(conn)
+				return
+			}
+			if ctx.Err() != nil {
+				c.invalidateConnLocked(conn)
+			}
+		}()
+		return fn(conn)
+	})
+}
+
+func (c *Client) invalidateConnLocked(conn *imapclient.Client) {
+	if conn == nil || c.conn != conn {
+		return
+	}
+	_ = conn.Close()
+	c.conn = nil
+	c.selectedMailbox = ""
+	c.selectedUIDValidity = 0
+	c.qresyncEnabled = false
+	c.clearQresyncCapture()
 }
 
 // selectMailbox selects a mailbox if not already selected. Caller must hold mu.
@@ -745,6 +771,19 @@ func messageIDHeaderFetchOptions() *imap.FetchOptions {
 			Specifier:    imap.PartSpecifierHeader,
 			HeaderFields: []string{"Message-ID"},
 			Peek:         true,
+		}},
+	}
+}
+
+// fullHeaderFetchOptions requests the whole header block. It is the fallback
+// for servers that return an empty HEADER.FIELDS section; see
+// fetchMessageIDChunk.
+func fullHeaderFetchOptions() *imap.FetchOptions {
+	return &imap.FetchOptions{
+		UID: true,
+		BodySection: []*imap.FetchItemBodySection{{
+			Specifier: imap.PartSpecifierHeader,
+			Peek:      true,
 		}},
 	}
 }
@@ -984,7 +1023,6 @@ func (c *Client) fetchMailboxMessageIDs(
 	result := make(map[string]bool, len(uids))
 	var unidentified []imap.UID
 	var missing []imap.UID
-	fetchOpts := messageIDHeaderFetchOptions()
 
 	for chunkStart := 0; chunkStart < len(uids); chunkStart += fetchChunkSize {
 		if ctx.Err() != nil {
@@ -999,7 +1037,7 @@ func (c *Client) fetchMailboxMessageIDs(
 			uidSet.AddNum(uid)
 		}
 
-		msgs, _, err := c.fetchChunk(ctx, mailbox, uidSet, fetchOpts)
+		msgs, _, err := c.fetchMessageIDChunk(ctx, mailbox, uidSet)
 		if err != nil {
 			return result, unidentified, missing, fmt.Errorf(
 				"message-ID fetch failed in %q: %w", mailbox, err)
@@ -1017,7 +1055,7 @@ func (c *Client) fetchMailboxMessageIDs(
 		for _, uid := range omitted {
 			recheckSet.AddNum(uid)
 		}
-		recheckMsgs, _, err := c.fetchChunk(ctx, mailbox, recheckSet, fetchOpts)
+		recheckMsgs, _, err := c.fetchMessageIDChunk(ctx, mailbox, recheckSet)
 		if err != nil {
 			return result, unidentified, missing, fmt.Errorf(
 				"message-ID recheck failed in %q: %w", mailbox, err)

@@ -25,6 +25,81 @@ func (failingMessageIDReader) Read([]byte) (int, error) {
 	return 0, errors.New("synthetic staged-ID read failure")
 }
 
+func TestPersistMessageDeliveryEvidenceEnrichesWithoutChangingLocalReadState(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	f := storetest.New(t)
+	firstDeliveredAt := time.Date(2026, 9, 14, 10, 30, 0, 0, time.UTC)
+	message := storetest.NewMessage(f.Source.ID, f.ConvID).
+		WithSourceMessageID("delivery-evidence").
+		Build()
+
+	messageID, err := f.Store.PersistMessage(&store.MessagePersistData{
+		Message: message,
+		Delivery: &store.MessageDeliveryEvidence{
+			DeliveredAt: sql.NullTime{Time: firstDeliveredAt, Valid: true},
+			IsDelivered: sql.NullBool{Bool: true, Valid: true},
+		},
+	})
+	require.NoError(err)
+	localReadAt := time.Date(2026, 9, 14, 11, 0, 0, 0, time.UTC)
+	_, err = f.Store.DB().Exec(f.Store.Rebind(
+		`UPDATE messages SET is_read = ?, read_at = ? WHERE id = ?`),
+		true, localReadAt, messageID)
+	require.NoError(err)
+
+	_, err = f.Store.PersistMessage(&store.MessagePersistData{
+		Message:  message,
+		Delivery: &store.MessageDeliveryEvidence{},
+	})
+	require.NoError(err)
+
+	var gotDeliveredAt, gotReadAt sql.NullTime
+	var gotDelivered, gotRead bool
+	require.NoError(f.Store.DB().QueryRow(f.Store.Rebind(`
+		SELECT delivered_at, is_delivered, read_at, is_read
+		FROM messages WHERE id = ?`), messageID).Scan(
+		&gotDeliveredAt, &gotDelivered, &gotReadAt, &gotRead,
+	))
+	require.True(gotDeliveredAt.Valid, "delivered_at should remain present")
+	assert.Equal(firstDeliveredAt, gotDeliveredAt.Time.UTC(),
+		"enrichment must keep the first delivered_at instant")
+	assert.True(gotDelivered)
+	require.True(gotReadAt.Valid, "read_at should remain present")
+	assert.Equal(localReadAt, gotReadAt.Time.UTC(),
+		"enrichment must not change the local read_at instant")
+	assert.True(gotRead)
+}
+
+func TestPersistMessageDeliveryEvidenceUsesNewExplicitEvidence(t *testing.T) {
+	require := require.New(t)
+	f := storetest.New(t)
+	message := storetest.NewMessage(f.Source.ID, f.ConvID).
+		WithSourceMessageID("delivery-evidence-update").
+		Build()
+	first := time.Date(2026, 9, 14, 10, 30, 0, 0, time.UTC)
+	second := first.Add(time.Minute)
+
+	var messageID int64
+	for _, deliveredAt := range []time.Time{first, second} {
+		id, err := f.Store.PersistMessage(&store.MessagePersistData{
+			Message: message,
+			Delivery: &store.MessageDeliveryEvidence{
+				DeliveredAt: sql.NullTime{Time: deliveredAt, Valid: true},
+			},
+		})
+		require.NoError(err)
+		messageID = id
+	}
+
+	var got sql.NullTime
+	require.NoError(f.Store.DB().QueryRow(f.Store.Rebind(
+		`SELECT delivered_at FROM messages WHERE id = ?`), messageID).Scan(&got))
+	require.True(got.Valid, "delivered_at should be present")
+	assert.Equal(t, second, got.Time.UTC(),
+		"delivered_at should use the newest explicit evidence")
+}
+
 // TestUpsertMessagePersistsListID catches a missing list_id column or an
 // upsert that omits the parsed email list identifier.
 func TestUpsertMessagePersistsListID(t *testing.T) {
@@ -1008,6 +1083,7 @@ func TestPersistRepairMessageReplacesCompleteSnapshotAtomically(t *testing.T) {
 	_, oldHits, err := fixture.Store.SearchMessages("original-target-token", 0, 10)
 	require.NoError(err)
 	assert.Zero(oldHits, "repair must remove the old FTS document")
+	waitForFeedPast(t, fixture.Store, after.ContentChangedAt.Time)
 	page, err := fixture.Store.ListChangedMessages(
 		t.Context(), store.ChangedMessagesFrom(fixture.Baseline.Add(time.Second)), 20)
 	require.NoError(err)
@@ -2197,4 +2273,57 @@ func TestCountMessagesPerMailbox(t *testing.T) {
 	assert.Equal(int64(2), counts["INBOX"], "INBOX count")
 	assert.Equal(int64(1), counts["Sent"], "Sent count")
 	assert.Equal(int64(1), counts["Drafts"], "Drafts count")
+}
+
+func TestEnsurePhoneParticipantContextCancelsBlockedNameBackfill(t *testing.T) {
+	require := require.New(t)
+	st := testutil.NewTestStore(t)
+	if !st.IsPostgreSQL() {
+		t.Skip("PostgreSQL embedding-clock lock required")
+	}
+	const phone = "+12025550100"
+	participantID, err := st.EnsurePhoneParticipantContext(t.Context(), phone, "")
+	require.NoError(err)
+
+	// Embedding publication holds this exclusive lock; the production
+	// participant-update trigger requests its shared form.
+	blocker, err := st.DB().BeginTx(t.Context(), nil)
+	require.NoError(err)
+	t.Cleanup(func() { _ = blocker.Rollback() })
+	_, err = blocker.ExecContext(t.Context(), `SELECT pg_advisory_xact_lock(
+        hashtextextended('msgvault.embedding_change_clock', 0))`)
+	require.NoError(err)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	result := make(chan error, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, err := st.EnsurePhoneParticipantContext(ctx, phone, "Taylor Example")
+		result <- err
+	}()
+	t.Cleanup(func() {
+		cancel()
+		_ = blocker.Rollback()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			assert.Fail(t, "phone participant write did not stop after releasing its blocker")
+		}
+	})
+	waitForPostgreSQLLockWait(t, st, "%UPDATE participants SET display_name =%")
+	cancel()
+	select {
+	case err := <-result:
+		require.ErrorIs(err, context.Canceled)
+	case <-time.After(5 * time.Second):
+		require.FailNow("cancelled phone participant write kept waiting for the embedding lock")
+	}
+
+	var name string
+	require.NoError(st.DB().QueryRow(st.Rebind(
+		`SELECT COALESCE(display_name, '') FROM participants WHERE id = ?`),
+		participantID).Scan(&name))
+	assert.Empty(t, name, "cancelled name backfill must roll back")
 }

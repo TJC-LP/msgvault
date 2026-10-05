@@ -30,6 +30,7 @@ import (
 	"go.kenn.io/kit/daemon"
 	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/peoplesweep"
+	"go.kenn.io/msgvault/internal/personenrollment"
 	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/testutil"
 	"go.kenn.io/msgvault/internal/vector"
@@ -144,7 +145,7 @@ func localPersonProviderDeps(
 		openReadStore: func() (personProviderStore, func(), error) {
 			return st, func() {}, nil
 		},
-		newChecker: func(peoplesweep.Config, personProviderStore) (personProviderChecker, error) {
+		newChecker: func(peoplesweep.Config, personProviderStore, personProviderSetupDeps) (personProviderChecker, error) {
 			return checker, nil
 		},
 		isDaemonSubprocess: func() bool { return true },
@@ -856,6 +857,10 @@ func TestPersonProviderRevokeIsIdempotent(t *testing.T) {
 	st := testutil.NewSQLiteTestStore(t)
 	_, err = st.EnsurePersonInferenceProfile(t.Context(), profile)
 	require.NoError(err)
+	require.NoError(st.RecordPersonInferenceCheck(t.Context(), store.PersonInferenceCheck{
+		ProfileFingerprint: profile.Fingerprint, CheckedAt: time.Now(),
+		DriverVersion: profile.DriverVersion, OutputMode: profile.OutputMode, ModelVersion: profile.Model,
+	}))
 	_, _, err = st.GrantPersonInferenceConsent(t.Context(), profile.Fingerprint, "cli")
 	require.NoError(err)
 	deps := localPersonProviderDeps(config, st, nil)
@@ -865,6 +870,7 @@ func TestPersonProviderRevokeIsIdempotent(t *testing.T) {
 	var firstStatus personProviderStatusOutput
 	require.NoError(json.Unmarshal([]byte(first), &firstStatus))
 	assert.False(firstStatus.Consent.Active)
+	assert.NotNil(firstStatus.Check, "ordinary consent revocation preserves the successful check")
 	require.NotNil(firstStatus.Consent.LastRevoked)
 	assert.Equal("cli", *firstStatus.Consent.LastRevoked.RevokedBy)
 
@@ -966,7 +972,7 @@ func TestPersonProviderCheckAcceptsAProfileName(t *testing.T) {
 		ModelVersion:      "beta-model-v1",
 	}}
 	deps := localPersonProviderDeps(config, st, checker)
-	deps.newChecker = func(got peoplesweep.Config, _ personProviderStore) (personProviderChecker, error) {
+	deps.newChecker = func(got peoplesweep.Config, _ personProviderStore, _ personProviderSetupDeps) (personProviderChecker, error) {
 		assert := newAssert(t)
 		assert.Equal("beta", got.Provider.Name)
 		return checker, nil
@@ -1256,6 +1262,11 @@ func personProviderMutationNoticeFixture(
 			return config.RestoreConfigFile(path, published, before)
 		},
 		configHomeDir: func() string { return filepath.Dir(path) },
+		removeWithDaemon: func(ctx context.Context, name, etag string) error {
+			record("daemon-remove")
+			_, err := personenrollment.NewService(path, st).RemoveProfile(ctx, etag, name, "", "cli", nil)
+			return err
+		},
 		proxy: func(*cobra.Command, []string, map[string]string) error {
 			record("proxy")
 			return nil
@@ -1266,10 +1277,9 @@ func personProviderMutationNoticeFixture(
 
 // TestPersonProviderUseAndRemoveRecommendDaemonRestartWhenDaemonKeepsStartupConfig
 // pins the local half of the mutation boundary: a successful local config
-// mutation must tell the operator that a running daemon keeps the people
-// sweep configuration captured at startup, while the same mutation without
-// a running daemon stays silent. The daemon subprocess case keeps the
-// notice too: the parent daemon scheduled its sweep from startup config.
+// mutation reports a pending restart only when a daemon keeps its startup
+// config. Removal refuses subprocess execution because it needs the parent
+// daemon's running policy, and uses the Settings operation from the frontend.
 func TestPersonProviderUseAndRemoveRecommendDaemonRestartWhenDaemonKeepsStartupConfig(t *testing.T) {
 	scenarios := []struct {
 		name               string
@@ -1295,6 +1305,12 @@ func TestPersonProviderUseAndRemoveRecommendDaemonRestartWhenDaemonKeepsStartupC
 				deps, events := personProviderMutationNoticeFixture(
 					t, scenario.isDaemonSubprocess, scenario.daemonOwnsStore)
 				output, err := executePersonProviderCommand(t, deps, operation.verb, "beta")
+				if operation.verb == "remove" && scenario.isDaemonSubprocess {
+					require.ErrorContains(err, "cannot identify the running people provider policy")
+					assert.NotContains(*events, "store")
+					assert.NotContains(*events, "edit")
+					return
+				}
 				require.NoError(err)
 				assert.Contains(output, operation.success)
 				if scenario.wantNotice {
@@ -1304,10 +1320,8 @@ func TestPersonProviderUseAndRemoveRecommendDaemonRestartWhenDaemonKeepsStartupC
 					assert.NotContains(output, "restart")
 				}
 				if operation.verb == "remove" {
-					if scenario.isDaemonSubprocess {
-						assert.Contains(*events, "store")
-					} else if scenario.daemonOwnsStore {
-						assert.Contains(*events, "proxy")
+					if scenario.daemonOwnsStore {
+						assert.Contains(*events, "daemon-remove")
 					} else {
 						assert.Contains(*events, "store")
 						assert.NotContains(*events, "proxy")
@@ -1321,13 +1335,13 @@ func TestPersonProviderUseAndRemoveRecommendDaemonRestartWhenDaemonKeepsStartupC
 // TestPersonProviderUseAndRemoveNoticeLiveIncompatibleDaemon pins the
 // restart guidance for a daemon that responds but fails the API
 // compatibility check. The compatibility-sensitive ownership signal finds
-// no daemon, so the mutation stays local and nothing is proxied to the
-// incompatible daemon, yet that live process still serves the people sweep
-// config it captured at startup: use and remove must recommend a daemon
-// restart instead of silently letting scheduled sweeps keep the stale
-// selection. The daemon is faked with the same responding ping endpoint and
-// runtime record pattern the restore-into-live-home guard tests use.
+// no daemon, yet that live process still serves its startup policy. Use
+// recommends a restart. Removal must refuse because it cannot revoke the
+// running policy through the incompatible daemon. The test uses a responding
+// ping endpoint and the runtime record pattern from the restore guards.
 func TestPersonProviderUseAndRemoveNoticeLiveIncompatibleDaemon(t *testing.T) {
+	cfg := testConfigValue()
+
 	newAssert := assert.New
 	newRequire := require.New
 	require := require.New(t)
@@ -1366,6 +1380,8 @@ func TestPersonProviderUseAndRemoveNoticeLiveIncompatibleDaemon(t *testing.T) {
 	savedCfg := cfg
 	t.Cleanup(func() { cfg = savedCfg })
 	cfg = &config.Config{Data: config.DataConfig{DataDir: dataDir}}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 	defaults := defaultPersonProviderCommandDeps()
 
 	for _, operation := range []struct {
@@ -1385,7 +1401,14 @@ func TestPersonProviderUseAndRemoveNoticeLiveIncompatibleDaemon(t *testing.T) {
 				return defaultOwnership(ctx)
 			}
 			deps.daemonAliveForRestartNotice = defaults.daemonAliveForRestartNotice
-			output, err := executePersonProviderCommand(t, deps, operation.verb, "beta")
+			output, err := executePersonProviderCommandContext(testCtx, t, deps, operation.verb, "beta")
+			if operation.verb == "remove" {
+				require.ErrorContains(err, "cannot identify the running people provider policy")
+				assert.NotContains(*events, "store")
+				assert.NotContains(*events, "edit")
+				assert.NotContains(*events, "daemon-remove")
+				return
+			}
 			require.NoError(err)
 			assert.Contains(output, operation.success)
 			assert.Contains(output, "running daemon")
@@ -1543,7 +1566,7 @@ func unreleasedCodexCommandDeps(
 ) personProviderCommandDeps {
 	t.Helper()
 	deps := localPersonProviderDeps(config, st, nil)
-	deps.newChecker = func(config peoplesweep.Config, st personProviderStore) (personProviderChecker, error) {
+	deps.newChecker = func(config peoplesweep.Config, st personProviderStore, _ personProviderSetupDeps) (personProviderChecker, error) {
 		registry, err := peoplesweep.NewDriverRegistry(nil, starter, peoplesweep.NewReleasedCodexIsolationGate())
 		if err != nil {
 			return nil, err
@@ -1551,7 +1574,7 @@ func unreleasedCodexCommandDeps(
 		return peoplesweep.NewRunner(config, st, registry,
 			peoplesweep.NewCredentialResolver(nil, os.LookupEnv))
 	}
-	deps.newCodexClient = func(config peoplesweep.Config) (personProviderCodexClient, error) {
+	deps.newCodexClient = func(config peoplesweep.Config, _ personProviderSetupDeps) (personProviderCodexClient, error) {
 		provider := configuredPersonProvider(config)
 		registry, err := peoplesweep.NewDriverRegistry(nil, starter, peoplesweep.NewReleasedCodexIsolationGate())
 		if err != nil {
@@ -1785,7 +1808,7 @@ func commandCodexScript(
 ) func(*bufio.Reader, io.Writer) error {
 	t.Helper()
 	return func(reader *bufio.Reader, writer io.Writer) error {
-		for id, want := range []string{"initialize", operation} {
+		for step, want := range []string{"initialize", "initialized", operation} {
 			line, err := reader.ReadBytes('\n')
 			if err != nil {
 				return fmt.Errorf("read command Codex request: %w", err)
@@ -1799,14 +1822,24 @@ func commandCodexScript(
 				return err
 			}
 			*methods = append(*methods, request.Method)
-			if request.Method != want || request.ID != int64(id+1) {
+			wantID := int64(0)
+			switch step {
+			case 0:
+				wantID = 1
+			case 2:
+				wantID = 2
+			}
+			if request.Method != want || request.ID != wantID {
 				return errors.New("unexpected Codex command transcript")
 			}
-			if operation == "account/login/start" && id == 1 {
+			if step == 1 {
+				continue
+			}
+			if operation == "account/login/start" && step == 2 {
 				assert.Equal(t, "chatgptDeviceCode", request.Params["type"])
 			}
 			response := map[string]any{"id": request.ID, "result": map[string]any{}}
-			if id == 1 {
+			if step == 2 {
 				response["result"] = result
 			}
 			encoded, err := json.Marshal(response)
@@ -1816,7 +1849,7 @@ func commandCodexScript(
 			if _, err := writer.Write(append(encoded, '\n')); err != nil {
 				return err
 			}
-			if operation == "account/login/start" && id == 1 {
+			if operation == "account/login/start" && step == 2 {
 				completed, err := json.Marshal(map[string]any{
 					"method": "account/login/completed",
 					"params": map[string]any{"success": true, "loginId": result["loginId"]},
@@ -1845,7 +1878,7 @@ func codexCommandDeps(
 		opens.Add(1)
 		return nil, func() {}, errors.New("archive store must not be opened")
 	}
-	deps.newCodexClient = func(config peoplesweep.Config) (personProviderCodexClient, error) {
+	deps.newCodexClient = func(config peoplesweep.Config, _ personProviderSetupDeps) (personProviderCodexClient, error) {
 		return peoplesweep.NewCodexAppServerDriver(
 			configuredPersonProvider(config), starter, commandCodexGate{},
 		)
@@ -1873,7 +1906,7 @@ func TestPersonProviderLoginUsesDeviceCode(t *testing.T) {
 	checks.Contains(output, "ABCD-1234")
 	checks.Contains(output, "2026-08-23T12:30:00Z")
 	checks.NotContains(output, "login-safe")
-	checks.Equal([]string{"initialize", "account/login/start"}, methods)
+	checks.Equal([]string{"initialize", "initialized", "account/login/start"}, methods)
 	checks.Zero(opens.Load())
 }
 
@@ -1902,7 +1935,7 @@ func TestPersonProviderModelsListsSupportedEfforts(t *testing.T) {
 	checks.Contains(output, "Test Model")
 	checks.Contains(output, "medium")
 	checks.Contains(output, "low, medium")
-	checks.Equal([]string{"initialize", "model/list"}, methods)
+	checks.Equal([]string{"initialize", "initialized", "model/list"}, methods)
 	checks.Zero(opens.Load())
 }
 

@@ -64,16 +64,27 @@ func (c *Client) AppendDraft(ctx context.Context, mailbox string, raw []byte) (D
 		return DraftAppendResult{State: DraftStateRejected, Code: "invalid_message"}, errors.New("draft message is empty")
 	}
 	if err := ctx.Err(); err != nil {
-		return DraftAppendResult{State: DraftStateCancelled, Code: "cancelled"}, err
+		return DraftAppendResult{State: DraftStateCancelled, Code: DraftStateCancelled}, err
 	}
 	var result DraftAppendResult
-	err := c.withConn(ctx, func(conn *imapclient.Client) error {
+	err := c.withDraftConn(ctx, func(conn *imapclient.Client) error {
 		if !conn.Caps().Has(imaplib.CapUIDPlus) {
 			result = DraftAppendResult{State: DraftStateRejected, Code: "uidplus_required"}
 			return &DraftAppendError{State: result.State, Code: result.Code, Err: errors.New("IMAP server does not advertise UIDPLUS")}
 		}
+		limit, advertised := conn.Caps().AppendLimit()
+		if advertised && limit == nil {
+			// An unreadable mailbox limit is unknown; APPEND's response decides.
+			if status, statusErr := conn.Status(mailbox, &imaplib.StatusOptions{AppendLimit: true}).Wait(); statusErr == nil && status != nil {
+				limit = status.AppendLimit
+			}
+		}
+		if limit != nil && uint64(len(raw)) > uint64(*limit) {
+			result = DraftAppendResult{State: DraftStateRejected, Code: "message_too_large"}
+			return &DraftAppendError{State: result.State, Code: result.Code, Err: fmt.Errorf("encoded draft size %d exceeds APPENDLIMIT %d", len(raw), *limit)}
+		}
 		if err := ctx.Err(); err != nil {
-			result = DraftAppendResult{State: DraftStateCancelled, Code: "cancelled"}
+			result = DraftAppendResult{State: DraftStateCancelled, Code: DraftStateCancelled}
 			return err
 		}
 		command := conn.Append(mailbox, int64(len(raw)), &imaplib.AppendOptions{
@@ -132,8 +143,11 @@ func (c *Client) AppendDraft(ctx context.Context, mailbox string, raw []byte) (D
 		if appendErr, ok := errors.AsType[*DraftAppendError](err); ok {
 			return result, appendErr
 		}
+		if result.State != "" {
+			return result, &DraftAppendError{State: result.State, Code: result.Code, Err: err}
+		}
 		if ctx.Err() != nil {
-			result = DraftAppendResult{State: DraftStateCancelled, Code: "cancelled"}
+			result = DraftAppendResult{State: DraftStateCancelled, Code: DraftStateCancelled}
 			return result, &DraftAppendError{State: result.State, Code: result.Code, Err: ctx.Err()}
 		}
 		if result.State == "" {

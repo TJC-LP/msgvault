@@ -16,6 +16,8 @@ type UploadTokenBody = TokenUploadRequest
 
 type EndBackupFreezeBody = BackupFreezeEndRequest
 
+type ControlCalendarBody = CalendarRequest
+
 type SaveCardDAVAccountBody = CardDAVAccountRequest
 
 type TestCardDAVAccountBody = CardDAVAccountRequest
@@ -102,15 +104,27 @@ type SearchFilesBody = FileSearchHTTPRequest
 
 type LinkIdentityParticipantsBody = IdentityLinkRequest
 
-type AcceptIdentityMatchCandidateBody = DecideIdentityMatchRequest
+type ReviewAcceptIdentityMatchCandidateBody = DecideIdentityMatchReviewedRequest
 
-type RejectIdentityMatchCandidateBody = DecideIdentityMatchRequest
+type ReviewRejectIdentityMatchCandidateBody = DecideIdentityMatchReviewedRequest
+
+type PersonMatchScoringConsentBody = PersonMatchConsentDecisionRequest
+
+type PersonMatchScoringRevokeBody = PersonMatchConsentDecisionRequest
+
+type RunPersonMatchScoringBody = PersonMatchScoringRequest
 
 type UnlinkIdentityParticipantsBody = IdentityLinkRequest
 
 type ImportMeetingBody = MeetingImportRequest
 
 type CreateImportJobBody = ImportJobRequest
+
+type ListMeetingActionItemsBody = MeetingActionsRequest
+
+type GetMeetingContextBody = MeetingContextRequest
+
+type GetMeetingMetricsBody = MeetingMetricsRequest
 
 type CreateOrLinkMessageTaskBody = TaskLinkMutationRequest
 
@@ -142,6 +156,12 @@ type SearchPeopleBody = PersonSearchRequest
 
 type PatchPersonBody = PatchPersonRequest
 
+type CreatePersonAgendaItemBody = PersonAgendaCreateRequest
+
+type LinkPersonAgendaItemBody = PersonAgendaLinkRequest
+
+type UpdatePersonAgendaItemBody = PersonAgendaUpdateRequest
+
 type SetPersonAttributeBody = SetPersonAttributeRequest
 
 type SetPersonBriefEnrollmentBody = PutPersonBriefEnrollmentRequest
@@ -170,6 +190,8 @@ type PatchPersonRelationshipBody = PatchPersonRelationshipRequest
 
 type RunQueryBody = QueryRequest
 
+type RunArchiveQueryBody = QueryRequest
+
 type CreateRelationshipTypeBody = CreateRelationshipTypeRequest
 
 type PatchRelationshipTypeBody = PatchRelationshipTypeRequest
@@ -191,6 +213,18 @@ type SearchVisualAttachmentsBody = VisualTextSearchRequest
 type GetSearchCoverageBody = SearchCoverageRequest
 
 type PatchSettingsBody = SettingsPatchRequest
+
+type StartSettingsPeopleCodexLoginBody = PeopleCodexLoginRequest
+
+type PutSettingsPeopleCodexProfileBody = PeopleCodexProfileRequest
+
+type PutSettingsPeopleInferencePresetBody = PeopleInferencePresetCreateRequest
+
+type ConsentSettingsPeopleInferenceProviderBody = PeopleInferenceConsentRequest
+
+type PutSettingsPeopleInferenceKeyBody = PeopleInferenceKeyWriteRequest
+
+type SelectSettingsPeopleInferenceBody = PeopleInferenceSelectionRequest
 
 type PutSettingsPersonEnrichmentProviderBody = PersonEnrichmentProviderUpdate
 

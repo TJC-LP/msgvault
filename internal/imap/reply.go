@@ -6,15 +6,14 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
 	stdmime "mime"
-	"mime/quotedprintable"
 	"net/mail"
 	"strings"
 	"time"
 	"unicode/utf8"
 
 	msgmime "go.kenn.io/msgvault/internal/mime"
+	"go.kenn.io/msgvault/internal/store"
 )
 
 // ReplyDraft is the composed RFC822 message and its parsed representation.
@@ -23,8 +22,37 @@ type ReplyDraft struct {
 	Parsed *msgmime.Message
 }
 
+// ReplyOptions selects the recipients for a reply.
+type ReplyOptions struct {
+	ReplyAll      bool
+	SelfAddresses []string
+}
+
+// ComposeOptions describes a new plain-text message.
+type ComposeOptions struct {
+	From    string
+	To      []string
+	Cc      []string
+	Bcc     []string
+	Subject string
+	Body    string
+}
+
+type plainTextEnvelope struct {
+	From, To, Cc, Bcc, ReplyTo []*mail.Address
+	Subject                    string
+	MessageID                  string
+	InReplyTo, References      []string
+}
+
 // BuildReply composes a single plain-text reply from an archived message.
 func BuildReply(parentRaw []byte, from, body string, now time.Time, messageID string) (ReplyDraft, error) {
+	return BuildReplyWithOptions(parentRaw, from, body, ReplyOptions{}, now, messageID)
+}
+
+// BuildReplyWithOptions composes a plain-text reply with the requested
+// recipient policy.
+func BuildReplyWithOptions(parentRaw []byte, from, body string, options ReplyOptions, now time.Time, messageID string) (ReplyDraft, error) {
 	if !utf8.ValidString(from) || strings.ContainsAny(from, "\r\n") {
 		return ReplyDraft{}, errors.New("invalid reply From address")
 	}
@@ -43,18 +71,9 @@ func BuildReply(parentRaw []byte, from, body string, now time.Time, messageID st
 	if err := validateSingletonHeaders(parent.Header); err != nil {
 		return ReplyDraft{}, err
 	}
-	replyTo := parent.Header.Get("Reply-To")
-	if replyTo == "" {
-		replyTo = parent.Header.Get("From")
-	}
-	addresses, err := mail.ParseAddressList(replyTo)
-	if err != nil || len(addresses) == 0 {
-		return ReplyDraft{}, errors.New("parent has invalid From or Reply-To")
-	}
-	for _, address := range addresses {
-		if err := validateAddress(address); err != nil {
-			return ReplyDraft{}, fmt.Errorf("parent has invalid reply address: %w", err)
-		}
+	to, cc, err := replyRecipients(parent.Header, fromAddress, options)
+	if err != nil {
+		return ReplyDraft{}, err
 	}
 
 	if messageID == "" {
@@ -91,49 +110,81 @@ func BuildReply(parentRaw []byte, from, body string, now time.Time, messageID st
 		references = append(references, parentID)
 	}
 
-	subject := normalizeReplySubject(decodeHeader(parent.Header.Get("Subject")))
-	fromValue := fromAddress.String()
-	toValue := formatAddresses(addresses)
-	if !validHeaderValue(subject) || !validHeaderValue(fromValue) || !validHeaderValue(toValue) {
-		return ReplyDraft{}, errors.New("invalid reply header")
+	return renderPlainTextDraft(plainTextEnvelope{
+		From: []*mail.Address{fromAddress}, To: to, Cc: cc,
+		Subject:   normalizeReplySubject(decodeHeader(parent.Header.Get("Subject"))),
+		MessageID: messageID, InReplyTo: messageIDList(parentID), References: references,
+	}, body, now)
+}
+
+func messageIDList(id string) []string {
+	if id == "" {
+		return nil
 	}
-	var raw bytes.Buffer
-	writeHeader := func(name, value string) {
-		_, _ = fmt.Fprintf(&raw, "%s: %s\r\n", name, value)
+	return []string{id}
+}
+
+func replyRecipients(header mail.Header, from *mail.Address, options ReplyOptions) (to, cc []*mail.Address, err error) {
+	replyTo := header.Get("Reply-To")
+	if replyTo == "" {
+		replyTo = header.Get("From")
 	}
-	writeHeader("Date", now.UTC().Format(time.RFC1123Z))
-	writeHeader("From", fromValue)
-	writeHeader("To", toValue)
-	if subject != "" {
-		if !isASCII(subject) {
-			subject = stdmime.QEncoding.Encode("UTF-8", subject)
+	primary, parseErr := mail.ParseAddressList(replyTo)
+	if parseErr != nil || len(primary) == 0 {
+		return nil, nil, errors.New("parent has invalid From or Reply-To")
+	}
+	for _, address := range primary {
+		if err := validateAddress(address); err != nil {
+			return nil, nil, fmt.Errorf("parent has invalid reply address: %w", err)
 		}
-		writeHeader("Subject", subject)
 	}
-	writeHeader("Message-ID", "<"+messageID+">")
-	if parentID != "" {
-		writeHeader("In-Reply-To", "<"+parentID+">")
-	}
-	if len(references) > 0 {
-		writeFoldedHeader(&raw, "References", formatMessageIDs(references))
-	}
-	writeHeader("MIME-Version", "1.0")
-	writeHeader("Content-Type", `text/plain; charset="utf-8"`)
-	writeHeader("Content-Transfer-Encoding", "quoted-printable")
-	raw.WriteString("\r\n")
-	qp := quotedprintable.NewWriter(&raw)
-	if _, err := io.WriteString(qp, body); err != nil {
-		return ReplyDraft{}, fmt.Errorf("encode reply body: %w", err)
-	}
-	if err := qp.Close(); err != nil {
-		return ReplyDraft{}, fmt.Errorf("close reply body: %w", err)
+	if !options.ReplyAll {
+		return primary, nil, nil
 	}
 
-	parsed, err := msgmime.Parse(raw.Bytes())
+	parentTo, err := parseDraftHeaderAddresses(header, "To", false)
 	if err != nil {
-		return ReplyDraft{}, fmt.Errorf("parse composed reply: %w", err)
+		return nil, nil, err
 	}
-	return ReplyDraft{Raw: raw.Bytes(), Parsed: parsed}, nil
+	parentCc, err := parseDraftHeaderAddresses(header, "Cc", false)
+	if err != nil {
+		return nil, nil, err
+	}
+	excluded := make(map[string]struct{}, len(options.SelfAddresses)+1)
+	excluded[store.NormalizeIdentifierForCompare(from.Address)] = struct{}{}
+	for _, address := range options.SelfAddresses {
+		parsed, parseErr := mail.ParseAddress(strings.TrimSpace(address))
+		key := strings.TrimSpace(address)
+		if parseErr == nil && parsed != nil {
+			key = parsed.Address
+		}
+		if key != "" {
+			excluded[store.NormalizeIdentifierForCompare(key)] = struct{}{}
+		}
+	}
+
+	seen := make(map[string]struct{}, len(primary)+len(parentTo)+len(parentCc))
+	appendVisible := func(dst []*mail.Address, addresses []*mail.Address) []*mail.Address {
+		for _, address := range addresses {
+			key := store.NormalizeIdentifierForCompare(address.Address)
+			if _, ok := excluded[key]; ok {
+				continue
+			}
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			dst = append(dst, address)
+		}
+		return dst
+	}
+	to = appendVisible(to, primary)
+	to = appendVisible(to, parentTo)
+	cc = appendVisible(cc, parentCc)
+	if len(to) == 0 && len(cc) == 0 {
+		return nil, nil, errors.New("reply-all has no recipients outside the sending account")
+	}
+	return to, cc, nil
 }
 
 func newReplyMessageID() (string, error) {
@@ -329,4 +380,111 @@ func writeFoldedHeader(raw *bytes.Buffer, name, value string) {
 		line += token
 	}
 	raw.WriteString(line + "\r\n")
+}
+
+// BuildDraftReplacement keeps the envelope and thread headers of a plain-text
+// draft while replacing its body and assigning a new Date and Message-ID.
+func BuildDraftReplacement(currentRaw []byte, body string, now time.Time, messageID string) (ReplyDraft, error) {
+	if len(currentRaw) == 0 {
+		return ReplyDraft{}, errors.New("draft message is empty")
+	}
+	if !utf8.ValidString(body) || strings.ContainsAny(body, "\x00") {
+		return ReplyDraft{}, errors.New("invalid draft body")
+	}
+	message, err := mail.ReadMessage(bytes.NewReader(currentRaw))
+	if err != nil {
+		return ReplyDraft{}, fmt.Errorf("read draft headers: %w", err)
+	}
+	if err := validateSingletonHeaders(message.Header); err != nil {
+		return ReplyDraft{}, err
+	}
+	contentType := message.Header.Get("Content-Type")
+	if contentType != "" {
+		mediaType, _, err := stdmime.ParseMediaType(contentType)
+		if err != nil {
+			return ReplyDraft{}, fmt.Errorf("invalid draft Content-Type: %w", err)
+		}
+		if !strings.EqualFold(mediaType, "text/plain") {
+			return ReplyDraft{}, errors.New("draft replacement requires a plain-text message")
+		}
+	}
+	parsedCurrent, err := msgmime.Parse(currentRaw)
+	if err != nil {
+		return ReplyDraft{}, fmt.Errorf("parse draft MIME: %w", err)
+	}
+	if len(parsedCurrent.Attachments) != 0 || parsedCurrent.BodyHTML != "" {
+		return ReplyDraft{}, errors.New("draft replacement does not support multipart or attachments")
+	}
+
+	from, err := parseDraftHeaderAddresses(message.Header, "From", true)
+	if err != nil {
+		return ReplyDraft{}, err
+	}
+	to, err := parseDraftHeaderAddresses(message.Header, "To", false)
+	if err != nil {
+		return ReplyDraft{}, err
+	}
+	cc, err := parseDraftHeaderAddresses(message.Header, "Cc", false)
+	if err != nil {
+		return ReplyDraft{}, err
+	}
+	bcc, err := parseDraftHeaderAddresses(message.Header, "Bcc", false)
+	if err != nil {
+		return ReplyDraft{}, err
+	}
+	replyTo, err := parseDraftHeaderAddresses(message.Header, "Reply-To", false)
+	if err != nil {
+		return ReplyDraft{}, err
+	}
+	if len(from) != 1 || len(to)+len(cc)+len(bcc) == 0 {
+		return ReplyDraft{}, errors.New("draft must contain one From and at least one recipient")
+	}
+	subject := decodeHeader(message.Header.Get("Subject"))
+	if !validHeaderValue(subject) {
+		return ReplyDraft{}, errors.New("invalid draft Subject header")
+	}
+	inReplyTo, err := parseMessageIDHeader(message.Header.Get("In-Reply-To"))
+	if err != nil {
+		return ReplyDraft{}, fmt.Errorf("invalid draft In-Reply-To: %w", err)
+	}
+	references, err := parseMessageIDHeader(message.Header.Get("References"))
+	if err != nil {
+		return ReplyDraft{}, fmt.Errorf("invalid draft References: %w", err)
+	}
+	if messageID == "" {
+		messageID, err = newReplyMessageID()
+		if err != nil {
+			return ReplyDraft{}, err
+		}
+	}
+	messageID, err = normalizeWireMessageID(messageID)
+	if err != nil {
+		return ReplyDraft{}, err
+	}
+
+	return renderPlainTextDraft(plainTextEnvelope{
+		From: from, To: to, Cc: cc, Bcc: bcc, ReplyTo: replyTo,
+		Subject: subject, MessageID: messageID,
+		InReplyTo: inReplyTo, References: references,
+	}, body, now)
+}
+
+func parseDraftHeaderAddresses(header mail.Header, name string, required bool) ([]*mail.Address, error) {
+	values := headerValues(header, name)
+	if len(values) == 0 {
+		if required {
+			return nil, fmt.Errorf("draft is missing %s header", name)
+		}
+		return nil, nil
+	}
+	addresses, err := mail.ParseAddressList(strings.Join(values, ", "))
+	if err != nil {
+		return nil, fmt.Errorf("invalid draft %s header: %w", name, err)
+	}
+	for _, address := range addresses {
+		if err := validateAddress(address); err != nil {
+			return nil, fmt.Errorf("invalid draft %s address: %w", name, err)
+		}
+	}
+	return addresses, nil
 }

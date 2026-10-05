@@ -132,16 +132,29 @@ type ListAttributeDefinitionsQuery struct {
 	IncludeHidden *bool `json:"include_hidden,omitempty"`
 }
 
+type ListCardDAVBooksQuery struct {
+	// Connection Saved connection name; omit for all connections
+	Connection *string `json:"connection,omitempty"`
+}
+
 type ListCardDAVRunsQuery struct {
 	// Limit Maximum runs to return (default 25, max 100)
 	Limit *int64 `json:"limit,omitempty" validate:"omitempty,gte=1,lte=100"`
 
 	// BeforeID Return runs with IDs lower than this cursor
 	BeforeID *int64 `json:"before_id,omitempty" validate:"omitempty,gte=1"`
+
+	// Connection Saved connection name; omit for all connections
+	Connection *string `json:"connection,omitempty"`
 }
 
 func (l ListCardDAVRunsQuery) Validate() error {
 	return runtime.ConvertValidatorError(typesValidator.Struct(l))
+}
+
+type GetCardDAVStatusQuery struct {
+	// Connection Saved connection name; omit for all connections
+	Connection *string `json:"connection,omitempty"`
 }
 
 type GetCLIAttachmentQuery struct {
@@ -190,6 +203,20 @@ func (g GetCLIMessageQuery) Validate() error {
 	return runtime.ConvertValidatorError(typesValidator.Struct(g))
 }
 
+type GetCLIMessageOriginalQuery struct {
+	// ID Internal message ID
+	ID *int64 `json:"id,omitempty"`
+
+	// MaxBytes Maximum decoded MIME bytes; omit for an unrestricted export
+	MaxBytes *int64 `json:"max_bytes,omitempty"`
+
+	// SourceMessageID Provider message ID
+	SourceMessageID *string `json:"source_message_id,omitempty"`
+
+	// Account Source identifier that narrows the lookup
+	Account *string `json:"account,omitempty"`
+}
+
 type GetCLIMessageRawQuery struct {
 	// ID Message numeric ID or source message ID
 	ID string `json:"id" validate:"required"`
@@ -197,6 +224,29 @@ type GetCLIMessageRawQuery struct {
 
 func (g GetCLIMessageRawQuery) Validate() error {
 	return runtime.ConvertValidatorError(typesValidator.Struct(g))
+}
+
+type GetCLIMessageThreadQuery struct {
+	// ID Internal ID of a message in the conversation
+	ID *int64 `json:"id,omitempty"`
+
+	// SourceMessageID Provider ID of a message in the conversation
+	SourceMessageID *string `json:"source_message_id,omitempty"`
+
+	// ThreadID Provider conversation ID
+	ThreadID *string `json:"thread_id,omitempty"`
+
+	// Account Source identifier that narrows the lookup
+	Account *string `json:"account,omitempty"`
+
+	// All Return fixed membership for the entire conversation; cannot be combined with limit or offset
+	All *bool `json:"all,omitempty"`
+
+	// Limit Messages per page (default 100, max 500)
+	Limit *int64 `json:"limit,omitempty"`
+
+	// Offset Messages to skip
+	Offset *int64 `json:"offset,omitempty"`
 }
 
 type SearchCLIQuery struct {
@@ -235,6 +285,12 @@ type GetCLIStatsQuery struct {
 }
 
 type SyncCLIQuery struct {
+	// BuildCache Build the analytics cache after sync even inside the interval
+	BuildCache *bool `json:"build-cache,omitempty"`
+
+	// NoBuildCache Skip the analytics cache refresh after sync
+	NoBuildCache *bool `json:"no-build-cache,omitempty"`
+
 	// Email Account email or display name to sync
 	Email *string `json:"email,omitempty"`
 
@@ -249,6 +305,12 @@ type SyncCLIQuery struct {
 }
 
 type SyncFullCLIQuery struct {
+	// BuildCache Build the analytics cache after sync even inside the interval
+	BuildCache *bool `json:"build-cache,omitempty"`
+
+	// NoBuildCache Skip the analytics cache refresh after sync
+	NoBuildCache *bool `json:"no-build-cache,omitempty"`
+
 	// Email Account email or display name to sync
 	Email *string `json:"email,omitempty"`
 
@@ -441,6 +503,17 @@ type ListIdentityMatchCandidatesQuery struct {
 
 	// Offset Zero-based candidate offset
 	Offset *int64 `json:"offset,omitempty"`
+}
+
+type ListPersonMatchJudgmentsQuery struct {
+	// CandidateID Optional candidate ID; zero lists all
+	CandidateID *int64 `json:"candidate_id,omitempty"`
+
+	// Limit Maximum judgments
+	Limit *int64 `json:"limit,omitempty"`
+
+	// BeforeID Older judgments with ID below this cursor
+	BeforeID *int64 `json:"before_id,omitempty"`
 }
 
 type SearchIntegrationTasksQuery struct {
@@ -951,6 +1024,16 @@ func (l ListPersonRelationshipReviewsQuery) Validate() error {
 		return nil
 	}
 	return errors
+}
+
+type RunQueryQuery struct {
+	// Fresh Request a background cache check including writes committed before this request
+	Fresh *bool `json:"fresh,omitempty"`
+}
+
+type RunArchiveQueryQuery struct {
+	// Fresh Request a background cache check including writes committed before this request
+	Fresh *bool `json:"fresh,omitempty"`
 }
 
 type SearchMessagesQuery struct {

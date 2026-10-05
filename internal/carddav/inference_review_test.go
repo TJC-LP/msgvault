@@ -249,7 +249,7 @@ func TestTwoServicesCancelQueuedPublishBeforeNetwork(t *testing.T) {
 	first := make(chan error, 1)
 	go func() { first <- service.PublishPerson(t.Context(), personID) }()
 	<-reached
-	second := NewService(st, service.client)
+	second := NewService(st, service.dav().client)
 	ctx, cancel := context.WithCancel(t.Context())
 	queued := make(chan error, 1)
 	go func() { queued <- second.PublishPerson(ctx, personID) }()
@@ -322,7 +322,7 @@ func TestReviewedPublicationRestartRecoversPersistedOwnershipWithoutAnotherPut(t
 	require.NoError(err)
 	t.Cleanup(func() { _ = reopened.Close() })
 	require.NoError(reopened.InitSchema())
-	restarted := NewService(reopened, service.client)
+	restarted := NewService(reopened, service.dav().client)
 	require.NoError(restarted.PublishPerson(t.Context(), personID))
 	assert.Equal(1, fixture.puts)
 	envelope, err := reopened.GetVCardResourceEnvelopeContext(t.Context(), fmt.Sprintf("carddav:%d", book.ID), book.CanonicalURL+"person.vcf")
@@ -347,7 +347,7 @@ func TestCurrentPublicationApprovalScopeChangesAfterUnpublishAndNewTarget(t *tes
 	require.NoError(err)
 	require.NoError(service.PublishReviewedPerson(t.Context(), personID, preview.ApprovalToken))
 	require.NoError(service.UnpublishPerson(t.Context(), personID))
-	account, err := st.GetCardDAVAccountContext(t.Context())
+	account, err := st.GetCardDAVAccountByIDContext(t.Context(), store.DefaultCardDAVAccountID)
 	require.NoError(err)
 	allowed := true
 	updatedAccount, books, err := st.ReplaceCardDAVDiscoveryContext(t.Context(), store.CardDAVDiscoveryInput{

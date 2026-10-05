@@ -22,6 +22,7 @@ msgvault requires OAuth credentials to access the Gmail API. This section walks 
 2. In the search bar, search for "Gmail API" and click the **Gmail API** box
 3. Click **Enable**
 4. If you wish to sync Google Calendar too, click **Library**, search for "Google Calendar API", click the **Google Calendar API** box and click **Enable**
+5. If you wish to sync Google Contacts over CardDAV, click **Library**, search for "CardDAV", click the **Google Contacts CardDAV API** box and click **Enable**. Without it, saving the CardDAV account fails during discovery because Google rejects every request with `SERVICE_DISABLED`
 
 ### Step 3: Configure OAuth Consent Screen
 
@@ -337,8 +338,8 @@ You need to register an application in Microsoft Entra (Azure AD) before using `
    - **Supported account types:** "Accounts in any organizational directory and personal Microsoft accounts"
     - **Redirect URI:** Platform = **Mobile and desktop applications**, URI = your `redirect_uri` from `config.toml` (default: `http://localhost:8089/callback/microsoft`)
 3. Click **Register**
-4. Under **API permissions**, click **Add a permission > APIs my organization uses**, search for **Office 365 Exchange Online**, select **Delegated permissions**, then add `IMAP.AccessAsUser.All`
-5. Under **Authentication**, enable **Allow public client flows** (required for PKCE)
+4. Under **API permissions**, click **Add a permission > Microsoft Graph > Delegated permissions**, then add `IMAP.AccessAsUser.All`
+5. Under **Authentication**, enable **Allow public client flows** (required for PKCE and for `--headless`)
 6. If you will use a custom `redirect_uri` in `config.toml`, make sure the Redirect URI in the app registration matches it exactly — including scheme, host, port, and path. For `https://localhost/` on a privileged port (e.g. 443), register that exact URI.
 7. Copy the **Application (client) ID** from the app's Overview page
 
@@ -372,6 +373,14 @@ This opens your browser for Microsoft OAuth consent. After you authorize, msgvau
 - Validates the token matches the email you specified
 - Auto-detects the correct IMAP host based on account type
 - Configures XOAUTH2 authentication automatically
+
+On a machine without a browser, such as a server or a container, add `--headless`:
+
+```bash
+msgvault add-o365 you@outlook.com --headless
+```
+
+msgvault prints a Microsoft URL and a code. Open the URL on any device and enter the code. `add-teams` accepts the same flag.
 
 Personal accounts (hotmail.com, outlook.com, live.com, msn.com) connect to `outlook.office.com`. Organizational accounts (company Microsoft 365) connect to `outlook.office365.com`. This detection is automatic.
 
@@ -411,6 +420,32 @@ Some organizations require administrator consent before delegated channel
 message permissions can be used. See [Microsoft Teams](/docs/usage/teams/) for the
 full Teams workflow.
 
+### Microsoft Graph Mail Sync
+
+If IMAP is turned off for a mailbox, `add-o365 --graph` syncs it through the
+Microsoft Graph mail API. It uses the same `[microsoft] client_id` and redirect
+URI. Add the **Microsoft Graph** delegated permission `Mail.Read` to the app
+registration, then authorize and sync:
+
+```bash
+msgvault add-o365 you@example.com --graph
+msgvault sync you@example.com
+```
+
+The token is saved under `tokens/msmail_<email>.json`, and the account has the
+type `msmail`. Each mail folder becomes a label. The first sync downloads every
+folder. Later syncs fetch only the changes, including moves between folders
+and deletes. The daemon schedules the account like any other.
+
+To delete messages at the source with `delete-staged`, also add the delegated
+permission `Mail.ReadWrite`. Sync does not use it. The first `delete-staged`
+for the account asks to upgrade the token. See
+[Deleting Email](/docs/usage/deletion/).
+
+A Graph account is a new account. If the same mailbox is also synced over
+IMAP, the vault holds two copies. Run `msgvault dedup --collection` to hide the
+extra copies, and `--undo` to reverse it.
+
 ### Sync Your Email
 
 After adding the account, sync it the same way as any other account:
@@ -421,7 +456,18 @@ msgvault sync-full you@outlook.com
 
 ### Headless Servers
 
-On a headless server (SSH, VPS, Docker), authorize on a machine with a browser and copy the token file to the server:
+Sign in from SSH, a server, or a container without opening a local browser:
+
+```bash
+msgvault add-o365 you@outlook.com --headless
+```
+
+For Graph mail, add `--graph`. For Teams, run
+`msgvault add-teams you@example.com --headless`.
+Open the printed Microsoft URL on another device and enter the code. Complete
+sign-in there; msgvault saves the token on the server.
+
+You can also authorize on another machine and copy its token. For IMAP mail:
 
 1. On your local machine, run `msgvault add-o365 you@outlook.com` and complete the browser flow.
 2. Copy the token to the server:

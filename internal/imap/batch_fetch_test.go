@@ -322,6 +322,14 @@ func TestLabelOnlyRescanDefersAllMailDedupUntilValidated(t *testing.T) {
 	require.NotNil(rawResults[0].Message)
 	assert.Nil(rawResults[0].Message.Raw,
 		"the overlapping mailbox copy must remain a dedup stub")
+
+	validationResults, err := client.GetMessagesRawBatchWithIdentityValidation(
+		context.Background(), []string{"Archive|1"})
+	require.NoError(err)
+	require.Len(validationResults, 1)
+	require.NoError(validationResults[0].Err)
+	require.NotNil(validationResults[0].Message)
+	assert.Equal(messageID, rawMIMEMessageID(validationResults[0].Message.Raw))
 }
 
 func TestSeedValidatedMessageDedupEligibility(t *testing.T) {
@@ -504,7 +512,7 @@ func TestApplyFetchResultsMarksMissingUIDs(t *testing.T) {
 	}
 
 	var c Client
-	omitted := c.applyFetchResults(results, uidToIdx, "Archive", chunk, msgs)
+	omitted := c.applyFetchResults(results, uidToIdx, "Archive", chunk, msgs, false)
 
 	require.NotNil(results[0].Message)
 	assert.Equal("Archive|10", results[0].Message.ID)
@@ -540,7 +548,7 @@ func TestApplyFetchResultsMarksMissingRawBody(t *testing.T) {
 			chunk := []batchFetchItem{{idx: 0, uid: imapapi.UID(10)}}
 
 			var c Client
-			c.applyFetchResults(results, uidToIdx, "Archive", chunk, []*imapclient.FetchMessageBuffer{tt.msg})
+			c.applyFetchResults(results, uidToIdx, "Archive", chunk, []*imapclient.FetchMessageBuffer{tt.msg}, false)
 
 			assert.Nil(t, results[0].Message)
 			require.ErrorIs(t, results[0].Err, errIMAPRawBodyMissing)
@@ -564,7 +572,7 @@ func TestApplyFetchResultsPreservesDedupStub(t *testing.T) {
 		seenRFC822IDs: map[string]bool{"duplicate@example.com": true},
 	}
 
-	c.applyFetchResults(results, uidToIdx, "Archive", chunk, msgs)
+	c.applyFetchResults(results, uidToIdx, "Archive", chunk, msgs, false)
 
 	require.NotNil(results[0].Message)
 	assert.Equal("Archive|10", results[0].Message.ID)
@@ -587,7 +595,7 @@ func TestApplyFetchResultsDedupsUsingRawMessageIDWithoutEnvelope(t *testing.T) {
 		seenRFC822IDs: map[string]bool{"duplicate@example.com": true},
 	}
 
-	c.applyFetchResults(results, uidToIdx, "Archive", chunk, msgs)
+	c.applyFetchResults(results, uidToIdx, "Archive", chunk, msgs, false)
 
 	require.NotNil(results[0].Message)
 	assert.Equal("Archive|10", results[0].Message.ID)
@@ -611,7 +619,7 @@ func TestApplyFetchResultsMergesLabelsUsingRawMessageIDWithoutEnvelope(t *testin
 		},
 	}
 
-	c.applyFetchResults(results, uidToIdx, "Archive", chunk, msgs)
+	c.applyFetchResults(results, uidToIdx, "Archive", chunk, msgs, false)
 
 	require.NotNil(results[0].Message)
 	assert.Equal([]string{"Archive", "Projects"}, results[0].Message.LabelIDs)
@@ -635,7 +643,7 @@ func TestApplyFetchResultsMergesLabelsWhenRawMessageIDHasRecoverableMIMEError(t 
 		},
 	}
 
-	c.applyFetchResults(results, uidToIdx, "Archive", chunk, msgs)
+	c.applyFetchResults(results, uidToIdx, "Archive", chunk, msgs, false)
 
 	require.NotNil(results[0].Message)
 	assert.Equal([]string{"Archive", "Projects"}, results[0].Message.LabelIDs)
@@ -658,7 +666,7 @@ func TestApplyFetchResultsImportsWhenRawMessageIDMissingOrInvalid(t *testing.T) 
 		},
 		{
 			name: "invalid message id value",
-			raw:  []byte("Message-ID: not a message id\r\n\r\nbody"),
+			raw:  []byte("Message-ID: <<broken@example.test>>\r\n\r\nbody"),
 		},
 	}
 
@@ -677,7 +685,7 @@ func TestApplyFetchResultsImportsWhenRawMessageIDMissingOrInvalid(t *testing.T) 
 				msgIDToLabels: map[string][]string{"existing": {"Projects"}},
 			}
 
-			c.applyFetchResults(results, uidToIdx, "Archive", chunk, msgs)
+			c.applyFetchResults(results, uidToIdx, "Archive", chunk, msgs, false)
 
 			require.NotNil(results[0].Message)
 			assert.Equal("Archive|10", results[0].Message.ID)
@@ -813,7 +821,7 @@ func TestMissingUIDDropsEarlierMembershipObservation(t *testing.T) {
 			fetchMessageBuffer("message-10", []byte("raw-10")),
 		}
 
-		omitted := c.applyFetchResults(results, uidToIdx, "Archive", chunk, msgs)
+		omitted := c.applyFetchResults(results, uidToIdx, "Archive", chunk, msgs, false)
 		markConfirmedGone(&c, results, nil, "Archive", omitted)
 
 		require.ErrorIs(t, results[1].Err, errIMAPFetchResultMissing)
@@ -1048,4 +1056,190 @@ func TestUIDTheMailboxStillReportsIsNotGone(t *testing.T) {
 			"a UID the mailbox still reports has not left it")
 		assert.Contains(observedUIDs(client), uint32(2))
 	})
+}
+
+// startEmptyHeaderFieldsIMAPServer answers the way DavMail does: a
+// HEADER.FIELDS fetch returns every UID but a zero-length section for UID 2,
+// while BODY.PEEK[HEADER] returns the full header. UID 1 answers both
+// correctly. Every UID FETCH command is sent on the returned channel.
+func startEmptyHeaderFieldsIMAPServer(t *testing.T) (string, <-chan string) {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = listener.Close() })
+
+	headers := map[string]string{
+		"1": "Message-ID: <uid-1@example.com>\r\n\r\n",
+		"2": "Subject: two\r\nMessage-ID: <uid-2@example.com>\r\n\r\n",
+	}
+	fetchCommands := make(chan string, 16)
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		_, _ = io.WriteString(conn, "* OK [CAPABILITY IMAP4rev1] synthetic server ready\r\n")
+		reader := bufio.NewReader(conn)
+		for {
+			line, readErr := reader.ReadString('\n')
+			if readErr != nil {
+				return
+			}
+			tag, command, _ := strings.Cut(strings.TrimSpace(line), " ")
+			upper := strings.ToUpper(command)
+			switch {
+			case strings.HasPrefix(upper, "LOGIN"):
+				_, _ = fmt.Fprintf(conn, "%s OK LOGIN completed\r\n", tag)
+			case strings.HasPrefix(upper, "SELECT"):
+				_, _ = io.WriteString(conn,
+					"* FLAGS (\\Seen)\r\n* 2 EXISTS\r\n* OK [UIDVALIDITY 1]\r\n* OK [UIDNEXT 3]\r\n")
+				_, _ = fmt.Fprintf(conn, "%s OK [READ-WRITE] SELECT completed\r\n", tag)
+			case strings.HasPrefix(upper, "UID FETCH"):
+				fetchCommands <- upper
+				fields := strings.Contains(upper, "HEADER.FIELDS")
+				uids := strings.Fields(upper)[2]
+				for _, uid := range []string{"1", "2"} {
+					if !strings.Contains(","+uids+",", ","+uid+",") && uids != "1:2" {
+						continue
+					}
+					section, body := "HEADER", headers[uid]
+					if fields {
+						section = `HEADER.FIELDS ("MESSAGE-ID")`
+						if uid == "2" {
+							body = ""
+						}
+					}
+					_, _ = fmt.Fprintf(conn, "* %s FETCH (UID %s FLAGS () BODY[%s] {%d}\r\n%s)\r\n",
+						uid, uid, section, len(body), body)
+				}
+				_, _ = fmt.Fprintf(conn, "%s OK UID FETCH completed\r\n", tag)
+			case strings.HasPrefix(upper, "LOGOUT"):
+				_, _ = fmt.Fprintf(conn, "* BYE closing\r\n%s OK LOGOUT completed\r\n", tag)
+				return
+			default:
+				_, _ = fmt.Fprintf(conn, "%s BAD unsupported synthetic command\r\n", tag)
+			}
+		}
+	}()
+	return listener.Addr().String(), fetchCommands
+}
+
+// TestEmptyHeaderFieldsSectionFallsBackToFullHeader covers servers that return
+// an empty HEADER.FIELDS section for a live message. The label reconcile and
+// the label map must read the Message-ID from BODY.PEEK[HEADER] instead of
+// failing the message on every sync, and must refetch only the UIDs that came
+// back empty.
+func TestEmptyHeaderFieldsSectionFallsBackToFullHeader(t *testing.T) {
+	t.Run("label fetch", func(t *testing.T) {
+		require := require.New(t)
+		assert := assert.New(t)
+		addr, fetchCommands := startEmptyHeaderFieldsIMAPServer(t)
+		client := newTestClient(t, addr)
+
+		results, err := client.GetMessageLabelsBatch(
+			t.Context(), []string{"INBOX|1", "INBOX|2"})
+
+		require.NoError(err)
+		require.Len(results, 2)
+		require.NoError(results[0].Err)
+		require.NoError(results[1].Err)
+		assert.Equal("uid-1@example.com", results[0].RFC822MessageID)
+		assert.Equal("uid-2@example.com", results[1].RFC822MessageID)
+		assert.Contains(<-fetchCommands, "HEADER.FIELDS")
+		assert.Equal("UID FETCH 2 (UID BODY.PEEK[HEADER])", <-fetchCommands)
+	})
+
+	t.Run("label map", func(t *testing.T) {
+		require := require.New(t)
+		assert := assert.New(t)
+		addr, _ := startEmptyHeaderFieldsIMAPServer(t)
+		client := newTestClient(t, addr)
+
+		client.mu.Lock()
+		defer client.mu.Unlock()
+		require.NoError(client.connect(t.Context()))
+		labels, unidentified, missing, err := client.fetchMailboxMessageIDs(
+			t.Context(), "INBOX", []imapapi.UID{1, 2})
+
+		require.NoError(err)
+		assert.Equal(map[string]bool{
+			"uid-1@example.com": true,
+			"uid-2@example.com": true,
+		}, labels)
+		assert.Empty(unidentified)
+		assert.Empty(missing)
+	})
+}
+
+func TestFullHeaderFallbackReselectFailureEndsTheBatch(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = listener.Close() })
+	unselectedFetches := make(chan string, 16)
+	go func() {
+	sessions:
+		for session := range 2 {
+			conn, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			defer func() { _ = conn.Close() }()
+			_, _ = io.WriteString(conn, "* OK [CAPABILITY IMAP4rev1] synthetic server ready\r\n")
+			reader := bufio.NewReader(conn)
+			for {
+				line, readErr := reader.ReadString('\n')
+				if readErr != nil {
+					return
+				}
+				tag, command, _ := strings.Cut(strings.TrimSpace(line), " ")
+				upper := strings.ToUpper(command)
+				switch {
+				case strings.HasPrefix(upper, "LOGIN"):
+					_, _ = fmt.Fprintf(conn, "%s OK LOGIN completed\r\n", tag)
+				case strings.HasPrefix(upper, "SELECT"):
+					if session == 1 {
+						_, _ = fmt.Fprintf(conn, "%s NO [NONEXISTENT] mailbox no longer exists\r\n", tag)
+						continue
+					}
+					_, _ = fmt.Fprintf(conn,
+						"* FLAGS (\\Seen)\r\n* %d EXISTS\r\n* OK [UIDVALIDITY 1]\r\n* OK [UIDNEXT %d]\r\n",
+						fetchChunkSize+1, fetchChunkSize+2)
+					_, _ = fmt.Fprintf(conn, "%s OK [READ-WRITE] SELECT completed\r\n", tag)
+				case strings.HasPrefix(upper, "UID FETCH"):
+					if session == 1 {
+						unselectedFetches <- upper
+						_, _ = fmt.Fprintf(conn, "%s BAD no mailbox selected\r\n", tag)
+						continue
+					}
+					if !strings.Contains(upper, "HEADER.FIELDS") {
+						// Disconnect during the full-header fallback. The new
+						// connection can log in but cannot select the mailbox.
+						_ = conn.Close()
+						continue sessions
+					}
+					for uid := 1; uid <= fetchChunkSize; uid++ {
+						_, _ = fmt.Fprintf(conn,
+							"* %d FETCH (UID %d FLAGS () BODY[HEADER.FIELDS (\"MESSAGE-ID\")] {0}\r\n)\r\n", uid, uid)
+					}
+					_, _ = fmt.Fprintf(conn, "%s OK UID FETCH completed\r\n", tag)
+				case strings.HasPrefix(upper, "LOGOUT"):
+					_, _ = fmt.Fprintf(conn, "* BYE closing\r\n%s OK LOGOUT completed\r\n", tag)
+					return
+				default:
+					_, _ = fmt.Fprintf(conn, "%s BAD unsupported synthetic command\r\n", tag)
+				}
+			}
+		}
+	}()
+	client := newTestClient(t, listener.Addr().String())
+	messageIDs := make([]string, fetchChunkSize+1)
+	for i := range messageIDs {
+		messageIDs[i] = fmt.Sprintf("INBOX|%d", i+1)
+	}
+
+	_, err = client.GetMessageLabelsBatch(t.Context(), messageIDs)
+
+	require.ErrorContains(t, err, "mailbox no longer exists")
+	assert.Empty(t, unselectedFetches, "the batch must stop before fetching another chunk")
 }

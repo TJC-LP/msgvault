@@ -17,6 +17,66 @@ import { createAllMatchingSelection, predicateFingerprint } from './selection';
 import { SEARCH_MODE_PREFERENCE_KEY } from '../search/modes';
 
 describe('Explore URL state', () => {
+  it('drops an impossible Directory date when reading the URL', () => {
+    window.history.replaceState(null, '', `/?explore=${encodeURIComponent(JSON.stringify({
+      workspace: 'directory', directoryLastContactAfter: '2026-02-31', directoryLastContactBefore: '2026-03-01'
+    }))}`);
+    const state = new ExploreState(window);
+    try {
+      expect(state.current.directoryLastContactAfter).toBe('');
+      expect(state.current.directoryLastContactBefore).toBe('2026-03-01');
+    } finally {
+      state.destroy();
+    }
+  });
+
+  it('shares an ordinary tab without defaults or another workspace selection', () => {
+    const search = serializeExploreURLState({
+      ...defaultExploreURLState,
+      workspace: 'everything',
+      relationshipTarget: 'cluster:42',
+      directoryQuery: 'Alex',
+      fileFilenameQuery: 'invoice',
+      activeRow: 'message:7',
+      scrollAnchor: { key: 'message:7', offset: 10 },
+    });
+
+    expect(search).toBe('?workspace=everything&mode=full_text');
+    expect(parseExploreURLState(search)).toMatchObject({
+      workspace: 'everything', relationshipTarget: null, directoryQuery: '', fileFilenameQuery: '',
+    });
+  });
+
+  it('restores readable workspace and search-mode parameters with selected filters', () => {
+    const search = '?workspace=files&mode=hybrid&explore=' + encodeURIComponent(JSON.stringify({
+      schemaVersion: 2,
+      query: 'project notes',
+      filters: [{ dimension: 'source', values: ['7'] }],
+      fileMIMEFamilies: ['pdf'],
+    }));
+    expect(parseExploreURLState(search)).toMatchObject({
+      workspace: 'files', searchMode: 'hybrid', query: 'project notes',
+      filters: [{ dimension: 'source', values: ['7'] }], fileMIMEFamilies: ['pdf'],
+    });
+  });
+
+  it('keeps inactive workspace choices in browser history while sharing only the current view', async () => {
+    window.history.replaceState(null, '', '/');
+    const state = new ExploreState(window);
+    state.commitNavigation({ relationshipTarget: 'cluster:42' });
+    state.commitWorkspace('everything');
+    expect(window.location.search).toBe('?workspace=everything&mode=full_text');
+
+    window.history.back();
+    await new Promise((resolve) => window.addEventListener('popstate', resolve, { once: true }));
+    expect(state.current).toMatchObject({ workspace: 'relationships', relationshipTarget: 'cluster:42' });
+    window.history.forward();
+    await new Promise((resolve) => window.addEventListener('popstate', resolve, { once: true }));
+    state.commitWorkspace('relationships');
+    expect(state.current.relationshipTarget).toBe('cluster:42');
+    state.destroy();
+  });
+
   it('restores the conflict identity review queue from URL state', () => {
     const restored = parseExploreURLState(serializeExploreURLState({
       ...defaultExploreURLState,
@@ -29,6 +89,20 @@ describe('Explore URL state', () => {
       workspace: 'directory_review',
       reviewKind: 'identity',
       identityState: 'conflict'
+    });
+  });
+
+  it('keeps the selected person when sharing a Fact review', () => {
+    const restored = parseExploreURLState(serializeExploreURLState({
+      ...defaultExploreURLState,
+      workspace: 'directory_review',
+      reviewKind: 'fact',
+      directoryPersonID: 7,
+      directoryQuery: 'Alex',
+    }));
+
+    expect(restored).toMatchObject({
+      workspace: 'directory_review', reviewKind: 'fact', directoryPersonID: 7, directoryQuery: '',
     });
   });
 
@@ -145,8 +219,52 @@ describe('Explore URL state', () => {
     expect(invalid.operationStatus).toBe('');
   });
 
+  it('round-trips the Settings category and shares it only from Settings', () => {
+    const restored = parseExploreURLState(serializeExploreURLState({
+      ...defaultExploreURLState, workspace: 'settings', settingsCategory: 'search'
+    }));
+    expect(restored.settingsCategory).toBe('search');
+    const elsewhere = serializeExploreURLState({
+      ...defaultExploreURLState, workspace: 'everything', settingsCategory: 'search'
+    });
+    expect(elsewhere).not.toContain('settingsCategory');
+    for (const invalid of ['<script>', 42, '', 'Search']) {
+      expect(parseExploreURLState(serializeExploreURLState({
+        ...defaultExploreURLState, workspace: 'settings', settingsCategory: invalid
+      } as unknown as ExploreURLState)).settingsCategory).toBe('browser');
+    }
+  });
+
+  it('lets a Settings authority choose its category', () => {
+    const restored = parseExploreURLState(serializeExploreURLState({
+      ...defaultExploreURLState,
+      workspace: 'settings',
+      settingsAuthority: 'person_embeddings',
+      settingsCategory: 'server'
+    }));
+    expect(restored.settingsCategory).toBe('search');
+  });
+
+  it('restores the Settings category on Back, including one an authority chose', async () => {
+    window.history.replaceState(null, '', '/');
+    const state = new ExploreState(window);
+    try {
+      state.commitNavigation({ workspace: 'settings', settingsAuthority: 'person_embeddings' });
+      state.commitNavigation({ settingsCategory: 'server', settingsAuthority: '' });
+      expect(state.current.settingsCategory).toBe('server');
+      const restored = new Promise((resolve) => window.addEventListener('popstate', resolve, { once: true }));
+      window.history.back();
+      await restored;
+      expect(state.current).toMatchObject({
+        settingsCategory: 'search', settingsAuthority: 'person_embeddings'
+      });
+    } finally {
+      state.destroy();
+    }
+  });
+
   it('round-trips only closed Settings authorities', () => {
-    for (const settingsAuthority of ['document_index', 'document_vector', 'visual_attachments'] as const) {
+    for (const settingsAuthority of ['semantic_search', 'person_embeddings', 'visual_attachments'] as const) {
       const restored = parseExploreURLState(serializeExploreURLState({
         ...defaultExploreURLState,
         workspace: 'settings',
@@ -163,12 +281,20 @@ describe('Explore URL state', () => {
     expect(invalid.settingsAuthority).toBe('');
   });
 
+  it('opens Settings on Appearance for a retired document authority link', () => {
+    const restored = parseExploreURLState(`?workspace=settings&explore=${encodeURIComponent(JSON.stringify({
+      schemaVersion: 2, settingsAuthority: 'document_index'
+    }))}`);
+    expect(restored.settingsAuthority).toBe('');
+    expect(restored.settingsCategory).toBe('browser');
+  });
+
   it.each([
     ['constructor', 'constructor'],
     ['toString', 'toString'],
     ['__proto__', '__proto__'],
-    ['an object', { authority: 'document_index' }],
-    ['a function', () => 'document_index']
+    ['an object', { authority: 'semantic_search' }],
+    ['a function', () => 'semantic_search']
   ] as const)('rejects inherited or non-string Settings authority %s', (_description, settingsAuthority) => {
     const restored = parseExploreURLState(serializeExploreURLState({
       ...defaultExploreURLState,
@@ -182,12 +308,12 @@ describe('Explore URL state', () => {
   it('centrally clears a Settings authority on every generic workspace navigation', () => {
     window.history.replaceState(null, '', '/');
     const state = new ExploreState(window);
-    state.commitNavigation({ workspace: 'settings', settingsAuthority: 'document_index' });
+    state.commitNavigation({ workspace: 'settings', settingsAuthority: 'semantic_search' });
 
     state.commitWorkspace('everything');
     expect(state.current.settingsAuthority).toBe('');
 
-    state.commitNavigation({ workspace: 'settings', settingsAuthority: 'document_vector' });
+    state.commitNavigation({ workspace: 'settings', settingsAuthority: 'person_embeddings' });
     state.commitWorkspace('settings');
     expect(state.current.settingsAuthority).toBe('');
     state.destroy();
@@ -246,22 +372,10 @@ describe('Explore URL state', () => {
     }
   });
 
-  it('round-trips every durable field in the versioned envelope', () => {
+  it('preserves Files filters, layout, and the selected item in shared URLs', () => {
     const state: ExploreURLState = {
-      schemaVersion: 2,
+      ...defaultExploreURLState,
       workspace: 'files',
-      directoryQuery: '',
-      directoryContactState: '',
-      directoryCategory: '',
-      directoryOrganization: '',
-      directoryPrimaryChannel: '',
-      directoryLastContactAfter: '',
-      directoryLastContactBefore: '',
-      directorySort: 'name',
-      directoryPersonID: null,
-      reviewKind: 'identity',
-      identityState: 'candidate',
-      relationshipReviewState: 'pending',
       query: 'from:alice quarterly plan',
       searchMode: 'hybrid',
       filters: [
@@ -269,40 +383,154 @@ describe('Explore URL state', () => {
         { dimension: 'after', values: ['2025-01-01'] }
       ],
       groupingChain: ['participant', 'year'],
-      presentation: 'table',
+      presentation: 'files',
       sort: [{ field: 'occurred_at', direction: 'desc' }],
       fileSort: { field: 'filename', direction: 'asc' },
       fileFilenameQuery: 'invoice',
       fileMIMEFamilies: ['pdf', 'image'],
-	  personFilePresentation: 'media',
-	  personFileDirections: ['from_person', 'group'],
-	  identityQuery: 'Shared Name',
-	  identitySort: { field: 'display_label', direction: 'asc' },
-	  analysisTarget: 'person:42',
-	  selectedIdentifier: 'email:alice@example.com',
-      relationshipFacet: 'domains',
-      relationshipTarget: 'domain:example.com',
-      relationshipShowAll: true,
-      relationshipFiles: true,
-      operationLane: '',
-      operationKind: '',
-      operationState: '',
-      operationStartedFrom: '',
-      operationStartedBefore: '',
-      operationRunID: null,
-      operationStatus: '',
-      settingsAuthority: '',
       columns: ['kind', 'people', 'title', 'excerpt', 'time', 'attachments', 'size'],
       columnWidths: { people: 240, title: 360 },
       selectedRow: 'message:42',
       inspectorPinned: true,
       inspectorWidth: 456,
-      conversationAnchor: 'message:37',
-      scrollAnchor: { key: 'message:31', offset: 12 },
-      activeRow: 'message:33'
+      conversationAnchor: 'message:37'
     };
 
     expect(parseExploreURLState(serializeExploreURLState(state))).toEqual(state);
+  });
+
+  it('sends an Everything-as-Files link to the Files workspace with its context', () => {
+    const restored = parseExploreURLState(
+      `?workspace=everything&mode=hybrid&explore=${encodeURIComponent(JSON.stringify({
+        presentation: 'files', query: 'invoice', filters: [{ dimension: 'source', values: ['7'] }],
+        groupingChain: ['year'], columns: ['kind', 'title']
+      }))}`
+    );
+    expect(restored).toMatchObject({
+      workspace: 'files', presentation: 'files', searchMode: 'hybrid', query: 'invoice',
+      filters: [{ dimension: 'source', values: ['7'] }], groupingChain: ['year'], columns: ['kind', 'title']
+    });
+  });
+
+  it('shares the Files workspace without repeating its implied presentation', () => {
+    const search = serializeExploreURLState({ ...defaultExploreURLState, workspace: 'files', presentation: 'files' });
+
+    expect(search).toBe('?workspace=files&mode=full_text');
+    expect(parseExploreURLState(search)).toMatchObject({ workspace: 'files', presentation: 'files' });
+  });
+
+  it('keeps Files presentation in the Files workspace', () => {
+    const restored = parseExploreURLState(
+      `?workspace=files&explore=${encodeURIComponent(JSON.stringify({ presentation: 'table' }))}`
+    );
+    expect(restored.presentation).toBe('files');
+  });
+
+  it('restores Files for an old Everything-as-Files history entry', async () => {
+    window.history.replaceState(null, '', '/?workspace=sources');
+    const state = new ExploreState(window);
+    try {
+      window.history.pushState(
+        {
+          exploreSearch: '?workspace=everything',
+          exploreState: { workspace: 'everything', presentation: 'files', query: 'budget' }
+        },
+        '',
+        '/?workspace=everything'
+      );
+      window.history.pushState(null, '', '/?workspace=sources');
+      const restored = new Promise((resolve) => window.addEventListener('popstate', resolve, { once: true }));
+      window.history.back();
+      await restored;
+      expect(state.current).toMatchObject({ workspace: 'files', presentation: 'files', query: 'budget' });
+    } finally {
+      state.destroy();
+    }
+  });
+
+  it('keeps a mode-less Everything-as-Files link on the configured default mode', () => {
+    window.history.replaceState(null, '', `/?workspace=everything&explore=${encodeURIComponent(
+      JSON.stringify({ presentation: 'files', query: 'budget' })
+    )}`);
+    const state = new ExploreState(window, null);
+    try {
+      expect(new URLSearchParams(window.location.search).get('workspace')).toBe('files');
+      expect(new URLSearchParams(window.location.search).has('mode')).toBe(false);
+
+      state.setConfiguredDefaultSearchMode('hybrid');
+
+      expect(state.current).toMatchObject({ workspace: 'files', query: 'budget', searchMode: 'hybrid' });
+    } finally {
+      state.destroy();
+    }
+  });
+
+  it('keeps a legacy Everything-as-Files link\'s search mode from its explore data', () => {
+    window.history.replaceState(null, '', `/?workspace=everything&explore=${encodeURIComponent(
+      JSON.stringify({ presentation: 'files', searchMode: 'semantic', query: 'budget' })
+    )}`);
+    const state = new ExploreState(window, null);
+    try {
+      expect(new URLSearchParams(window.location.search).get('mode')).toBe('semantic');
+      expect(state.current).toMatchObject({ workspace: 'files', searchMode: 'semantic' });
+
+      state.setConfiguredDefaultSearchMode('hybrid');
+
+      expect(state.current.searchMode).toBe('semantic');
+    } finally {
+      state.destroy();
+    }
+  });
+
+  it('restores the active row and scroll anchor from an old Everything-as-Files history entry', async () => {
+    window.history.replaceState(null, '', '/?workspace=sources');
+    const state = new ExploreState(window);
+    try {
+      window.history.pushState(
+        {
+          exploreSearch: '?workspace=everything',
+          exploreState: {
+            workspace: 'everything', presentation: 'files',
+            activeRow: 'attachment:9', scrollAnchor: { key: 'attachment:9', offset: 24 }
+          }
+        },
+        '',
+        '/?workspace=everything'
+      );
+      window.history.pushState(null, '', '/?workspace=sources');
+      const back = new Promise((resolve) => window.addEventListener('popstate', resolve, { once: true }));
+      window.history.back();
+      await back;
+      expect(state.current).toMatchObject({
+        workspace: 'files', activeRow: 'attachment:9', scrollAnchor: { key: 'attachment:9', offset: 24 }
+      });
+
+      const away = new Promise((resolve) => window.addEventListener('popstate', resolve, { once: true }));
+      window.history.forward();
+      await away;
+      expect(state.current.workspace).toBe('sources');
+      const forward = new Promise((resolve) => window.addEventListener('popstate', resolve, { once: true }));
+      window.history.back();
+      await forward;
+      expect(state.current).toMatchObject({
+        workspace: 'files', activeRow: 'attachment:9', scrollAnchor: { key: 'attachment:9', offset: 24 }
+      });
+    } finally {
+      state.destroy();
+    }
+  });
+
+  it('leaves Files for Everything without carrying the Files presentation', () => {
+    window.history.replaceState(null, '', '/?workspace=files');
+    const state = new ExploreState(window);
+    try {
+      state.commitWorkspace('everything');
+      expect(state.current).toMatchObject({ workspace: 'everything', presentation: 'table' });
+      state.commitNavigation({ presentation: 'files' });
+      expect(state.current).toMatchObject({ workspace: 'files', presentation: 'files' });
+    } finally {
+      state.destroy();
+    }
   });
 
   it('restores an identity facet tuple from the URL', () => {
@@ -768,6 +996,27 @@ describe('ExploreState history ownership', () => {
     explicit.destroy();
   });
 
+  it('commits a search into another workspace as one history entry', () => {
+    const values = new Map<string, string>();
+    const storage = {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => values.set(key, value)
+    };
+    window.history.replaceState(null, '', '/?workspace=sources&mode=full_text');
+    const state = new ExploreState(window, storage);
+    const before = window.history.length;
+
+    state.commitSearchIn('everything', 'quarterly report', 'hybrid');
+
+    expect(window.history.length).toBe(before + 1);
+    expect(state.current.workspace).toBe('everything');
+    expect(state.current.query).toBe('quarterly report');
+    expect(state.current.searchMode).toBe('hybrid');
+    expect(state.current.selectedRow).toBeNull();
+    expect(values.get(SEARCH_MODE_PREFERENCE_KEY)).toBe('hybrid');
+    state.destroy();
+  });
+
   it('adopts the configured default mode when URL and saved preference are silent', () => {
     const emptyStorage = {
       getItem: () => null,
@@ -1039,7 +1288,7 @@ describe('ExploreState history ownership', () => {
     state.destroy();
   });
 
-  it('restores row, scroll, inspector, grouping, and mode on popstate', () => {
+  it('restores row, scroll, inspector, grouping, and mode on popstate', async () => {
     const state = new ExploreState(window);
     const restored: ExploreURLState = {
       ...defaultExploreURLState,
@@ -1051,11 +1300,54 @@ describe('ExploreState history ownership', () => {
       searchMode: 'hybrid',
       activeRow: 'conversation:8'
     };
-    window.history.replaceState(null, '', serializeExploreURLState(restored));
-
-    window.dispatchEvent(new PopStateEvent('popstate'));
+    state.commitNavigation(restored);
+    state.commitWorkspace('settings');
+    window.history.back();
+    await new Promise((resolve) => window.addEventListener('popstate', resolve, { once: true }));
 
     expect(state.current).toMatchObject(restored);
+    state.destroy();
+  });
+
+  it('retains only matching archive ownership across replacements and on the prior nested-push entry', async () => {
+    window.history.replaceState(null, '', '/');
+    const state = new ExploreState(window);
+    state.commitNavigation({ selectedRow: 'group:domain:exact.example' });
+    state.commitRestorableNavigation({ selectedRow: 'archive-meeting:42' });
+    const owned = { msgvaultArchivedMeeting: { id: 42, returnSelectedRow: 'group:domain:exact.example' } };
+    window.history.replaceState({ ...owned, unrelated: 'do not retain' }, '', window.location.href);
+    state.replaceCommittedNavigation({ conversationAnchor: '43' });
+    expect(window.history.state).toMatchObject(owned);
+    expect(window.history.state).not.toHaveProperty('unrelated');
+    state.replaceTransient({ activeRow: 'message:9', scrollAnchor: { key: 'message:9', offset: 12 } });
+    expect(window.history.state).toMatchObject(owned);
+    expect(window.history.state).not.toHaveProperty('unrelated');
+    state.commitRestorableNavigation({ selectedRow: 'archive-meeting:43', conversationAnchor: null });
+    expect(window.history.state).not.toHaveProperty('msgvaultArchivedMeeting');
+    const back = new Promise<void>((resolve) => window.addEventListener('popstate', () => resolve(), { once: true }));
+    window.history.back(); await back;
+    expect(window.history.state).toMatchObject(owned);
+    expect(window.history.state).not.toHaveProperty('unrelated');
+    expect(state.current).toMatchObject({ selectedRow: 'archive-meeting:42', conversationAnchor: '43',
+      activeRow: 'message:9', scrollAnchor: { key: 'message:9', offset: 12 } });
+    state.replaceCommittedNavigation({ selectedRow: 'group:domain:exact.example' });
+    expect(window.history.state).not.toHaveProperty('msgvaultArchivedMeeting');
+    state.destroy();
+  });
+
+  it.each([
+    { id: 43, returnSelectedRow: 'group:domain:exact.example' },
+    { id: '42', returnSelectedRow: null },
+    { id: 42, returnSelectedRow: 7 },
+    { id: 42 },
+    null
+  ])('does not retain invalid archive history ownership %j', (marker) => {
+    window.history.replaceState(null, '', '/');
+    const state = new ExploreState(window);
+    state.commitRestorableNavigation({ selectedRow: 'archive-meeting:42' });
+    window.history.replaceState({ msgvaultArchivedMeeting: marker }, '', window.location.href);
+    state.replaceTransient({ activeRow: 'message:9' });
+    expect(window.history.state).not.toHaveProperty('msgvaultArchivedMeeting');
     state.destroy();
   });
 
@@ -1201,9 +1493,7 @@ describe('ExploreState history ownership', () => {
 
     const replacement = {
       ...defaultExploreURLState,
-      query: 'replacement',
-      activeRow: 'message:replacement',
-      scrollAnchor: { key: 'message:replacement', offset: 12 }
+      query: 'replacement'
     };
     window.history.replaceState(null, '', serializeExploreURLState(replacement));
     window.dispatchEvent(new PopStateEvent('popstate'));

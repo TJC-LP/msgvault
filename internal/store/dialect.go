@@ -168,6 +168,10 @@ type Dialect interface {
 	// free to use a column-update on messages.
 	FTSUpsert(q querier, doc FTSDoc) error
 
+	// FTSMatches reports whether the stored search document for
+	// doc.MessageID is exactly what FTSUpsert would write for doc.
+	FTSMatches(q querier, doc FTSDoc) (bool, error)
+
 	// FTSSearchClause returns SQL fragments for full-text search using ?
 	// placeholders. Returns: join clause, where clause, order-by clause,
 	// and the number of times the caller must re-bind the search term to
@@ -319,6 +323,12 @@ type Dialect interface {
 
 	// CheckpointWAL checkpoints the WAL (SQLite) or is a no-op (PostgreSQL).
 	CheckpointWAL(db *sql.DB) error
+	// CheckpointWALContext checkpoints the WAL using ctx to interrupt a busy
+	// SQLite checkpoint, or is a no-op for PostgreSQL.
+	CheckpointWALContext(ctx context.Context, db *sql.DB) error
+	// CheckpointWALPassive checkpoints without waiting on readers or writers
+	// (SQLite) or is a no-op (PostgreSQL). ctx bounds pool acquisition and PRAGMA.
+	CheckpointWALPassive(ctx context.Context, db *sql.DB) error
 
 	// Schema migration
 

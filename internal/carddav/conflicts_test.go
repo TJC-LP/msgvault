@@ -57,7 +57,7 @@ func TestPullConflictBlocksOnlyMappingAndAdvancesBookFence(t *testing.T) {
 
 	_, err := service.Sync(t.Context(), SyncOptions{Full: true})
 	require.NoError(err)
-	books, err := st.ListCardDAVAddressBooksContext(t.Context())
+	books, err := st.ListCardDAVAddressBooksContext(t.Context(), store.AllCardDAVAccounts)
 	require.NoError(err)
 	beforeRevision := books[0].SyncRevision
 	alice, err := st.GetCardDAVResourceContext(t.Context(), book.ID, server.URL+"/books/personal/alice.vcf")
@@ -84,7 +84,7 @@ func TestPullConflictBlocksOnlyMappingAndAdvancesBookFence(t *testing.T) {
 
 	_, err = service.Sync(t.Context(), SyncOptions{Full: true})
 	require.NoError(err)
-	books, err = st.ListCardDAVAddressBooksContext(t.Context())
+	books, err = st.ListCardDAVAddressBooksContext(t.Context(), store.AllCardDAVAccounts)
 	require.NoError(err)
 	assert.Equal(beforeRevision+1, books[0].SyncRevision)
 
@@ -690,7 +690,7 @@ func TestConditional412CapturesConflictAndKeepLocalRefetchesCurrentETag(t *testi
 	server := httptest.NewServer(fixture.handler(t))
 	t.Cleanup(server.Close)
 	service, st, personID, book := seededMutationServiceForServer(t, server)
-	service.client.requestTimeout = 250 * time.Millisecond
+	service.dav().client.requestTimeout = 250 * time.Millisecond
 	require.NoError(service.PublishPerson(t.Context(), personID))
 	_, err := st.AddPersonContactPointContext(t.Context(), personID, store.PersonContactPointInput{
 		AddressKind: store.ContactAddressEmail, OriginalValue: "alice-local@example.test",
@@ -785,7 +785,7 @@ func TestSyncSkipsConflictedPublicationAndStillAdvancesToken(t *testing.T) {
 
 	_, err = service.Sync(t.Context(), SyncOptions{Full: true})
 	require.NoError(err)
-	books, err := st.ListCardDAVAddressBooksContext(t.Context())
+	books, err := st.ListCardDAVAddressBooksContext(t.Context(), store.AllCardDAVAccounts)
 	require.NoError(err)
 	for _, candidate := range books {
 		if candidate.ID == book.ID {
@@ -806,7 +806,7 @@ func TestSyncAbortsPullAfterPendingPublicationRecoveryFailure(t *testing.T) {
 	server := httptest.NewServer(fixture.handler(t))
 	t.Cleanup(server.Close)
 	service, st, personID, book := seededMutationServiceForServer(t, server)
-	service.client.requestTimeout = 250 * time.Millisecond
+	service.dav().client.requestTimeout = 250 * time.Millisecond
 	require.NoError(service.PublishPerson(t.Context(), personID))
 	_, err := st.AddPersonContactPointContext(t.Context(), personID, store.PersonContactPointInput{
 		AddressKind: store.ContactAddressEmail, OriginalValue: "alice-local@example.test",
@@ -928,7 +928,7 @@ func TestKeepLocalTombstoneTimeoutPersistsIntentAndRecoversWithoutReplay(t *test
 
 	fixture := &conflictMutationServer{timeoutDelete: true}
 	service, st, book, mapping, conflict := seedLocalTombstoneConflict(t, fixture)
-	service.client.requestTimeout = 250 * time.Millisecond
+	service.dav().client.requestTimeout = 250 * time.Millisecond
 
 	require.Error(service.ResolveConflict(t.Context(), conflict.ID, ResolutionKeepLocal))
 	pending, err := st.GetCardDAVConflictContext(t.Context(), conflict.ID)
@@ -958,7 +958,7 @@ func TestPullTombstoneCompletesTimedOutKeepLocalWithoutDeleteReplay(t *testing.T
 
 	fixture := &conflictMutationServer{timeoutDelete: true, syncToken: "token-after-tombstone"}
 	service, st, book, mapping, conflict := seedLocalTombstoneConflict(t, fixture)
-	service.client.requestTimeout = 250 * time.Millisecond
+	service.dav().client.requestTimeout = 250 * time.Millisecond
 	_, err := st.DB().Exec(st.Rebind(`UPDATE carddav_address_books
 		SET supports_sync_collection = TRUE WHERE id = ?`), book.ID)
 	require.NoError(err)
@@ -979,7 +979,7 @@ func TestPullTombstoneCompletesTimedOutKeepLocalWithoutDeleteReplay(t *testing.T
 	require.NoError(err)
 	assert.Equal(store.CardDAVConflictResolved, resolved.Status)
 	assert.Equal(store.CardDAVResolutionKeepLocal, resolved.Resolution)
-	books, err := st.ListCardDAVAddressBooksContext(t.Context())
+	books, err := st.ListCardDAVAddressBooksContext(t.Context(), store.AllCardDAVAccounts)
 	require.NoError(err)
 	require.Len(books, 1)
 	assert.Equal("token-after-tombstone", books[0].SyncToken)
@@ -1030,7 +1030,7 @@ func TestKeepLocalTombstoneThrottleClearsIntentAndPersistsGate(t *testing.T) {
 	after, getErr := st.GetCardDAVResourceContext(t.Context(), book.ID, mapping.Href)
 	require.NoError(getErr)
 	assert.Equal(before.MappingRevision, after.MappingRevision)
-	gate, getErr := st.GetCardDAVRetryAfterContext(t.Context())
+	gate, getErr := st.GetCardDAVRetryAfterContext(t.Context(), store.DefaultCardDAVAccountID)
 	require.NoError(getErr)
 	require.NotNil(gate)
 	assert.WithinDuration(started.Add(time.Hour), *gate, 5*time.Second)
@@ -1062,7 +1062,7 @@ func TestPullTombstoneCompletesTimedOutUnpublishAndRetainsPerson(t *testing.T) {
 
 	fixture := &conflictMutationServer{timeoutDelete: true, syncToken: "token-after-unpublish"}
 	service, st, personID, book, mapping, conflict := seedUnpublishConflict(t, fixture)
-	service.client.requestTimeout = 250 * time.Millisecond
+	service.dav().client.requestTimeout = 250 * time.Millisecond
 	_, err := st.DB().Exec(st.Rebind(`UPDATE carddav_address_books
 		SET supports_sync_collection = TRUE WHERE id = ?`), book.ID)
 	require.NoError(err)
@@ -1090,7 +1090,7 @@ func TestPullTombstoneCompletesTimedOutUnpublishAndRetainsPerson(t *testing.T) {
 	require.NoError(err)
 	assert.Equal(store.CardDAVConflictResolved, resolved.Status)
 	assert.Equal(store.CardDAVResolutionKeepLocal, resolved.Resolution)
-	books, err := st.ListCardDAVAddressBooksContext(t.Context())
+	books, err := st.ListCardDAVAddressBooksContext(t.Context(), store.AllCardDAVAccounts)
 	require.NoError(err)
 	require.Len(books, 1)
 	assert.Equal("token-after-unpublish", books[0].SyncToken)
@@ -1102,7 +1102,7 @@ func TestPullRefreshSupersedesTimedOutTombstoneIntentBeforeFreshDelete(t *testin
 
 	fixture := &conflictMutationServer{timeoutDelete: true}
 	service, st, book, mapping, conflict := seedLocalTombstoneConflict(t, fixture)
-	service.client.requestTimeout = 250 * time.Millisecond
+	service.dav().client.requestTimeout = 250 * time.Millisecond
 	require.Error(service.ResolveConflict(t.Context(), conflict.ID, ResolutionKeepLocal))
 	pending, err := st.GetCardDAVConflictContext(t.Context(), conflict.ID)
 	require.NoError(err)
@@ -1148,7 +1148,7 @@ func TestDirectConflictRefreshDoesNotSupersedePendingTombstoneIntent(t *testing.
 
 	fixture := &conflictMutationServer{timeoutDelete: true}
 	service, st, book, mapping, conflict := seedLocalTombstoneConflict(t, fixture)
-	service.client.requestTimeout = 250 * time.Millisecond
+	service.dav().client.requestTimeout = 250 * time.Millisecond
 	require.Error(service.ResolveConflict(t.Context(), conflict.ID, ResolutionKeepLocal))
 	pending, err := st.GetCardDAVConflictContext(t.Context(), conflict.ID)
 	require.NoError(err)
@@ -1310,7 +1310,7 @@ func TestOversizedAmbiguousRecoveryRebasesAndRetainsReadOnlyIntent(t *testing.T)
 	server := httptest.NewServer(fixture.handler(t))
 	t.Cleanup(server.Close)
 	service, st, personID, book := seededMutationServiceForServer(t, server)
-	service.client.requestTimeout = 250 * time.Millisecond
+	service.dav().client.requestTimeout = 250 * time.Millisecond
 	require.NoError(service.PublishPerson(t.Context(), personID))
 	_, err := st.AddPersonContactPointContext(t.Context(), personID, store.PersonContactPointInput{
 		AddressKind: store.ContactAddressEmail, OriginalValue: "recovery-local@example.test",
@@ -1321,6 +1321,9 @@ func TestOversizedAmbiguousRecoveryRebasesAndRetainsReadOnlyIntent(t *testing.T)
 	fixture.timeoutPut = true
 	fixture.mu.Unlock()
 	require.Error(service.PublishPerson(t.Context(), personID))
+	// The short deadline above exercises an ambiguous write. Recovery reads a
+	// deliberately oversized response and needs the normal request deadline.
+	service.dav().client.requestTimeout = 5 * time.Second
 	pending, err := st.GetCardDAVPublicationContext(t.Context(), personID)
 	require.NoError(err)
 	require.Equal(store.CardDAVMutationUpdate, pending.PendingOperation)

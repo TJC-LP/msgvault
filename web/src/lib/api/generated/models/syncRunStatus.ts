@@ -7,10 +7,6 @@ export interface SyncRunStatus {
   /** @nullable */
   completed_at: string | null;
   /** @nullable */
-  cursor_after: string | null;
-  /** @nullable */
-  cursor_before: string | null;
-  /** @nullable */
   error_message: string | null;
   errors_count: number;
   id: number;

@@ -474,7 +474,7 @@ func TestPersonEnrichmentManualRunPersistsAndReusesRunIDBeforeWork(t *testing.T)
 				require.NoError(t, workErr)
 				require.NotEmpty(t, work)
 				lease, claimErr := st.ClaimWork(ctx, personenrichment.ClaimOptions{
-					RunID: runID, Owner: "manual-test-worker", ProviderName: profile.Name,
+					RunID: runID, Owner: "manual-test-worker", ProviderName: profile.Name, ProfileFingerprint: profile.Fingerprint,
 					Now: now, LeaseDuration: time.Minute,
 				})
 				require.NoError(t, claimErr)
@@ -596,7 +596,7 @@ func TestPersonEnrichmentManualRunKeepsRunIDOnLeaseAndAttemptAndReportsFinalCoun
 				return false, nil
 			}
 			lease, claimErr := st.ClaimWork(ctx, personenrichment.ClaimOptions{
-				RunID: runID, Owner: "manual-final-worker", ProviderName: profile.Name,
+				RunID: runID, Owner: "manual-final-worker", ProviderName: profile.Name, ProfileFingerprint: profile.Fingerprint,
 				Now: now, LeaseDuration: time.Minute,
 			})
 			require.NoError(t, claimErr)
@@ -696,6 +696,7 @@ func testPersonEnrichmentCommandDeps(
 	t *testing.T, enrichment personenrichment.Config, st *store.Store,
 ) personEnrichmentCommandDeps {
 	t.Helper()
+	cfg := testConfigValue()
 	saved := cfg
 	t.Cleanup(func() { cfg = saved })
 	cfg = providerCredentialTestConfig(t)

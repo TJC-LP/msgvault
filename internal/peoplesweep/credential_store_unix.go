@@ -216,6 +216,34 @@ const (
 
 func (*unixCredentialDeleteGuard) credentialDeleteGuard() {}
 
+// credentialRevisionData reads the pinned target while its namespace lock is
+// held. Reentering the regular store load path here would deadlock on that
+// lock and could observe a different pathname target.
+func (g *unixCredentialDeleteGuard) credentialRevisionData() ([]byte, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.state != credentialDeleteGuardReady || g.target == nil || g.target.credentialFD < 0 {
+		return nil, errors.New("people provider credential deletion guard is not ready")
+	}
+	var data []byte
+	buffer := make([]byte, 32*1024)
+	for offset := int64(0); ; {
+		count, err := unix.Pread(g.target.credentialFD, buffer, offset)
+		if err != nil {
+			return nil, fmt.Errorf("read pinned people provider credential revision: %w", err)
+		}
+		if count == 0 {
+			break
+		}
+		data = append(data, buffer[:count]...)
+		offset += int64(count)
+	}
+	if len(data) == 0 {
+		return nil, ErrCredentialNotFound
+	}
+	return data, nil
+}
+
 func (*unixCredentialCleanupGuard) credentialCleanupGuard() {}
 
 func (*unixCredentialDeleteGuard) String() string {
@@ -363,6 +391,9 @@ func (s *FileCredentialStore) openExistingCredentialDelete(
 	}()
 	target.tokensFD, retErr = unix.Open(s.tokensDir,
 		unix.O_RDONLY|unix.O_CLOEXEC|unix.O_DIRECTORY|unix.O_NOFOLLOW, 0)
+	if errors.Is(retErr, os.ErrNotExist) {
+		return nil, fmt.Errorf("%w for profile %q: %w", ErrCredentialNotFound, profileName, retErr)
+	}
 	if retErr != nil {
 		return nil, fmt.Errorf("open existing people provider tokens directory without following symlinks: %w", retErr)
 	}
@@ -376,6 +407,9 @@ func (s *FileCredentialStore) openExistingCredentialDelete(
 
 	target.rootFD, retErr = unix.Openat(target.tokensFD, credentialNamespace,
 		unix.O_RDONLY|unix.O_CLOEXEC|unix.O_DIRECTORY|unix.O_NOFOLLOW, 0)
+	if errors.Is(retErr, os.ErrNotExist) {
+		return nil, fmt.Errorf("%w for profile %q: %w", ErrCredentialNotFound, profileName, retErr)
+	}
 	if retErr != nil {
 		return nil, fmt.Errorf("open existing people provider credential directory without following symlinks: %w", retErr)
 	}

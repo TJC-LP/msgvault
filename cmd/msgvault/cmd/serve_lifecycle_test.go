@@ -17,6 +17,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -40,7 +41,8 @@ func TestNativeOperationRecoveryRunsBeforeDaemonServices(t *testing.T) {
 	_, err = st.StartSync(source.ID, "incremental")
 	require.NoError(err)
 	_, err = st.StartCardDAVSyncRunContext(t.Context(), store.CardDAVSyncRunStart{
-		Trigger: store.CardDAVSyncTriggerScheduled,
+		AccountID: store.DefaultCardDAVAccountID,
+		Trigger:   store.CardDAVSyncTriggerScheduled,
 	})
 	require.NoError(err)
 	ledgers := []struct {
@@ -100,15 +102,19 @@ func TestDaemonAndServeLifecycleCommandSurfaces(t *testing.T) {
 }
 
 func TestDaemonAndServeStatusHaveIdenticalBehavior(t *testing.T) {
+	cfg := testConfigValue()
+
 	assert := assert.New(t)
 	require := require.New(t)
 	dataDir := t.TempDir()
 	oldCfg := cfg
 	cfg = lifecycleTestConfig(dataDir)
 	t.Cleanup(func() { cfg = oldCfg })
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
 
 	run := func(args ...string) (string, error) {
 		root := newTestRootCmd()
+		root.SetContext(testCtx)
 		root.SilenceUsage = true
 		root.AddCommand(newDaemonCommand())
 		compatServe := &cobra.Command{Use: "serve"}
@@ -118,7 +124,7 @@ func TestDaemonAndServeStatusHaveIdenticalBehavior(t *testing.T) {
 		root.SetOut(&stdout)
 		root.SetErr(io.Discard)
 		root.SetArgs(args)
-		err := root.ExecuteContext(context.Background())
+		err := root.ExecuteContext(testCtx)
 		return stdout.String(), err
 	}
 
@@ -249,6 +255,8 @@ func TestRunServeStatusIncludesVectorHealth(t *testing.T) {
 }
 
 func TestServeStatusCommandUsesAuthenticatedHealthForOperationDetails(t *testing.T) {
+	cfg := testConfigValue()
+
 	assert := assert.New(t)
 	require := require.New(t)
 	dataDir := t.TempDir()
@@ -304,7 +312,7 @@ func TestServeStatusCommandUsesAuthenticatedHealthForOperationDetails(t *testing
 	t.Cleanup(func() { cfg = oldCfg })
 
 	cmd, stdout, stderr := lifecycleTestCommand()
-	cmd.SetContext(context.Background())
+	cmd.SetContext(testInvocationContext(context.Background(), cfg, invocationOptions{}))
 	statusCmd, _, err := serveCmd.Find([]string{"status"})
 	require.NoError(err, "find serve status")
 	require.NoError(statusCmd.RunE(cmd, nil), "serve status")
@@ -316,6 +324,59 @@ func TestServeStatusCommandUsesAuthenticatedHealthForOperationDetails(t *testing
 	assert.NotContains(out, "archive operation in progress",
 		"status must not fall back to redacted public health when authenticated health is available")
 	assert.Empty(stderr.String(), "status must not write to stderr")
+}
+
+func TestDaemonStatusContinuesWhenServerAPIKeyFileIsUnavailable(t *testing.T) {
+	clearServerKeyEnvironment(t)
+	require := require.New(t)
+	assert := assert.New(t)
+	dataDir := t.TempDir()
+	cfg := lifecycleTestConfig(dataDir)
+	cfg.Server.APIKeyFile = filepath.Join(dataDir, "missing-api-key")
+
+	var publicHealthRequests atomic.Int32
+	mux := http.NewServeMux()
+	mux.Handle("/api/ping", daemon.NewPingHandler(daemon.PingHandlerOptions{
+		Service: daemonService,
+		Version: Version,
+	}))
+	mux.HandleFunc("/api/v1/health", func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	})
+	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
+		publicHealthRequests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok","vector":{"status":"initializing"}}`))
+	})
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+	host, portText, err := net.SplitHostPort(server.Listener.Addr().String())
+	require.NoError(err)
+	port, err := strconv.Atoi(portText)
+	require.NoError(err)
+	_, err = daemonRuntimeStore(dataDir).Write(daemon.RuntimeRecord{
+		PID:     os.Getpid(),
+		Network: daemon.NetworkTCP,
+		Address: net.JoinHostPort(host, portText),
+		Service: daemonService,
+		Version: Version,
+		Metadata: map[string]string{
+			runtimeHost:             host,
+			runtimePort:             strconv.Itoa(port),
+			runtimeAPIVersion:       strconv.Itoa(daemonAPIVersion),
+			runtimeAPISchemaVersion: api.APISchemaVersion,
+			runtimeCreateTime:       matchingProcessCreateTime(t),
+		},
+	})
+	require.NoError(err)
+
+	command, stdout, _ := lifecycleTestCommand()
+	command.SetContext(testInvocationContext(t.Context(), cfg, invocationOptions{}))
+	status := newLifecycleCommand("status", false)
+	require.NoError(status.RunE(command, nil))
+	assert.Contains(stdout.String(), "msgvault running at")
+	assert.Contains(stdout.String(), "vector:  initializing")
+	assert.Positive(publicHealthRequests.Load(), "public health details remain available without the configured key")
 }
 
 func TestFetchDaemonOperationUsesAuthenticatedHealth(t *testing.T) {
@@ -514,7 +575,7 @@ func TestStopDaemonRuntimeRecordRejectsUnprovedCreateTimeMismatch(t *testing.T) 
 				},
 			}
 
-			err = stopDaemonRuntimeRecord(io.Discard, dataDir, rec, "configured-api-key", 10*time.Millisecond)
+			err = stopDaemonRuntimeRecord(io.Discard, dataDir, rec, "configured-api-key", 10*time.Millisecond, testDiscardLogger())
 
 			require.ErrorIs(err, errDaemonIdentityUnconfirmed, "unproved mismatch must be rejected")
 			assert.Positive(proofRequests.Load(), "mismatched endpoint is challenged")
@@ -545,6 +606,10 @@ func TestStopLiveDaemonsUsesLegacyShutdownWhenCreateTimeSkewed(t *testing.T) {
 	testStopLiveDaemonsUsesAuthenticatedHTTP(t, "6000", 5_000, true, false)
 }
 
+func TestDaemonStopUsesRuntimeTokenWhenServerAPIKeyFileIsUnavailable(t *testing.T) {
+	testStopLiveDaemons(t, "", 0, false, true, true)
+}
+
 func testStopLiveDaemonsUsesAuthenticatedHTTP(
 	t *testing.T,
 	recordedCreateTime string,
@@ -553,6 +618,20 @@ func testStopLiveDaemonsUsesAuthenticatedHTTP(
 	identityEndpointSupported bool,
 ) {
 	t.Helper()
+	testStopLiveDaemons(t, recordedCreateTime, liveCreateTime, liveCreateTimeOK,
+		identityEndpointSupported, false)
+}
+
+func testStopLiveDaemons(
+	t *testing.T,
+	recordedCreateTime string,
+	liveCreateTime int64,
+	liveCreateTimeOK bool,
+	identityEndpointSupported bool,
+	serverAPIKeyFileUnavailable bool,
+) {
+	t.Helper()
+	clearServerKeyEnvironment(t)
 	require := require.New(t)
 	assert := assert.New(t)
 	dataDir := t.TempDir()
@@ -594,7 +673,7 @@ func testStopLiveDaemonsUsesAuthenticatedHTTP(
 			shutdownTokens <- r.Header.Get(api.DaemonShutdownTokenHeader)
 			w.WriteHeader(http.StatusAccepted)
 			go func() {
-				time.Sleep(25 * time.Millisecond)
+				time.Sleep(25 * time.Millisecond) //nolint:kennlint // holds the OS ownership lock past the reply
 				releaseOwner.Do(func() { _ = owner.Close() })
 			}()
 		default:
@@ -624,9 +703,15 @@ func testStopLiveDaemonsUsesAuthenticatedHTTP(
 	})
 	require.NoError(err, "write runtime record")
 	cmd, stdout, _ := lifecycleTestCommand()
-
-	require.NoError(stopLiveDaemonsWithAPIKey(cmd, dataDir, "configured-api-key", false),
-		"stop daemon with indeterminate process identity")
+	cfg := lifecycleTestConfig(dataDir)
+	if serverAPIKeyFileUnavailable {
+		cfg.Server.APIKeyFile = filepath.Join(dataDir, "missing-api-key")
+	} else {
+		cfg.Server.APIKey = "configured-api-key"
+	}
+	cmd.SetContext(testInvocationContext(t.Context(), cfg, invocationOptions{}))
+	stop := newLifecycleCommand("stop", false)
+	require.NoError(stop.RunE(cmd, nil), "stop daemon with indeterminate process identity")
 
 	select {
 	case got := <-shutdownTokens:
@@ -701,7 +786,7 @@ func TestStopDaemonRuntimeRecordNeverSignalsProvedCreateTimeMismatchOnShutdownFa
 				},
 			}
 
-			err = stopDaemonRuntimeRecord(io.Discard, dataDir, rec, "configured-api-key", 10*time.Millisecond)
+			err = stopDaemonRuntimeRecord(io.Discard, dataDir, rec, "configured-api-key", 10*time.Millisecond, testDiscardLogger())
 
 			require.Error(err, "failed authenticated shutdown remains an error")
 			require.ErrorContains(err, tt.wantError)
@@ -922,7 +1007,11 @@ func TestRunServeStartAlreadyRunningWritesOnlyStdout(t *testing.T) {
 		err, "write runtime")
 
 	cmd, stdout, stderr := lifecycleTestCommand()
-	require.NoError(runServeStart(cmd, lifecycleTestConfig(dataDir)))
+	cfg := lifecycleTestConfig(dataDir)
+	cfg.Server.BindAddr = "0.0.0.0"
+	require.NoError(runServeStart(cmd, cfg))
+	_, err = os.Stat(cfg.ServerKeyFilePath())
+	require.ErrorIs(err, os.ErrNotExist, "reusing a daemon must not mint a replacement key")
 	assert.Equal(
 		"msgvault already running at http://"+net.JoinHostPort(server.Host, portText)+
 			" (pid "+strconv.Itoa(os.Getpid())+")\n",
@@ -1029,7 +1118,7 @@ func TestRunServeStartDoesNotDowngradeNewerDaemon(t *testing.T) {
 	require.NoError(
 		err, "write runtime")
 
-	stubStopDaemonRuntimeForUpgrade(t, func(config.Config, *DaemonRuntime) error {
+	stubStopDaemonRuntimeForUpgrade(t, func(config.Config, *DaemonRuntime, *slog.Logger) error {
 		require.Fail("older CLI must not stop a newer daemon")
 		return nil
 	})
@@ -1073,7 +1162,7 @@ func TestRunServeStartUpgradesOlderDaemon(t *testing.T) {
 		err, "write runtime")
 
 	var stoppedPID int
-	stubStopDaemonRuntimeForUpgrade(t, func(_ config.Config, rt *DaemonRuntime) error {
+	stubStopDaemonRuntimeForUpgrade(t, func(_ config.Config, rt *DaemonRuntime, _ *slog.Logger) error {
 		stoppedPID = rt.Record.PID
 		return nil
 	})
@@ -1107,6 +1196,67 @@ func TestRunServeStartUpgradesOlderDaemon(t *testing.T) {
 	assert.Empty(stderr.String())
 }
 
+func TestRunServeStartIgnoresDisabledDaemonAutoStart(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+
+	withTestVersion(t, "v1.1.0")
+	dataDir := t.TempDir()
+	server := httptestPingDaemon(t)
+	portText := strconv.Itoa(server.Port)
+	_, err := daemonRuntimeStore(dataDir).Write(daemon.RuntimeRecord{
+		PID:     os.Getpid(),
+		Network: daemon.NetworkTCP,
+		Address: net.JoinHostPort(server.Host, portText),
+		Service: daemonService,
+		Version: "v1.0.0",
+		Metadata: map[string]string{
+			runtimeHost:             server.Host,
+			runtimePort:             portText,
+			runtimeAPIVersion:       strconv.Itoa(daemonAPIVersion),
+			runtimeAPISchemaVersion: api.APISchemaVersion,
+			runtimeCreateTime:       matchingProcessCreateTime(t),
+		},
+	})
+	require.NoError(err, "write runtime")
+
+	var stoppedPID int
+	stubStopDaemonRuntimeForUpgrade(t, func(_ config.Config, rt *DaemonRuntime, _ *slog.Logger) error {
+		stoppedPID = rt.Record.PID
+		return nil
+	})
+	waitCh := make(chan error)
+	stubStartServeBackgroundProcess(t, func(*config.Config, backgroundServeStartOptions) (*backgroundServeProcess, error) {
+		return &backgroundServeProcess{
+			PID:     777,
+			LogPath: "/tmp/msgvault-serve.log",
+			Wait:    waitCh,
+		}, nil
+	})
+	stubWaitForBackgroundServeReady(t, func(
+		context.Context,
+		string,
+		<-chan error,
+		time.Duration,
+	) (*DaemonRuntime, bool, error) {
+		return &DaemonRuntime{
+			Record: daemon.RuntimeRecord{PID: 777},
+			Host:   "127.0.0.1",
+			Port:   9090,
+		}, true, nil
+	})
+	c := lifecycleTestConfig(dataDir)
+	c.Server.DaemonAutoStart = new(false)
+	cmd, stdout, stderr := lifecycleTestCommand()
+	require.NoError(runServeStart(cmd, c))
+	assert.Equal(os.Getpid(), stoppedPID, "explicit start still stops an older daemon")
+	assert.Equal(
+		"msgvault running at http://127.0.0.1:9090 (pid 777)\n"+
+			"Logs: /tmp/msgvault-serve.log\n",
+		stdout.String())
+	assert.Empty(stderr.String())
+}
+
 func TestRunServeStartHonorsNeverAutoRestartPolicy(t *testing.T) {
 	assert := assert.New(t)
 	require :=
@@ -1133,7 +1283,7 @@ func TestRunServeStartHonorsNeverAutoRestartPolicy(t *testing.T) {
 	require.NoError(
 		err, "write runtime")
 
-	stubStopDaemonRuntimeForUpgrade(t, func(config.Config, *DaemonRuntime) error {
+	stubStopDaemonRuntimeForUpgrade(t, func(config.Config, *DaemonRuntime, *slog.Logger) error {
 		require.FailNow("never policy must not stop a compatible daemon")
 		return errors.New("unreachable")
 	})
@@ -1178,7 +1328,7 @@ func TestRunServeStartUpgradesOlderIncompatibleDaemon(t *testing.T) {
 		err, "write runtime")
 
 	var stoppedPID int
-	stubStopDaemonRuntimeForUpgrade(t, func(_ config.Config, rt *DaemonRuntime) error {
+	stubStopDaemonRuntimeForUpgrade(t, func(_ config.Config, rt *DaemonRuntime, _ *slog.Logger) error {
 		stoppedPID = rt.Record.PID
 		return nil
 	})
@@ -1237,7 +1387,7 @@ func TestRunServeStartRefusesNewerIncompatibleDaemon(t *testing.T) {
 	require.NoError(
 		err, "write runtime")
 
-	stubStopDaemonRuntimeForUpgrade(t, func(config.Config, *DaemonRuntime) error {
+	stubStopDaemonRuntimeForUpgrade(t, func(config.Config, *DaemonRuntime, *slog.Logger) error {
 		require.FailNow("older CLI must not stop a newer incompatible daemon")
 		return errors.New("unreachable")
 	})
@@ -1297,6 +1447,73 @@ func TestRunServeRestartStartsWhenNoDaemonIsRunning(t *testing.T) {
 			"Logs: /tmp/msgvault-serve.log\n",
 		stdout.String())
 	assert.Empty(t, stderr.String())
+}
+
+func TestDaemonReplacementRejectsInvalidConfigBeforeStopping(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		bind        string
+		agentAccess bool
+		upgrade     bool
+		wantError   string
+	}{
+		{"restart missing interface", "iface:msgvault-nonexistent-restart-interface", false, false, "resolve bind interface"},
+		{"restart missing agent key", "127.0.0.1", true, false, "agent_access"},
+		{"upgrade missing agent key", "127.0.0.1", true, true, "agent_access"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			assert := assert.New(t)
+			require := require.New(t)
+			dataDir := t.TempDir()
+			standIn := startBlockingDaemonStandIn(t)
+			created, ok := processCreateTimeMillis(standIn.Process.Pid)
+			require.True(ok, "read stand-in process create time")
+			record := daemon.RuntimeRecord{
+				PID:     standIn.Process.Pid,
+				Network: daemon.NetworkTCP,
+				Address: net.JoinHostPort("127.0.0.1", "1"),
+				Service: daemonService,
+				Version: Version,
+				Metadata: map[string]string{
+					runtimeHost:             "127.0.0.1",
+					runtimePort:             "1",
+					runtimeAPIVersion:       strconv.Itoa(daemonAPIVersion),
+					runtimeAPISchemaVersion: api.APISchemaVersion,
+					runtimeCreateTime:       strconv.FormatInt(created, 10),
+					runtimeShutdownToken:    "stand-in-shutdown-token",
+				},
+			}
+			_, err := daemonRuntimeStore(dataDir).Write(record)
+			require.NoError(err, "write live daemon runtime")
+
+			var shutdownRequests atomic.Int32
+			previousShutdown := requestDaemonShutdownForRun
+			requestDaemonShutdownForRun = func(daemon.RuntimeRecord) (bool, error) {
+				shutdownRequests.Add(1)
+				if err := standIn.Process.Kill(); err != nil {
+					return false, err
+				}
+				_ = standIn.Wait()
+				return true, nil
+			}
+			t.Cleanup(func() { requestDaemonShutdownForRun = previousShutdown })
+			stubStartServeBackgroundProcess(t, func(*config.Config, backgroundServeStartOptions) (*backgroundServeProcess, error) {
+				return nil, errors.New("invalid replacement must not be launched")
+			})
+			cfg := lifecycleTestConfig(dataDir)
+			cfg.Server.BindAddr = tt.bind
+			cfg.Server.AgentAccess = tt.agentAccess
+			if tt.upgrade {
+				err = stopDaemonRuntimeForUpgradeImpl(*cfg, daemonRuntimeFromRecord(record), slog.New(slog.DiscardHandler))
+			} else {
+				cmd, _, _ := lifecycleTestCommand()
+				err = runServeRestart(cmd, cfg)
+			}
+			require.ErrorContains(err, tt.wantError)
+			assert.Zero(shutdownRequests.Load(), "reject an invalid replacement before stopping the daemon")
+			assert.True(daemon.ProcessAlive(standIn.Process.Pid), "the existing daemon must keep running")
+		})
+	}
 }
 
 func TestRunServeStartNotReadyPrintsWebUIURLForFixedPort(t *testing.T) {
@@ -1509,7 +1726,7 @@ func TestNewDaemonIdleTrackerOnlyRunsForBackgroundServeChild(t *testing.T) {
 
 	tracker := newDaemonIdleTracker(cfg, func() {
 		require.FailNow(t, "foreground serve must not arm idle shutdown")
-	})
+	}, testDiscardLogger())
 
 	assert.Nil(t, tracker)
 }
@@ -1520,7 +1737,7 @@ func TestNewDaemonIdleTrackerUsesServerConfigTimeout(t *testing.T) {
 	cfg.Server.DaemonIdleTimeout = 20 * time.Millisecond
 	fired := make(chan struct{})
 
-	tracker := newDaemonIdleTracker(cfg, func() { close(fired) })
+	tracker := newDaemonIdleTracker(cfg, func() { close(fired) }, testDiscardLogger())
 	require.NotNil(t, tracker)
 
 	go tracker.Run(t.Context())
@@ -1540,7 +1757,7 @@ func TestNewDaemonIdleTrackerEnvOverrideDisables(t *testing.T) {
 
 	tracker := newDaemonIdleTracker(cfg, func() {
 		require.FailNow(t, "idle tracker fired despite env disable")
-	})
+	}, testDiscardLogger())
 
 	assert.Nil(t, tracker)
 }
@@ -1552,6 +1769,15 @@ func lifecycleTestCommand() (*cobra.Command, *bytes.Buffer, *bytes.Buffer) {
 	cmd.SetOut(stdout)
 	cmd.SetErr(stderr)
 	return cmd, stdout, stderr
+}
+
+func clearServerKeyEnvironment(t *testing.T) {
+	t.Helper()
+	for _, name := range []string{"MSGVAULT_API_KEY", "MSGVAULT_API_KEY_FILE", "MSGVAULT_API_KEY_ENV"} {
+		value, _ := os.LookupEnv(name)
+		t.Setenv(name, value)
+		require.NoError(t, os.Unsetenv(name), "clear %s", name)
+	}
 }
 
 func runtimeDataDirFile(t *testing.T) string {
@@ -1570,7 +1796,7 @@ func withTestVersion(t *testing.T, version string) {
 
 func stubStopDaemonRuntimeForUpgrade(
 	t *testing.T,
-	fn func(config.Config, *DaemonRuntime) error,
+	fn func(config.Config, *DaemonRuntime, *slog.Logger) error,
 ) {
 	t.Helper()
 	old := stopDaemonRuntimeForUpgrade
@@ -1702,15 +1928,17 @@ func TestWaitForDaemonExitWithProgressExplainsLongStops(t *testing.T) {
 }
 
 func TestWaitForDaemonExitWithProgressGivesUpAtGrace(t *testing.T) {
-	restoreStopWaitPacing(t, 5*time.Millisecond, 10*time.Millisecond)
-	out := &bytes.Buffer{}
+	synctest.Test(t, func(t *testing.T) {
+		restoreStopWaitPacing(t, 5*time.Millisecond, 10*time.Millisecond)
+		out := &bytes.Buffer{}
 
-	exited := waitForDaemonExitWithProgress(out, daemon.RuntimeRecord{PID: 4242}, nil,
-		50*time.Millisecond, time.Millisecond,
-		func(daemon.RuntimeRecord) bool { return true })
+		exited := waitForDaemonExitWithProgress(out, daemon.RuntimeRecord{PID: 4242}, nil,
+			50*time.Millisecond, time.Millisecond,
+			func(daemon.RuntimeRecord) bool { return true })
 
-	assert.False(t, exited, "wait must give up at the grace deadline")
-	assert.Contains(t, out.String(), "Waiting up to")
+		assert.False(t, exited, "wait must give up at the grace deadline")
+		assert.Contains(t, out.String(), "Waiting up to")
+	})
 }
 
 func TestWaitForDaemonExitWithProgressQuietOnFastExit(t *testing.T) {

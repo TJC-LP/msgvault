@@ -97,7 +97,9 @@ func (p *commandOperationPass) checkpoint(ctx context.Context, counters operatio
 	checkpointCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), commandOperationRecorderTimeout)
 	defer cancel()
 	if err := p.recorder.Checkpoint(checkpointCtx, p.id, counters); err != nil {
-		logger.Error("operation recorder checkpoint failed", "kind", p.kind, "error", err)
+		if state := invocationFromContext(ctx); state != nil && state.logger != nil {
+			state.logger.Error("operation recorder checkpoint failed", "kind", p.kind, "error", err)
+		}
 	}
 }
 
@@ -110,13 +112,17 @@ func (p *commandOperationPass) finish(
 	publicError := commandOperationPublicError(ctx, runErr)
 	state, err := operations.DeriveInvocationState(p.kind, counters, publicError)
 	if err != nil {
-		logger.Error("operation recorder finish state failed", "kind", p.kind, "error", err)
+		if state := invocationFromContext(ctx); state != nil && state.logger != nil {
+			state.logger.Error("operation recorder finish state failed", "kind", p.kind, "error", err)
+		}
 		return
 	}
 	finishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), commandOperationRecorderTimeout)
 	defer cancel()
 	if err := p.recorder.Finish(finishCtx, p.id, counters, state, publicError); err != nil {
-		logger.Error("operation recorder finish failed", "kind", p.kind, "error", err)
+		if inv := invocationFromContext(ctx); inv != nil && inv.logger != nil {
+			inv.logger.Error("operation recorder finish failed", "kind", p.kind, "error", err)
+		}
 	}
 }
 
@@ -183,6 +189,7 @@ type documentBuildResult struct {
 type documentBuildFailure struct {
 	CanonicalBlobHash string
 	ReasonCode        string
+	Detail            string
 }
 
 type documentsCommandDeps struct {
@@ -190,8 +197,8 @@ type documentsCommandDeps struct {
 	newMistralProcessor   func(*documentindex.DocumentsConfig) (documentindex.MistralProcessor, error)
 	validateProbeFixtures func(context.Context, mistral.Policy, mistral.ProbeFixtureConfig) error
 	runCapabilityProbe    func(context.Context, *mistral.Client, mistral.ProbeConfig) (mistral.CapabilityManifest, error)
-	openStore             func() (*store.Store, func(), error)
-	openAttachments       func(*store.Store) (documentindex.DocumentAttachmentOpener, func() error, error)
+	openStore             func(context.Context) (*store.Store, func(), error)
+	openAttachments       func(context.Context, *store.Store) (documentindex.DocumentAttachmentOpener, func() error, error)
 	openReadClient        func(context.Context) (documentReadClient, func(), error)
 	runDocumentVector     func(context.Context, *store.Store, int64, int) (vectordocument.ReconcileResult, error)
 }
@@ -213,9 +220,13 @@ func defaultDocumentsCommandDeps() documentsCommandDeps {
 		newMistralProcessor:   newConfiguredMistralProcessor,
 		validateProbeFixtures: mistral.ValidateProbeFixtures,
 		runCapabilityProbe:    mistral.RunCapabilityProbe,
-		openStore:             openWritableStoreAndInit,
-		runDocumentVector:     runConfiguredDocumentVectorGeneration,
-		openAttachments:       openDocumentAttachments,
+		openStore: func(ctx context.Context) (*store.Store, func(), error) {
+			return openWritableStoreAndInitForInvocation(invocationFromContext(ctx))
+		},
+		runDocumentVector: runConfiguredDocumentVectorGeneration,
+		openAttachments: func(ctx context.Context, st *store.Store) (documentindex.DocumentAttachmentOpener, func() error, error) {
+			return openDocumentAttachments(st, invocationFromContext(ctx))
+		},
 		openReadClient: func(ctx context.Context) (documentReadClient, func(), error) {
 			client, _, err := OpenHTTPStore(ctx)
 			if err != nil {
@@ -373,7 +384,7 @@ func newBuildDocumentsCmd(deps documentsCommandDeps) *cobra.Command {
 				mode = documentBuildStartRebuild
 			}
 			if !isDaemonCLISubprocess() {
-				return runDaemonCLICommandHTTPFromCobraWithLocalFiles(command, args, documentProviderForwardEnv())
+				return runDaemonCLICommandHTTPFromCobraWithLocalFiles(command, args, documentProviderForwardEnv(invocationFromCommand(command)))
 			}
 			return runBuildDocuments(command, capabilityPath, limit, mode, confirmed, deps)
 		},
@@ -396,7 +407,7 @@ func newResumeDocumentsCmd(deps documentsCommandDeps) *cobra.Command {
 		Args:  cobra.NoArgs,
 		RunE: func(command *cobra.Command, args []string) error {
 			if !isDaemonCLISubprocess() {
-				return runDaemonCLICommandHTTPFromCobraWithLocalFiles(command, args, documentProviderForwardEnv())
+				return runDaemonCLICommandHTTPFromCobraWithLocalFiles(command, args, documentProviderForwardEnv(invocationFromCommand(command)))
 			}
 			return runBuildDocuments(command, capabilityPath, limit, documentBuildResume, confirmed, deps)
 		},
@@ -485,10 +496,12 @@ func newPurgeDocumentDerivedCmd(deps documentsCommandDeps) *cobra.Command {
 
 // documentProviderForwardEnv carries the caller's configured provider key to
 // the daemon-owned subprocess that performs an explicitly requested build.
-func documentProviderForwardEnv() map[string]string {
-	if cfg == nil {
+func documentProviderForwardEnv(state *invocation) map[string]string {
+	state = invocationState(context.Background(), state)
+	if state == nil || state.cfg == nil {
 		return nil
 	}
+	cfg := state.cfg
 	name := cfg.Attachments.Documents.APIKeyEnv
 	if name == "" {
 		return nil
@@ -506,9 +519,11 @@ func runProbeMistral(
 	validateOnly bool,
 	deps documentsCommandDeps,
 ) error {
-	if cfg == nil {
+	state := invocationFromCommand(command)
+	if state == nil || state.cfg == nil {
 		return errors.New("document probe requires loaded configuration")
 	}
+	cfg := state.cfg
 	documentsConfig := &cfg.Attachments.Documents
 	if !validateOnly {
 		if !documentsConfig.Enabled {
@@ -571,7 +586,7 @@ func runConsentMistral(
 	confirmed bool,
 	deps documentsCommandDeps,
 ) error {
-	documentsConfig, manifest, inputPolicy, profile, err := configuredDocumentProfile(capabilityPath)
+	documentsConfig, manifest, inputPolicy, profile, err := configuredDocumentProfile(capabilityPath, invocationFromCommand(command))
 	if err != nil {
 		return err
 	}
@@ -587,7 +602,7 @@ func runConsentMistral(
 	if manifest.MaxUnits < documentsConfig.MaxPagesPerDocument || len(inputPolicy.AllowedMediaTypes) == 0 {
 		return errors.New("document capability manifest does not authorize the configured policy")
 	}
-	st, cleanup, err := deps.openStore()
+	st, cleanup, err := deps.openStore(command.Context())
 	if err != nil {
 		return err
 	}
@@ -601,7 +616,19 @@ func runConsentMistral(
 	}); err != nil {
 		return err
 	}
-	if err := bootstrapDocumentOccurrencesIfConsented(command.Context(), st); err != nil {
+	if profile.IncludeInline {
+		// Repeat the full scan on every confirmed inline consent. An older
+		// completed bootstrap, or an interrupted consent scan, may omit rows.
+		reconciler, err := documentindex.NewReconciler(st, documentindex.ReconcilerConfig{
+			AttachmentPageSize: 1000, ChangePageSize: 1000,
+		})
+		if err != nil {
+			return err
+		}
+		if _, err := reconciler.FullReconcile(command.Context()); err != nil {
+			return err
+		}
+	} else if err := bootstrapDocumentOccurrencesIfConsented(command.Context(), st); err != nil {
 		return err
 	}
 	_, _ = fmt.Fprintf(command.OutOrStdout(),
@@ -630,6 +657,11 @@ func printDocumentConsentDisclosure(
 	inputPolicy documentindex.ResolvedInputPolicy,
 ) {
 	_, _ = fmt.Fprintln(w, "Hosted document extraction disclosure:")
+	roles := "standalone document attachments"
+	if profile.IncludeInline {
+		roles = "standalone and inline document attachments"
+	}
+	_, _ = fmt.Fprintf(w, "- Scope includes %s in the configured document formats and message sources.\n", roles)
 	_, _ = fmt.Fprintf(w, "- Authenticated upload routes target %s (%s):\n", profile.Endpoint, profile.Region)
 	for _, mediaType := range inputPolicy.AllowedMediaTypes {
 		route := inputPolicy.Routes[mediaType]
@@ -671,10 +703,15 @@ func runBuildDocuments(
 	confirmed bool,
 	deps documentsCommandDeps,
 ) (runErr error) {
+	state := invocationFromCommand(command)
+	if state == nil || state.cfg == nil {
+		return errors.New("document build requires loaded configuration")
+	}
+	cfg := state.cfg
 	if limit <= 0 || limit > 10_000 {
 		return errors.New("document build limit must be between 1 and 10000")
 	}
-	documentsConfig, manifest, inputPolicy, profile, err := configuredDocumentProfile(capabilityPath)
+	documentsConfig, manifest, inputPolicy, profile, err := configuredDocumentProfile(capabilityPath, invocationFromCommand(command))
 	if err != nil {
 		return err
 	}
@@ -692,7 +729,7 @@ func runBuildDocuments(
 		)
 		return errors.New("document build requires --yes after reviewing the provider upload preflight")
 	}
-	st, cleanup, err := deps.openStore()
+	st, cleanup, err := deps.openStore(command.Context())
 	if err != nil {
 		return err
 	}
@@ -729,7 +766,7 @@ func runBuildDocuments(
 	printDocumentBuildPreflight(
 		command.OutOrStdout(), documentsConfig, profile, inputPolicy, status, limit, mode,
 	)
-	attachments, closeAttachments, err := deps.openAttachments(st)
+	attachments, closeAttachments, err := deps.openAttachments(command.Context(), st)
 	if err != nil {
 		return err
 	}
@@ -931,6 +968,7 @@ func executeDocumentBuild(
 			result.Failures = append(result.Failures, documentBuildFailure{
 				CanonicalBlobHash: extraction.CanonicalBlobHash,
 				ReasonCode:        extraction.FailureReasonCode,
+				Detail:            extraction.FailureDetail,
 			})
 			pass.checkpoint(ctx, documentExtractionCounters(result))
 			continue
@@ -963,6 +1001,9 @@ func executeDocumentBuild(
 		var details strings.Builder
 		for _, failure := range result.Failures {
 			fmt.Fprintf(&details, "\n%s: %s", failure.CanonicalBlobHash, failure.ReasonCode)
+			if failure.Detail != "" {
+				fmt.Fprintf(&details, ": %s", failure.Detail)
+			}
 		}
 		return result, fmt.Errorf(
 			"document build completed with %d extraction failure(s):%s\nretry one with `msgvault documents retry --capabilities <manifest> --hash <sha256>`",
@@ -1007,7 +1048,9 @@ func runDocumentStatus(
 	jsonOutput bool,
 	deps documentsCommandDeps,
 ) error {
-	documentsConfig, _, inputPolicy, profile, err := configuredDocumentProfile(capabilityPath)
+	documentsConfig, _, inputPolicy, profile, err := configuredDocumentProfile(
+		capabilityPath, invocationFromCommand(command),
+	)
 	if err != nil {
 		return err
 	}
@@ -1070,6 +1113,16 @@ func runDocumentStatus(
 		_, _ = fmt.Fprintf(command.OutOrStdout(), "Active full rebuild: %d of %d owner(s) remaining\n",
 			rebuildStatus.RemainingOwners, rebuildStatus.SnapshotOwners)
 	}
+	for _, failure := range status.Failures {
+		_, _ = fmt.Fprintf(command.OutOrStdout(), "%s: %s", failure.CanonicalBlobHash, failure.ReasonCode)
+		if failure.Detail != "" {
+			_, _ = fmt.Fprintf(command.OutOrStdout(), ": %s", failure.Detail)
+		}
+		_, _ = fmt.Fprintln(command.OutOrStdout())
+	}
+	if len(status.Failures) > 0 && !status.FailuresExhausted {
+		_, _ = fmt.Fprintln(command.OutOrStdout(), "Additional document failures omitted; retry reported documents and check status again.")
+	}
 	return nil
 }
 
@@ -1079,11 +1132,11 @@ func runRetryDocument(
 	canonicalBlobHash string,
 	deps documentsCommandDeps,
 ) error {
-	profile, err := configuredDocumentProfileOnly(capabilityPath)
+	profile, err := configuredDocumentProfileOnly(capabilityPath, invocationFromCommand(command))
 	if err != nil {
 		return err
 	}
-	st, cleanup, err := deps.openStore()
+	st, cleanup, err := deps.openStore(command.Context())
 	if err != nil {
 		return err
 	}
@@ -1100,8 +1153,8 @@ func runRetryDocument(
 	return nil
 }
 
-func configuredDocumentProfileOnly(capabilityPath string) (store.DocumentExtractionProfile, error) {
-	documentsConfig, manifest, inputPolicy, profile, err := configuredDocumentProfile(capabilityPath)
+func configuredDocumentProfileOnly(capabilityPath string, state *invocation) (store.DocumentExtractionProfile, error) {
+	documentsConfig, manifest, inputPolicy, profile, err := configuredDocumentProfile(capabilityPath, state)
 	_ = documentsConfig
 	_ = manifest
 	_ = inputPolicy
@@ -1117,7 +1170,7 @@ func runRetireDocumentProfile(
 	if !confirmed {
 		return errors.New("document profile retirement requires --yes")
 	}
-	st, cleanup, err := deps.openStore()
+	st, cleanup, err := deps.openStore(command.Context())
 	if err != nil {
 		return err
 	}
@@ -1142,7 +1195,7 @@ func runPurgeDocumentDerived(
 	if !confirmed {
 		return errors.New("document derivative purge requires --yes")
 	}
-	st, cleanup, err := deps.openStore()
+	st, cleanup, err := deps.openStore(command.Context())
 	if err != nil {
 		return err
 	}
@@ -1198,7 +1251,7 @@ func openDocumentReadClient(
 	if deps.openReadClient != nil {
 		return deps.openReadClient(ctx)
 	}
-	st, cleanup, err := deps.openStore()
+	st, cleanup, err := deps.openStore(ctx)
 	if err != nil {
 		return nil, func() {}, err
 	}
@@ -1331,11 +1384,14 @@ func bootstrapDocumentOccurrencesIfConsented(ctx context.Context, st *store.Stor
 
 func configuredDocumentProfile(
 	capabilityPath string,
+	state *invocation,
 ) (*documentindex.DocumentsConfig, mistral.CapabilityManifest, documentindex.ResolvedInputPolicy, store.DocumentExtractionProfile, error) {
-	if cfg == nil {
+	state = invocationState(context.Background(), state)
+	if state == nil || state.cfg == nil {
 		return nil, mistral.CapabilityManifest{}, documentindex.ResolvedInputPolicy{}, store.DocumentExtractionProfile{},
 			errors.New("document operation requires loaded configuration")
 	}
+	cfg := state.cfg
 	documentsConfig := &cfg.Attachments.Documents
 	if documentsConfig.RetentionPosture == documentindex.RetentionUnknown ||
 		documentsConfig.TrainingPosture == documentindex.TrainingUnknown {
@@ -1394,14 +1450,20 @@ func documentProfileForConfig(
 		Model: values.Model, RetentionPosture: values.Retention,
 		TrainingPosture:   values.Training,
 		AllowedMediaTypes: allowedMediaTypes, PolicyJSON: policyJSON,
+		IncludeInline: documentsConfig.Scope.IncludeInline,
 	}
 	return inputPolicy, profile, nil
 }
 
 func openDocumentAttachments(
 	st *store.Store,
+	state *invocation,
 ) (documentindex.DocumentAttachmentOpener, func() error, error) {
-	attachments, err := attachmentstore.New(store.NewPackCatalog(st), cfg.AttachmentsDir())
+	state = invocationState(context.Background(), state)
+	if state == nil || state.cfg == nil {
+		return nil, nil, errors.New("configuration is unavailable")
+	}
+	attachments, err := attachmentstore.New(store.NewPackCatalog(st), state.cfg.AttachmentsDir())
 	if err != nil {
 		return nil, nil, err
 	}

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
 	"fmt"
 	"io"
@@ -31,16 +32,32 @@ const (
 
 var configureHumaOnce sync.Once
 
-// marshalAPIJSON writes nil slices as empty arrays to match the OpenAPI schema.
-func marshalAPIJSON(w io.Writer, value any) error {
-	err := jsonv2.MarshalWrite(
-		w, value,
+// marshalAPIJSONBytes encodes an API response with the wire options every
+// JSON route shares: nil slices encode as empty arrays to match the OpenAPI
+// schema, and invalid UTF-8 bytes are replaced with U+FFFD.
+func marshalAPIJSONBytes(value any) ([]byte, error) {
+	data, err := jsonv2.Marshal(value,
 		jsonv2.FormatNilSliceAsNull(false),
+		// Replace each invalid UTF-8 byte with U+FFFD, as encoding/json v1
+		// did, so one damaged stored value cannot fail a whole response.
+		jsontext.AllowInvalidUTF8(true),
 	)
 	if err != nil {
-		return fmt.Errorf("marshal API JSON: %w", err)
+		return nil, fmt.Errorf("marshal API JSON: %w", err)
 	}
-	return nil
+	return data, nil
+}
+
+// marshalAPIJSON writes the complete encoded value in one Write, or nothing.
+// Streaming straight to w would flush finished top-level members before a
+// later member failed, leaving the client a truncated body.
+func marshalAPIJSON(w io.Writer, value any) error {
+	data, err := marshalAPIJSONBytes(value)
+	if err != nil {
+		return err
+	}
+	_, err = w.Write(data)
+	return err
 }
 
 type apiHTTPError struct {
@@ -128,6 +145,7 @@ func (s *Server) setupHumaAPI(mux humago.Mux) huma.API {
 	configureHuma()
 
 	config := huma.DefaultConfig("msgvault API", APISchemaVersion)
+	config.Components.Schemas = huma.NewMapRegistry("#/components/schemas/", calendarSchemaName)
 	jsonFormat := huma.Format{
 		Marshal: marshalAPIJSON,
 		Unmarshal: func(data []byte, value any) error {
@@ -271,6 +289,7 @@ func (s *Server) registerHumaRoutes(api huma.API, apiV1 huma.API) {
 	s.registerPersonProfileRoutes(apiV1)
 	s.registerPersonNetworkRoutes(apiV1)
 	s.registerPersonTrackingRoutes(apiV1)
+	s.registerPersonAgendaRoutes(apiV1)
 	s.registerPersonBriefRoutes(apiV1)
 	s.registerPersonMergeRoutes(apiV1)
 	s.registerOrganizationRoutes(apiV1)
@@ -286,6 +305,7 @@ func (s *Server) registerHumaRoutes(api huma.API, apiV1 huma.API) {
 	s.registerPersonRelationshipRoutes(apiV1)
 	s.registerIdentityLinkRoutes(apiV1)
 	s.registerIdentityMatchRoutes(apiV1)
+	s.registerPersonMatchScoringRoutes(apiV1)
 	s.registerTaskIntegrationRoutes(apiV1)
 	s.registerTaskLinkRoutes(apiV1)
 	s.registerSearchCoverageRoute(apiV1)
@@ -340,6 +360,10 @@ func (s *Server) registerHumaRoutes(api huma.API, apiV1 huma.API) {
 	registerAPIV1RawHumaJSONRouteWithRequest[CLIEmbeddingsPlanRequest, CLIEmbeddingsPlanResponse](apiV1, "planCLIEmbeddings", http.MethodPost, "/cli/embeddings/plan", "Plan CLI embeddings management", s.handleCLIEmbeddingsPlan)
 	registerAPIV1RawHumaNDJSONRouteWithRequest[CLIRunRequest, CLIRunEvent](apiV1, "runCLI", http.MethodPost, "/cli/run", "Run an allowlisted CLI command", s.handleCLIRun)
 	registerAPIV1RawHumaJSONRoute[cliMessageResponse](apiV1, "getCLIMessage", http.MethodGet, "/cli/message", "Get one message for CLI output", s.handleCLIMessage)
+	registerAPIV1RawHumaJSONRouteWithErrors[cliOriginalMessageResponse](apiV1, "getCLIMessageOriginal", http.MethodGet, "/cli/message/original", "Get one message's original MIME for export", s.handleCLIMessageOriginal,
+		http.StatusBadRequest, http.StatusNotFound, http.StatusConflict, http.StatusRequestEntityTooLarge, http.StatusServiceUnavailable)
+	registerAPIV1RawHumaJSONRouteWithErrors[query.ThreadPage](apiV1, "getCLIMessageThread", http.MethodGet, "/cli/message/thread", "List one conversation in chronological order for export", s.handleCLIMessageThread,
+		http.StatusBadRequest, http.StatusNotFound, http.StatusConflict, http.StatusServiceUnavailable)
 	// Agent-token management routes: owner API key required.
 	registerAPIV1RawHumaJSONRouteWithRequest[agentTokenIssueRequest, agentTokenIssueResponse](apiV1, "issueAgentToken", http.MethodPost, "/agent-tokens", "Issue a restricted agent grant", s.handleIssueAgentToken, http.StatusCreated)
 	registerAPIV1RawHumaJSONRoute[agentTokenListResponse](apiV1, "listAgentTokens", http.MethodGet, "/agent-tokens", "List active agent grants", s.handleListAgentTokens)
@@ -388,6 +412,8 @@ func (s *Server) registerHumaRoutes(api huma.API, apiV1 huma.API) {
 	registerAPIV1RawHumaJSONRoute[MessageListResponse](apiV1, "listMessages", http.MethodGet, "/messages", "List messages", s.handleListMessages)
 	registerAPIV1RawHumaJSONRoute[MessageDetail](apiV1, "getMessage", http.MethodGet, "/messages/{id}", "Get one message", s.handleGetMessage)
 	s.registerMeetingImportRoute(apiV1)
+	s.registerMeetingRoutes(apiV1)
+	s.registerCalendarControlRoute(apiV1)
 	registerAPIV1RawHumaJSONRoute[ConversationResponse](apiV1, "getConversation", http.MethodGet, "/conversations/{id}", "Get a bounded containing conversation", s.handleGetConversation)
 	registerAPIV1RawHumaJSONRoute[AttachmentInfo](apiV1, "getAttachment", http.MethodGet, "/attachments/{id}", "Get attachment metadata", s.handleGetAttachment)
 	registerAPIV1RawHumaBinaryRoute(
@@ -452,7 +478,25 @@ func (s *Server) registerHumaRoutes(api huma.API, apiV1 huma.API) {
 	)
 	registerAPIV1RawHumaJSONOneOfRoute(apiV1, "searchMessages", http.MethodGet, "/search", "Search messages", s.handleSearch, reflect.TypeFor[SearchResult](), reflect.TypeFor[hybridSearchResponse]())
 
-	registerAPIV1RawHumaJSONRouteWithRequest[QueryRequest, query.QueryResult](apiV1, "runQuery", http.MethodPost, "/query", "Run an aggregate query", s.handleQuery)
+	for _, route := range []struct {
+		id, path, summary string
+		handler           http.HandlerFunc
+	}{
+		{"runQuery", "/query", "Run an aggregate query", s.handleQuery},
+		{"runArchiveQuery", "/query/archive", "Run SQL restricted to archive analytics files", s.handleArchiveQuery},
+	} {
+		queryOp := rawAPIV1Operation(route.id, http.MethodPost, route.path, route.summary)
+		queryOp.RequestBody = jsonRequestBodyFor[QueryRequest](apiV1)
+		queryOp.Responses = jsonResponsesFor[query.QueryResult](apiV1)
+		queryOp.Responses[httpStatusKey(http.StatusAccepted)] = &huma.Response{
+			Description: http.StatusText(http.StatusAccepted),
+			Content: map[string]*huma.MediaType{
+				applicationJSONMediaType: {Schema: schemaFor[CacheBuildAccepted](apiV1)},
+			},
+		}
+		registerRawHumaRoute(apiV1, queryOp, route.handler)
+	}
+	registerAPIV1RawHumaJSONRoute[CacheBuildStatus](apiV1, "getCacheBuildStatus", http.MethodGet, "/cache-builds/{job_id}", "Get analytics cache build status", s.handleCacheBuildStatus)
 	registerAPIV1RawHumaJSONRoute[AggregateResponse](apiV1, "getAggregates", http.MethodGet, "/aggregates", "Get aggregate rows", s.handleAggregates)
 	registerAPIV1RawHumaJSONRoute[AggregateResponse](apiV1, "getSubAggregates", http.MethodGet, "/aggregates/sub", "Get nested aggregate rows", s.handleSubAggregates)
 	registerAPIV1RawHumaJSONRoute[FilteredMessagesResponse](apiV1, "filterMessages", http.MethodGet, "/messages/filter", "List filtered messages", s.handleFilteredMessages)
@@ -720,6 +764,10 @@ func rawRouteParameters(operationID string) []*huma.Param {
 		}
 	case "getOperationRun":
 		return []*huma.Param{pathStringParam("id", "Opaque archive-bound operation run ID")}
+	case "getCacheBuildStatus":
+		return []*huma.Param{pathStringParam("job_id", "Analytics cache build job ID")}
+	case "runQuery", "runArchiveQuery":
+		return []*huma.Param{queryBooleanParam("fresh", "Request a background cache check including writes committed before this request")}
 	case "getCLIStats":
 		return scopeParams()
 	case "getImportJob":
@@ -766,6 +814,23 @@ func rawRouteParameters(operationID string) []*huma.Param {
 		}
 	case "getCLIMessage", "getCLIMessageRaw":
 		return []*huma.Param{queryStringParam("id", "Message numeric ID or source message ID", true)}
+	case "getCLIMessageOriginal":
+		return []*huma.Param{
+			queryIntegerParam("id", "Internal message ID"),
+			queryIntegerParam("max_bytes", "Maximum decoded MIME bytes; omit for an unrestricted export"),
+			queryStringParam("source_message_id", "Provider message ID", false),
+			queryStringParam("account", "Source identifier that narrows the lookup", false),
+		}
+	case "getCLIMessageThread":
+		return []*huma.Param{
+			queryIntegerParam("id", "Internal ID of a message in the conversation"),
+			queryStringParam("source_message_id", "Provider ID of a message in the conversation", false),
+			queryStringParam("thread_id", "Provider conversation ID", false),
+			queryStringParam("account", "Source identifier that narrows the lookup", false),
+			queryBooleanParam("all", "Return fixed membership for the entire conversation; cannot be combined with limit or offset"),
+			queryIntegerParam(limitParam, "Messages per page (default 100, max 500)"),
+			queryIntegerParam("offset", "Messages to skip"),
+		}
 	case "getCLIAttachment":
 		return []*huma.Param{queryStringParam("content_hash", "Attachment SHA-256 content hash", true)}
 	case "getCLICollection":
@@ -774,6 +839,8 @@ func rawRouteParameters(operationID string) []*huma.Param {
 		return []*huma.Param{queryBooleanParam("full_rebuild", "Rebuild all cache files from scratch")}
 	case "syncCLI":
 		return []*huma.Param{
+			queryBooleanParam("build-cache", "Build the analytics cache after sync even inside the interval"),
+			queryBooleanParam("no-build-cache", "Skip the analytics cache refresh after sync"),
 			queryStringParam("email", "Account email or display name to sync", false),
 			queryIntegerParam("source_id", "Exact source ID to sync"),
 			queryRefArrayParam("folder", "IMAP folder names to include (repeatable)"),
@@ -781,6 +848,8 @@ func rawRouteParameters(operationID string) []*huma.Param {
 		}
 	case "syncFullCLI":
 		return []*huma.Param{
+			queryBooleanParam("build-cache", "Build the analytics cache after sync even inside the interval"),
+			queryBooleanParam("no-build-cache", "Skip the analytics cache refresh after sync"),
 			queryStringParam("email", "Account email or display name to sync", false),
 			queryIntegerParam("source_id", "Exact source ID to sync"),
 			queryStringParam("query", "Gmail search query", false),
@@ -816,7 +885,8 @@ func rawRouteParameters(operationID string) []*huma.Param {
 			queryIntegerParam(limitParam, "Maximum candidates to return (default 100, max 500)"),
 			queryIntegerParam("offset", "Zero-based candidate offset"),
 		}
-	case "acceptIdentityMatchCandidate", "rejectIdentityMatchCandidate":
+	case "getIdentityMatchCandidate", "reviewAcceptIdentityMatchCandidate",
+		"reviewRejectIdentityMatchCandidate":
 		return []*huma.Param{pathIntegerParam("Identity match candidate ID")}
 	case "searchIntegrationTasks":
 		return []*huma.Param{queryStringParam("q", "Task title search within the configured project", true)}

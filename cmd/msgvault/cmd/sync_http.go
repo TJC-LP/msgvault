@@ -9,20 +9,27 @@ import (
 
 	"github.com/mattn/go-isatty"
 	"github.com/spf13/cobra"
+	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/daemonclient"
 	"golang.org/x/oauth2"
 )
 
 func runSyncIncrementalHTTP(cmd *cobra.Command, args []string) error {
+	force, skip, flagErr := manualSyncCacheFlags(cmd)
+	if flagErr != nil {
+		return usageErr(cmd, flagErr)
+	}
 	selector, _, err := syncSourceSelector(cmd, args)
 	if err != nil {
 		return usageErr(cmd, err)
 	}
 	req := daemonclient.CLISyncRequest{
-		Folders:     parseFolderFilter(syncFolders),
-		SkipFolders: parseFolderFilter(syncSkipFolders),
-		SourceID:    selector.SourceID,
-		SourceIDSet: selector.SourceIDSet,
+		BuildCache:   force,
+		NoBuildCache: skip,
+		Folders:      parseFolderFilter(syncFolders),
+		SkipFolders:  parseFolderFilter(syncSkipFolders),
+		SourceID:     selector.SourceID,
+		SourceIDSet:  selector.SourceIDSet,
 	}
 	if len(args) == 1 {
 		req.Email = selector.Account
@@ -31,21 +38,27 @@ func runSyncIncrementalHTTP(cmd *cobra.Command, args []string) error {
 }
 
 func runSyncFullHTTP(cmd *cobra.Command, args []string) error {
+	force, skip, flagErr := manualSyncCacheFlags(cmd)
+	if flagErr != nil {
+		return usageErr(cmd, flagErr)
+	}
 	selector, _, err := syncSourceSelector(cmd, args)
 	if err != nil {
 		return usageErr(cmd, err)
 	}
 	req := daemonclient.CLISyncRequest{
-		Full:        true,
-		Query:       syncQuery,
-		NoResume:    syncNoResume,
-		Before:      syncBefore,
-		After:       syncAfter,
-		Limit:       syncLimit,
-		Folders:     parseFolderFilter(syncFolders),
-		SkipFolders: parseFolderFilter(syncSkipFolders),
-		SourceID:    selector.SourceID,
-		SourceIDSet: selector.SourceIDSet,
+		BuildCache:   force,
+		NoBuildCache: skip,
+		Full:         true,
+		Query:        syncQuery,
+		NoResume:     syncNoResume,
+		Before:       syncBefore,
+		After:        syncAfter,
+		Limit:        syncLimit,
+		Folders:      parseFolderFilter(syncFolders),
+		SkipFolders:  parseFolderFilter(syncSkipFolders),
+		SourceID:     selector.SourceID,
+		SourceIDSet:  selector.SourceIDSet,
 	}
 	if len(args) == 1 {
 		req.Email = selector.Account
@@ -60,7 +73,7 @@ func runSyncHTTP(cmd *cobra.Command, req daemonclient.CLISyncRequest) error {
 	}
 	defer func() { _ = st.Close() }()
 
-	if err := preflightReauth(cmd.Context(), buildSyncPreflight(st, info), req.Email, req.SourceID); err != nil {
+	if err := preflightReauth(cmd.Context(), buildSyncPreflight(st, info, invocationFromCommand(cmd)), req.Email, req.SourceID); err != nil {
 		return err
 	}
 
@@ -118,13 +131,25 @@ type preflightConfig struct {
 
 // buildSyncPreflight wires the production preflight config from global config,
 // the daemon client, and the resolved store endpoint.
-func buildSyncPreflight(st *daemonclient.Client, info HTTPStoreInfo) preflightConfig {
-	getMgr := oauthManagerCache()
+func buildSyncPreflight(st *daemonclient.Client, info HTTPStoreInfo, state *invocation) preflightConfig {
+	getMgr := oauthManagerCache(state)
+	var cfg *config.Config
+	if state != nil {
+		cfg = state.cfg
+	}
+	var oauthConfigured bool
+	var serviceAccountKey func(string) string
+	if cfg != nil {
+		oauthConfigured = cfg.OAuth.HasAnyConfig()
+		serviceAccountKey = cfg.OAuth.ServiceAccountKeyFor
+	} else {
+		serviceAccountKey = func(string) string { return "" }
+	}
 	return preflightConfig{
 		Local: info.Kind == HTTPStoreLocalDaemon,
 		Interactive: isatty.IsTerminal(os.Stdin.Fd()) ||
 			isatty.IsCygwinTerminal(os.Stdin.Fd()),
-		OAuthConfigured: cfg.OAuth.HasAnyConfig(),
+		OAuthConfigured: oauthConfigured,
 		Out:             os.Stdout,
 		ListGmailAccounts: func(ctx context.Context) ([]preflightAccount, error) {
 			accounts, err := st.GetCLIAccounts(ctx)
@@ -145,7 +170,7 @@ func buildSyncPreflight(st *daemonclient.Client, info HTTPStoreInfo) preflightCo
 			}
 			return gmail, nil
 		},
-		ServiceAccountKey: cfg.OAuth.ServiceAccountKeyFor,
+		ServiceAccountKey: serviceAccountKey,
 		ManagerFor: func(appName string) (preflightReauthManager, error) {
 			mgr, err := getMgr(appName)
 			if err != nil {

@@ -15,6 +15,9 @@ func (s *Service) conflictPersonOperation(ctx context.Context, conflictID int64)
 	if err != nil {
 		return ctx, nil, err
 	}
+	if err := s.requireOwnBook(ctx, conflict.AddressBookID); err != nil {
+		return ctx, nil, err
+	}
 	mapping, err := s.store.GetCardDAVResourceContext(ctx, conflict.AddressBookID, conflict.Href)
 	if err != nil {
 		return ctx, nil, err
@@ -38,7 +41,7 @@ func (s *Service) conflictPersonOperation(ctx context.Context, conflictID int64)
 }
 
 func (s *Service) PreviewConflictPublication(ctx context.Context, conflictID int64) (*PublicationPreview, error) {
-	if s == nil || s.store == nil || s.client == nil {
+	if s == nil || s.store == nil || s.remote == nil {
 		return nil, errors.New("CardDAV service is not configured")
 	}
 	ctx, release, err := s.conflictPersonOperation(ctx, conflictID)
@@ -53,6 +56,9 @@ func (s *Service) conflictPublicationPlanUnlocked(ctx context.Context, conflictI
 	var plan store.CardDAVConflictLocalApprovalPlan
 	source, err := s.store.LoadCardDAVConflictReviewSourceContext(ctx, conflictID)
 	if err != nil {
+		return nil, plan, err
+	}
+	if err := s.requireOwnBook(ctx, source.Book.ID); err != nil {
 		return nil, plan, err
 	}
 	if personID, ok := ctx.Value(conflictGuardKey{}).(int64); ok && source.Person.ID != personID {
@@ -87,7 +93,7 @@ func (s *Service) previewConflictPublicationUnlocked(ctx context.Context, confli
 }
 
 func (s *Service) ApproveConflictPublication(ctx context.Context, conflictID int64, token string) error {
-	if s == nil || s.store == nil || s.client == nil {
+	if s == nil || s.store == nil || s.remote == nil {
 		return errors.New("CardDAV service is not configured")
 	}
 	ctx, release, err := s.conflictPersonOperation(ctx, conflictID)

@@ -63,6 +63,100 @@ func (c CLIDeduplicatePlanRequestPlanProtocol) Validate() error {
 	}
 }
 
+type CalendarRequestAction string
+
+const (
+	Conflicts CalendarRequestAction = "conflicts"
+	Create    CalendarRequestAction = "create"
+	Delete    CalendarRequestAction = "delete"
+	Freebusy  CalendarRequestAction = "freebusy"
+	Move      CalendarRequestAction = "move"
+	Respond   CalendarRequestAction = "respond"
+	Update    CalendarRequestAction = "update"
+)
+
+// Validate checks if the CalendarRequestAction value is valid
+func (c CalendarRequestAction) Validate() error {
+	switch c {
+	case Conflicts, Create, Delete, Freebusy, Move, Respond, Update:
+		return nil
+	default:
+		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid CalendarRequestAction value, got: %v", c))
+	}
+}
+
+type CalendarRequestResponse string
+
+const (
+	CalendarRequestResponseAccepted  CalendarRequestResponse = "accepted"
+	CalendarRequestResponseDeclined  CalendarRequestResponse = "declined"
+	CalendarRequestResponseTentative CalendarRequestResponse = "tentative"
+)
+
+// Validate checks if the CalendarRequestResponse value is valid
+func (c CalendarRequestResponse) Validate() error {
+	switch c {
+	case CalendarRequestResponseAccepted, CalendarRequestResponseDeclined, CalendarRequestResponseTentative:
+		return nil
+	default:
+		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid CalendarRequestResponse value, got: %v", c))
+	}
+}
+
+type CalendarRequestScope string
+
+const (
+	CalendarRequestScopeAll    CalendarRequestScope = "all"
+	CalendarRequestScopeFuture CalendarRequestScope = "future"
+	CalendarRequestScopeSingle CalendarRequestScope = "single"
+)
+
+// Validate checks if the CalendarRequestScope value is valid
+func (c CalendarRequestScope) Validate() error {
+	switch c {
+	case CalendarRequestScopeAll, CalendarRequestScopeFuture, CalendarRequestScopeSingle:
+		return nil
+	default:
+		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid CalendarRequestScope value, got: %v", c))
+	}
+}
+
+type CalendarRequestSendUpdates string
+
+const (
+	CalendarRequestSendUpdatesAll          CalendarRequestSendUpdates = "all"
+	CalendarRequestSendUpdatesExternalOnly CalendarRequestSendUpdates = "externalOnly"
+	CalendarRequestSendUpdatesNone         CalendarRequestSendUpdates = "none"
+)
+
+// Validate checks if the CalendarRequestSendUpdates value is valid
+func (c CalendarRequestSendUpdates) Validate() error {
+	switch c {
+	case CalendarRequestSendUpdatesAll, CalendarRequestSendUpdatesExternalOnly, CalendarRequestSendUpdatesNone:
+		return nil
+	default:
+		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid CalendarRequestSendUpdates value, got: %v", c))
+	}
+}
+
+// CalendarResultOutcomeCode Machine-readable classification for a partial provider write
+type CalendarResultOutcomeCode string
+
+const (
+	CalendarOutcomeUnknown CalendarResultOutcomeCode = "calendar_outcome_unknown"
+	CalendarPartial        CalendarResultOutcomeCode = "calendar_partial"
+)
+
+// Validate checks if the CalendarResultOutcomeCode value is valid
+func (c CalendarResultOutcomeCode) Validate() error {
+	switch c {
+	case CalendarOutcomeUnknown, CalendarPartial:
+		return nil
+	default:
+		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid CalendarResultOutcomeCode value, got: %v", c))
+	}
+}
+
 type CandidateClassification string
 
 const (
@@ -424,6 +518,24 @@ func (c CardDAVStatusResponseRepairReason) Validate() error {
 	}
 }
 
+type ConnectionSyncOutcomeStatus string
+
+const (
+	ConnectionSyncOutcomeStatusFailed    ConnectionSyncOutcomeStatus = "failed"
+	ConnectionSyncOutcomeStatusPartial   ConnectionSyncOutcomeStatus = "partial"
+	ConnectionSyncOutcomeStatusSucceeded ConnectionSyncOutcomeStatus = "succeeded"
+)
+
+// Validate checks if the ConnectionSyncOutcomeStatus value is valid
+func (c ConnectionSyncOutcomeStatus) Validate() error {
+	switch c {
+	case ConnectionSyncOutcomeStatusFailed, ConnectionSyncOutcomeStatusPartial, ConnectionSyncOutcomeStatusSucceeded:
+		return nil
+	default:
+		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid ConnectionSyncOutcomeStatus value, got: %v", c))
+	}
+}
+
 type CreateAttributeDefinitionRequestCardinality string
 
 const (
@@ -518,14 +630,14 @@ type DiscoverEventType string
 
 const (
 	DiscoverEventTypeProgress DiscoverEventType = "progress"
+	DiscoverEventTypeResult   DiscoverEventType = "result"
 	Error                     DiscoverEventType = "error"
-	Result                    DiscoverEventType = "result"
 )
 
 // Validate checks if the DiscoverEventType value is valid
 func (d DiscoverEventType) Validate() error {
 	switch d {
-	case DiscoverEventTypeProgress, Error, Result:
+	case DiscoverEventTypeProgress, DiscoverEventTypeResult, Error:
 		return nil
 	default:
 		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid DiscoverEventType value, got: %v", d))
@@ -919,6 +1031,42 @@ func (i ImportJobResponseStatus) Validate() error {
 	}
 }
 
+type MeetingActionsRequestStatus string
+
+const (
+	MeetingActionsRequestStatusCancelled MeetingActionsRequestStatus = "cancelled"
+	MeetingActionsRequestStatusCompleted MeetingActionsRequestStatus = "completed"
+	MeetingActionsRequestStatusPending   MeetingActionsRequestStatus = "pending"
+	MeetingActionsRequestStatusUnknown   MeetingActionsRequestStatus = "unknown"
+)
+
+// Validate checks if the MeetingActionsRequestStatus value is valid
+func (m MeetingActionsRequestStatus) Validate() error {
+	switch m {
+	case MeetingActionsRequestStatusCancelled, MeetingActionsRequestStatusCompleted, MeetingActionsRequestStatusPending, MeetingActionsRequestStatusUnknown:
+		return nil
+	default:
+		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid MeetingActionsRequestStatus value, got: %v", m))
+	}
+}
+
+type MeetingContextRequestFormat string
+
+const (
+	JSON     MeetingContextRequestFormat = "json"
+	Markdown MeetingContextRequestFormat = "markdown"
+)
+
+// Validate checks if the MeetingContextRequestFormat value is valid
+func (m MeetingContextRequestFormat) Validate() error {
+	switch m {
+	case JSON, Markdown:
+		return nil
+	default:
+		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid MeetingContextRequestFormat value, got: %v", m))
+	}
+}
+
 type MeetingImportResponseStatus string
 
 const (
@@ -933,6 +1081,24 @@ func (m MeetingImportResponseStatus) Validate() error {
 		return nil
 	default:
 		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid MeetingImportResponseStatus value, got: %v", m))
+	}
+}
+
+type MeetingScopeRequestDeletion string
+
+const (
+	Active  MeetingScopeRequestDeletion = "active"
+	Any     MeetingScopeRequestDeletion = "any"
+	Deleted MeetingScopeRequestDeletion = "deleted"
+)
+
+// Validate checks if the MeetingScopeRequestDeletion value is valid
+func (m MeetingScopeRequestDeletion) Validate() error {
+	switch m {
+	case Active, Any, Deleted:
+		return nil
+	default:
+		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid MeetingScopeRequestDeletion value, got: %v", m))
 	}
 }
 
@@ -1699,6 +1865,24 @@ func (p ParticipantCompletionHTTPRowKind) Validate() error {
 	}
 }
 
+type PeopleInferencePresetCreateRequestPresetID string
+
+const (
+	Openai     PeopleInferencePresetCreateRequestPresetID = "openai"
+	Openrouter PeopleInferencePresetCreateRequestPresetID = "openrouter"
+	Venice     PeopleInferencePresetCreateRequestPresetID = "venice"
+)
+
+// Validate checks if the PeopleInferencePresetCreateRequestPresetID value is valid
+func (p PeopleInferencePresetCreateRequestPresetID) Validate() error {
+	switch p {
+	case Openai, Openrouter, Venice:
+		return nil
+	default:
+		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid PeopleInferencePresetCreateRequestPresetID value, got: %v", p))
+	}
+}
+
 type PersonEnrichmentProviderSettingKind string
 
 const (
@@ -2289,6 +2473,24 @@ func (s SettingValidationFormat) Validate() error {
 		return nil
 	default:
 		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid SettingValidationFormat value, got: %v", s))
+	}
+}
+
+type SyncResultStatus string
+
+const (
+	SyncResultStatusFailed    SyncResultStatus = "failed"
+	SyncResultStatusPartial   SyncResultStatus = "partial"
+	SyncResultStatusSucceeded SyncResultStatus = "succeeded"
+)
+
+// Validate checks if the SyncResultStatus value is valid
+func (s SyncResultStatus) Validate() error {
+	switch s {
+	case SyncResultStatusFailed, SyncResultStatusPartial, SyncResultStatusSucceeded:
+		return nil
+	default:
+		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid SyncResultStatus value, got: %v", s))
 	}
 }
 

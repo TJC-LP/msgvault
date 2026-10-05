@@ -25,6 +25,7 @@ import (
 )
 
 func TestExploreHTTPUsesCommittedDuckDBReadModel(t *testing.T) {
+	t.Parallel()
 	assertions := assert.New(t)
 	requirements := require.New(t)
 	engine := newExploreDuckDBFixture(t)
@@ -51,7 +52,33 @@ func TestExploreHTTPUsesCommittedDuckDBReadModel(t *testing.T) {
 	assertions.Equal("Newest", row["title"])
 }
 
+func TestExploreResourceLimitExplainsRecovery(t *testing.T) {
+	t.Parallel()
+	_, analyticsDir := newExploreDuckDBFixtureWithDir(t)
+	engine, err := query.NewDuckDBEngine(analyticsDir, "", nil, query.DuckDBOptions{
+		MemoryLimit: "1MB",
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, engine.Close()) })
+	srv := newTestServerWithEngine(t, engine)
+
+	for _, path := range []string{"/api/v1/explore", "/api/v1/files/search"} {
+		t.Run(path, func(t *testing.T) {
+			assertions := assert.New(t)
+			response := postExploreJSON(t, srv, path, `{ "limit": 100 }`)
+			assertions.Equal(http.StatusServiceUnavailable, response.Code)
+			var body ErrorResponse
+			require.NoError(t, json.Unmarshal(response.Body.Bytes(), &body))
+			assertions.Equal("query_resource_exhausted", body.Error, response.Body.String())
+			assertions.Contains(body.Message, "analytics.query_memory_limit")
+			assertions.Contains(body.Message, "analytics.query_temp_limit")
+			assertions.Contains(body.Message, "restart")
+		})
+	}
+}
+
 func TestExploreGroupsAndFilesUseCompleteDuckDBFacts(t *testing.T) {
+	t.Parallel()
 	assertions := assert.New(t)
 	requirements := require.New(t)
 	engine := newExploreDuckDBFixture(t)
@@ -86,6 +113,7 @@ func TestExploreGroupsAndFilesUseCompleteDuckDBFacts(t *testing.T) {
 }
 
 func TestExploreParticipantGroupsResolveDurableLabelsEndToEnd(t *testing.T) {
+	t.Parallel()
 	requirements := require.New(t)
 	assertions := assert.New(t)
 	srv := newTestServerWithEngine(t, newExploreDuckDBFixture(t))
@@ -112,6 +140,7 @@ func TestExploreParticipantGroupsResolveDurableLabelsEndToEnd(t *testing.T) {
 // ranking returns Alice, so the keyed request resolving Bob proves the exact
 // lookup reaches the engine instead of the ranked listing.
 func TestExploreGroupsGroupKeyHydratesLowRankedGroupEndToEnd(t *testing.T) {
+	t.Parallel()
 	requirements := require.New(t)
 	assertions := assert.New(t)
 	srv := newTestServerWithEngine(t, newExploreDuckDBFixture(t))
@@ -143,6 +172,7 @@ func TestExploreGroupsGroupKeyHydratesLowRankedGroupEndToEnd(t *testing.T) {
 }
 
 func TestExplorePreflightPinsRevisionAndExcludesCompletePredicate(t *testing.T) {
+	t.Parallel()
 	assertions := assert.New(t)
 	requirements := require.New(t)
 	engine := &rawExploreEngine{DuckDBEngine: newExploreDuckDBFixture(t)}
@@ -218,6 +248,7 @@ func TestExplorePreflightPinsRevisionAndExcludesCompletePredicate(t *testing.T) 
 }
 
 func TestExploreFullTextAndVisibleMatchCountsUseExactCandidates(t *testing.T) {
+	t.Parallel()
 	assertions := assert.New(t)
 	requirements := require.New(t)
 	engine := newExploreDuckDBFixture(t)
@@ -255,6 +286,7 @@ func TestExploreFullTextAndVisibleMatchCountsUseExactCandidates(t *testing.T) {
 }
 
 func TestExploreFullTextPaginationRejectsChangedLexicalRevision(t *testing.T) {
+	t.Parallel()
 	assertions := assert.New(t)
 	requirements := require.New(t)
 	engine := newExploreDuckDBFixture(t)
@@ -282,6 +314,7 @@ func TestExploreFullTextPaginationRejectsChangedLexicalRevision(t *testing.T) {
 }
 
 func TestExploreSemanticIssuesBoundedSnapshotWithoutInventingTotal(t *testing.T) {
+	t.Parallel()
 	assertions := assert.New(t)
 	requirements := require.New(t)
 	engine := newExploreDuckDBFixture(t)
@@ -335,6 +368,7 @@ func (s *exploreClusterStore) ClusterEdges(int64) ([]store.LinkEdge, error) {
 }
 
 func TestPersonFilesSemanticSearchIntersectsDirectionScopeEndToEnd(t *testing.T) {
+	t.Parallel()
 	requirements := require.New(t)
 	assertions := assert.New(t)
 	engine := newExploreDuckDBFixture(t)
@@ -374,6 +408,7 @@ func TestPersonFilesSemanticSearchIntersectsDirectionScopeEndToEnd(t *testing.T)
 }
 
 func TestExploreSemanticPaginationFollowsSnapshotRankNotArchiveDate(t *testing.T) {
+	t.Parallel()
 	assertions := assert.New(t)
 	requirements := require.New(t)
 	engine := newExploreDuckDBFixture(t)
@@ -410,6 +445,7 @@ func TestExploreSemanticPaginationFollowsSnapshotRankNotArchiveDate(t *testing.T
 // the retired generation. Reuse must re-run the issuing path's
 // active-generation check instead of serving retired candidates.
 func TestExploreSnapshotReuseRevalidatesActiveGeneration(t *testing.T) {
+	t.Parallel()
 	vecCfg := vector.Config{
 		Enabled:    true,
 		Embeddings: vector.EmbeddingsConfig{Model: "test", Dimension: 2},
@@ -465,6 +501,7 @@ func TestExploreSnapshotReuseRevalidatesActiveGeneration(t *testing.T) {
 }
 
 func TestExploreSemanticPreflightRequiresAndReusesCandidateSnapshot(t *testing.T) {
+	t.Parallel()
 	assertions := assert.New(t)
 	requirements := require.New(t)
 	engine := newExploreDuckDBFixture(t)
@@ -496,6 +533,7 @@ func TestExploreSemanticPreflightRequiresAndReusesCandidateSnapshot(t *testing.T
 }
 
 func TestExploreIdentityFilterDirectionsAndHydrationAcrossSearchModes(t *testing.T) {
+	t.Parallel()
 	fixture := newExploreIdentityAPIFixture(t)
 	tests := []struct {
 		name string
@@ -578,6 +616,7 @@ func TestExploreIdentityFilterDirectionsAndHydrationAcrossSearchModes(t *testing
 }
 
 func TestExploreIdentityFilterCursorCanonicalizesEmptyDirectionAsAny(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	fixture := newExploreIdentityAPIFixture(t)
@@ -611,6 +650,7 @@ func TestExploreIdentityFilterCursorCanonicalizesEmptyDirectionAsAny(t *testing.
 }
 
 func TestExploreFilesIdentityCursorCanonicalizesEmptyDirectionAsAny(t *testing.T) {
+	t.Parallel()
 	requirements := require.New(t)
 	assertions := assert.New(t)
 	fixture := newExploreIdentityAPIFixture(t)
@@ -653,6 +693,7 @@ func TestExploreFilesIdentityCursorCanonicalizesEmptyDirectionAsAny(t *testing.T
 }
 
 func TestExploreIdentityFilterResolvesForGroupsFilesPreflightAndMatchCounts(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	fixture := newExploreIdentityAPIFixture(t)
@@ -713,6 +754,7 @@ func TestExploreIdentityFilterResolvesForGroupsFilesPreflightAndMatchCounts(t *t
 }
 
 func TestExploreGroupsIdentityFilterPreservesTupleOrderAndNormalizesEmptyDirection(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	fixture := newExploreIdentityAPIFixture(t)
@@ -733,6 +775,7 @@ func TestExploreGroupsIdentityFilterPreservesTupleOrderAndNormalizesEmptyDirecti
 }
 
 func TestExploreHydrationUsesEmptyArraysForRowsWithoutAnchors(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	base := newExploreDuckDBFixture(t)
@@ -969,13 +1012,13 @@ func newExploreDuckDBFixtureWithRecipients(t *testing.T, recipientValues string)
 }
 
 func newExploreDuckDBFixtureWithMessagesAndRecipients(
-	t *testing.T, messageValues, recipientValues string, lastMessageID int64,
+	tb testing.TB, messageValues, recipientValues string, lastMessageID int64,
 ) (*query.DuckDBEngine, string) {
-	t.Helper()
-	analyticsDir := t.TempDir()
+	tb.Helper()
+	analyticsDir := tb.TempDir()
 	db, err := sql.Open("duckdb", "")
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	require.NoError(tb, err)
+	tb.Cleanup(func() { require.NoError(tb, db.Close()) })
 
 	tables := []struct {
 		dir, file, columns, values string
@@ -1000,28 +1043,28 @@ func newExploreDuckDBFixtureWithMessagesAndRecipients(
 	}
 	for _, table := range tables {
 		dir := filepath.Join(analyticsDir, table.dir)
-		require.NoError(t, os.MkdirAll(dir, 0o755))
+		require.NoError(tb, os.MkdirAll(dir, 0o755))
 		where := ""
 		if table.empty {
 			where = " WHERE false"
 		}
 		path := filepath.ToSlash(filepath.Join(dir, table.file))
 		_, err := db.Exec(fmt.Sprintf("COPY (SELECT * FROM (VALUES %s) AS t(%s)%s) TO '%s' (FORMAT PARQUET)", table.values, table.columns, where, path))
-		require.NoError(t, err, "write %s", table.dir)
+		require.NoError(tb, err, "write %s", table.dir)
 	}
-	ensureIdentityCacheFixtureDatasets(t, db, analyticsDir)
+	ensureIdentityCacheFixtureDatasets(tb, db, analyticsDir)
 	fingerprint, err := query.CacheDatasetFingerprint(analyticsDir)
-	require.NoError(t, err)
+	require.NoError(tb, err)
 	state, err := json.Marshal(query.CacheSyncState{
 		LastMessageID: lastMessageID, LastSyncAt: time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC),
 		SchemaVersion: query.CacheSchemaVersion, PublishedAt: time.Date(2026, 7, 18, 12, 1, 0, 0, time.UTC),
 		DatasetFingerprint: fingerprint,
 	})
-	require.NoError(t, err)
-	require.NoError(t, os.WriteFile(query.CacheStatePath(analyticsDir), state, 0o600))
+	require.NoError(tb, err)
+	require.NoError(tb, os.WriteFile(query.CacheStatePath(analyticsDir), state, 0o600))
 
 	engine, err := query.NewDuckDBEngine(analyticsDir, "", nil)
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, engine.Close()) })
+	require.NoError(tb, err)
+	tb.Cleanup(func() { require.NoError(tb, engine.Close()) })
 	return engine, analyticsDir
 }

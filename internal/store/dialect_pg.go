@@ -447,25 +447,49 @@ func truncateBytesRuneSafe(s string) string {
 // callers treat the returned error as warn-only on the sync path (search_fts
 // stays NULL), so a bad input can never wedge FTS.
 func (d *PostgreSQLDialect) FTSUpsert(q querier, doc FTSDoc) error {
-	subject := truncateBytesRuneSafe(doc.Subject)
-	body := truncateBytesRuneSafe(doc.Body)
-	fromAddr := truncateBytesRuneSafe(doc.FromAddr)
-	toAddrs := truncateBytesRuneSafe(doc.ToAddrs)
-	ccAddrs := truncateBytesRuneSafe(doc.CcAddrs)
-	charCap := strconv.Itoa(maxFTSBodyChars)
+	vector, args := pgFTSVector(doc)
 	_, err := q.Exec(
-		`UPDATE messages SET search_fts =
-			setweight(to_tsvector('simple', LEFT(COALESCE($2, ''), `+charCap+`)), 'A') ||
-			setweight(to_tsvector('simple', LEFT(COALESCE($4, ''), `+charCap+`)), 'B') ||
-			setweight(to_tsvector('simple', LEFT(COALESCE($5, ''), `+charCap+`)), 'C') ||
-			setweight(to_tsvector('simple', LEFT(COALESCE($6, ''), `+charCap+`)), 'C') ||
-			setweight(to_tsvector('simple', LEFT(COALESCE($3, ''), `+charCap+`)), 'D'),
+		`UPDATE messages SET search_fts = `+vector+`,
 			indexing_version = `+strconv.Itoa(CurrentFTSIndexingVersion)+`
 		WHERE id = $1`,
-		doc.MessageID, subject, body,
-		fromAddr, toAddrs, ccAddrs,
+		args...,
 	)
 	return err
+}
+
+// FTSMatches compares the stored tsvector with the one FTSUpsert would write.
+func (d *PostgreSQLDialect) FTSMatches(q querier, doc FTSDoc) (bool, error) {
+	vector, args := pgFTSVector(doc)
+	var matches bool
+	err := q.QueryRow(
+		`SELECT COALESCE(search_fts = `+vector+`
+			AND indexing_version = `+strconv.Itoa(CurrentFTSIndexingVersion)+`, FALSE)
+		FROM messages WHERE id = $1`,
+		args...,
+	).Scan(&matches)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return matches, err
+}
+
+// pgFTSVector returns the bounded tsvector expression for doc and its
+// arguments, with $1 bound to doc.MessageID.
+func pgFTSVector(doc FTSDoc) (string, []any) {
+	charCap := strconv.Itoa(maxFTSBodyChars)
+	vector := `setweight(to_tsvector('simple', LEFT(COALESCE($2, ''), ` + charCap + `)), 'A') ||
+			setweight(to_tsvector('simple', LEFT(COALESCE($4, ''), ` + charCap + `)), 'B') ||
+			setweight(to_tsvector('simple', LEFT(COALESCE($5, ''), ` + charCap + `)), 'C') ||
+			setweight(to_tsvector('simple', LEFT(COALESCE($6, ''), ` + charCap + `)), 'C') ||
+			setweight(to_tsvector('simple', LEFT(COALESCE($3, ''), ` + charCap + `)), 'D')`
+	return vector, []any{
+		doc.MessageID,
+		truncateBytesRuneSafe(doc.Subject),
+		truncateBytesRuneSafe(doc.Body),
+		truncateBytesRuneSafe(doc.FromAddr),
+		truncateBytesRuneSafe(doc.ToAddrs),
+		truncateBytesRuneSafe(doc.CcAddrs),
+	}
 }
 
 // FTSSearchClause returns SQL fragments for tsvector full-text search.
@@ -621,6 +645,7 @@ func (d *PostgreSQLDialect) FTSRebuildSchema(ctx context.Context, q contextQueri
 //	TEXT → TEXT, DATETIME → TIMESTAMPTZ, JSON → JSONB.
 func (d *PostgreSQLDialect) LegacyColumnMigrations() []ColumnMigration {
 	return []ColumnMigration{
+		{`ALTER TABLE person_match_judgment_cursor ADD COLUMN IF NOT EXISTS started_at_zero BOOLEAN NOT NULL DEFAULT FALSE`, "person_match_judgment_cursor.started_at_zero"},
 		{`ALTER TABLE carddav_publications ADD COLUMN IF NOT EXISTS outgoing_envelope_metadata BYTEA`, "carddav_publications.outgoing_envelope_metadata"},
 		{`ALTER TABLE carddav_publications ADD COLUMN IF NOT EXISTS approved_body_sha256 TEXT`, "carddav_publications.approved_body_sha256"},
 		{`ALTER TABLE carddav_publications ADD COLUMN IF NOT EXISTS approved_inference_revision BIGINT`, "carddav_publications.approved_inference_revision"},
@@ -710,6 +735,9 @@ func (d *PostgreSQLDialect) LegacyColumnMigrations() []ColumnMigration {
 		{`ALTER TABLE attachments ADD COLUMN IF NOT EXISTS role_source TEXT NOT NULL DEFAULT 'unknown' CHECK (role_source IN ('mime_disposition', 'provider_explicit', 'importer_semantics', 'legacy_api', 'raw_mime_repair', 'unknown'))`, "attachments.role_source"},
 		{`ALTER TABLE attachments ADD COLUMN IF NOT EXISTS source_part_key TEXT CHECK (source_part_key IS NULL OR source_part_key != '')`, "attachments.source_part_key"},
 		{`ALTER TABLE attachments ADD COLUMN IF NOT EXISTS content_id TEXT`, "attachments.content_id"},
+		{`ALTER TABLE document_extraction_profiles ADD COLUMN IF NOT EXISTS include_inline BOOLEAN NOT NULL DEFAULT FALSE`, "document_extraction_profiles.include_inline"},
+		{`ALTER TABLE document_extractions ADD COLUMN IF NOT EXISTS failure_reason TEXT`, "document_extractions.failure_reason"},
+		{`ALTER TABLE document_extractions ADD COLUMN IF NOT EXISTS failure_detail TEXT`, "document_extractions.failure_detail"},
 		{`ALTER TABLE document_extractions ADD COLUMN IF NOT EXISTS rebuild_id TEXT REFERENCES document_extraction_rebuilds(id) ON DELETE SET NULL`, "document_extractions.rebuild_id"},
 		{`ALTER TABLE document_extractions ADD COLUMN IF NOT EXISTS request_count INTEGER NOT NULL DEFAULT 0 CHECK (request_count >= 0)`, "document_extractions.request_count"},
 		{`ALTER TABLE document_extractions ADD COLUMN IF NOT EXISTS retry_count INTEGER NOT NULL DEFAULT 0 CHECK (retry_count >= 0 AND retry_count <= request_count)`, "document_extractions.retry_count"},
@@ -2221,6 +2249,12 @@ func (d *PostgreSQLDialect) SchemaFiles() []string {
 // CheckpointWAL is a no-op for PostgreSQL (no WAL checkpoint needed).
 func (d *PostgreSQLDialect) CheckpointWAL(db *sql.DB) error { return nil }
 
+// CheckpointWALContext is a no-op for PostgreSQL.
+func (d *PostgreSQLDialect) CheckpointWALContext(ctx context.Context, db *sql.DB) error { return nil }
+
+// CheckpointWALPassive is a no-op for PostgreSQL.
+func (d *PostgreSQLDialect) CheckpointWALPassive(ctx context.Context, db *sql.DB) error { return nil }
+
 // SchemaStaleCheck returns the SQL to check whether migrations are needed.
 // PostgreSQL uses information_schema instead of pragma_table_info.
 func (d *PostgreSQLDialect) SchemaStaleCheck() string {
@@ -2315,6 +2349,7 @@ func (d *PostgreSQLDialect) IsFTSValueTooLargeError(err error) bool {
 var exclusiveLockTables = []string{
 	"sync_runs", "sources", "conversations", "conversation_participants",
 	"messages", "message_recipients", "message_labels", "message_bodies", "message_raw",
+	"meeting_details", "meeting_action_items",
 	"attachments", "document_occurrences", "labels", "participants", "participant_identifiers", "reactions",
 	"participant_contact_observations", identityMatchCandidatesTableName, identityMatchCandidateSourcesTableName,
 	identityMatchEvidenceTableName, identityMatchEvidenceSourcesTableName,
@@ -2331,7 +2366,7 @@ var exclusiveLockTables = []string{
 	"collections", "collection_sources", "account_identities", "applied_migrations",
 	"sync_operations",
 	"source_import_items", "sync_run_items", "sync_checkpoints",
-	"imap_folder_state", "imap_message_memberships",
+	"imap_folder_state", "imap_message_memberships", "imap_drafts", "gmail_drafts", "chat_drafts", "beeper_drafts",
 }
 
 // BeginExclusive opens a transaction on conn and locks every table the

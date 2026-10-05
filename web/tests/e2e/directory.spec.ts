@@ -1,6 +1,7 @@
 import AxeBuilder from '@axe-core/playwright';
 import { expect, test, type Page } from '@playwright/test';
 
+import { parseExploreURLState } from '../../src/lib/explore/state.svelte';
 import { installMixedArchive } from './fixtures/mixed-archive';
 
 function directoryURL(personID?: number): string {
@@ -15,7 +16,24 @@ async function expectNoAxeViolations(page: Page, label: string): Promise<void> {
     .toEqual([]);
 }
 
-test('Directory lists durable people, opens split detail, and scopes Media & Files to the durable person', async ({ page }) => {
+async function installTallDirectory(page: Page): Promise<void> {
+  await page.unroute('**/api/v1/people/directory*');
+  await page.route('**/api/v1/people/directory*', (route) => route.fulfill({
+    json: {
+      people: Array.from({ length: 40 }, (_, index) => ({
+        id: index === 0 ? 42 : 100 + index,
+        revision: 1,
+        display_name: index === 0 ? 'Archive Person' : `Synthetic Person ${index}`,
+        primary_channel: 'email',
+        contact_state: 'active',
+        categories: [],
+        organizations: []
+      }))
+    }
+  }));
+}
+
+test('Directory lists durable people, opens split detail, and scopes Media & files to the durable person', async ({ page }) => {
   const requests: string[] = [];
   page.on('request', (request) => requests.push(new URL(request.url()).pathname));
   await installMixedArchive(page);
@@ -32,17 +50,162 @@ test('Directory lists durable people, opens split detail, and scopes Media & Fil
   await expect(page.getByRole('complementary', { name: 'Person detail' })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Archive Person' })).toBeVisible();
   const overview = page.getByRole('tab', { name: 'Overview' });
-  const media = page.getByRole('tab', { name: 'Media & Files' });
+  const media = page.getByRole('tab', { name: 'Media & files' });
+  const maintenanceTab = page.getByRole('tab', { name: 'Maintenance' });
   await overview.focus();
   await page.keyboard.press('End');
+  await expect(maintenanceTab).toBeFocused();
+  await expect(maintenanceTab).toHaveAttribute('aria-selected', 'true');
+  await page.keyboard.press('ArrowLeft');
   await expect(media).toBeFocused();
   await expect(media).toHaveAttribute('aria-selected', 'true');
-  await expect(page.getByRole('tabpanel', { name: 'Media & Files' })).toBeVisible();
+  await expect(page.getByRole('tabpanel', { name: 'Media & files' })).toBeVisible();
   await expect(page.getByRole('grid', { name: 'Files results' }).getByText('durable-person.pdf')).toBeVisible();
   expect(requests).toContain('/api/v1/people/42/files/search');
   expect(requests).not.toContain('/api/v1/participants/42/files/search');
   expect(requests).not.toContain('/api/v1/files/search');
   await expectNoAxeViolations(page, 'Directory split media detail');
+});
+
+test('Directory keeps a one-sided last contacted date as a chip across reload until it is removed', async ({ page }) => {
+  await installMixedArchive(page);
+  const afterBoundaries: Array<string | null> = [];
+  page.on('request', (request) => {
+    const url = new URL(request.url());
+    if (url.pathname === '/api/v1/people/directory') afterBoundaries.push(url.searchParams.get('last_contact_after'));
+  });
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await page.goto(directoryURL());
+
+  const directory = page.getByRole('main', { name: 'Directory' });
+  await expect(directory.getByRole('row', { name: /Archive Person/ })).toBeVisible();
+  await directory.getByRole('button', { name: 'Filters' }).click();
+  const panel = directory.getByRole('group', { name: 'Directory filters' });
+  const chip = directory.getByRole('button', { name: 'Remove Last contacted after Jan 1, 2026 filter' });
+  await expect(chip).toHaveCount(0);
+
+  await panel.getByLabel('Last contacted after', { exact: true }).fill('2026-01-01');
+  await expect(chip).toBeVisible();
+  await expect(directory.getByRole('button', { name: /^Remove Last contacted before/ })).toHaveCount(0);
+  await expect.poll(() => afterBoundaries.at(-1)).toBe('2026-01-01T00:00:00Z');
+  expect(parseExploreURLState(new URL(page.url()).search).directoryLastContactAfter).toBe('2026-01-01');
+
+  await page.reload();
+  await expect(chip).toBeVisible();
+  await expect.poll(() => afterBoundaries.at(-1)).toBe('2026-01-01T00:00:00Z');
+  await directory.getByRole('button', { name: 'Filters' }).click();
+  await expect(panel.getByLabel('Last contacted after', { exact: true })).toHaveValue('2026-01-01');
+
+  await chip.click();
+  await expect(chip).toHaveCount(0);
+  await expect(panel.getByLabel('Last contacted after', { exact: true })).toHaveValue('');
+  await expect.poll(() => afterBoundaries.at(-1)).toBeNull();
+  expect(parseExploreURLState(new URL(page.url()).search).directoryLastContactAfter).toBe('');
+});
+
+test('Person page opens the relationship and the facts review for the same person', async ({ page }) => {
+  await installMixedArchive(page);
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await page.goto(directoryURL(42));
+
+  const detail = page.getByRole('complementary', { name: 'Person detail' });
+  await expect(detail.getByRole('heading', { name: 'Archive Person' })).toBeVisible();
+  await detail.getByRole('button', { name: 'Open relationship' }).click();
+  await expect(page.getByRole('main', { name: 'Relationships' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Archive Person' })).toBeVisible();
+  expect(parseExploreURLState(new URL(page.url()).search).relationshipTarget).toBe('cluster:12');
+
+  await page.goBack();
+  await expect(detail.getByRole('heading', { name: 'Archive Person' })).toBeVisible();
+  await detail.getByRole('button', { name: 'Review facts' }).click();
+  await expect(page.getByRole('main', { name: 'Reviews' })).toBeVisible();
+  await expect(page.getByRole('radio', { name: 'Facts' })).toBeChecked();
+  const fact = page.getByRole('region', { name: 'Facts' });
+  await expect(fact.getByRole('button', { name: 'Person: Archive Person' })).toBeVisible();
+  expect(parseExploreURLState(new URL(page.url()).search).directoryPersonID).toBe(42);
+});
+
+test('Person tabs stay on one line at phone width', async ({ page }) => {
+  await installMixedArchive(page);
+  await page.setViewportSize({ width: 420, height: 860 });
+  await page.goto(directoryURL(42));
+
+  const drawer = page.getByRole('dialog', { name: 'Person detail' });
+  const tabs = drawer.getByRole('tab');
+  await expect(tabs).toHaveCount(7);
+  const offsets = await tabs.evaluateAll((elements) => elements.map((element) => (element as HTMLElement).offsetTop));
+  expect(new Set(offsets).size).toBe(1);
+});
+
+test('Directory person detail scrolls independently at desktop width', async ({ page }) => {
+  await installMixedArchive(page);
+  await installTallDirectory(page);
+  await page.setViewportSize({ width: 1280, height: 600 });
+  await page.goto(directoryURL(42));
+  const pane = page.getByRole('complementary', { name: 'Person detail' });
+  await expect(pane.getByRole('heading', { name: 'Archive Person' })).toBeVisible();
+  await pane.getByRole('tab', { name: 'Maintenance' }).click();
+  const metrics = await pane.evaluate((el) => ({
+    scroll: el.scrollHeight,
+    client: el.clientHeight,
+    overflow: getComputedStyle(el).overflowY
+  }));
+  expect(metrics.scroll).toBeGreaterThan(metrics.client);
+  expect(metrics.overflow).toBe('auto');
+  await pane.evaluate((el) => el.scrollTo(0, el.scrollHeight));
+  expect(await pane.evaluate((el) => el.scrollTop)).toBeGreaterThan(0);
+  await expect(page.getByRole('region', { name: 'Person merge history' }).or(pane.locator('section').last())).toBeInViewport();
+
+  const directory = page.getByRole('main', { name: 'Directory' });
+  const list = directory.getByRole('region', { name: 'Directory results' });
+  const toolbar = directory.getByRole('heading', { level: 1, name: 'Directory' });
+  const filters = directory.locator('.directory-toolbar');
+  const before = { toolbar: await toolbar.boundingBox(), filters: await filters.boundingBox() };
+  const listMetrics = await list.evaluate((el) => ({ scroll: el.scrollHeight, client: el.clientHeight, overflow: getComputedStyle(el).overflowY }));
+  expect(listMetrics.scroll).toBeGreaterThan(listMetrics.client);
+  expect(listMetrics.overflow).toBe('auto');
+  await list.evaluate((el) => el.scrollTo(0, el.scrollHeight));
+  expect(await list.evaluate((el) => el.scrollTop)).toBeGreaterThan(0);
+  expect((await toolbar.boundingBox())?.y).toBe(before.toolbar?.y);
+  expect((await filters.boundingBox())?.y).toBe(before.filters?.y);
+});
+
+test('Directory list stays in its flexible row when a promotion alert appears', async ({ page }) => {
+  await installMixedArchive(page);
+  await installTallDirectory(page);
+  await page.setViewportSize({ width: 1280, height: 720 });
+  await page.goto('/');
+  await page.getByRole('grid', { name: 'Relationship results' }).getByText('Archive Person').click();
+  await page.getByRole('button', { name: 'Open in Directory' }).click();
+  const directory = page.getByRole('main', { name: 'Directory' });
+  await expect(directory.getByRole('button', { name: 'Promote to person' })).toBeVisible();
+
+  async function expectContentContained(): Promise<void> {
+    const metrics = await directory.evaluate((root) => {
+      const content = root.querySelector('.directory-content');
+      if (!(content instanceof HTMLElement)) throw new Error('Directory content missing');
+      return {
+        rootBottom: root.getBoundingClientRect().bottom,
+        contentBottom: content.getBoundingClientRect().bottom,
+        contentHeight: content.getBoundingClientRect().height
+      };
+    });
+    expect(metrics.contentHeight).toBeGreaterThan(0);
+    expect(metrics.contentBottom).toBeLessThanOrEqual(metrics.rootBottom + 1);
+    const list = directory.getByRole('region', { name: 'Directory results' });
+    const listMetrics = await list.evaluate((el) => ({ scroll: el.scrollHeight, client: el.clientHeight, overflow: getComputedStyle(el).overflowY }));
+    expect(listMetrics.scroll).toBeGreaterThan(listMetrics.client);
+    expect(listMetrics.overflow).toBe('auto');
+  }
+
+  await expectContentContained();
+  await page.route('**/api/v1/people', (route) => route.fulfill({
+    status: 409,
+    json: { error: 'person_binding_conflict', message: 'Synthetic promotion conflict.' }
+  }));
+  await directory.getByRole('button', { name: 'Promote to person' }).click();
+  await expect(directory.getByRole('alert')).toContainText('Synthetic promotion conflict.');
+  await expectContentContained();
 });
 
 test('Directory opens selected detail in an accessible narrow drawer', async ({ page }) => {
@@ -65,6 +228,7 @@ test('Directory profile maintenance uses exact safe requests and GET-only ambigu
   const archive = await installMixedArchive(page);
   await page.setViewportSize({ width: 1280, height: 900 });
   await page.goto(directoryURL(42));
+  await page.getByRole('tab', { name: 'Maintenance' }).click();
 
   const maintenance = page.getByRole('region', { name: 'Profile maintenance' });
   await expect(maintenance).toBeVisible();
@@ -92,6 +256,7 @@ test('Directory profile maintenance uses exact safe requests and GET-only ambigu
   await expect(toggle).toBeFocused();
 
   const reveal = maintenance.getByRole('button', { name: 'Show sensitive eligible fields' });
+  await expect(reveal).toBeEnabled();
   await reveal.focus();
   await page.keyboard.press('Enter');
   await expect(maintenance.getByText('Private note')).toBeVisible();
@@ -109,8 +274,14 @@ test('Directory profile maintenance uses exact safe requests and GET-only ambigu
   ]);
 
   await page.setViewportSize({ width: 390, height: 844 });
-  await expect(maintenance.getByText('Time zone')).toBeVisible();
-  await maintenance.getByRole('button', { name: 'Show sensitive eligible fields' }).focus();
+  const drawer = page.getByRole('dialog', { name: 'Person detail' });
+  await drawer.getByRole('tab', { name: 'Maintenance' }).click();
+  const drawerMaintenance = drawer.getByRole('region', { name: 'Profile maintenance' });
+  await expect(drawerMaintenance.getByText('Time zone')).toBeVisible();
+  const drawerReveal = drawerMaintenance.getByRole('button', { name: 'Show sensitive eligible fields' });
+  await expect(drawerReveal).toBeEnabled();
+  await drawerReveal.focus();
+  await expect(drawerReveal).toBeFocused();
   await page.keyboard.press('Enter');
   await expect(maintenance.getByText('Private note')).toBeVisible();
   const targetCards = maintenance.locator('li');

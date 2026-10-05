@@ -1,5 +1,5 @@
 import { expect, test } from '@playwright/test';
-import { selectKitOption, selectKitTopBarTab, setKitTheme } from './kit-ui';
+import { selectWorkspace, setKitTheme, setTemporaryDensity } from './kit-ui';
 
 const row = {
   key: 'message:1',
@@ -12,7 +12,7 @@ const row = {
   source_id: 1,
   source_identifier: 'archive@example.com',
   source_type: 'synthetic',
-  participant_labels: ['Example Person'],
+  participant_labels: ['Example Person With A Long Archive Display Name'],
   participant_ids: [1],
   attachment_count: 1,
   attachment_size: 2048,
@@ -55,7 +55,7 @@ test.beforeEach(async ({ page }) => {
         id: 1, key: 'file:1', entry_key: 'message:1', message_id: 1, conversation_id: 1,
         occurred_at: '2026-07-18T12:00:00Z', source_id: 1, source_type: 'synthetic',
         source_identifier: 'archive@example.com', containing_title: 'Synthetic archive subject',
-        filename: 'synthetic.pdf', mime_type: 'application/pdf', mime_family: 'pdf', size_bytes: 2048,
+        filename: 'SyntheticArchiveAttachmentWithAnUnbrokenDescriptiveFilename.pdf', mime_type: 'application/pdf', mime_family: 'pdf', size_bytes: 2048,
         content_state: 'missing_blob', content_available: false
       }],
       total_count: 1, cache_revision: 'cache-theme', search_provenance: {}
@@ -63,6 +63,43 @@ test.beforeEach(async ({ page }) => {
   }));
   await page.goto(`/?explore=${encodeURIComponent(JSON.stringify({ workspace: 'everything' }))}`);
   await expect(page.getByText('Synthetic archive subject')).toBeVisible();
+});
+
+test('compact workspace links preserve browser navigation and reopen the selected tab', async ({ page }) => {
+  await selectWorkspace(page, 'Files');
+  await expect(page.getByText('SyntheticArchiveAttachmentWithAnUnbrokenDescriptiveFilename.pdf', { exact: true })).toBeVisible();
+  await expect(page).toHaveURL(/\?workspace=files&mode=full_text$/);
+  const filesURL = page.url();
+
+  await selectWorkspace(page, 'Everything');
+  await expect(page.getByText('Synthetic archive subject', { exact: true })).toBeVisible();
+  await expect(page).toHaveURL(/\?workspace=everything&mode=full_text$/);
+  await page.goBack();
+  await expect(page.getByText('SyntheticArchiveAttachmentWithAnUnbrokenDescriptiveFilename.pdf', { exact: true })).toBeVisible();
+  await page.goto(filesURL);
+  await expect(page.getByText('SyntheticArchiveAttachmentWithAnUnbrokenDescriptiveFilename.pdf', { exact: true })).toBeVisible();
+});
+
+test('query failures explain recovery in Everything and Files', async ({ page }) => {
+  const failure = {
+    error: 'query_resource_exhausted',
+    message: 'This query ran out of memory or temporary disk space. Try narrowing the results with filters. ' +
+      'The person running msgvault can check available resources and increase analytics.query_memory_limit ' +
+      'or analytics.query_temp_limit in config.toml, then restart the server.',
+  };
+  await page.route('**/api/v1/explore', (route) => route.fulfill({ status: 503, json: failure }));
+  const failFiles = (route: import('@playwright/test').Route) => route.fulfill({ status: 503, json: failure });
+  await page.route('**/api/v1/files/search', failFiles);
+  await page.reload();
+  await expect(page.getByRole('alert')).toContainText('analytics.query_memory_limit');
+  await expect(page.getByRole('alert')).toContainText('restart the server');
+
+  await selectWorkspace(page, 'Files');
+  await expect(page.getByRole('alert')).toContainText('analytics.query_temp_limit');
+  await expect(page.getByText('0 files', { exact: true })).toHaveCount(0);
+  await page.unroute('**/api/v1/files/search', failFiles);
+  await page.getByRole('button', { name: 'Retry request' }).click();
+  await expect(page.getByText('SyntheticArchiveAttachmentWithAnUnbrokenDescriptiveFilename.pdf', { exact: true })).toBeVisible();
 });
 
 test('one registry drives selection, searchable help, palette, and editable suspension', async ({ page }) => {
@@ -152,10 +189,10 @@ for (const theme of ['light', 'dark'] as const) {
     expect(requiredRoles.filter(([, value]) => !value)).toEqual([]);
     await expectRenderedContrast(page.locator('[data-row-key="message:1"] strong'), 4.5);
 
-    const infoButton = page.getByRole('button', { name: 'Search', exact: true });
-    await expect(infoButton).toHaveClass(/kit-button--solid/);
-    await expect(infoButton).toHaveClass(/kit-button--info/);
-    await expectRenderedContrast(infoButton, 4.5);
+    const searchButton = page.getByRole('button', { name: 'Search', exact: true });
+    await expect(searchButton).toHaveClass(/kit-button--soft/);
+    await expect(searchButton).toHaveClass(/kit-button--neutral/);
+    await expectRenderedContrast(searchButton, 4.5);
 
     const grid = page.getByRole('grid', { name: 'Everything results' });
     await grid.focus();
@@ -172,19 +209,24 @@ for (const theme of ['light', 'dark'] as const) {
     await expect(activeOption).toHaveClass(/highlighted/);
     await page.keyboard.press('Escape');
 
-    await selectKitTopBarTab(page, 'Saved Views');
-    const workflowButton = page.getByRole('button', { name: 'Save', exact: true });
-    await expect(workflowButton).toHaveClass(/kit-button--solid/);
-    await expect(workflowButton).toHaveClass(/kit-button--workflow/);
-    await expectRenderedContrast(workflowButton, 4.5);
+    await page.getByRole('button', { name: 'Save view…' }).click();
+    const saveDialog = page.getByRole('dialog', { name: 'Save view' });
+    await saveDialog.getByRole('textbox', { name: 'Name' }).fill('Contrast check');
+    const saveButton = saveDialog.getByRole('button', { name: 'Save', exact: true });
+    await expect(saveButton).toBeEnabled();
+    await expect(saveButton).toHaveClass(/kit-button--solid/);
+    await expect(saveButton).toHaveClass(/kit-button--info/);
+    await expectRenderedContrast(saveButton, 4.5);
+    await saveDialog.getByRole('button', { name: 'Cancel' }).click();
+    await expect(saveDialog).toHaveCount(0);
 
-    await selectKitTopBarTab(page, 'Files');
+    await selectWorkspace(page, 'Files');
     const filesGrid = page.getByRole('grid', { name: 'Files results' });
     await filesGrid.focus();
     await page.keyboard.press('ArrowDown');
     await expect(filesGrid).toHaveCSS('box-shadow', /0px 0px 0px 2px inset/);
 
-    await selectKitTopBarTab(page, 'Settings');
+    await selectWorkspace(page, 'Settings');
     const settings = page.getByRole('main', { name: 'Settings' });
     await expect(settings).toBeVisible();
     await expectRenderedContrast(settings.locator('.row__hint').first(), 4.5);
@@ -197,7 +239,7 @@ for (const theme of ['light', 'dark'] as const) {
   for (const density of ['compact', 'comfortable'] as const) {
     test(`${theme} ${density} analytical shell geometry`, async ({ page }) => {
       await setKitTheme(page, theme);
-      await selectKitOption(page, 'Temporary density', `Density: ${density === 'compact' ? 'Compact' : 'Comfortable'}`);
+      await setTemporaryDensity(page, density === 'compact' ? 'Compact' : 'Comfortable');
       await expect(page.locator('html')).toHaveAttribute('data-density', density);
       await expect(page.locator('[data-row-key="message:1"]')).toHaveCSS(
         'height', density === 'compact' ? '36px' : '46px'
@@ -249,3 +291,89 @@ function measureRenderedContrast(
   const values = [luminance(foreground), luminance(background)].sort((a, b) => b - a);
   return (values[0]! + 0.05) / (values[1]! + 0.05);
 }
+
+test('Deletions keeps the global search shortcut available', async ({ page }) => {
+  await page.route('**/api/v1/deletions', route => route.fulfill({ json: { manifests: [] } }));
+  await selectWorkspace(page, 'Deletions');
+  await expect(page.getByRole('heading', { name: 'Deletions', exact: true })).toBeVisible();
+  await page.keyboard.press('/');
+  await expect(page.getByRole('searchbox', { name: 'Search everything' })).toBeFocused();
+});
+
+test('truncated people and filenames disclose full labels on hover', async ({ page }) => {
+  const people = page.locator('.cell--people .kit-tooltip-trigger').first();
+  await people.hover();
+  await expect(page.getByRole('tooltip')).toHaveText('Example Person With A Long Archive Display Name');
+  await expect(page.getByRole('tooltip')).toBeInViewport();
+  await page.keyboard.press('Escape');
+  await selectWorkspace(page, 'Files');
+  const filename = page.getByRole('grid', { name: 'Files results' }).locator('.kit-tooltip-trigger').first();
+  await filename.hover();
+  const tooltip = page.getByRole('tooltip');
+  await expect(tooltip).toHaveText('SyntheticArchiveAttachmentWithAnUnbrokenDescriptiveFilename.pdf');
+  await expect(tooltip).toBeInViewport();
+  expect(await tooltip.evaluate(element => element.scrollWidth - element.clientWidth)).toBeLessThanOrEqual(1);
+  const bounds = await tooltip.boundingBox();
+  const trigger = await filename.boundingBox();
+  expect(Math.abs(bounds!.y - trigger!.y)).toBeLessThan(100);
+});
+
+test('clicking a people label preserves Everything keyboard navigation and one grid tab stop', async ({ page }) => {
+  await page.route('**/api/v1/explore', route => route.fulfill({ json: {
+    rows: [row, { ...row, key: 'message:2', title: 'Second archive subject' }],
+    total_count: 2, cache_revision: 'cache-theme', search_provenance: {}
+  } }));
+  await page.reload();
+  const grid = page.getByRole('grid', { name: 'Everything results' });
+  await grid.locator('.people-label').first().click();
+  await expect(grid).toBeFocused();
+  await page.keyboard.press('j');
+  await expect(grid).toHaveAttribute('aria-activedescendant', 'everything-row-message-3a-2');
+  await page.keyboard.press('ArrowUp');
+  await expect(grid).toHaveAttribute('aria-activedescendant', 'everything-row-message-3a-1');
+  await page.keyboard.press('ArrowDown');
+  await page.keyboard.press('Enter');
+  await expect(page.getByRole('complementary', { name: 'Reading pane: Second archive subject' })).toBeVisible();
+  await page.keyboard.press('Escape');
+  await expect(grid).toBeFocused();
+  await page.keyboard.press('Tab');
+  await expect.poll(() => grid.evaluate(element => element.contains(document.activeElement))).toBe(false);
+});
+
+test('clicking a filename returns to Files keyboard navigation without extra row tab stops', async ({ page }) => {
+  const files = [1, 2].map(id => ({
+    id, key: `file:${id}`, entry_key: `message:${id}`, message_id: id, conversation_id: id,
+    occurred_at: '2026-07-18T12:00:00Z', source_id: 1, source_type: 'synthetic',
+    source_identifier: 'archive@example.com', containing_title: `Containing item ${id}`,
+    filename: `Attachment ${id}.pdf`, mime_type: 'application/pdf', mime_family: 'pdf', size_bytes: 2048,
+    content_state: 'missing_blob', content_available: false
+  }));
+  await page.route('**/api/v1/files/search', route => route.fulfill({ json: {
+    files, total_count: 2, cache_revision: 'cache-theme', search_provenance: {}
+  } }));
+  for (const file of files) {
+    await page.route(`**/api/v1/files/${file.id}`, route => route.fulfill({ json: file }));
+  }
+  await selectWorkspace(page, 'Files');
+  const grid = page.getByRole('grid', { name: 'Files results' });
+  await grid.getByText('Attachment 1.pdf', { exact: true }).click();
+  await expect(page.getByRole('dialog', { name: 'View Attachment 1.pdf' })).toBeVisible();
+  await page.keyboard.press('Escape');
+  await expect(grid).toBeFocused();
+  await page.keyboard.press('j');
+  await expect(grid).toHaveAttribute('aria-activedescendant', 'file-row-2');
+  await page.keyboard.press('k');
+  await expect(grid).toHaveAttribute('aria-activedescendant', 'file-row-1');
+  await page.keyboard.press('ArrowDown');
+  await page.keyboard.press('Enter');
+  await expect(page.getByRole('dialog', { name: 'View Attachment 2.pdf' })).toBeVisible();
+  await page.keyboard.press('Escape');
+  await expect(grid).toBeFocused();
+  for (const label of ['Sort by date', 'Sort by filename', 'Sort by size',
+    'Open containing item Containing item 1', 'Open containing item Containing item 2']) {
+    await page.keyboard.press('Tab');
+    await expect(grid.getByRole('button', { name: label, exact: true })).toBeFocused();
+  }
+  await page.keyboard.press('Tab');
+  await expect.poll(() => grid.evaluate(element => element.contains(document.activeElement))).toBe(false);
+});

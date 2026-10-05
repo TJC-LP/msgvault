@@ -6,6 +6,7 @@ import (
 	"encoding/json/v2"
 	"errors"
 	"fmt"
+	"net/mail"
 	"strconv"
 	"strings"
 	"time"
@@ -15,11 +16,11 @@ import (
 	"go.kenn.io/msgvault/internal/config"
 	imaplib "go.kenn.io/msgvault/internal/imap"
 	"go.kenn.io/msgvault/internal/mime"
+	"go.kenn.io/msgvault/internal/sourceops"
 	"go.kenn.io/msgvault/internal/store"
 )
 
 var (
-	errDraftReplyFromRequired = errors.New("--from is required")
 	errDraftReplyBodyRequired = errors.New("--body is required")
 )
 
@@ -29,23 +30,32 @@ const (
 )
 
 type draftReplyIntent struct {
-	MessageID int64
-	From      string
-	Body      string
-	JSON      bool
+	MessageID   int64
+	From        string
+	Body        string
+	JSON        bool
+	ReplyAll    bool
+	Account     string
+	SourceID    int64
+	SourceIDSet bool
 }
 
 // draftReplyTarget is the archived parent message and the granted source
 // mailbox that will hold the reply.
 type draftReplyTarget struct {
-	parent  *store.APIMessage
-	source  *store.Source
-	mailbox string
-	raw     []byte
+	parent           *store.APIMessage
+	parentSource     *store.Source
+	source           *store.Source
+	mailbox          string
+	raw              []byte
+	forward          bool
+	attachmentWrites *[]store.AttachmentWrite
 }
 
 type draftReplyOutput struct {
 	Status          string `json:"status"`
+	DraftID         string `json:"draft_id,omitempty"`
+	Revision        int64  `json:"revision,omitzero"`
 	MessageID       int64  `json:"message_id,omitzero"`
 	OperationRef    string `json:"operation_ref"`
 	RFC822MessageID string `json:"rfc822_message_id"`
@@ -75,7 +85,7 @@ func parseDraftReplyArgs(args []string) (draftReplyIntent, error) {
 	}
 	var intent draftReplyIntent
 	var positional string
-	var fromSet, bodySet, jsonSet bool
+	var fromSet, bodySet, jsonSet, allSet, accountSet, sourceIDSet bool
 	rest := args[1:]
 	for len(rest) > 0 {
 		arg := rest[0]
@@ -90,21 +100,39 @@ func parseDraftReplyArgs(args []string) (draftReplyIntent, error) {
 		}
 		name, value, hasValue := strings.Cut(nameValue, "=")
 		switch name {
-		case "from", "body":
+		case draftFromFlag, "body", "account", "source-id":
 			if !hasValue {
 				if len(rest) == 0 {
 					return invalidDraftReplyArgs("--%s requires a value", name)
 				}
 				value, rest = rest[0], rest[1:]
 			}
-			if (name == "from" && fromSet) || (name == "body" && bodySet) {
+			if (name == draftFromFlag && fromSet) || (name == "body" && bodySet) ||
+				(name == "account" && accountSet) || (name == "source-id" && sourceIDSet) {
 				return invalidDraftReplyArgs("--%s given more than once", name)
 			}
-			if name == "from" {
+			switch name {
+			case draftFromFlag:
 				intent.From, fromSet = value, true
-			} else {
+			case "body":
 				intent.Body, bodySet = value, true
+			case "account":
+				if strings.TrimSpace(value) == "" {
+					return invalidDraftReplyArgs("--account must not be empty")
+				}
+				intent.Account, accountSet = strings.TrimSpace(value), true
+			case "source-id":
+				id, parseErr := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+				if parseErr != nil || id <= 0 {
+					return invalidDraftReplyArgs("source ID must be a positive integer")
+				}
+				intent.SourceID, intent.SourceIDSet, sourceIDSet = id, true, true
 			}
+		case "all":
+			if allSet || (hasValue && value != "true") {
+				return invalidDraftReplyArgs("--all accepts one flag without a value")
+			}
+			intent.ReplyAll, allSet = true, true
 		case "json":
 			if jsonSet {
 				return invalidDraftReplyArgs("--json given more than once")
@@ -124,8 +152,8 @@ func parseDraftReplyArgs(args []string) (draftReplyIntent, error) {
 			return invalidDraftReplyArgs("unknown flag --%s", name)
 		}
 	}
-	if !fromSet || intent.From == "" {
-		return invalidDraftReplyArgs("--from is required")
+	if fromSet && intent.From == "" {
+		return invalidDraftReplyArgs("--from must not be empty")
 	}
 	if !bodySet {
 		return invalidDraftReplyArgs("--body is required")
@@ -135,6 +163,9 @@ func parseDraftReplyArgs(args []string) (draftReplyIntent, error) {
 		return invalidDraftReplyArgs("message ID must be a positive integer")
 	}
 	intent.MessageID = id
+	if intent.SourceIDSet && intent.Account != "" {
+		return invalidDraftReplyArgs("--account and --source-id are mutually exclusive")
+	}
 	return intent, nil
 }
 
@@ -161,13 +192,187 @@ func authorizeIMAPDraft(policy []config.IMAPDraftSource, sourceID int64, sourceT
 	return "", draftReplyError("draft_disabled", fmt.Errorf("source %d has no enabled [[imap.drafts]] grant", sourceID))
 }
 
-func hasConfirmedSourceIdentity(identities []store.AccountIdentity, address string) bool {
+func draftSourceRef(source *store.Source) agentgrant.SourceRef {
+	return agentgrant.SourceRef{ID: source.ID, Type: source.SourceType, Identifier: source.Identifier}
+}
+
+func parseDraftSender(value string) (*mail.Address, string, error) {
+	addresses, err := mail.ParseAddressList(strings.TrimSpace(value))
+	if err != nil || len(addresses) != 1 || addresses[0] == nil || addresses[0].Address == "" {
+		return nil, "", errors.New("expected exactly one mailbox identity")
+	}
+	address := addresses[0]
+	if !strings.Contains(address.Address, "@") || strings.ContainsAny(address.Address, "\r\n") {
+		return nil, "", errors.New("mailbox identity is malformed")
+	}
+	return address, store.NormalizeIdentifierForCompare(address.Address), nil
+}
+
+func confirmedDraftIdentities(identities []store.AccountIdentity) (map[string]string, []string) {
+	selected := make(map[string]string, len(identities))
+	all := make([]string, 0, len(identities))
 	for _, identity := range identities {
-		if !identity.ConfirmedAt.IsZero() && store.EqualIdentifier(identity.Address, address) {
-			return true
+		if identity.ConfirmedAt.IsZero() {
+			continue
+		}
+		address, key, err := parseDraftSender(identity.Address)
+		if err != nil {
+			continue
+		}
+		if _, seen := selected[key]; seen {
+			continue
+		}
+		selected[key] = address.String()
+		all = append(all, address.Address)
+	}
+	return selected, all
+}
+
+func (a *storeAPIAdapter) selectDraftSender(
+	identities []store.AccountIdentity,
+	requested string,
+	grant *agentgrant.Grant,
+	source *store.Source,
+) (string, []string, error) {
+	eligible, selfAddresses := confirmedDraftIdentities(identities)
+	ref := draftSourceRef(source)
+	if requested != "" {
+		address, key, err := parseDraftSender(requested)
+		if err != nil {
+			return "", nil, draftReplyError("invalid_from", err)
+		}
+		if _, ok := eligible[key]; !ok {
+			return "", nil, draftReplyError("invalid_from", errors.New("--from is not a confirmed identity on the selected source"))
+		}
+		if grant != nil && !grant.AllowsSender(agentgrant.PermissionDraftCreate, ref, key) {
+			return "", nil, draftReplyNotPermitted(errors.New("selected sender is not in the grant"))
+		}
+		return address.String(), selfAddresses, nil
+	}
+
+	candidates := make([]string, 0, len(eligible))
+	for key, value := range eligible {
+		if grant != nil && !grant.AllowsSender(agentgrant.PermissionDraftCreate, ref, key) {
+			continue
+		}
+		candidates = append(candidates, value)
+	}
+	if len(candidates) == 0 {
+		if grant != nil {
+			return "", nil, draftReplyNotPermitted(errors.New("the grant has no eligible sender identity on the selected source"))
+		}
+		return "", nil, draftReplyError("invalid_from", errors.New("the selected source has no confirmed mailbox identity"))
+	}
+	if len(candidates) > 1 {
+		return "", nil, draftReplyError("from_ambiguous", errors.New("--from is required when the selected source has multiple eligible identities"))
+	}
+	return candidates[0], selfAddresses, nil
+}
+
+// resolveDraftTarget performs source, grant, sender, policy, and provider
+// configuration checks before it reads an archived parent or opens IMAP.
+func (a *storeAPIAdapter) resolveDraftTarget(
+	ctx context.Context,
+	parentID *int64,
+	account string,
+	sourceID int64,
+	sourceIDSet bool,
+	requestedFrom string,
+	grant *agentgrant.Grant,
+) (draftReplyTarget, string, []string, error) {
+	var parentSource *store.Source
+	if parentID != nil {
+		var err error
+		parentSource, err = a.store.GetMessageSourceContext(ctx, *parentID)
+		if err != nil {
+			if grant != nil {
+				return draftReplyTarget{}, "", nil, draftReplyNotPermitted(errors.New("parent source is not available"))
+			}
+			return draftReplyTarget{}, "", nil, draftReplyError("invalid_parent", fmt.Errorf("load parent source: %w", err))
+		}
+		if err := authorizeDelegatedDraftSource(grant, parentSource); err != nil {
+			return draftReplyTarget{}, "", nil, err
 		}
 	}
-	return false
+
+	var source *store.Source
+	var err error
+	if sourceIDSet || strings.TrimSpace(account) != "" {
+		source, err = sourceops.ResolveExactOne(a.store, sourceops.Selector{
+			Account: account, SourceID: sourceID, SourceIDSet: sourceIDSet,
+		})
+		if err != nil {
+			if grant != nil {
+				return draftReplyTarget{}, "", nil, draftReplyNotPermitted(errors.New("destination source is not available"))
+			}
+			return draftReplyTarget{}, "", nil, draftReplyError("invalid_source", fmt.Errorf("resolve destination source: %w", err))
+		}
+	} else if parentSource != nil && (parentSource.SourceType == "imap" || parentSource.SourceType == "gmail") {
+		source = parentSource
+	} else if parentSource != nil {
+		return draftReplyTarget{}, "", nil, draftReplyError("invalid_source", errors.New("an offline parent requires --account or --source-id for a live IMAP destination"))
+	} else {
+		return draftReplyTarget{}, "", nil, draftReplyError("invalid_source", errors.New("--account or --source-id is required"))
+	}
+
+	if err := authorizeDelegatedDraftSource(grant, source); err != nil {
+		return draftReplyTarget{}, "", nil, err
+	}
+	identities, err := a.store.ListAccountIdentitiesContext(ctx, source.ID)
+	if err != nil {
+		return draftReplyTarget{}, "", nil, draftReplyError("invalid_from", fmt.Errorf("list identities for source %d: %w", source.ID, err))
+	}
+	from, selfAddresses, err := a.selectDraftSender(identities, requestedFrom, grant, source)
+	if err != nil {
+		return draftReplyTarget{}, "", nil, err
+	}
+	var mailbox string
+	switch source.SourceType {
+	case "imap":
+		mailbox, err = authorizeIMAPDraft(a.draftPolicy, source.ID, source.SourceType)
+		if err != nil {
+			return draftReplyTarget{}, "", nil, err
+		}
+		if !source.SyncConfig.Valid {
+			return draftReplyTarget{}, "", nil, draftReplyError("invalid_source", fmt.Errorf("source %d has no sync config", source.ID))
+		}
+		imapConfig, err := imaplib.ConfigFromJSON(source.SyncConfig.String)
+		if err != nil {
+			return draftReplyTarget{}, "", nil, draftReplyError("invalid_source", fmt.Errorf("source %d sync config: %w", source.ID, err))
+		}
+		if imapConfig.Identifier() != source.Identifier {
+			return draftReplyTarget{}, "", nil, draftReplyError("invalid_source", fmt.Errorf("source %d sync config identifier does not match the source", source.ID))
+		}
+	case "gmail":
+		if parentSource == nil {
+			return draftReplyTarget{}, "", nil, draftReplyError("draft_disabled", errors.New("draft-compose requires an IMAP source"))
+		}
+		if parentSource.ID != source.ID {
+			return draftReplyTarget{}, "", nil, draftReplyError("draft_disabled", errors.New("gmail draft replies must use the parent source"))
+		}
+		if err := authorizeGmailDraft(a.gmailDraftPolicy, source.ID, source.SourceType); err != nil {
+			return draftReplyTarget{}, "", nil, err
+		}
+	default:
+		return draftReplyTarget{}, "", nil, draftReplyError("draft_disabled", fmt.Errorf("source %d is a %q source", source.ID, source.SourceType))
+	}
+
+	target := draftReplyTarget{parentSource: parentSource, source: source, mailbox: mailbox}
+	if parentID != nil {
+		parent, err := a.store.GetMessageContext(ctx, *parentID)
+		if err != nil {
+			return draftReplyTarget{}, "", nil, draftReplyError("invalid_parent", fmt.Errorf("load message %d: %w", *parentID, err))
+		}
+		if !store.IsEmailMessageType(parent.MessageType) {
+			return draftReplyTarget{}, "", nil, draftReplyError("invalid_parent", errors.New("parent message is not an email"))
+		}
+		raw, err := a.store.GetMessageRawContext(ctx, parent.ID)
+		if err != nil {
+			return draftReplyTarget{}, "", nil, draftReplyError("invalid_parent", fmt.Errorf("load raw MIME for message %d: %w", parent.ID, err))
+		}
+		target.parent, target.raw = parent, raw
+	}
+	return target, from, selfAddresses, nil
 }
 
 func (a *storeAPIAdapter) runCLIReplyDraft(
@@ -182,20 +387,77 @@ func (a *storeAPIAdapter) runCLIReplyDraft(
 	if err != nil {
 		return err
 	}
-	target, err := a.resolveDraftReplyTarget(ctx, intent, req.Grant)
+	target, from, selfAddresses, err := a.resolveDraftTarget(
+		ctx, &intent.MessageID, intent.Account, intent.SourceID, intent.SourceIDSet,
+		intent.From, req.Grant,
+	)
 	if err != nil {
 		return err
 	}
-	reply, err := imaplib.BuildReply(target.raw, intent.From, intent.Body, time.Now(), "")
+	reply, err := imaplib.BuildReplyWithOptions(target.raw, from, intent.Body, imaplib.ReplyOptions{
+		ReplyAll: intent.ReplyAll, SelfAddresses: selfAddresses,
+	}, time.Now(), "")
 	if err != nil {
 		return draftReplyError("invalid_reply_metadata", err)
 	}
-	if len(reply.Parsed.From) != 1 || len(reply.Parsed.To) == 0 {
-		return draftReplyError("invalid_reply_metadata", errors.New("composed reply needs one From and at least one To address"))
+	if target.source.SourceType == "gmail" {
+		if len(reply.Parsed.From) != 1 || len(reply.Parsed.To)+len(reply.Parsed.Cc)+len(reply.Parsed.Bcc) == 0 {
+			return draftReplyError("invalid_reply_metadata", errors.New("composed reply needs one From and at least one recipient"))
+		}
+		messageIDValue := mime.NormalizeMessageID(reply.Parsed.MessageID)
+		if messageIDValue == "" {
+			return draftReplyError("invalid_reply_metadata", errors.New("composed reply has no usable Message-ID"))
+		}
+		return a.runGmailReplyDraft(ctx, intent, target, reply, "<"+messageIDValue+">", emit)
 	}
-	messageIDValue := mime.NormalizeMessageID(reply.Parsed.MessageID)
+	return a.createDraft(ctx, target, reply, intent.JSON, emit)
+}
+
+// refreshDraftCache runs the daemon's best-effort analytics rebuild once the
+// draft is durable, so aggregate views include it before the next sync. A
+// failure is logged and never changes the result the client already received.
+func (a *storeAPIAdapter) refreshDraftCache(ctx context.Context, source *store.Source) {
+	if a.draftCacheRefresh == nil {
+		return
+	}
+	if err := a.draftCacheRefresh(ctx, source.Identifier); err != nil {
+		if errors.Is(err, context.Canceled) {
+			return
+		}
+		if a.logger != nil {
+			a.logger.Error("draft analytics cache refresh failed", "source_id", source.ID, "error", err)
+		}
+	}
+}
+
+// authorizeDelegatedDraftSource checks whether the grant (if any) permits
+// draft creation on the given source. Returns nil when grant is nil (owner
+// path). The check runs before authorizeIMAPDraft so an out-of-scope source
+// never discloses whether drafting is enabled.
+func authorizeDelegatedDraftSource(grant *agentgrant.Grant, source *store.Source) error {
+	if grant == nil {
+		return nil
+	}
+	ref := draftSourceRef(source)
+	if !grant.Allows(agentgrant.PermissionDraftCreate, ref) {
+		return draftReplyNotPermitted(fmt.Errorf("source %d is not in grant %s", source.ID, grant.ID))
+	}
+	return nil
+}
+
+func (a *storeAPIAdapter) createDraft(
+	ctx context.Context,
+	target draftReplyTarget,
+	draft imaplib.ReplyDraft,
+	asJSON bool,
+	emit func(api.CLIRunEvent) error,
+) error {
+	if len(draft.Parsed.From) != 1 || len(draft.Parsed.To)+len(draft.Parsed.Cc)+len(draft.Parsed.Bcc) == 0 {
+		return draftReplyError("invalid_reply_metadata", errors.New("draft needs one From and at least one recipient"))
+	}
+	messageIDValue := mime.NormalizeMessageID(draft.Parsed.MessageID)
 	if messageIDValue == "" {
-		return draftReplyError("invalid_reply_metadata", errors.New("composed reply has no usable Message-ID"))
+		return draftReplyError("invalid_reply_metadata", errors.New("composed draft has no usable Message-ID"))
 	}
 	messageIDValue = "<" + messageIDValue + ">"
 
@@ -210,7 +472,16 @@ func (a *storeAPIAdapter) runCLIReplyDraft(
 	}
 	defer func() { _ = execution.Release() }()
 
-	receipt, err := a.appendDraftReply(ctx, target, reply.Raw, emit)
+	clientFactory := a.draftClientFactory
+	if clientFactory == nil {
+		clientFactory = defaultDraftClientFactory
+	}
+	client, err := clientFactory(ctx, target.source)
+	if err != nil {
+		return draftReplyError("invalid_source", fmt.Errorf("build IMAP client for source %d: %w", target.source.ID, err))
+	}
+	defer func() { _ = client.Close() }()
+	receipt, err := a.appendDraftReplyWithClient(ctx, client, target, draft.Raw, emit)
 	if err != nil {
 		return err
 	}
@@ -227,108 +498,29 @@ func (a *storeAPIAdapter) runCLIReplyDraft(
 		UID:             receipt.UID,
 		UIDValidity:     receipt.UIDValidity,
 	}
-	localID, err := a.store.PersistIMAPDraftContext(ctx, receiptModel, draftReplyParticipants(reply.Parsed), func(ids []int64) *store.MessagePersistData {
-		return draftReplyPersistData(target, reply, receiptModel, messageIDValue, ids)
+	evidenceCtx, cancelEvidence := localDraftEvidenceContext(ctx)
+	defer cancelEvidence()
+	draftRecord, err := a.store.PersistIMAPDraftContext(evidenceCtx, receiptModel, draftReplyParticipants(draft.Parsed), func(ids []int64) *store.MessagePersistData {
+		return draftReplyPersistData(target, draft, receiptModel, messageIDValue, ids)
 	})
 	if err != nil {
 		result.Status = draftReplyStatusLocalFailed
-		_ = emitDraftReplyOutput(emit, cliStreamStderr, intent.JSON, result)
+		_ = emitDraftReplyOutput(emit, cliStreamStderr, asJSON, result)
 		return draftReplyError(draftReplyStatusLocalFailed, err)
 	}
-	result.MessageID = localID
-	if err := emitDraftReplyOutput(emit, cliStreamStdout, intent.JSON, result); err != nil {
+	defer a.releaseDraftSourceAndRefreshCache(ctx, target.source, execution)
+	result.DraftID = draftRecord.DraftID
+	result.Revision = draftRecord.Revision
+	result.MessageID = draftRecord.CurrentMessageID
+	if err := emitDraftReplyOutput(emit, cliStreamStdout, asJSON, result); err != nil {
 		return draftReplyError("output_failed", err)
 	}
-	// The draft is durable and reported. Free the source for syncs before the
-	// cache rebuild, which can take a while and needs no lock.
-	if err := execution.Release(); err != nil {
-		logger.Error("release source after draft", "source_id", target.source.ID, "error", err)
-	}
-	a.refreshDraftCache(ctx, target.source)
+	_ = client.Close()
 	return nil
-}
-
-// refreshDraftCache runs the daemon's best-effort analytics rebuild once the
-// draft is durable, so aggregate views include it before the next sync. A
-// failure is logged and never changes the result the client already received.
-func (a *storeAPIAdapter) refreshDraftCache(ctx context.Context, source *store.Source) {
-	if a.draftCacheRefresh == nil {
-		return
-	}
-	if err := a.draftCacheRefresh(ctx, source.Identifier); err != nil {
-		if errors.Is(err, context.Canceled) {
-			return
-		}
-		logger.Error("draft analytics cache refresh failed", "source_id", source.ID, "error", err)
-	}
-}
-
-// authorizeDelegatedDraftSource checks whether the grant (if any) permits
-// draft creation on the given source. Returns nil when grant is nil (owner
-// path). The check runs before authorizeIMAPDraft so an out-of-scope source
-// never discloses whether drafting is enabled.
-func authorizeDelegatedDraftSource(grant *agentgrant.Grant, source *store.Source) error {
-	if grant == nil {
-		return nil
-	}
-	ref := agentgrant.SourceRef{ID: source.ID, Type: source.SourceType, Identifier: source.Identifier}
-	if !grant.Allows(agentgrant.PermissionDraftCreate, ref) {
-		return draftReplyNotPermitted(fmt.Errorf("source %d is not in grant %s", source.ID, grant.ID))
-	}
-	return nil
-}
-
-// resolveDraftReplyTarget loads the parent, checks the operator grant, and
-// confirms the sender identity. It runs before the sync lock is taken so a
-// denied request never blocks a sync.
-func (a *storeAPIAdapter) resolveDraftReplyTarget(ctx context.Context, intent draftReplyIntent, grant *agentgrant.Grant) (draftReplyTarget, error) {
-	parent, err := a.store.GetMessageContext(ctx, intent.MessageID)
-	if err != nil {
-		if grant != nil {
-			return draftReplyTarget{}, draftReplyNotPermitted(fmt.Errorf("load message %d: %w", intent.MessageID, err))
-		}
-		return draftReplyTarget{}, draftReplyError("invalid_parent", fmt.Errorf("load message %d: %w", intent.MessageID, err))
-	}
-	source, err := a.store.GetSourceByIDContext(ctx, parent.SourceID)
-	if err != nil {
-		if grant != nil {
-			return draftReplyTarget{}, draftReplyNotPermitted(fmt.Errorf("load source %d: %w", parent.SourceID, err))
-		}
-		return draftReplyTarget{}, draftReplyError("invalid_source", fmt.Errorf("load source %d: %w", parent.SourceID, err))
-	}
-	if err := authorizeDelegatedDraftSource(grant, source); err != nil {
-		return draftReplyTarget{}, err
-	}
-	mailbox, err := authorizeIMAPDraft(a.draftPolicy, source.ID, source.SourceType)
-	if err != nil {
-		return draftReplyTarget{}, err
-	}
-	if !source.SyncConfig.Valid {
-		return draftReplyTarget{}, draftReplyError("invalid_source", fmt.Errorf("source %d has no sync config", source.ID))
-	}
-	imapConfig, err := imaplib.ConfigFromJSON(source.SyncConfig.String)
-	if err != nil {
-		return draftReplyTarget{}, draftReplyError("invalid_source", fmt.Errorf("source %d sync config: %w", source.ID, err))
-	}
-	if imapConfig.Identifier() != source.Identifier {
-		return draftReplyTarget{}, draftReplyError("invalid_source", fmt.Errorf("source %d sync config identifier does not match the source", source.ID))
-	}
-	raw, err := a.store.GetMessageRawContext(ctx, parent.ID)
-	if err != nil {
-		return draftReplyTarget{}, draftReplyError("invalid_parent", fmt.Errorf("load raw MIME for message %d: %w", parent.ID, err))
-	}
-	identities, err := a.store.ListAccountIdentitiesContext(ctx, source.ID)
-	if err != nil {
-		return draftReplyTarget{}, draftReplyError("invalid_from", fmt.Errorf("list identities for source %d: %w", source.ID, err))
-	}
-	if !hasConfirmedSourceIdentity(identities, intent.From) {
-		return draftReplyTarget{}, draftReplyError("invalid_from", fmt.Errorf("--from is not a confirmed identity on source %d", source.ID))
-	}
-	return draftReplyTarget{parent: parent, source: source, mailbox: mailbox, raw: raw}, nil
 }
 
 func defaultDraftClientFactory(ctx context.Context, source *store.Source) (*imaplib.Client, error) {
-	client, err := buildAPIClient(ctx, source, oauthManagerCache(), nil)
+	client, err := buildAPIClient(ctx, source, oauthManagerCache(invocationFromContext(ctx)), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -339,23 +531,13 @@ func defaultDraftClientFactory(ctx context.Context, source *store.Source) (*imap
 	return imapClient, nil
 }
 
-// appendDraftReply sends the single APPEND. Any failure after this point
-// leaves a state the operator must inspect before retrying.
-func (a *storeAPIAdapter) appendDraftReply(
+func (a *storeAPIAdapter) appendDraftReplyWithClient(
 	ctx context.Context,
+	client *imaplib.Client,
 	target draftReplyTarget,
 	raw []byte,
 	emit func(api.CLIRunEvent) error,
 ) (imaplib.DraftAppendResult, error) {
-	clientFactory := a.draftClientFactory
-	if clientFactory == nil {
-		clientFactory = defaultDraftClientFactory
-	}
-	client, err := clientFactory(ctx, target.source)
-	if err != nil {
-		return imaplib.DraftAppendResult{}, draftReplyError("invalid_source", fmt.Errorf("build IMAP client for source %d: %w", target.source.ID, err))
-	}
-	defer func() { _ = client.Close() }()
 	receipt, err := client.AppendDraft(ctx, target.mailbox, raw)
 	if err != nil {
 		if emit != nil {
@@ -370,8 +552,12 @@ func (a *storeAPIAdapter) appendDraftReply(
 }
 
 func draftReplyParticipants(parsed *mime.Message) []store.ParticipantPersistData {
-	participants := make([]store.ParticipantPersistData, 0, len(parsed.From)+len(parsed.To))
-	for _, address := range append(append([]mime.Address(nil), parsed.From...), parsed.To...) {
+	addresses := append([]mime.Address(nil), parsed.From...)
+	addresses = append(addresses, parsed.To...)
+	addresses = append(addresses, parsed.Cc...)
+	addresses = append(addresses, parsed.Bcc...)
+	participants := make([]store.ParticipantPersistData, 0, len(addresses))
+	for _, address := range addresses {
 		participants = append(participants, store.ParticipantPersistData{
 			EmailAddress: address.Email,
 			DisplayName:  address.Name,
@@ -392,22 +578,44 @@ func draftReplyPersistData(
 ) *store.MessagePersistData {
 	parsed := reply.Parsed
 	fromCount := len(parsed.From)
-	toAddresses := make([]string, len(parsed.To))
-	for i, address := range parsed.To {
-		toAddresses[i] = address.Email
+	toCount := len(parsed.To)
+	ccCount := len(parsed.Cc)
+	bccCount := len(parsed.Bcc)
+	toAddresses := addressStrings(parsed.To)
+	ccAddresses := addressStrings(parsed.Cc)
+	bccAddresses := addressStrings(parsed.Bcc)
+	fromAddresses := addressStrings(parsed.From)
+	var conversationKey string
+	var replyToMessageID sql.NullInt64
+	if target.forward { // forwards start their own conversation
+		conversationKey = fmt.Sprintf("draft-forward-%d-%d-%s", receipt.SourceID, receipt.UIDValidity, store.IMAPDraftSourceMessageID(receipt))
+	} else if target.parent != nil {
+		conversationKey = target.parent.SourceConversationID
+		replyToMessageID = sql.NullInt64{Int64: target.parent.ID, Valid: true}
+		if conversationKey == "" {
+			conversationKey = fmt.Sprintf("draft-reply-%d", target.parent.ID)
+		}
+		if target.parentSource != nil && target.parentSource.ID != target.source.ID {
+			conversationKey = fmt.Sprintf("draft-reply-%d-%d-%s", target.parentSource.ID, target.source.ID, conversationKey)
+		}
+	} else {
+		conversationKey = fmt.Sprintf("draft-compose-%d-%d-%s", receipt.SourceID, receipt.UIDValidity, store.IMAPDraftSourceMessageID(receipt))
 	}
-	conversationKey := target.parent.SourceConversationID
-	if conversationKey == "" {
-		conversationKey = fmt.Sprintf("draft-reply-%d", target.parent.ID)
-	}
+	at := fromCount
+	fromIDs := ids[:fromCount]
+	toIDs := ids[at : at+toCount]
+	at += toCount
+	ccIDs := ids[at : at+ccCount]
+	at += ccCount
+	bccIDs := ids[at : at+bccCount]
 	return &store.MessagePersistData{
 		Message: &store.Message{
 			SourceID:        target.source.ID,
 			SourceMessageID: store.IMAPDraftSourceMessageID(receipt),
 			RFC822MessageID: sql.NullString{String: messageIDValue, Valid: true},
 			MessageType:     "email", IsFromMe: true, IdentityDerivedIsFromMe: true,
-			SenderID:         sql.NullInt64{Int64: ids[0], Valid: true},
-			ReplyToMessageID: sql.NullInt64{Int64: target.parent.ID, Valid: true},
+			SenderID:         sql.NullInt64{Int64: fromIDs[0], Valid: true},
+			ReplyToMessageID: replyToMessageID,
 			Subject:          sql.NullString{String: parsed.Subject, Valid: parsed.Subject != ""},
 			Snippet:          sql.NullString{String: strings.TrimSpace(parsed.BodyText), Valid: parsed.BodyText != ""},
 			SentAt:           sql.NullTime{Time: parsed.Date, Valid: !parsed.Date.IsZero()},
@@ -421,10 +629,19 @@ func draftReplyPersistData(
 		BodyText: sql.NullString{String: parsed.BodyText, Valid: true},
 		RawMIME:  reply.Raw, RawFormat: "mime",
 		Recipients: []store.RecipientSet{
-			{Type: "from", ParticipantIDs: ids[:fromCount], EmailAddresses: []string{parsed.From[0].Email}},
-			{Type: "to", ParticipantIDs: ids[fromCount:], EmailAddresses: toAddresses},
+			{Type: "from", ParticipantIDs: fromIDs, EmailAddresses: fromAddresses},
+			{Type: "to", ParticipantIDs: toIDs, EmailAddresses: toAddresses},
+			{Type: "cc", ParticipantIDs: ccIDs, EmailAddresses: ccAddresses},
+			{Type: "bcc", ParticipantIDs: bccIDs, EmailAddresses: bccAddresses},
 		},
-		FTS: &store.FTSDoc{Subject: parsed.Subject, Body: parsed.BodyText, FromAddr: parsed.From[0].Email, ToAddrs: strings.Join(toAddresses, " ")},
+		FTS: &store.FTSDoc{
+			Subject:  parsed.Subject,
+			Body:     parsed.BodyText,
+			FromAddr: parsed.From[0].Email,
+			ToAddrs:  strings.Join(toAddresses, " "),
+			CcAddrs:  strings.Join(ccAddresses, " "),
+		},
+		MIMEAttachmentReplacement: target.attachmentWrites,
 	}
 }
 
@@ -437,8 +654,8 @@ func emitDraftReplyOutput(emit func(api.CLIRunEvent) error, stream string, asJSO
 	case asJSON:
 		text = string(marshalDraftReplyOutput(result)) + "\n"
 	case result.Status == draftReplyStatusCreated:
-		text = fmt.Sprintf("created draft message %d (%s|%d|%d), operation %s\n",
-			result.MessageID, result.Mailbox, result.UIDValidity, result.UID, result.OperationRef)
+		text = fmt.Sprintf("created draft message %d (%s|%d|%d), operation %s, draft %s revision %d\n",
+			result.MessageID, result.Mailbox, result.UIDValidity, result.UID, result.OperationRef, result.DraftID, result.Revision)
 	default:
 		text = fmt.Sprintf("remote accepted; local persistence failed, inspect operation %s\n", result.OperationRef)
 	}

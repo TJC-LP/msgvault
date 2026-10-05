@@ -13,6 +13,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"go.kenn.io/msgvault/internal/daemonclient"
 	"go.kenn.io/msgvault/internal/deletion"
 	"go.kenn.io/msgvault/internal/export"
 	"go.kenn.io/msgvault/internal/peoplebrowser"
@@ -53,6 +54,9 @@ const (
 	toolArgBefore        = "before"
 	toolArgAccount       = "account"
 	toolArgOffset        = "offset"
+	toolArgLength        = "length"
+	toolArgSourceMsgID   = "source_message_id"
+	toolArgThreadID      = "thread_id"
 	toolArgMinScore      = "min_score"
 	toolArgMaxChars      = "max_chars"
 	toolArgAttachmentID  = "attachment_id"
@@ -127,18 +131,26 @@ func listLimitArg(args map[string]any) int {
 }
 
 type handlers struct {
-	engine             query.Engine
-	attachmentsDir     string
-	attachmentReader   AttachmentReader
-	manifestSaver      DeletionManifestSaver
-	hybridSearcher     HybridSearcher
-	similarSearcher    SimilarSearcher
-	dataDir            string
-	documentSearcher   DocumentSearcher
-	personFileSearcher PersonFileSearcher
-	peopleBackend      peoplebrowser.Backend
-	directoryBackend   peoplebrowser.DirectoryLister
-	savedViews         savedview.Service
+	downloads           *downloadCache
+	engine              query.Engine
+	archiveSQLQuerier   ArchiveSQLQuerier
+	attachmentsDir      string
+	attachmentReader    AttachmentReader
+	manifestSaver       DeletionManifestSaver
+	hybridSearcher      HybridSearcher
+	similarSearcher     SimilarSearcher
+	dataDir             string
+	documentSearcher    DocumentSearcher
+	personFileSearcher  PersonFileSearcher
+	peopleBackend       peoplebrowser.Backend
+	directoryBackend    peoplebrowser.DirectoryLister
+	savedViews          savedview.Service
+	meetings            MeetingBackend
+	calendar            CalendarBackend
+	personAgendaBackend PersonAgendaBackend
+	identityReview      IdentityReviewBackend
+	personCardDAV       PersonCardDAVBackend
+	identityScoring     IdentityScoringBackend
 
 	// Optional vector-search wiring. When hybridEngine is nil, the
 	// search_message_bodies handler rejects mode=vector and mode=hybrid with
@@ -149,6 +161,34 @@ type handlers struct {
 	vectorCfg      vector.Config
 	backend        vector.Backend
 	visualSearcher VisualSearcher
+}
+
+// ArchiveSQLQuerier executes SQL confined to published archive analytics data.
+type ArchiveSQLQuerier interface {
+	QueryArchiveSQL(ctx context.Context, sql string, fresh bool) (*query.QueryResult, *daemonclient.CacheBuildAccepted, error)
+}
+
+func (h *handlers) querySQL(ctx context.Context, req toolRequest) (*toolResult, error) {
+	args := req.GetArguments()
+	sql, ok := args["sql"].(string)
+	if !ok || strings.TrimSpace(sql) == "" {
+		return toolErrorResult("sql is required"), nil
+	}
+	if err := query.EnsureReadOnly(sql); err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+	fresh, _ := args["fresh"].(bool)
+	if h.archiveSQLQuerier == nil {
+		return toolErrorResult("SQL queries are unavailable"), nil
+	}
+	result, accepted, err := h.archiveSQLQuerier.QueryArchiveSQL(ctx, sql, fresh)
+	if err != nil {
+		return nil, newInternalError("query SQL", err)
+	}
+	if accepted != nil {
+		return jsonResult(accepted)
+	}
+	return jsonResult(result)
 }
 
 type VisualSearcher interface {
@@ -273,7 +313,10 @@ func (h *handlers) searchVisualAttachments(ctx context.Context, req toolRequest)
 		After: after, Before: before,
 	})
 	if err != nil {
-		return toolErrorResult("visual_search_failed: " + err.Error()), nil //nolint:nilerr // MCP tool errors are successful protocol responses.
+		if result := translateDaemonRequestError(err); result != nil {
+			return result, nil
+		}
+		return toolErrorResult("visual_search_failed: " + err.Error()), nil
 	}
 	return jsonResult(response)
 }
@@ -423,8 +466,17 @@ type HybridSearchHit struct {
 type HybridSearchResult struct {
 	Hits          []HybridSearchHit
 	PoolSaturated bool
+	Accelerator   string
 	Generation    HybridGeneration
 	HasMore       bool
+	TookMS        int64
+	Timings       HybridSearchTimings
+}
+
+type HybridSearchTimings struct {
+	QueryEmbeddingMS int64 `json:"query_embedding_ms"`
+	RetrievalMS      int64 `json:"retrieval_ms"`
+	HydrationMS      int64 `json:"hydration_ms"`
 }
 
 type SimilarSearcher interface {
@@ -465,6 +517,12 @@ func translateDaemonRequestError(err error) *toolResult {
 
 	var message string
 	switch coded.APIErrorCode() {
+	case "visual_search_not_ready":
+		message = "visual_search_not_ready: visual attachment search is unavailable"
+	case "vector_initializing":
+		message = "vector_initializing: vector search is still initializing"
+	case "vector_init_failed":
+		message = "vector_init_failed: vector search failed to initialize"
 	case "invalid_query":
 		message = "invalid_query: search query is invalid"
 	case "invalid_account":
@@ -958,7 +1016,10 @@ type searchMessageBodiesResponse struct {
 
 	Mode          string                  `json:"mode"`
 	PoolSaturated bool                    `json:"pool_saturated"`
+	Accelerator   string                  `json:"accelerator,omitempty"`
 	Generation    hybridGenerationSummary `json:"generation"`
+	TookMS        int64                   `json:"took_ms"`
+	Timings       HybridSearchTimings     `json:"timings"`
 }
 
 // searchMessageBodiesHybrid runs vector or hybrid search via the configured
@@ -979,6 +1040,7 @@ func (h *handlers) searchMessageBodiesHybrid(
 			"vector_not_enabled: vector search is not configured on this server",
 		), nil
 	}
+	started := time.Now()
 
 	// Resolve account filter to a source ID for the structured Filter.
 	account, _ := args[toolArgAccount].(string)
@@ -1047,6 +1109,7 @@ func (h *handlers) searchMessageBodiesHybrid(
 	if err != nil {
 		return dependencyError("search semantic index", err)
 	}
+	hydrationStarted := time.Now()
 
 	// Bulk-hydrate hits in one round-trip instead of looping
 	// GetMessage per result (which fetches body, From, To, Cc, Bcc,
@@ -1100,6 +1163,7 @@ func (h *handlers) searchMessageBodiesHybrid(
 	if err := h.attachVectorChunkMatches(ctx, meta.Generation.ID, meta.QueryVector, page, minScore); err != nil {
 		return nil, err
 	}
+	hydrationDuration := time.Since(hydrationStarted)
 
 	nextPageServable := maxPage == 0 || requestedEnd < maxPage
 	hasMore := false
@@ -1115,12 +1179,19 @@ func (h *handlers) searchMessageBodiesHybrid(
 		paginatedResponse: newPaginatedResponseNoTotal(page, offset, hasMore),
 		Mode:              mode,
 		PoolSaturated:     meta.PoolSaturated,
+		Accelerator:       meta.Accelerator,
 		Generation: hybridGenerationSummary{
 			ID:          int64(meta.Generation.ID),
 			Model:       meta.Generation.Model,
 			Dimension:   meta.Generation.Dimension,
 			Fingerprint: meta.Generation.Fingerprint,
 			State:       string(meta.Generation.State),
+		},
+		TookMS: time.Since(started).Milliseconds(),
+		Timings: HybridSearchTimings{
+			QueryEmbeddingMS: meta.QueryEmbeddingDuration.Milliseconds(),
+			RetrievalMS:      meta.RetrievalDuration.Milliseconds(),
+			HydrationMS:      hydrationDuration.Milliseconds(),
 		},
 	})
 }
@@ -1209,7 +1280,10 @@ func (h *handlers) searchMessageBodiesHybridViaSearcher(
 		paginatedResponse: newPaginatedResponseNoTotal(items, offset, hasMore),
 		Mode:              mode,
 		PoolSaturated:     result.PoolSaturated,
+		Accelerator:       result.Accelerator,
 		Generation:        result.Generation,
+		TookMS:            result.TookMS,
+		Timings:           result.Timings,
 	})
 }
 
@@ -1805,20 +1879,51 @@ func (h *handlers) getAttachment(ctx context.Context, req toolRequest) (*toolRes
 	if err != nil {
 		return toolErrorResult(err.Error()), nil
 	}
+	chunkReq, chunked, err := chunkArgs(args)
+	if err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
 
-	payload, err := h.attachmentService().load(ctx, id)
+	var payload *attachmentPayload
+	var snapshot *downloadSnapshot
+	if chunked {
+		snapshot, err = h.downloads.get(ctx, downloadKey{attachment: id}, chunkReq, func() (*downloadSnapshot, error) {
+			payload, err := h.attachmentService().loadBounded(ctx, id, maxDownloadBytes)
+			if err != nil {
+				return nil, err
+			}
+			return &downloadSnapshot{data: payload.data, attachment: payload}, nil
+		})
+		if err == nil {
+			payload = snapshot.attachment
+		}
+	} else {
+		payload, err = h.attachmentService().load(ctx, id)
+	}
 	if err != nil {
 		if unavailable, ok := errors.AsType[*attachmentUnavailableError](err); ok {
 			return toolErrorResult(unavailable.message), nil
 		}
+		if errors.Is(err, errDownloadExpired) || errors.Is(err, errDownloadTooLarge) {
+			return toolErrorResult(err.Error()), nil
+		}
 		return nil, err
 	}
 	att := payload.metadata
-
 	metaObj := getAttachmentResponse{
 		Filename: att.Filename,
 		MIMEType: payload.mimeType,
 		Size:     att.Size,
+	}
+	if chunked {
+		chunk, err := sliceChunk(snapshot.data, snapshot.digest, chunkReq)
+		if err != nil {
+			return toolErrorResult(err.Error()), nil
+		}
+		metaObj.Size = chunk.Size
+		metaObj.Offset, metaObj.Length = &chunk.Offset, &chunk.Length
+		metaObj.SHA256, metaObj.Complete, metaObj.DataBase64 = &chunk.SHA256, &chunk.Complete, &chunk.DataBase64
+		return jsonResult(metaObj)
 	}
 	result, err := jsonResult(metaObj)
 	if err != nil {
@@ -2088,6 +2193,19 @@ func positiveInt64Arg(args map[string]any, key string) (int64, error) {
 	if !ok || math.IsNaN(value) || math.IsInf(value, 0) || value <= 0 ||
 		value >= float64(math.MaxInt64) || math.Trunc(value) != value {
 		return 0, fmt.Errorf("%s must be a positive integer", key)
+	}
+	return int64(value), nil
+}
+
+func nonnegativeInt64Arg(args map[string]any, key string) (int64, error) {
+	raw, found := args[key]
+	if !found {
+		return 0, nil
+	}
+	value, ok := raw.(float64)
+	if !ok || math.IsNaN(value) || math.IsInf(value, 0) || value < 0 ||
+		value >= float64(math.MaxInt64) || value > maxJSONSafeInteger || math.Trunc(value) != value {
+		return 0, fmt.Errorf("%s must be a nonnegative safe integer", key)
 	}
 	return int64(value), nil
 }

@@ -34,9 +34,13 @@ import (
 // the resolved recipient address (envelope, else participant), never an empty
 // string. Version 27 adds curated person display names.
 // Version 28 projects RFC Message-ID into every messages cache shard.
+// Version 29 persists compact logical and temperature contributions so
+// incremental builds can update them without rescanning expanded activity.
+// Version 30 stores direct activity edges and expands conversation membership
+// from the current roster when queried.
 // Schema bumps force a full rebuild before readers use an older publication,
 // so committed caches never mix shards of different shapes.
-const CacheSchemaVersion = 28
+const CacheSchemaVersion = 30
 
 // CacheSyncState is the commit marker written after a complete analytics
 // cache publication. SQLite remains authoritative; these watermarks only
@@ -48,9 +52,13 @@ type CacheSyncState struct {
 	LastCompletedSyncRunID int64     `json:"last_completed_sync_run_id,omitzero"`
 	LastCacheAdditionCount int64     `json:"last_cache_addition_count,omitzero"`
 	LastCacheUpdateCount   int64     `json:"last_cache_update_count,omitzero"`
-	LastFailedSyncRunCount int64     `json:"last_failed_sync_run_count,omitzero"`
-	LastFailedSyncRunIDSum int64     `json:"last_failed_sync_run_id_sum,omitzero"`
-	IdentityRevision       int64     `json:"identity_revision,omitzero"`
+	// LastRelatedChangeSeq is the highest child-row journal entry represented
+	// by this committed publication. The journal is written transactionally
+	// with SQLite mutations and advances only after marker-last publication.
+	LastRelatedChangeSeq   int64 `json:"last_related_change_seq,omitzero"`
+	LastFailedSyncRunCount int64 `json:"last_failed_sync_run_count,omitzero"`
+	LastFailedSyncRunIDSum int64 `json:"last_failed_sync_run_id_sum,omitzero"`
+	IdentityRevision       int64 `json:"identity_revision,omitzero"`
 	// DerivedDataRevision tracks offline repairs that rewrite existing
 	// message, snippet, search, or attachment facts. Those rows are already
 	// inside the committed message ID boundary, so drift requires a full cache
@@ -81,6 +89,11 @@ type CacheSyncState struct {
 	PersonDisplayNameRevision int64     `json:"person_display_name_revision,omitzero"`
 	PublishedAt               time.Time `json:"published_at"`
 	DatasetFingerprint        string    `json:"dataset_fingerprint"`
+	// FullRebuildRequired marks an overlapping sync on a legacy archive without
+	// a child-row repair journal. Later children may be absent for parents inside
+	// LastMessageID, so no append can safely repair that publication. Journaled
+	// archives instead retain their snapshot watermarks for normal catch-up.
+	FullRebuildRequired bool `json:"full_rebuild_required,omitempty"`
 
 	ConversationParticipantsFingerprint string `json:"conversation_participants_fingerprint,omitempty"`
 	// ConversationTypesFingerprint hashes (id, conversation_type, title) for
@@ -121,13 +134,14 @@ func (e *CacheUnavailableError) Unwrap() error { return ErrCacheUnavailable }
 // Revision identifies one committed cache publication. It intentionally uses
 // only commit-marker fields, never ambient filesystem state.
 func (s CacheSyncState) Revision() string {
-	payload := fmt.Sprintf("v=%d|message=%d|watermark=%s|run=%d|add=%d|update=%d|fail_count=%d|fail_sum=%d|identity=%d|derived_data=%d|account_identity=%d|participant_identifier=%d|participant_display_name=%d|person_display_name=%d|published=%s",
+	payload := fmt.Sprintf("v=%d|message=%d|watermark=%s|run=%d|add=%d|update=%d|related=%d|fail_count=%d|fail_sum=%d|identity=%d|derived_data=%d|account_identity=%d|participant_identifier=%d|participant_display_name=%d|person_display_name=%d|published=%s",
 		s.SchemaVersion,
 		s.LastMessageID,
 		s.LastSyncAt.UTC().Format(time.RFC3339Nano),
 		s.LastCompletedSyncRunID,
 		s.LastCacheAdditionCount,
 		s.LastCacheUpdateCount,
+		s.LastRelatedChangeSeq,
 		s.LastFailedSyncRunCount,
 		s.LastFailedSyncRunIDSum,
 		s.IdentityRevision,
@@ -161,6 +175,35 @@ func ReadCacheSyncState(analyticsDir string) (CacheSyncState, error) {
 // inspection so tests can count full fingerprint walks. Production code never
 // replaces it.
 var inspectDatasetFingerprint = CacheDatasetFingerprint
+
+// InspectCacheMarkerReadiness checks the marker without walking Parquet files.
+// Serving paths use it for freshness decisions; DuckDBEngine validates the
+// committed files before executing a query.
+func InspectCacheMarkerReadiness(analyticsDir string) (CacheReadiness, error) {
+	info, err := os.Stat(analyticsDir)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return CacheAbsent, nil
+	case err != nil:
+		return "", fmt.Errorf("inspect analytics cache root: %w", err)
+	case !info.IsDir():
+		return "", fmt.Errorf("inspect analytics cache root: %s is not a directory", analyticsDir)
+	}
+	state, err := ReadCacheSyncState(analyticsDir)
+	switch {
+	case errors.Is(err, os.ErrNotExist), errors.Is(err, errInvalidCacheState):
+		return CacheInterrupted, nil
+	case err != nil:
+		return "", fmt.Errorf("read analytics cache state: %w", err)
+	}
+	if state.LastSyncAt.IsZero() || state.PublishedAt.IsZero() || state.DatasetFingerprint == "" {
+		return CacheInterrupted, nil
+	}
+	if state.SchemaVersion != CacheSchemaVersion {
+		return CacheStaleSchema, nil
+	}
+	return CacheReady, nil
+}
 
 // InspectCacheReadiness classifies only committed live cache paths. Sibling
 // staging directories are deliberately outside analyticsDir and never enter

@@ -702,6 +702,94 @@ func (o *EndBackupFreezeRequestOptions) GetHeader() (map[string]string, error) {
 	return nil, nil
 }
 
+// GetCacheBuildStatusRequestOptions is the options needed to make a request to GetCacheBuildStatus.
+type GetCacheBuildStatusRequestOptions struct {
+	PathParams *GetCacheBuildStatusPath
+}
+
+// Validate validates all the fields in the options.
+// Use it if fields validation was not run.
+func (o *GetCacheBuildStatusRequestOptions) Validate() error {
+	var errors runtime.ValidationErrors
+
+	if o.PathParams != nil {
+		if v, ok := any(o.PathParams).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("PathParams", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+
+	return errors
+}
+
+// GetPathParams returns the path params as a map.
+func (o *GetCacheBuildStatusRequestOptions) GetPathParams() (map[string]any, error) {
+	return runtime.AsMap[any](o.PathParams)
+}
+
+// GetQuery returns the query params as a map.
+func (o *GetCacheBuildStatusRequestOptions) GetQuery() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetBody returns the payload in any type that can be marshalled to JSON by the client.
+func (o *GetCacheBuildStatusRequestOptions) GetBody() any {
+	return nil
+}
+
+// GetHeader returns the headers as a map.
+func (o *GetCacheBuildStatusRequestOptions) GetHeader() (map[string]string, error) {
+	return nil, nil
+}
+
+// ControlCalendarRequestOptions is the options needed to make a request to ControlCalendar.
+type ControlCalendarRequestOptions struct {
+	Body *ControlCalendarBody
+}
+
+// Validate validates all the fields in the options.
+// Use it if fields validation was not run.
+func (o *ControlCalendarRequestOptions) Validate() error {
+	var errors runtime.ValidationErrors
+
+	if o.Body != nil {
+		if v, ok := any(o.Body).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Body", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+
+	return errors
+}
+
+// GetPathParams returns the path params as a map.
+func (o *ControlCalendarRequestOptions) GetPathParams() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetQuery returns the query params as a map.
+func (o *ControlCalendarRequestOptions) GetQuery() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetBody returns the payload in any type that can be marshalled to JSON by the client.
+func (o *ControlCalendarRequestOptions) GetBody() any {
+	return o.Body
+}
+
+// GetHeader returns the headers as a map.
+func (o *ControlCalendarRequestOptions) GetHeader() (map[string]string, error) {
+	return nil, nil
+}
+
 // SaveCardDAVAccountRequestOptions is the options needed to make a request to SaveCardDAVAccount.
 type SaveCardDAVAccountRequestOptions struct {
 	Body *SaveCardDAVAccountBody
@@ -787,6 +875,50 @@ func (o *TestCardDAVAccountRequestOptions) GetBody() any {
 
 // GetHeader returns the headers as a map.
 func (o *TestCardDAVAccountRequestOptions) GetHeader() (map[string]string, error) {
+	return nil, nil
+}
+
+// ListCardDAVBooksRequestOptions is the options needed to make a request to ListCardDAVBooks.
+type ListCardDAVBooksRequestOptions struct {
+	Query *ListCardDAVBooksQuery
+}
+
+// Validate validates all the fields in the options.
+// Use it if fields validation was not run.
+func (o *ListCardDAVBooksRequestOptions) Validate() error {
+	var errors runtime.ValidationErrors
+
+	if o.Query != nil {
+		if v, ok := any(o.Query).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Query", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+
+	return errors
+}
+
+// GetPathParams returns the path params as a map.
+func (o *ListCardDAVBooksRequestOptions) GetPathParams() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetQuery returns the query params as a map.
+func (o *ListCardDAVBooksRequestOptions) GetQuery() (map[string]any, error) {
+	return runtime.AsMap[any](o.Query)
+}
+
+// GetBody returns the payload in any type that can be marshalled to JSON by the client.
+func (o *ListCardDAVBooksRequestOptions) GetBody() any {
+	return nil
+}
+
+// GetHeader returns the headers as a map.
+func (o *ListCardDAVBooksRequestOptions) GetHeader() (map[string]string, error) {
 	return nil, nil
 }
 
@@ -1307,6 +1439,50 @@ func (o *ListCardDAVRunsRequestOptions) GetBody() any {
 
 // GetHeader returns the headers as a map.
 func (o *ListCardDAVRunsRequestOptions) GetHeader() (map[string]string, error) {
+	return nil, nil
+}
+
+// GetCardDAVStatusRequestOptions is the options needed to make a request to GetCardDAVStatus.
+type GetCardDAVStatusRequestOptions struct {
+	Query *GetCardDAVStatusQuery
+}
+
+// Validate validates all the fields in the options.
+// Use it if fields validation was not run.
+func (o *GetCardDAVStatusRequestOptions) Validate() error {
+	var errors runtime.ValidationErrors
+
+	if o.Query != nil {
+		if v, ok := any(o.Query).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Query", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+
+	return errors
+}
+
+// GetPathParams returns the path params as a map.
+func (o *GetCardDAVStatusRequestOptions) GetPathParams() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetQuery returns the query params as a map.
+func (o *GetCardDAVStatusRequestOptions) GetQuery() (map[string]any, error) {
+	return runtime.AsMap[any](o.Query)
+}
+
+// GetBody returns the payload in any type that can be marshalled to JSON by the client.
+func (o *GetCardDAVStatusRequestOptions) GetBody() any {
+	return nil
+}
+
+// GetHeader returns the headers as a map.
+func (o *GetCardDAVStatusRequestOptions) GetHeader() (map[string]string, error) {
 	return nil, nil
 }
 
@@ -2296,6 +2472,50 @@ func (o *GetCLIMessageRequestOptions) GetHeader() (map[string]string, error) {
 	return nil, nil
 }
 
+// GetCLIMessageOriginalRequestOptions is the options needed to make a request to GetCLIMessageOriginal.
+type GetCLIMessageOriginalRequestOptions struct {
+	Query *GetCLIMessageOriginalQuery
+}
+
+// Validate validates all the fields in the options.
+// Use it if fields validation was not run.
+func (o *GetCLIMessageOriginalRequestOptions) Validate() error {
+	var errors runtime.ValidationErrors
+
+	if o.Query != nil {
+		if v, ok := any(o.Query).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Query", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+
+	return errors
+}
+
+// GetPathParams returns the path params as a map.
+func (o *GetCLIMessageOriginalRequestOptions) GetPathParams() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetQuery returns the query params as a map.
+func (o *GetCLIMessageOriginalRequestOptions) GetQuery() (map[string]any, error) {
+	return runtime.AsMap[any](o.Query)
+}
+
+// GetBody returns the payload in any type that can be marshalled to JSON by the client.
+func (o *GetCLIMessageOriginalRequestOptions) GetBody() any {
+	return nil
+}
+
+// GetHeader returns the headers as a map.
+func (o *GetCLIMessageOriginalRequestOptions) GetHeader() (map[string]string, error) {
+	return nil, nil
+}
+
 // GetCLIMessageRawRequestOptions is the options needed to make a request to GetCLIMessageRaw.
 type GetCLIMessageRawRequestOptions struct {
 	Query *GetCLIMessageRawQuery
@@ -2337,6 +2557,50 @@ func (o *GetCLIMessageRawRequestOptions) GetBody() any {
 
 // GetHeader returns the headers as a map.
 func (o *GetCLIMessageRawRequestOptions) GetHeader() (map[string]string, error) {
+	return nil, nil
+}
+
+// GetCLIMessageThreadRequestOptions is the options needed to make a request to GetCLIMessageThread.
+type GetCLIMessageThreadRequestOptions struct {
+	Query *GetCLIMessageThreadQuery
+}
+
+// Validate validates all the fields in the options.
+// Use it if fields validation was not run.
+func (o *GetCLIMessageThreadRequestOptions) Validate() error {
+	var errors runtime.ValidationErrors
+
+	if o.Query != nil {
+		if v, ok := any(o.Query).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Query", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+
+	return errors
+}
+
+// GetPathParams returns the path params as a map.
+func (o *GetCLIMessageThreadRequestOptions) GetPathParams() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetQuery returns the query params as a map.
+func (o *GetCLIMessageThreadRequestOptions) GetQuery() (map[string]any, error) {
+	return runtime.AsMap[any](o.Query)
+}
+
+// GetBody returns the payload in any type that can be marshalled to JSON by the client.
+func (o *GetCLIMessageThreadRequestOptions) GetBody() any {
+	return nil
+}
+
+// GetHeader returns the headers as a map.
+func (o *GetCLIMessageThreadRequestOptions) GetHeader() (map[string]string, error) {
 	return nil, nil
 }
 
@@ -4393,15 +4657,59 @@ func (o *ListIdentityMatchCandidatesRequestOptions) GetHeader() (map[string]stri
 	return nil, nil
 }
 
-// AcceptIdentityMatchCandidateRequestOptions is the options needed to make a request to AcceptIdentityMatchCandidate.
-type AcceptIdentityMatchCandidateRequestOptions struct {
-	PathParams *AcceptIdentityMatchCandidatePath
-	Body       *AcceptIdentityMatchCandidateBody
+// GetIdentityMatchCandidateRequestOptions is the options needed to make a request to GetIdentityMatchCandidate.
+type GetIdentityMatchCandidateRequestOptions struct {
+	PathParams *GetIdentityMatchCandidatePath
 }
 
 // Validate validates all the fields in the options.
 // Use it if fields validation was not run.
-func (o *AcceptIdentityMatchCandidateRequestOptions) Validate() error {
+func (o *GetIdentityMatchCandidateRequestOptions) Validate() error {
+	var errors runtime.ValidationErrors
+
+	if o.PathParams != nil {
+		if v, ok := any(o.PathParams).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("PathParams", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+
+	return errors
+}
+
+// GetPathParams returns the path params as a map.
+func (o *GetIdentityMatchCandidateRequestOptions) GetPathParams() (map[string]any, error) {
+	return runtime.AsMap[any](o.PathParams)
+}
+
+// GetQuery returns the query params as a map.
+func (o *GetIdentityMatchCandidateRequestOptions) GetQuery() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetBody returns the payload in any type that can be marshalled to JSON by the client.
+func (o *GetIdentityMatchCandidateRequestOptions) GetBody() any {
+	return nil
+}
+
+// GetHeader returns the headers as a map.
+func (o *GetIdentityMatchCandidateRequestOptions) GetHeader() (map[string]string, error) {
+	return nil, nil
+}
+
+// ReviewAcceptIdentityMatchCandidateRequestOptions is the options needed to make a request to ReviewAcceptIdentityMatchCandidate.
+type ReviewAcceptIdentityMatchCandidateRequestOptions struct {
+	PathParams *ReviewAcceptIdentityMatchCandidatePath
+	Body       *ReviewAcceptIdentityMatchCandidateBody
+}
+
+// Validate validates all the fields in the options.
+// Use it if fields validation was not run.
+func (o *ReviewAcceptIdentityMatchCandidateRequestOptions) Validate() error {
 	var errors runtime.ValidationErrors
 
 	if o.PathParams != nil {
@@ -4427,34 +4735,34 @@ func (o *AcceptIdentityMatchCandidateRequestOptions) Validate() error {
 }
 
 // GetPathParams returns the path params as a map.
-func (o *AcceptIdentityMatchCandidateRequestOptions) GetPathParams() (map[string]any, error) {
+func (o *ReviewAcceptIdentityMatchCandidateRequestOptions) GetPathParams() (map[string]any, error) {
 	return runtime.AsMap[any](o.PathParams)
 }
 
 // GetQuery returns the query params as a map.
-func (o *AcceptIdentityMatchCandidateRequestOptions) GetQuery() (map[string]any, error) {
+func (o *ReviewAcceptIdentityMatchCandidateRequestOptions) GetQuery() (map[string]any, error) {
 	return nil, nil
 }
 
 // GetBody returns the payload in any type that can be marshalled to JSON by the client.
-func (o *AcceptIdentityMatchCandidateRequestOptions) GetBody() any {
+func (o *ReviewAcceptIdentityMatchCandidateRequestOptions) GetBody() any {
 	return o.Body
 }
 
 // GetHeader returns the headers as a map.
-func (o *AcceptIdentityMatchCandidateRequestOptions) GetHeader() (map[string]string, error) {
+func (o *ReviewAcceptIdentityMatchCandidateRequestOptions) GetHeader() (map[string]string, error) {
 	return nil, nil
 }
 
-// RejectIdentityMatchCandidateRequestOptions is the options needed to make a request to RejectIdentityMatchCandidate.
-type RejectIdentityMatchCandidateRequestOptions struct {
-	PathParams *RejectIdentityMatchCandidatePath
-	Body       *RejectIdentityMatchCandidateBody
+// ReviewRejectIdentityMatchCandidateRequestOptions is the options needed to make a request to ReviewRejectIdentityMatchCandidate.
+type ReviewRejectIdentityMatchCandidateRequestOptions struct {
+	PathParams *ReviewRejectIdentityMatchCandidatePath
+	Body       *ReviewRejectIdentityMatchCandidateBody
 }
 
 // Validate validates all the fields in the options.
 // Use it if fields validation was not run.
-func (o *RejectIdentityMatchCandidateRequestOptions) Validate() error {
+func (o *ReviewRejectIdentityMatchCandidateRequestOptions) Validate() error {
 	var errors runtime.ValidationErrors
 
 	if o.PathParams != nil {
@@ -4480,22 +4788,198 @@ func (o *RejectIdentityMatchCandidateRequestOptions) Validate() error {
 }
 
 // GetPathParams returns the path params as a map.
-func (o *RejectIdentityMatchCandidateRequestOptions) GetPathParams() (map[string]any, error) {
+func (o *ReviewRejectIdentityMatchCandidateRequestOptions) GetPathParams() (map[string]any, error) {
 	return runtime.AsMap[any](o.PathParams)
 }
 
 // GetQuery returns the query params as a map.
-func (o *RejectIdentityMatchCandidateRequestOptions) GetQuery() (map[string]any, error) {
+func (o *ReviewRejectIdentityMatchCandidateRequestOptions) GetQuery() (map[string]any, error) {
 	return nil, nil
 }
 
 // GetBody returns the payload in any type that can be marshalled to JSON by the client.
-func (o *RejectIdentityMatchCandidateRequestOptions) GetBody() any {
+func (o *ReviewRejectIdentityMatchCandidateRequestOptions) GetBody() any {
 	return o.Body
 }
 
 // GetHeader returns the headers as a map.
-func (o *RejectIdentityMatchCandidateRequestOptions) GetHeader() (map[string]string, error) {
+func (o *ReviewRejectIdentityMatchCandidateRequestOptions) GetHeader() (map[string]string, error) {
+	return nil, nil
+}
+
+// PersonMatchScoringConsentRequestOptions is the options needed to make a request to PersonMatchScoringConsent.
+type PersonMatchScoringConsentRequestOptions struct {
+	Body *PersonMatchScoringConsentBody
+}
+
+// Validate validates all the fields in the options.
+// Use it if fields validation was not run.
+func (o *PersonMatchScoringConsentRequestOptions) Validate() error {
+	var errors runtime.ValidationErrors
+
+	if o.Body != nil {
+		if v, ok := any(o.Body).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Body", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+
+	return errors
+}
+
+// GetPathParams returns the path params as a map.
+func (o *PersonMatchScoringConsentRequestOptions) GetPathParams() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetQuery returns the query params as a map.
+func (o *PersonMatchScoringConsentRequestOptions) GetQuery() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetBody returns the payload in any type that can be marshalled to JSON by the client.
+func (o *PersonMatchScoringConsentRequestOptions) GetBody() any {
+	return o.Body
+}
+
+// GetHeader returns the headers as a map.
+func (o *PersonMatchScoringConsentRequestOptions) GetHeader() (map[string]string, error) {
+	return nil, nil
+}
+
+// ListPersonMatchJudgmentsRequestOptions is the options needed to make a request to ListPersonMatchJudgments.
+type ListPersonMatchJudgmentsRequestOptions struct {
+	Query *ListPersonMatchJudgmentsQuery
+}
+
+// Validate validates all the fields in the options.
+// Use it if fields validation was not run.
+func (o *ListPersonMatchJudgmentsRequestOptions) Validate() error {
+	var errors runtime.ValidationErrors
+
+	if o.Query != nil {
+		if v, ok := any(o.Query).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Query", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+
+	return errors
+}
+
+// GetPathParams returns the path params as a map.
+func (o *ListPersonMatchJudgmentsRequestOptions) GetPathParams() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetQuery returns the query params as a map.
+func (o *ListPersonMatchJudgmentsRequestOptions) GetQuery() (map[string]any, error) {
+	return runtime.AsMap[any](o.Query)
+}
+
+// GetBody returns the payload in any type that can be marshalled to JSON by the client.
+func (o *ListPersonMatchJudgmentsRequestOptions) GetBody() any {
+	return nil
+}
+
+// GetHeader returns the headers as a map.
+func (o *ListPersonMatchJudgmentsRequestOptions) GetHeader() (map[string]string, error) {
+	return nil, nil
+}
+
+// PersonMatchScoringRevokeRequestOptions is the options needed to make a request to PersonMatchScoringRevoke.
+type PersonMatchScoringRevokeRequestOptions struct {
+	Body *PersonMatchScoringRevokeBody
+}
+
+// Validate validates all the fields in the options.
+// Use it if fields validation was not run.
+func (o *PersonMatchScoringRevokeRequestOptions) Validate() error {
+	var errors runtime.ValidationErrors
+
+	if o.Body != nil {
+		if v, ok := any(o.Body).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Body", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+
+	return errors
+}
+
+// GetPathParams returns the path params as a map.
+func (o *PersonMatchScoringRevokeRequestOptions) GetPathParams() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetQuery returns the query params as a map.
+func (o *PersonMatchScoringRevokeRequestOptions) GetQuery() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetBody returns the payload in any type that can be marshalled to JSON by the client.
+func (o *PersonMatchScoringRevokeRequestOptions) GetBody() any {
+	return o.Body
+}
+
+// GetHeader returns the headers as a map.
+func (o *PersonMatchScoringRevokeRequestOptions) GetHeader() (map[string]string, error) {
+	return nil, nil
+}
+
+// RunPersonMatchScoringRequestOptions is the options needed to make a request to RunPersonMatchScoring.
+type RunPersonMatchScoringRequestOptions struct {
+	Body *RunPersonMatchScoringBody
+}
+
+// Validate validates all the fields in the options.
+// Use it if fields validation was not run.
+func (o *RunPersonMatchScoringRequestOptions) Validate() error {
+	var errors runtime.ValidationErrors
+
+	if o.Body != nil {
+		if v, ok := any(o.Body).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Body", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+
+	return errors
+}
+
+// GetPathParams returns the path params as a map.
+func (o *RunPersonMatchScoringRequestOptions) GetPathParams() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetQuery returns the query params as a map.
+func (o *RunPersonMatchScoringRequestOptions) GetQuery() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetBody returns the payload in any type that can be marshalled to JSON by the client.
+func (o *RunPersonMatchScoringRequestOptions) GetBody() any {
+	return o.Body
+}
+
+// GetHeader returns the headers as a map.
+func (o *RunPersonMatchScoringRequestOptions) GetHeader() (map[string]string, error) {
 	return nil, nil
 }
 
@@ -4716,6 +5200,138 @@ func (o *SearchIntegrationTasksRequestOptions) GetBody() any {
 
 // GetHeader returns the headers as a map.
 func (o *SearchIntegrationTasksRequestOptions) GetHeader() (map[string]string, error) {
+	return nil, nil
+}
+
+// ListMeetingActionItemsRequestOptions is the options needed to make a request to ListMeetingActionItems.
+type ListMeetingActionItemsRequestOptions struct {
+	Body *ListMeetingActionItemsBody
+}
+
+// Validate validates all the fields in the options.
+// Use it if fields validation was not run.
+func (o *ListMeetingActionItemsRequestOptions) Validate() error {
+	var errors runtime.ValidationErrors
+
+	if o.Body != nil {
+		if v, ok := any(o.Body).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Body", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+
+	return errors
+}
+
+// GetPathParams returns the path params as a map.
+func (o *ListMeetingActionItemsRequestOptions) GetPathParams() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetQuery returns the query params as a map.
+func (o *ListMeetingActionItemsRequestOptions) GetQuery() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetBody returns the payload in any type that can be marshalled to JSON by the client.
+func (o *ListMeetingActionItemsRequestOptions) GetBody() any {
+	return o.Body
+}
+
+// GetHeader returns the headers as a map.
+func (o *ListMeetingActionItemsRequestOptions) GetHeader() (map[string]string, error) {
+	return nil, nil
+}
+
+// GetMeetingContextRequestOptions is the options needed to make a request to GetMeetingContext.
+type GetMeetingContextRequestOptions struct {
+	Body *GetMeetingContextBody
+}
+
+// Validate validates all the fields in the options.
+// Use it if fields validation was not run.
+func (o *GetMeetingContextRequestOptions) Validate() error {
+	var errors runtime.ValidationErrors
+
+	if o.Body != nil {
+		if v, ok := any(o.Body).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Body", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+
+	return errors
+}
+
+// GetPathParams returns the path params as a map.
+func (o *GetMeetingContextRequestOptions) GetPathParams() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetQuery returns the query params as a map.
+func (o *GetMeetingContextRequestOptions) GetQuery() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetBody returns the payload in any type that can be marshalled to JSON by the client.
+func (o *GetMeetingContextRequestOptions) GetBody() any {
+	return o.Body
+}
+
+// GetHeader returns the headers as a map.
+func (o *GetMeetingContextRequestOptions) GetHeader() (map[string]string, error) {
+	return nil, nil
+}
+
+// GetMeetingMetricsRequestOptions is the options needed to make a request to GetMeetingMetrics.
+type GetMeetingMetricsRequestOptions struct {
+	Body *GetMeetingMetricsBody
+}
+
+// Validate validates all the fields in the options.
+// Use it if fields validation was not run.
+func (o *GetMeetingMetricsRequestOptions) Validate() error {
+	var errors runtime.ValidationErrors
+
+	if o.Body != nil {
+		if v, ok := any(o.Body).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Body", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+
+	return errors
+}
+
+// GetPathParams returns the path params as a map.
+func (o *GetMeetingMetricsRequestOptions) GetPathParams() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetQuery returns the query params as a map.
+func (o *GetMeetingMetricsRequestOptions) GetQuery() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetBody returns the payload in any type that can be marshalled to JSON by the client.
+func (o *GetMeetingMetricsRequestOptions) GetBody() any {
+	return o.Body
+}
+
+// GetHeader returns the headers as a map.
+func (o *GetMeetingMetricsRequestOptions) GetHeader() (map[string]string, error) {
 	return nil, nil
 }
 
@@ -6657,6 +7273,262 @@ func (o *PatchPersonRequestOptions) GetBody() any {
 // GetHeader returns the headers as a map.
 func (o *PatchPersonRequestOptions) GetHeader() (map[string]string, error) {
 	return runtime.AsMap[string](o.Header)
+}
+
+// ListPersonAgendaRequestOptions is the options needed to make a request to ListPersonAgenda.
+type ListPersonAgendaRequestOptions struct {
+	PathParams *ListPersonAgendaPath
+}
+
+// Validate validates all the fields in the options.
+// Use it if fields validation was not run.
+func (o *ListPersonAgendaRequestOptions) Validate() error {
+	var errors runtime.ValidationErrors
+
+	if o.PathParams != nil {
+		if v, ok := any(o.PathParams).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("PathParams", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+
+	return errors
+}
+
+// GetPathParams returns the path params as a map.
+func (o *ListPersonAgendaRequestOptions) GetPathParams() (map[string]any, error) {
+	return runtime.AsMap[any](o.PathParams)
+}
+
+// GetQuery returns the query params as a map.
+func (o *ListPersonAgendaRequestOptions) GetQuery() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetBody returns the payload in any type that can be marshalled to JSON by the client.
+func (o *ListPersonAgendaRequestOptions) GetBody() any {
+	return nil
+}
+
+// GetHeader returns the headers as a map.
+func (o *ListPersonAgendaRequestOptions) GetHeader() (map[string]string, error) {
+	return nil, nil
+}
+
+// CreatePersonAgendaItemRequestOptions is the options needed to make a request to CreatePersonAgendaItem.
+type CreatePersonAgendaItemRequestOptions struct {
+	PathParams *CreatePersonAgendaItemPath
+	Body       *CreatePersonAgendaItemBody
+	Header     *CreatePersonAgendaItemHeaders
+}
+
+// Validate validates all the fields in the options.
+// Use it if fields validation was not run.
+func (o *CreatePersonAgendaItemRequestOptions) Validate() error {
+	var errors runtime.ValidationErrors
+
+	if o.PathParams != nil {
+		if v, ok := any(o.PathParams).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("PathParams", err)
+			}
+		}
+	}
+
+	if o.Body != nil {
+		if v, ok := any(o.Body).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Body", err)
+			}
+		}
+	}
+
+	if o.Header != nil {
+		if v, ok := any(o.Header).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Header", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+
+	return errors
+}
+
+// GetPathParams returns the path params as a map.
+func (o *CreatePersonAgendaItemRequestOptions) GetPathParams() (map[string]any, error) {
+	return runtime.AsMap[any](o.PathParams)
+}
+
+// GetQuery returns the query params as a map.
+func (o *CreatePersonAgendaItemRequestOptions) GetQuery() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetBody returns the payload in any type that can be marshalled to JSON by the client.
+func (o *CreatePersonAgendaItemRequestOptions) GetBody() any {
+	return o.Body
+}
+
+// GetHeader returns the headers as a map.
+func (o *CreatePersonAgendaItemRequestOptions) GetHeader() (map[string]string, error) {
+	return runtime.AsMap[string](o.Header)
+}
+
+// LinkPersonAgendaItemRequestOptions is the options needed to make a request to LinkPersonAgendaItem.
+type LinkPersonAgendaItemRequestOptions struct {
+	PathParams *LinkPersonAgendaItemPath
+	Body       *LinkPersonAgendaItemBody
+}
+
+// Validate validates all the fields in the options.
+// Use it if fields validation was not run.
+func (o *LinkPersonAgendaItemRequestOptions) Validate() error {
+	var errors runtime.ValidationErrors
+
+	if o.PathParams != nil {
+		if v, ok := any(o.PathParams).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("PathParams", err)
+			}
+		}
+	}
+
+	if o.Body != nil {
+		if v, ok := any(o.Body).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Body", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+
+	return errors
+}
+
+// GetPathParams returns the path params as a map.
+func (o *LinkPersonAgendaItemRequestOptions) GetPathParams() (map[string]any, error) {
+	return runtime.AsMap[any](o.PathParams)
+}
+
+// GetQuery returns the query params as a map.
+func (o *LinkPersonAgendaItemRequestOptions) GetQuery() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetBody returns the payload in any type that can be marshalled to JSON by the client.
+func (o *LinkPersonAgendaItemRequestOptions) GetBody() any {
+	return o.Body
+}
+
+// GetHeader returns the headers as a map.
+func (o *LinkPersonAgendaItemRequestOptions) GetHeader() (map[string]string, error) {
+	return nil, nil
+}
+
+// UnlinkPersonAgendaItemRequestOptions is the options needed to make a request to UnlinkPersonAgendaItem.
+type UnlinkPersonAgendaItemRequestOptions struct {
+	PathParams *UnlinkPersonAgendaItemPath
+}
+
+// Validate validates all the fields in the options.
+// Use it if fields validation was not run.
+func (o *UnlinkPersonAgendaItemRequestOptions) Validate() error {
+	var errors runtime.ValidationErrors
+
+	if o.PathParams != nil {
+		if v, ok := any(o.PathParams).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("PathParams", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+
+	return errors
+}
+
+// GetPathParams returns the path params as a map.
+func (o *UnlinkPersonAgendaItemRequestOptions) GetPathParams() (map[string]any, error) {
+	return runtime.AsMap[any](o.PathParams)
+}
+
+// GetQuery returns the query params as a map.
+func (o *UnlinkPersonAgendaItemRequestOptions) GetQuery() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetBody returns the payload in any type that can be marshalled to JSON by the client.
+func (o *UnlinkPersonAgendaItemRequestOptions) GetBody() any {
+	return nil
+}
+
+// GetHeader returns the headers as a map.
+func (o *UnlinkPersonAgendaItemRequestOptions) GetHeader() (map[string]string, error) {
+	return nil, nil
+}
+
+// UpdatePersonAgendaItemRequestOptions is the options needed to make a request to UpdatePersonAgendaItem.
+type UpdatePersonAgendaItemRequestOptions struct {
+	PathParams *UpdatePersonAgendaItemPath
+	Body       *UpdatePersonAgendaItemBody
+}
+
+// Validate validates all the fields in the options.
+// Use it if fields validation was not run.
+func (o *UpdatePersonAgendaItemRequestOptions) Validate() error {
+	var errors runtime.ValidationErrors
+
+	if o.PathParams != nil {
+		if v, ok := any(o.PathParams).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("PathParams", err)
+			}
+		}
+	}
+
+	if o.Body != nil {
+		if v, ok := any(o.Body).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Body", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+
+	return errors
+}
+
+// GetPathParams returns the path params as a map.
+func (o *UpdatePersonAgendaItemRequestOptions) GetPathParams() (map[string]any, error) {
+	return runtime.AsMap[any](o.PathParams)
+}
+
+// GetQuery returns the query params as a map.
+func (o *UpdatePersonAgendaItemRequestOptions) GetQuery() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetBody returns the payload in any type that can be marshalled to JSON by the client.
+func (o *UpdatePersonAgendaItemRequestOptions) GetBody() any {
+	return o.Body
+}
+
+// GetHeader returns the headers as a map.
+func (o *UpdatePersonAgendaItemRequestOptions) GetHeader() (map[string]string, error) {
+	return nil, nil
 }
 
 // ListPersonAttributesRequestOptions is the options needed to make a request to ListPersonAttributes.
@@ -8762,13 +9634,22 @@ func (o *PatchPersonRelationshipRequestOptions) GetHeader() (map[string]string, 
 
 // RunQueryRequestOptions is the options needed to make a request to RunQuery.
 type RunQueryRequestOptions struct {
-	Body *RunQueryBody
+	Query *RunQueryQuery
+	Body  *RunQueryBody
 }
 
 // Validate validates all the fields in the options.
 // Use it if fields validation was not run.
 func (o *RunQueryRequestOptions) Validate() error {
 	var errors runtime.ValidationErrors
+
+	if o.Query != nil {
+		if v, ok := any(o.Query).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Query", err)
+			}
+		}
+	}
 
 	if o.Body != nil {
 		if v, ok := any(o.Body).(runtime.Validator); ok {
@@ -8791,7 +9672,7 @@ func (o *RunQueryRequestOptions) GetPathParams() (map[string]any, error) {
 
 // GetQuery returns the query params as a map.
 func (o *RunQueryRequestOptions) GetQuery() (map[string]any, error) {
-	return nil, nil
+	return runtime.AsMap[any](o.Query)
 }
 
 // GetBody returns the payload in any type that can be marshalled to JSON by the client.
@@ -8801,6 +9682,59 @@ func (o *RunQueryRequestOptions) GetBody() any {
 
 // GetHeader returns the headers as a map.
 func (o *RunQueryRequestOptions) GetHeader() (map[string]string, error) {
+	return nil, nil
+}
+
+// RunArchiveQueryRequestOptions is the options needed to make a request to RunArchiveQuery.
+type RunArchiveQueryRequestOptions struct {
+	Query *RunArchiveQueryQuery
+	Body  *RunArchiveQueryBody
+}
+
+// Validate validates all the fields in the options.
+// Use it if fields validation was not run.
+func (o *RunArchiveQueryRequestOptions) Validate() error {
+	var errors runtime.ValidationErrors
+
+	if o.Query != nil {
+		if v, ok := any(o.Query).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Query", err)
+			}
+		}
+	}
+
+	if o.Body != nil {
+		if v, ok := any(o.Body).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Body", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+
+	return errors
+}
+
+// GetPathParams returns the path params as a map.
+func (o *RunArchiveQueryRequestOptions) GetPathParams() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetQuery returns the query params as a map.
+func (o *RunArchiveQueryRequestOptions) GetQuery() (map[string]any, error) {
+	return runtime.AsMap[any](o.Query)
+}
+
+// GetBody returns the payload in any type that can be marshalled to JSON by the client.
+func (o *RunArchiveQueryRequestOptions) GetBody() any {
+	return o.Body
+}
+
+// GetHeader returns the headers as a map.
+func (o *RunArchiveQueryRequestOptions) GetHeader() (map[string]string, error) {
 	return nil, nil
 }
 
@@ -9771,6 +10705,739 @@ func (o *PatchSettingsRequestOptions) GetBody() any {
 
 // GetHeader returns the headers as a map.
 func (o *PatchSettingsRequestOptions) GetHeader() (map[string]string, error) {
+	return runtime.AsMap[string](o.Header)
+}
+
+// StartSettingsPeopleCodexLoginRequestOptions is the options needed to make a request to StartSettingsPeopleCodexLogin.
+type StartSettingsPeopleCodexLoginRequestOptions struct {
+	Body *StartSettingsPeopleCodexLoginBody
+}
+
+// Validate validates all the fields in the options.
+// Use it if fields validation was not run.
+func (o *StartSettingsPeopleCodexLoginRequestOptions) Validate() error {
+	var errors runtime.ValidationErrors
+
+	if o.Body != nil {
+		if v, ok := any(o.Body).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Body", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+
+	return errors
+}
+
+// GetPathParams returns the path params as a map.
+func (o *StartSettingsPeopleCodexLoginRequestOptions) GetPathParams() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetQuery returns the query params as a map.
+func (o *StartSettingsPeopleCodexLoginRequestOptions) GetQuery() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetBody returns the payload in any type that can be marshalled to JSON by the client.
+func (o *StartSettingsPeopleCodexLoginRequestOptions) GetBody() any {
+	return o.Body
+}
+
+// GetHeader returns the headers as a map.
+func (o *StartSettingsPeopleCodexLoginRequestOptions) GetHeader() (map[string]string, error) {
+	return nil, nil
+}
+
+// CancelSettingsPeopleCodexLoginRequestOptions is the options needed to make a request to CancelSettingsPeopleCodexLogin.
+type CancelSettingsPeopleCodexLoginRequestOptions struct {
+	PathParams *CancelSettingsPeopleCodexLoginPath
+}
+
+// Validate validates all the fields in the options.
+// Use it if fields validation was not run.
+func (o *CancelSettingsPeopleCodexLoginRequestOptions) Validate() error {
+	var errors runtime.ValidationErrors
+
+	if o.PathParams != nil {
+		if v, ok := any(o.PathParams).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("PathParams", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+
+	return errors
+}
+
+// GetPathParams returns the path params as a map.
+func (o *CancelSettingsPeopleCodexLoginRequestOptions) GetPathParams() (map[string]any, error) {
+	return runtime.AsMap[any](o.PathParams)
+}
+
+// GetQuery returns the query params as a map.
+func (o *CancelSettingsPeopleCodexLoginRequestOptions) GetQuery() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetBody returns the payload in any type that can be marshalled to JSON by the client.
+func (o *CancelSettingsPeopleCodexLoginRequestOptions) GetBody() any {
+	return nil
+}
+
+// GetHeader returns the headers as a map.
+func (o *CancelSettingsPeopleCodexLoginRequestOptions) GetHeader() (map[string]string, error) {
+	return nil, nil
+}
+
+// GetSettingsPeopleCodexLoginRequestOptions is the options needed to make a request to GetSettingsPeopleCodexLogin.
+type GetSettingsPeopleCodexLoginRequestOptions struct {
+	PathParams *GetSettingsPeopleCodexLoginPath
+}
+
+// Validate validates all the fields in the options.
+// Use it if fields validation was not run.
+func (o *GetSettingsPeopleCodexLoginRequestOptions) Validate() error {
+	var errors runtime.ValidationErrors
+
+	if o.PathParams != nil {
+		if v, ok := any(o.PathParams).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("PathParams", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+
+	return errors
+}
+
+// GetPathParams returns the path params as a map.
+func (o *GetSettingsPeopleCodexLoginRequestOptions) GetPathParams() (map[string]any, error) {
+	return runtime.AsMap[any](o.PathParams)
+}
+
+// GetQuery returns the query params as a map.
+func (o *GetSettingsPeopleCodexLoginRequestOptions) GetQuery() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetBody returns the payload in any type that can be marshalled to JSON by the client.
+func (o *GetSettingsPeopleCodexLoginRequestOptions) GetBody() any {
+	return nil
+}
+
+// GetHeader returns the headers as a map.
+func (o *GetSettingsPeopleCodexLoginRequestOptions) GetHeader() (map[string]string, error) {
+	return nil, nil
+}
+
+// GetSettingsPeopleCodexModelsRequestOptions is the options needed to make a request to GetSettingsPeopleCodexModels.
+type GetSettingsPeopleCodexModelsRequestOptions struct {
+	PathParams *GetSettingsPeopleCodexModelsPath
+}
+
+// Validate validates all the fields in the options.
+// Use it if fields validation was not run.
+func (o *GetSettingsPeopleCodexModelsRequestOptions) Validate() error {
+	var errors runtime.ValidationErrors
+
+	if o.PathParams != nil {
+		if v, ok := any(o.PathParams).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("PathParams", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+
+	return errors
+}
+
+// GetPathParams returns the path params as a map.
+func (o *GetSettingsPeopleCodexModelsRequestOptions) GetPathParams() (map[string]any, error) {
+	return runtime.AsMap[any](o.PathParams)
+}
+
+// GetQuery returns the query params as a map.
+func (o *GetSettingsPeopleCodexModelsRequestOptions) GetQuery() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetBody returns the payload in any type that can be marshalled to JSON by the client.
+func (o *GetSettingsPeopleCodexModelsRequestOptions) GetBody() any {
+	return nil
+}
+
+// GetHeader returns the headers as a map.
+func (o *GetSettingsPeopleCodexModelsRequestOptions) GetHeader() (map[string]string, error) {
+	return nil, nil
+}
+
+// PutSettingsPeopleCodexProfileRequestOptions is the options needed to make a request to PutSettingsPeopleCodexProfile.
+type PutSettingsPeopleCodexProfileRequestOptions struct {
+	PathParams *PutSettingsPeopleCodexProfilePath
+	Body       *PutSettingsPeopleCodexProfileBody
+	Header     *PutSettingsPeopleCodexProfileHeaders
+}
+
+// Validate validates all the fields in the options.
+// Use it if fields validation was not run.
+func (o *PutSettingsPeopleCodexProfileRequestOptions) Validate() error {
+	var errors runtime.ValidationErrors
+
+	if o.PathParams != nil {
+		if v, ok := any(o.PathParams).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("PathParams", err)
+			}
+		}
+	}
+
+	if o.Body != nil {
+		if v, ok := any(o.Body).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Body", err)
+			}
+		}
+	}
+
+	if o.Header != nil {
+		if v, ok := any(o.Header).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Header", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+
+	return errors
+}
+
+// GetPathParams returns the path params as a map.
+func (o *PutSettingsPeopleCodexProfileRequestOptions) GetPathParams() (map[string]any, error) {
+	return runtime.AsMap[any](o.PathParams)
+}
+
+// GetQuery returns the query params as a map.
+func (o *PutSettingsPeopleCodexProfileRequestOptions) GetQuery() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetBody returns the payload in any type that can be marshalled to JSON by the client.
+func (o *PutSettingsPeopleCodexProfileRequestOptions) GetBody() any {
+	return o.Body
+}
+
+// GetHeader returns the headers as a map.
+func (o *PutSettingsPeopleCodexProfileRequestOptions) GetHeader() (map[string]string, error) {
+	return runtime.AsMap[string](o.Header)
+}
+
+// DisableSettingsPeopleInferenceRequestOptions is the options needed to make a request to DisableSettingsPeopleInference.
+type DisableSettingsPeopleInferenceRequestOptions struct {
+	Header *DisableSettingsPeopleInferenceHeaders
+}
+
+// Validate validates all the fields in the options.
+// Use it if fields validation was not run.
+func (o *DisableSettingsPeopleInferenceRequestOptions) Validate() error {
+	var errors runtime.ValidationErrors
+
+	if o.Header != nil {
+		if v, ok := any(o.Header).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Header", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+
+	return errors
+}
+
+// GetPathParams returns the path params as a map.
+func (o *DisableSettingsPeopleInferenceRequestOptions) GetPathParams() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetQuery returns the query params as a map.
+func (o *DisableSettingsPeopleInferenceRequestOptions) GetQuery() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetBody returns the payload in any type that can be marshalled to JSON by the client.
+func (o *DisableSettingsPeopleInferenceRequestOptions) GetBody() any {
+	return nil
+}
+
+// GetHeader returns the headers as a map.
+func (o *DisableSettingsPeopleInferenceRequestOptions) GetHeader() (map[string]string, error) {
+	return runtime.AsMap[string](o.Header)
+}
+
+// DeleteSettingsPeopleInferenceProviderRequestOptions is the options needed to make a request to DeleteSettingsPeopleInferenceProvider.
+type DeleteSettingsPeopleInferenceProviderRequestOptions struct {
+	PathParams *DeleteSettingsPeopleInferenceProviderPath
+	Header     *DeleteSettingsPeopleInferenceProviderHeaders
+}
+
+// Validate validates all the fields in the options.
+// Use it if fields validation was not run.
+func (o *DeleteSettingsPeopleInferenceProviderRequestOptions) Validate() error {
+	var errors runtime.ValidationErrors
+
+	if o.PathParams != nil {
+		if v, ok := any(o.PathParams).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("PathParams", err)
+			}
+		}
+	}
+
+	if o.Header != nil {
+		if v, ok := any(o.Header).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Header", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+
+	return errors
+}
+
+// GetPathParams returns the path params as a map.
+func (o *DeleteSettingsPeopleInferenceProviderRequestOptions) GetPathParams() (map[string]any, error) {
+	return runtime.AsMap[any](o.PathParams)
+}
+
+// GetQuery returns the query params as a map.
+func (o *DeleteSettingsPeopleInferenceProviderRequestOptions) GetQuery() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetBody returns the payload in any type that can be marshalled to JSON by the client.
+func (o *DeleteSettingsPeopleInferenceProviderRequestOptions) GetBody() any {
+	return nil
+}
+
+// GetHeader returns the headers as a map.
+func (o *DeleteSettingsPeopleInferenceProviderRequestOptions) GetHeader() (map[string]string, error) {
+	return runtime.AsMap[string](o.Header)
+}
+
+// PutSettingsPeopleInferencePresetRequestOptions is the options needed to make a request to PutSettingsPeopleInferencePreset.
+type PutSettingsPeopleInferencePresetRequestOptions struct {
+	PathParams *PutSettingsPeopleInferencePresetPath
+	Body       *PutSettingsPeopleInferencePresetBody
+	Header     *PutSettingsPeopleInferencePresetHeaders
+}
+
+// Validate validates all the fields in the options.
+// Use it if fields validation was not run.
+func (o *PutSettingsPeopleInferencePresetRequestOptions) Validate() error {
+	var errors runtime.ValidationErrors
+
+	if o.PathParams != nil {
+		if v, ok := any(o.PathParams).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("PathParams", err)
+			}
+		}
+	}
+
+	if o.Body != nil {
+		if v, ok := any(o.Body).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Body", err)
+			}
+		}
+	}
+
+	if o.Header != nil {
+		if v, ok := any(o.Header).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Header", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+
+	return errors
+}
+
+// GetPathParams returns the path params as a map.
+func (o *PutSettingsPeopleInferencePresetRequestOptions) GetPathParams() (map[string]any, error) {
+	return runtime.AsMap[any](o.PathParams)
+}
+
+// GetQuery returns the query params as a map.
+func (o *PutSettingsPeopleInferencePresetRequestOptions) GetQuery() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetBody returns the payload in any type that can be marshalled to JSON by the client.
+func (o *PutSettingsPeopleInferencePresetRequestOptions) GetBody() any {
+	return o.Body
+}
+
+// GetHeader returns the headers as a map.
+func (o *PutSettingsPeopleInferencePresetRequestOptions) GetHeader() (map[string]string, error) {
+	return runtime.AsMap[string](o.Header)
+}
+
+// CheckSettingsPeopleInferenceProviderRequestOptions is the options needed to make a request to CheckSettingsPeopleInferenceProvider.
+type CheckSettingsPeopleInferenceProviderRequestOptions struct {
+	PathParams *CheckSettingsPeopleInferenceProviderPath
+	Header     *CheckSettingsPeopleInferenceProviderHeaders
+}
+
+// Validate validates all the fields in the options.
+// Use it if fields validation was not run.
+func (o *CheckSettingsPeopleInferenceProviderRequestOptions) Validate() error {
+	var errors runtime.ValidationErrors
+
+	if o.PathParams != nil {
+		if v, ok := any(o.PathParams).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("PathParams", err)
+			}
+		}
+	}
+
+	if o.Header != nil {
+		if v, ok := any(o.Header).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Header", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+
+	return errors
+}
+
+// GetPathParams returns the path params as a map.
+func (o *CheckSettingsPeopleInferenceProviderRequestOptions) GetPathParams() (map[string]any, error) {
+	return runtime.AsMap[any](o.PathParams)
+}
+
+// GetQuery returns the query params as a map.
+func (o *CheckSettingsPeopleInferenceProviderRequestOptions) GetQuery() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetBody returns the payload in any type that can be marshalled to JSON by the client.
+func (o *CheckSettingsPeopleInferenceProviderRequestOptions) GetBody() any {
+	return nil
+}
+
+// GetHeader returns the headers as a map.
+func (o *CheckSettingsPeopleInferenceProviderRequestOptions) GetHeader() (map[string]string, error) {
+	return runtime.AsMap[string](o.Header)
+}
+
+// ConsentSettingsPeopleInferenceProviderRequestOptions is the options needed to make a request to ConsentSettingsPeopleInferenceProvider.
+type ConsentSettingsPeopleInferenceProviderRequestOptions struct {
+	PathParams *ConsentSettingsPeopleInferenceProviderPath
+	Body       *ConsentSettingsPeopleInferenceProviderBody
+	Header     *ConsentSettingsPeopleInferenceProviderHeaders
+}
+
+// Validate validates all the fields in the options.
+// Use it if fields validation was not run.
+func (o *ConsentSettingsPeopleInferenceProviderRequestOptions) Validate() error {
+	var errors runtime.ValidationErrors
+
+	if o.PathParams != nil {
+		if v, ok := any(o.PathParams).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("PathParams", err)
+			}
+		}
+	}
+
+	if o.Body != nil {
+		if v, ok := any(o.Body).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Body", err)
+			}
+		}
+	}
+
+	if o.Header != nil {
+		if v, ok := any(o.Header).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Header", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+
+	return errors
+}
+
+// GetPathParams returns the path params as a map.
+func (o *ConsentSettingsPeopleInferenceProviderRequestOptions) GetPathParams() (map[string]any, error) {
+	return runtime.AsMap[any](o.PathParams)
+}
+
+// GetQuery returns the query params as a map.
+func (o *ConsentSettingsPeopleInferenceProviderRequestOptions) GetQuery() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetBody returns the payload in any type that can be marshalled to JSON by the client.
+func (o *ConsentSettingsPeopleInferenceProviderRequestOptions) GetBody() any {
+	return o.Body
+}
+
+// GetHeader returns the headers as a map.
+func (o *ConsentSettingsPeopleInferenceProviderRequestOptions) GetHeader() (map[string]string, error) {
+	return runtime.AsMap[string](o.Header)
+}
+
+// DeleteSettingsPeopleInferenceKeyRequestOptions is the options needed to make a request to DeleteSettingsPeopleInferenceKey.
+type DeleteSettingsPeopleInferenceKeyRequestOptions struct {
+	PathParams *DeleteSettingsPeopleInferenceKeyPath
+	Header     *DeleteSettingsPeopleInferenceKeyHeaders
+}
+
+// Validate validates all the fields in the options.
+// Use it if fields validation was not run.
+func (o *DeleteSettingsPeopleInferenceKeyRequestOptions) Validate() error {
+	var errors runtime.ValidationErrors
+
+	if o.PathParams != nil {
+		if v, ok := any(o.PathParams).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("PathParams", err)
+			}
+		}
+	}
+
+	if o.Header != nil {
+		if v, ok := any(o.Header).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Header", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+
+	return errors
+}
+
+// GetPathParams returns the path params as a map.
+func (o *DeleteSettingsPeopleInferenceKeyRequestOptions) GetPathParams() (map[string]any, error) {
+	return runtime.AsMap[any](o.PathParams)
+}
+
+// GetQuery returns the query params as a map.
+func (o *DeleteSettingsPeopleInferenceKeyRequestOptions) GetQuery() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetBody returns the payload in any type that can be marshalled to JSON by the client.
+func (o *DeleteSettingsPeopleInferenceKeyRequestOptions) GetBody() any {
+	return nil
+}
+
+// GetHeader returns the headers as a map.
+func (o *DeleteSettingsPeopleInferenceKeyRequestOptions) GetHeader() (map[string]string, error) {
+	return runtime.AsMap[string](o.Header)
+}
+
+// PutSettingsPeopleInferenceKeyRequestOptions is the options needed to make a request to PutSettingsPeopleInferenceKey.
+type PutSettingsPeopleInferenceKeyRequestOptions struct {
+	PathParams *PutSettingsPeopleInferenceKeyPath
+	Body       *PutSettingsPeopleInferenceKeyBody
+	Header     *PutSettingsPeopleInferenceKeyHeaders
+}
+
+// Validate validates all the fields in the options.
+// Use it if fields validation was not run.
+func (o *PutSettingsPeopleInferenceKeyRequestOptions) Validate() error {
+	var errors runtime.ValidationErrors
+
+	if o.PathParams != nil {
+		if v, ok := any(o.PathParams).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("PathParams", err)
+			}
+		}
+	}
+
+	if o.Body != nil {
+		if v, ok := any(o.Body).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Body", err)
+			}
+		}
+	}
+
+	if o.Header != nil {
+		if v, ok := any(o.Header).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Header", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+
+	return errors
+}
+
+// GetPathParams returns the path params as a map.
+func (o *PutSettingsPeopleInferenceKeyRequestOptions) GetPathParams() (map[string]any, error) {
+	return runtime.AsMap[any](o.PathParams)
+}
+
+// GetQuery returns the query params as a map.
+func (o *PutSettingsPeopleInferenceKeyRequestOptions) GetQuery() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetBody returns the payload in any type that can be marshalled to JSON by the client.
+func (o *PutSettingsPeopleInferenceKeyRequestOptions) GetBody() any {
+	return o.Body
+}
+
+// GetHeader returns the headers as a map.
+func (o *PutSettingsPeopleInferenceKeyRequestOptions) GetHeader() (map[string]string, error) {
+	return runtime.AsMap[string](o.Header)
+}
+
+// RevokeSettingsPeopleInferenceProviderRequestOptions is the options needed to make a request to RevokeSettingsPeopleInferenceProvider.
+type RevokeSettingsPeopleInferenceProviderRequestOptions struct {
+	PathParams *RevokeSettingsPeopleInferenceProviderPath
+	Header     *RevokeSettingsPeopleInferenceProviderHeaders
+}
+
+// Validate validates all the fields in the options.
+// Use it if fields validation was not run.
+func (o *RevokeSettingsPeopleInferenceProviderRequestOptions) Validate() error {
+	var errors runtime.ValidationErrors
+
+	if o.PathParams != nil {
+		if v, ok := any(o.PathParams).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("PathParams", err)
+			}
+		}
+	}
+
+	if o.Header != nil {
+		if v, ok := any(o.Header).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Header", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+
+	return errors
+}
+
+// GetPathParams returns the path params as a map.
+func (o *RevokeSettingsPeopleInferenceProviderRequestOptions) GetPathParams() (map[string]any, error) {
+	return runtime.AsMap[any](o.PathParams)
+}
+
+// GetQuery returns the query params as a map.
+func (o *RevokeSettingsPeopleInferenceProviderRequestOptions) GetQuery() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetBody returns the payload in any type that can be marshalled to JSON by the client.
+func (o *RevokeSettingsPeopleInferenceProviderRequestOptions) GetBody() any {
+	return nil
+}
+
+// GetHeader returns the headers as a map.
+func (o *RevokeSettingsPeopleInferenceProviderRequestOptions) GetHeader() (map[string]string, error) {
+	return runtime.AsMap[string](o.Header)
+}
+
+// SelectSettingsPeopleInferenceRequestOptions is the options needed to make a request to SelectSettingsPeopleInference.
+type SelectSettingsPeopleInferenceRequestOptions struct {
+	Body   *SelectSettingsPeopleInferenceBody
+	Header *SelectSettingsPeopleInferenceHeaders
+}
+
+// Validate validates all the fields in the options.
+// Use it if fields validation was not run.
+func (o *SelectSettingsPeopleInferenceRequestOptions) Validate() error {
+	var errors runtime.ValidationErrors
+
+	if o.Body != nil {
+		if v, ok := any(o.Body).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Body", err)
+			}
+		}
+	}
+
+	if o.Header != nil {
+		if v, ok := any(o.Header).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Header", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+
+	return errors
+}
+
+// GetPathParams returns the path params as a map.
+func (o *SelectSettingsPeopleInferenceRequestOptions) GetPathParams() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetQuery returns the query params as a map.
+func (o *SelectSettingsPeopleInferenceRequestOptions) GetQuery() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetBody returns the payload in any type that can be marshalled to JSON by the client.
+func (o *SelectSettingsPeopleInferenceRequestOptions) GetBody() any {
+	return o.Body
+}
+
+// GetHeader returns the headers as a map.
+func (o *SelectSettingsPeopleInferenceRequestOptions) GetHeader() (map[string]string, error) {
 	return runtime.AsMap[string](o.Header)
 }
 

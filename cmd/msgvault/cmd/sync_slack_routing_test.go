@@ -5,11 +5,14 @@ import (
 	"context"
 	"testing"
 
+	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/msgvault/internal/attachmentpolicy"
 	"go.kenn.io/msgvault/internal/clirun"
 	"go.kenn.io/msgvault/internal/config"
+	"go.kenn.io/msgvault/internal/slack"
+	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/testutil"
 )
 
@@ -64,6 +67,8 @@ func TestResolveSlackSyncSourcesFiltersByTeam(t *testing.T) {
 }
 
 func TestRunConfiguredSlackSyncIsolatesBrokenWorkspaces(t *testing.T) {
+	cfg := testConfigValue()
+
 	require := require.New(t)
 	st := testutil.NewTestStore(t)
 
@@ -82,28 +87,71 @@ func TestRunConfiguredSlackSyncIsolatesBrokenWorkspaces(t *testing.T) {
 		HomeDir: tmpDir,
 		Data:    config.DataConfig{DataDir: tmpDir},
 	}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 
-	err = runConfiguredSlackSync(context.Background(), st)
+	err = runConfiguredSlackSync(testCtx, st)
 	require.ErrorContains(err, "malformed identifier")
 	require.ErrorContains(err, "no Slack token for UME in workspace T09")
 }
 
+func TestScheduledSlackAttemptsResumeAfterInterruptedWorkspace(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	st := testutil.NewTestStore(t)
+	for _, identifier := range []string{"T01:U01", "T02:U02", "T03:U03"} {
+		_, err := st.GetOrCreateSource(sourceTypeSlack, identifier)
+		require.NoError(err)
+	}
+	sources, err := resolveSlackSyncSources(st, "")
+	require.NoError(err)
+	rotation := &slackWorkspaceRotation{}
+	ctx, cancel := context.WithCancel(context.Background())
+	var first []string
+	err = runScheduledSlackAttempts(ctx, sources, rotation, func(src *store.Source) (bool, error) {
+		first = append(first, src.Identifier)
+		cancel() // the scheduler's hard yield interrupted this workspace
+		return true, context.Canceled
+	}, func() error { return nil })
+	require.ErrorIs(err, context.Canceled)
+	assert.Equal([]string{sources[0].Identifier}, first)
+
+	var resumed []string
+	err = runScheduledSlackAttempts(context.Background(), sources, rotation,
+		func(src *store.Source) (bool, error) {
+			resumed = append(resumed, src.Identifier)
+			return true, nil
+		}, func() error { return nil })
+	require.NoError(err)
+	assert.Equal(append(append([]string{}, sources[1].Identifier, sources[2].Identifier), sources[0].Identifier), resumed,
+		"the next scheduler run resumes after the interrupted workspace")
+}
+
 func TestSlackImportOptionsDeriveFromConfig(t *testing.T) {
+	cfg := testConfigValue()
+
 	assert := assert.New(t)
 	savedCfg := cfg
 	t.Cleanup(func() { cfg = savedCfg })
 	media := false
+	dms := false
+	groupDMs := true
 	cfg = &config.Config{
 		HomeDir: t.TempDir(),
 		Slack: config.SlackConfig{
+			PrivateChannels: new(false),
 			Channels:        []string{"eng"},
 			ExcludeChannels: []string{"noise"},
+			DMs:             &dms,
+			GroupDMs:        &groupDMs,
 			Media:           &media,
 			MaxMediaMB:      7,
 		},
 	}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 
-	opts := slackImportOptions("T01", "UME")
+	opts := slackImportOptions("T01", "UME", cfg)
 	assert.Equal("T01", opts.TeamID)
 	assert.Equal("UME", opts.UserID)
 	assert.False(opts.NoMedia, "persistent config is represented by typed policy, not the one-run flag")
@@ -111,6 +159,40 @@ func TestSlackImportOptionsDeriveFromConfig(t *testing.T) {
 	assert.Equal(int64(7)<<20, opts.MaxMediaBytes)
 	assert.Equal([]string{"eng"}, opts.IncludeChannels)
 	assert.Equal([]string{"noise"}, opts.ExcludeChannels)
+	assert.True(opts.ExcludeDMs)
+	assert.True(opts.ExcludePrivateChannels)
+	assert.False(opts.ExcludeGroupDMs)
+}
+
+func TestApplySlackConversationOverrides(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	configured := &cobra.Command{}
+	configured.Flags().Bool("dms", true, "")
+	configured.Flags().Bool("group-dms", true, "")
+	configured.Flags().Bool("private-channels", true, "")
+	configuredOpts := slack.ImportOptions{ExcludeDMs: true, ExcludePrivateChannels: true}
+	applySlackConversationOverrides(configured, &configuredOpts, false, false, false)
+	assert.True(configuredOpts.ExcludePrivateChannels)
+	assert.True(configuredOpts.ExcludeDMs)
+	assert.False(configuredOpts.ExcludeGroupDMs)
+
+	cmd := &cobra.Command{}
+	dms := true
+	groupDMs := false
+	cmd.Flags().Bool("dms", true, "")
+	cmd.Flags().Bool("group-dms", true, "")
+	cmd.Flags().Bool("private-channels", true, "")
+	require.NoError(cmd.Flags().Set("dms", "true"))
+	require.NoError(cmd.Flags().Set("group-dms", "false"))
+	require.NoError(cmd.Flags().Set("private-channels", "true"))
+
+	opts := slack.ImportOptions{ExcludeDMs: true, ExcludePrivateChannels: true}
+	applySlackConversationOverrides(cmd, &opts, true, dms, groupDMs)
+	assert.False(opts.ExcludePrivateChannels)
+
+	assert.False(opts.ExcludeDMs)
+	assert.True(opts.ExcludeGroupDMs)
 }
 
 func TestWriteSlackProgressSanitizesProviderNames(t *testing.T) {
@@ -157,23 +239,31 @@ func TestSyncSlackCommandUsesDaemonRunner(t *testing.T) {
 	server, requests := newDaemonCLIRunnerTestServer(t, func(req daemonCLIRunTestRequest) {
 		assert.Equal([]string{
 			"sync-slack",
+			"--dms=false",
 			"--full",
+			"--group-dms=false",
 			"--limit=25",
 			"--no-threads",
+			"--private-channels=false",
 			"T0123456789",
 		}, req.Args, "args")
 	}, `{"type":"stdout","data":"Syncing Slack workspace T0123456789\n"}`, `{"type":"complete"}`)
-	configureRemoteDaemonForTest(t, server.URL)
+	testCtx := configureRemoteDaemonForTest(t, server.URL)
+	_ = testCtx
 
 	var stdout bytes.Buffer
 	cmd := newSyncSlackCmd()
+	cmd.SetContext(testCtx)
 	cmd.SetOut(&stdout)
 	cmd.SetErr(&stdout)
 	cmd.SetArgs([]string{
 		"T0123456789",
+		"--dms=false",
 		"--full",
+		"--group-dms=false",
 		"--limit", "25",
 		"--no-threads",
+		"--private-channels=false",
 	})
 
 	require.NoError(t, cmd.Execute(), "sync-slack")
@@ -188,11 +278,13 @@ func TestAddSlackCommandForwardsTokenEnv(t *testing.T) {
 		assert.Equal([]string{"add-slack"}, req.Args, "args")
 		assert.Equal("xoxp-test-123", req.Env[clirun.EnvSlackToken], "token env forwarded")
 	}, `{"type":"stdout","data":"Added Slack workspace Testers\n"}`, `{"type":"complete"}`)
-	configureRemoteDaemonForTest(t, server.URL)
+	testCtx := configureRemoteDaemonForTest(t, server.URL)
+	_ = testCtx
 	t.Setenv(clirun.EnvSlackToken, "xoxp-test-123")
 
 	var stdout bytes.Buffer
 	cmd := newAddSlackCmd()
+	cmd.SetContext(testCtx)
 	cmd.SetOut(&stdout)
 	cmd.SetErr(&stdout)
 	cmd.SetArgs([]string{})

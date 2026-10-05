@@ -1,5 +1,5 @@
 ---
-last_edited: "2026-09-08"
+last_edited: "2026-10-02"
 title: Choose a Source
 description: Find the right sync or import path for mail, chat, meetings, calendars, and contacts.
 ---
@@ -19,7 +19,7 @@ non-Google provider.
 |---|---|---|
 | Gmail or Google Workspace | [Gmail setup](../setup.md#configure-oauth) | Google OAuth app and account authorization; read-only access is an option |
 | An IMAP mailbox | [IMAP sync](../usage/imap.md) | Server address and credentials, often an app password |
-| Microsoft 365 mail | [Microsoft 365 setup](../cli-reference.md#add-o365) | A Microsoft OAuth app and IMAP access |
+| Microsoft 365 or Outlook.com mail | [Microsoft mail setup](oauth-setup.md#microsoft-365-outlook-hotmail) | A Microsoft OAuth app; choose IMAP or Graph mail access |
 | Maildir or Maildir++ archive | [Maildir import](../usage/importing.md#import-maildir) | A stable snapshot with `cur`, `new`, and `tmp` directories |
 | MailMate-style `.mailbox` directories | [EML import](../usage/importing.md) | A `.mailbox` tree containing `.eml` files and an archive identifier |
 | MBOX, Apple Mail, or Outlook PST | [Local email import](../usage/importing.md) | An exported mailbox or readable local mail directory |
@@ -38,7 +38,7 @@ also a separate opt-in because downloading an image can activate email tracking.
 | Microsoft Teams | [Teams sync](../usage/teams.md) | Chats, self-chat, channels, replies, and available media |
 | Discord | [Discord sync](../usage/discord.md) | Bot-accessible guild channels, threads, and forums; personal DMs are outside this integration |
 | Beeper Desktop | [Beeper sync](../usage/beeper.md) | History and media exposed by the running local Beeper API |
-| WhatsApp, iMessage, Google Voice, Messenger | [Text message imports](../usage/text-messages.md) | Supported backups or exports, with your identity supplied where required |
+| WhatsApp, iMessage, iMazing CSV, Google Voice, Messenger | [Text message imports](../usage/text-messages.md) | Supported backups or exports, with your identity supplied where required |
 | SMS Backup & Restore | [Android SMS and call logs](../usage/text-messages.md) | Local XML/ZIP or scheduled imports from a configured Drive folder |
 
 Chat media has size and room-participant limits. A message can be archived
@@ -50,8 +50,8 @@ missing downloads.
 
 | Your source | Start here | What it adds |
 |---|---|---|
-| Granola, Circleback, or Notion AI Meeting Notes | [Meeting notes and transcripts](../usage/meetings.md) | Searchable notes, transcripts where available, and participants |
-| Another meeting capture tool | [Meeting import API](../api-server.md) | Provider-neutral ingestion keyed by source and external meeting ID |
+| Granola, Plaud, Circleback, Notion AI Meeting Notes, or Muesli | [Meeting notes and transcripts](../usage/meetings.md) | Searchable notes, context exports, recorded actions, and meeting-time coverage |
+| Another meeting capture tool | [Meeting import workflow](../usage/meetings.md#import-from-any-meeting-source) | Provider-neutral ingestion keyed by source and external meeting ID |
 | Google Calendar | [Calendar sync](../usage/calendar.md) | Events, organizers, attendees, recurrence, and cancellation state |
 | CardDAV address book | [CardDAV contacts](../usage/people-carddav.md) | Imported contacts and explicit publication of curated profiles |
 
@@ -72,4 +72,6 @@ review its conflict and consent workflow before enabling that direction.
 
 For records already stored, keyword search and analytics use the archive.
 Optional [semantic search and profile automation](../usage/recommended-configuration.md)
-have their own provider configuration and consent steps.
+have their own provider configuration. Message embeddings are enabled through
+configuration; people, visual, and document features also require their stated
+consent steps.

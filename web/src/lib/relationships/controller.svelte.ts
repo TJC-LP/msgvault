@@ -138,7 +138,7 @@ export class RelationshipsController {
   relationshipCalendar = $state<RelationshipCalendar | null>(null);
   relationshipCalendarYear = $state(new Date().getUTCFullYear());
   relationshipCalendarCurrentYear = $state(this.relationshipCalendarYear);
-  relationshipCalendarFirstYear = $state(this.relationshipCalendarYear);
+  relationshipCalendarFirstYear = $state<number | null>(null);
   relationshipCalendarLoading = $state(false);
   relationshipCalendarError = $state<string | null>(null);
   private readonly client: APIClient;
@@ -168,7 +168,6 @@ export class RelationshipsController {
     this.timezone = timezone;
     this.relationshipCalendarYear = currentYearInTimezone(this.timezone());
     this.relationshipCalendarCurrentYear = this.relationshipCalendarYear;
-    this.relationshipCalendarFirstYear = this.relationshipCalendarYear;
   }
   personMergeContextSnapshot(): RelationshipsMergeContext {
     return {
@@ -550,6 +549,7 @@ export class RelationshipsController {
       clusterID === undefined ||
       !signal ||
       signal.aborted ||
+      this.relationshipCalendarFirstYear === null ||
       year < this.relationshipCalendarFirstYear ||
       year > currentYear
     )
@@ -828,7 +828,7 @@ export class RelationshipsController {
     this.relationshipCalendar = null;
     this.relationshipCalendarCurrentYear = currentYearInTimezone(this.timezone());
     this.relationshipCalendarYear = selectedYear ?? this.relationshipCalendarCurrentYear;
-    this.relationshipCalendarFirstYear = this.relationshipCalendarYear;
+    this.relationshipCalendarFirstYear = null;
     this.relationshipCalendarLoading = false;
     this.relationshipCalendarError = null;
     this.relationshipCalendarCacheRevision = null;
@@ -932,15 +932,15 @@ function contextPredicate(predicate: ExplorePredicate): ExplorePredicate {
 function hasActiveFilters(context: ExplorePredicate): boolean {
   return (context.filters ?? []).length > 0;
 }
-/** Contextual summary metrics win; the unfiltered GET remains the fallback
- * source of cluster metadata (identifiers, member/edge graph) that the
- * link/unlink UI needs and the summary row may omit. */
+/** Contextual summary metrics win; the unfiltered GET remains the
+ * source of live cluster metadata (identifiers, member/edge graph) that
+ * analytical summaries do not enrich. */
 function mergePersonDetail(base: PersonSummary, summary: PersonSummary): PersonSummary {
   return {
     ...base,
     ...summary,
-    cluster: summary.cluster ?? base.cluster,
-    identifiers: summary.identifiers.length > 0 ? summary.identifiers : base.identifiers,
+    cluster: base.cluster,
+    identifiers: base.identifiers,
   };
 }
 // The generated summary types carry `[key: string]: unknown` index

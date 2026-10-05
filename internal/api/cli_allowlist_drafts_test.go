@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -18,13 +19,78 @@ import (
 )
 
 func TestCLIRunDraftAllowlist(t *testing.T) {
-	assert.True(t, cliRunCommandAllowed([]string{"draft-reply", "42", "--from=alice@example.com", "--body=body"}))
-	assert.False(t, cliRunCommandAllowed([]string{"configure-imap-drafts"}))
-	assert.False(t, cliRunCommandAllowed([]string{"draft-reply"}))
+	t.Parallel()
+	assertions := assert.New(t)
+	assertions.True(cliRunCommandAllowed([]string{"draft-reply", "42", "--from=alice@example.com", "--body=body"}))
+	assertions.True(cliRunCommandAllowed([]string{"draft-forward", "42", "--source-id=7", "--to=bob@example.com"}))
+	assertions.True(IsCLIRunDraftLifecycle([]string{"draft-get", "draft-abc"}))
+	assertions.True(IsCLIRunDraftSendAs([]string{"draft-send-as", "alice@example.com"}))
+	assertions.True(cliRunCommandAllowed([]string{"draft-send-as", "alice@example.com"}))
+	assertions.True(cliRunCommandAllowed([]string{"draft-edit", "draft-abc", "--revision=1", "--body=body"}))
+	assertions.True(cliRunCommandAllowed([]string{"draft-delete", "draft-abc", "--revision=1"}))
+	assertions.True(IsCLIRunDraftLifecycle([]string{"draft-recover", "draft-abc", "--revision=1"}))
+	assertions.True(cliRunCommandAllowed([]string{"draft-recover", "draft-abc", "--revision=1"}))
+	assertions.False(cliRunCommandAllowed([]string{"configure-imap-drafts"}))
+	assertions.False(cliRunCommandAllowed([]string{"draft-reply"}))
+	assertions.False(cliRunCommandAllowed([]string{"draft-get"}))
+	assertions.False(cliRunCommandAllowed([]string{"draft-send-as"}))
+}
+
+func TestDelegatedDraftRecoverRequiresActionPermission(t *testing.T) {
+	t.Parallel()
+	source := agentgrant.SourceRef{ID: 1, Type: "imap", Identifier: "alice@example.com"}
+	assert.True(t, delegatedCLIRunAdmitted(
+		[]string{"draft-recover", "draft-abc", "--revision=1"},
+		&agentgrant.Grant{Permissions: []agentgrant.Permission{agentgrant.PermissionDraftEdit}},
+	))
+	assert.True(t, delegatedCLIRunAdmitted(
+		[]string{"draft-recover", "draft-abc", "--revision=1"},
+		&agentgrant.Grant{Permissions: []agentgrant.Permission{agentgrant.PermissionDraftDelete}},
+	))
+	assert.False(t, delegatedCLIRunAdmitted(
+		[]string{"draft-recover", "draft-abc", "--revision=1"},
+		&agentgrant.Grant{Permissions: []agentgrant.Permission{agentgrant.PermissionDraftCreate}, Sources: []agentgrant.SourceRef{source}},
+	))
+}
+
+func TestDelegatedDraftLifecycleRequiresActionPermission(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name        string
+		command     string
+		permissions []agentgrant.Permission
+		want        bool
+	}{
+		{name: "get with create", command: CLIRunDraftGetCommand, permissions: []agentgrant.Permission{agentgrant.PermissionDraftCreate}, want: true},
+		{name: "get with edit", command: CLIRunDraftGetCommand, permissions: []agentgrant.Permission{agentgrant.PermissionDraftEdit}, want: true},
+		{name: "get with delete", command: CLIRunDraftGetCommand, permissions: []agentgrant.Permission{agentgrant.PermissionDraftDelete}, want: true},
+		{name: "get with no permission", command: CLIRunDraftGetCommand},
+		{name: "edit with edit", command: CLIRunDraftEditCommand, permissions: []agentgrant.Permission{agentgrant.PermissionDraftEdit}, want: true},
+		{name: "edit with create", command: CLIRunDraftEditCommand, permissions: []agentgrant.Permission{agentgrant.PermissionDraftCreate}},
+		{name: "edit with delete", command: CLIRunDraftEditCommand, permissions: []agentgrant.Permission{agentgrant.PermissionDraftDelete}},
+		{name: "delete with delete", command: CLIRunDraftDeleteCommand, permissions: []agentgrant.Permission{agentgrant.PermissionDraftDelete}, want: true},
+		{name: "delete with create", command: CLIRunDraftDeleteCommand, permissions: []agentgrant.Permission{agentgrant.PermissionDraftCreate}},
+		{name: "delete with edit", command: CLIRunDraftDeleteCommand, permissions: []agentgrant.Permission{agentgrant.PermissionDraftEdit}},
+		{name: "send-as", command: CLIRunDraftSendAsCommand, permissions: []agentgrant.Permission{agentgrant.PermissionDraftDelete}},
+		{name: "nil grant", command: CLIRunDraftGetCommand, want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var grant *agentgrant.Grant
+			if tc.name != "nil grant" {
+				grant = &agentgrant.Grant{Permissions: tc.permissions}
+			}
+			assert.Equal(t, tc.want, delegatedCLIRunAdmitted([]string{tc.command}, grant))
+		})
+	}
 }
 
 // newDelegatedTestServer creates a server with agentGrants enabled and issues a grant.
 func newDelegatedTestServer(t *testing.T) (*Server, string) {
+	t.Helper()
+	return newDelegatedTestServerWithGate(t, nil)
+}
+
+func newDelegatedTestServerWithGate(t *testing.T, gate OperationGate) (*Server, string) {
 	t.Helper()
 	reg := agentgrant.NewRegistry()
 	stub := &stubSourceStore{
@@ -41,10 +107,11 @@ func newDelegatedTestServer(t *testing.T) (*Server, string) {
 		},
 	}
 	srv := NewServerWithOptions(ServerOptions{
-		Config:    cfg,
-		Store:     stub,
-		Logger:    testLogger(),
-		Scheduler: newMockScheduler(),
+		Config:        cfg,
+		Store:         stub,
+		Logger:        testLogger(),
+		Scheduler:     newMockScheduler(),
+		OperationGate: gate,
 	})
 	srv.agentGrants = reg
 
@@ -58,6 +125,7 @@ func newDelegatedTestServer(t *testing.T) (*Server, string) {
 
 // TestDelegatedCLIRunAdmission tests proof matrix row 9.
 func TestDelegatedCLIRunAdmission(t *testing.T) {
+	t.Parallel()
 	srv, secret := newDelegatedTestServer(t)
 
 	// Helper: send a run request as delegated caller with the full router
@@ -81,6 +149,16 @@ func TestDelegatedCLIRunAdmission(t *testing.T) {
 		code := sendDelegated([]string{"draft-reply", "42", "--from=alice@example.com", "--body=hi"})
 		// 200 means it reached the runner (no early rejection)
 		assert.Equal(t, http.StatusOK, code)
+	})
+
+	t.Run("draft-compose is admitted with draft.create", func(t *testing.T) {
+		code := sendDelegated([]string{"draft-compose", "--source-id=1", "--to=alice@example.com", "--body=hi"})
+		assert.Equal(t, http.StatusOK, code)
+	})
+
+	t.Run("draft-forward requires owner access", func(t *testing.T) {
+		code := sendDelegated([]string{"draft-forward", "42", "--source-id=1", "--to=alice@example.com"})
+		assert.Equal(t, http.StatusBadRequest, code)
 	})
 
 	t.Run("add-imap returns command_not_allowed", func(t *testing.T) {
@@ -144,6 +222,204 @@ func TestDelegatedCLIRunAdmission(t *testing.T) {
 	})
 }
 
+func TestDelegatedCLIRunRequiresGrantedPermission(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name  string
+		grant *agentgrant.Grant
+		code  int
+		calls int
+	}{
+		{name: "draft.create", grant: &agentgrant.Grant{Permissions: []agentgrant.Permission{agentgrant.PermissionDraftCreate}}, code: http.StatusOK, calls: 1},
+		{name: "missing permission", grant: &agentgrant.Grant{}, code: http.StatusBadRequest},
+		{name: "nil grant", code: http.StatusBadRequest},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert := assert.New(t)
+			runnerCalls := 0
+			stub := &stubSourceStore{}
+			stub.runFunc = func(context.Context, CLIRunRequest, func(CLIRunEvent) error) error {
+				runnerCalls++
+				return nil
+			}
+			srv := &Server{store: stub, logger: testLogger()}
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/cli/run", bytes.NewBufferString(`{"args":["draft-reply","42"]}`))
+			req = req.WithContext(context.WithValue(req.Context(), requestSecurityContextKey{}, requestSecurity{
+				auth: requestAuthentication{Mode: AuthModeDelegated, Grant: tc.grant},
+			}))
+			resp := httptest.NewRecorder()
+			srv.handleCLIRun(resp, req)
+			assert.Equal(tc.code, resp.Code)
+			assert.Equal(tc.calls, runnerCalls)
+			if tc.code != http.StatusOK {
+				var response ErrorResponse
+				require.NoError(t, json.NewDecoder(resp.Body).Decode(&response))
+				assert.Equal("command_not_allowed", response.Error)
+			}
+		})
+	}
+}
+
+func TestDelegatedDraftLifecycleCommandsSkipBusyOperationGate(t *testing.T) { //nolint:paralleltest // swaps the package-level operationGateWaitLimit
+	gate := NewSerialOperationGate()
+	srv, secret := newDelegatedTestServerWithGate(t, gate)
+	serverStore, ok := srv.store.(*stubSourceStore)
+	setupRequirements := require.New(t)
+	setupRequirements.True(ok, "delegated fixture must expose its stub store")
+
+	runnerCalls := 0
+	serverStore.runFunc = func(_ context.Context, _ CLIRunRequest, _ func(CLIRunEvent) error) error {
+		runnerCalls++
+		return nil
+	}
+
+	oldWaitLimit := operationGateWaitLimit
+	operationGateWaitLimit = 20 * time.Millisecond
+	t.Cleanup(func() { operationGateWaitLimit = oldWaitLimit })
+
+	release, ok := gate.BeginLabeledWorkContext(context.Background(), "owner draft operation")
+	setupRequirements.True(ok, "hold operation gate for delegated requests")
+	defer release()
+
+	commands := []struct {
+		name string
+		args []string
+	}{
+		{name: "edit", args: []string{"draft-edit", "draft-abc", "--revision=1", "--body=updated"}},
+		{name: "delete", args: []string{"draft-delete", "draft-abc", "--revision=1"}},
+		{name: "send-as", args: []string{"draft-send-as", "alice@example.com"}},
+	}
+
+	for _, command := range commands {
+		t.Run(command.name, func(t *testing.T) {
+			assertions := assert.New(t)
+			requirements := require.New(t)
+			body, err := json.Marshal(CLIRunRequest{Args: command.args})
+			requirements.NoError(err)
+
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/cli/run", bytes.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set(apiprotocol.AgentTokenHeader, secret)
+			response := httptest.NewRecorder()
+			done := make(chan struct{})
+			go func() {
+				srv.Router().ServeHTTP(response, req)
+				close(done)
+			}()
+
+			select {
+			case <-done:
+			case <-time.After(200 * time.Millisecond):
+				requirements.FailNow("delegated lifecycle rejection must not wait on a held operation gate")
+			}
+
+			assertions.Equal(http.StatusBadRequest, response.Code)
+			var apiError ErrorResponse
+			requirements.NoError(json.NewDecoder(response.Body).Decode(&apiError))
+			assertions.Equal("command_not_allowed", apiError.Error)
+			assertions.Equal(0, runnerCalls)
+			assertions.False(gate.HasRequestWaiters())
+		})
+	}
+}
+
+func TestDelegatedDraftGetSkipsBusyOperationGate(t *testing.T) { //nolint:paralleltest // swaps the package-level operationGateWaitLimit
+	assertions := assert.New(t)
+	requirements := require.New(t)
+	gate := NewSerialOperationGate()
+	srv, secret := newDelegatedTestServerWithGate(t, gate)
+	serverStore, ok := srv.store.(*stubSourceStore)
+	requirements.True(ok, "delegated fixture must expose its stub store")
+	runnerCalls := 0
+	serverStore.runFunc = func(_ context.Context, _ CLIRunRequest, _ func(CLIRunEvent) error) error {
+		runnerCalls++
+		return nil
+	}
+
+	oldWaitLimit := operationGateWaitLimit
+	operationGateWaitLimit = 20 * time.Millisecond
+	t.Cleanup(func() { operationGateWaitLimit = oldWaitLimit })
+
+	release, ok := gate.BeginLabeledWorkContext(context.Background(), "owner draft operation")
+	requirements.True(ok, "hold operation gate for delegated request")
+	defer release()
+
+	body, err := json.Marshal(CLIRunRequest{Args: []string{"draft-get", "draft-abc"}})
+	requirements.NoError(err)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/cli/run", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(apiprotocol.AgentTokenHeader, secret)
+	response := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		srv.Router().ServeHTTP(response, req)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(200 * time.Millisecond):
+		requirements.FailNow("delegated draft-get must not wait on a held operation gate")
+	}
+
+	assertions.Equal(http.StatusOK, response.Code)
+	assertions.Equal(1, runnerCalls)
+	assertions.False(gate.HasRequestWaiters())
+}
+
+func TestOwnerDraftLifecycleCommandsUseOperationGateAndRunner(t *testing.T) {
+	t.Parallel()
+	gate := &recordingOperationGate{allow: true}
+	srv, _ := newDelegatedTestServerWithGate(t, gate)
+	serverStore, ok := srv.store.(*stubSourceStore)
+	setupRequirements := require.New(t)
+	setupRequirements.True(ok, "owner fixture must expose its stub store")
+
+	runnerCalls := 0
+	serverStore.runFunc = func(_ context.Context, _ CLIRunRequest, _ func(CLIRunEvent) error) error {
+		runnerCalls++
+		return nil
+	}
+
+	commands := []struct {
+		name string
+		args []string
+	}{
+		{name: "get", args: []string{"draft-get", "draft-abc"}},
+		{name: "edit", args: []string{"draft-edit", "draft-abc", "--revision=1", "--body=updated"}},
+		{name: "delete", args: []string{"draft-delete", "draft-abc", "--revision=1"}},
+		{name: "send-as", args: []string{"draft-send-as", "alice@example.com"}},
+	}
+
+	for _, command := range commands {
+		t.Run(command.name, func(t *testing.T) {
+			assertions := assert.New(t)
+			requirements := require.New(t)
+			body, err := json.Marshal(CLIRunRequest{Args: command.args})
+			requirements.NoError(err)
+			beforeRuns := runnerCalls
+			beforeBegins, beforeDone := gate.counts()
+
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/cli/run", bytes.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("X-Api-Key", "test-owner-key")
+			response := httptest.NewRecorder()
+			srv.Router().ServeHTTP(response, req)
+
+			assertions.Equal(http.StatusOK, response.Code)
+			assertions.Equal(beforeRuns+1, runnerCalls)
+			begins, done := gate.counts()
+			if command.name == "get" || command.name == "send-as" {
+				assertions.Equal(beforeBegins, begins)
+				assertions.Equal(beforeDone, done)
+			} else {
+				assertions.Equal(beforeBegins+1, begins)
+				assertions.Equal(beforeDone+1, done)
+			}
+		})
+	}
+}
+
 // TestDelegatedGrantScopesSource is the mutation probe for cli_handlers.go:1315.
 // It drives a delegated draft-reply through the real handler against a source
 // that is not in the grant, and asserts the request is refused.
@@ -151,6 +427,7 @@ func TestDelegatedCLIRunAdmission(t *testing.T) {
 // grant, which bypasses the source check and produces a 200 with no error event,
 // making the assertion fail.
 func TestDelegatedGrantScopesSource(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 	reg := agentgrant.NewRegistry()

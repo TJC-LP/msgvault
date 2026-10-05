@@ -16,6 +16,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cenkalti/backoff/v7"
+
 	"go.kenn.io/msgvault/internal/export"
 	"go.kenn.io/msgvault/internal/gmail"
 	"go.kenn.io/msgvault/internal/identityops"
@@ -355,26 +357,25 @@ func (s *Syncer) runPageIdentityDiscovery(
 	sourceID int64,
 	sourceMessageIDs []string,
 ) (parkedBacklog bool) {
-	backoff := identityDiscoveryRetryBackoff
-	var err error
-	for attempt := range identityDiscoveryAttempts {
-		if _, err = identityops.DiscoverStrongForSourceMessageIDs(
-			ctx, s.store, sourceID, sourceMessageIDs,
-		); err == nil {
-			return false
-		}
-		if ctx.Err() != nil || attempt == identityDiscoveryAttempts-1 {
-			break
-		}
-		s.logger.Warn(identityDiscoveryRetryLogMessage,
-			"source_id", sourceID, "attempt", attempt+1, "error", err)
-		select {
-		case <-time.After(backoff):
-		case <-ctx.Done():
-			return false
-		}
-		backoff *= 2
+	policy := backoff.NewExponentialBackOff()
+	policy.InitialInterval = identityDiscoveryRetryBackoff
+	policy.MaxInterval = 2 * identityDiscoveryRetryBackoff
+	policy.Multiplier = 2
+	attempt := 0
+	_, err := backoff.Retry(ctx, func() (struct{}, error) {
+		attempt++
+		_, err := identityops.DiscoverStrongForSourceMessageIDs(
+			ctx, s.store, sourceID, sourceMessageIDs)
+		return struct{}{}, err
+	}, backoff.WithBackOff(policy), backoff.WithMaxTries(identityDiscoveryAttempts),
+		backoff.WithMaxElapsedTime(0), backoff.WithNotify(func(err error, _ time.Duration) {
+			s.logger.Warn(identityDiscoveryRetryLogMessage,
+				"source_id", sourceID, "attempt", attempt, "error", err)
+		}))
+	if err == nil {
+		return false
 	}
+	err = backoff.AsRetryError(err).LastErr
 	if ctx.Err() != nil {
 		return false
 	}
@@ -901,7 +902,8 @@ func (s *Syncer) processBatch(ctx context.Context, syncID, sourceID int64, listR
 	// Raw MIME is needed for new messages and as a compatibility fallback for
 	// incomplete snapshots whose client cannot fetch labels separately.
 	if len(fetchIDs) > 0 {
-		rawMessages, err := s.getMessagesRawBatchWithDiagnostics(ctx, fetchIDs)
+		rawMessages, err := s.getMessagesRawBatchWithIdentityValidation(
+			ctx, fetchIDs, inconclusiveRefreshes)
 		if err != nil {
 			for _, id := range fetchIDs {
 				s.recordSyncItem(syncID, id, syncItemPhaseFetch, store.SyncRunItemStatusError, syncItemKindBatchFetchError, err)
@@ -1343,6 +1345,10 @@ func (s *Syncer) full(
 		s.failStoppedSync(state.syncID, err)
 		return nil, fmt.Errorf("get profile: %w", err)
 	}
+	if err := s.refreshProfileIdentity(ctx, source, profile); err != nil {
+		s.failStoppedSync(state.syncID, err)
+		return nil, err
+	}
 	handoffHistoryID := profile.HistoryID
 	if reconcilePresence {
 		if state.handoffCursor == "" {
@@ -1504,11 +1510,11 @@ func (s *Syncer) full(
 		return nil, err
 	}
 
-	// Checkpoint WAL after sync to fold it back into the main database.
-	// This prevents WAL accumulation across long sync sessions and ensures
-	// readers (e.g. build-cache) see a consistent database state.
-	if err := s.store.CheckpointWAL(); err != nil {
-		s.logger.Warn("wal checkpoint after sync failed", "error", err)
+	// Fold what the WAL can give back without waiting on readers or writers.
+	// A busy archive usually leaves frames behind; the daemon's daily SQLite
+	// maintenance truncates the WAL off-peak.
+	if err := s.store.CheckpointWALPassive(ctx); err != nil {
+		s.logger.Debug("wal checkpoint after sync incomplete", "error", err)
 	}
 
 	// Build summary
@@ -2247,16 +2253,17 @@ func buildRecipientSet(recipientType string, addresses []mime.Address, participa
 	return rs
 }
 
-// storeAttachment stores an attachment to disk and records it in the database.
-func (s *Syncer) storeAttachment(messageID int64, att *mime.Attachment) error {
-	storagePath, err := export.StoreAttachmentFile(s.opts.AttachmentsDir, att)
+// StoreMIMEAttachment publishes one MIME attachment through the same
+// content-addressed path used by ordinary sync and returns its row data.
+func StoreMIMEAttachment(attachmentsDir string, att *mime.Attachment) (store.AttachmentWrite, error) {
+	storagePath, err := export.StoreAttachmentFile(attachmentsDir, att)
 	if err != nil || storagePath == "" {
-		return err
+		return store.AttachmentWrite{}, err
 	}
 
 	role, roleSource := store.AttachmentRoleFromMIME(
 		att.Disposition, att.IsInline, att.ContentID)
-	return s.store.UpsertAttachmentRecord(context.Background(), messageID, store.AttachmentWrite{
+	return store.AttachmentWrite{
 		Filename:      att.Filename,
 		MIMEType:      att.ContentType,
 		StoragePath:   storagePath,
@@ -2266,7 +2273,16 @@ func (s *Syncer) storeAttachment(messageID int64, att *mime.Attachment) error {
 		RoleSource:    roleSource,
 		SourcePartKey: att.PartKey,
 		ContentID:     att.ContentID,
-	})
+	}, nil
+}
+
+// storeAttachment stores an attachment to disk and records it in the database.
+func (s *Syncer) storeAttachment(messageID int64, att *mime.Attachment) error {
+	write, err := StoreMIMEAttachment(s.opts.AttachmentsDir, att)
+	if err != nil || write.StoragePath == "" {
+		return err
+	}
+	return s.store.UpsertAttachmentRecord(context.Background(), messageID, write)
 }
 
 // joinEmails concatenates email addresses from a slice of mime.Address with spaces.

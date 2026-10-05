@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"net/http"
 	"net/url"
@@ -74,7 +75,23 @@ type StatsResponse struct {
 	// "still initializing" from "not configured" instead of permanently
 	// omitting the visual tool after a transient 503.
 	VectorVisualStatus string `json:"vector_visual_status,omitempty"`
+	// Stale reports that the archive counts come from an earlier snapshot
+	// because a fresh count did not finish in time; AsOf says when that
+	// snapshot was taken.
+	Stale bool      `json:"stale,omitempty"`
+	AsOf  time.Time `json:"as_of,omitzero"`
+	// VectorStatsUnavailable reports that vector statistics did not answer
+	// within their deadline; vector_search is then partial or absent.
+	VectorStatsUnavailable bool `json:"vector_stats_unavailable,omitempty"`
 }
+
+// Stats latency bounds: how long a request waits for fresh archive counts
+// before serving the previous snapshot, and how long vector statistics may
+// take before the response omits them.
+const (
+	statsSnapshotWait  = 2 * time.Second
+	vectorStatsTimeout = 3 * time.Second
+)
 
 // APIMessage is an alias for store.APIMessage — single source of truth for
 // the message DTO shared between the store and API layers.
@@ -116,6 +133,12 @@ type SourceStatus struct {
 	Schedule              string         `json:"schedule,omitempty"`
 	NextSyncAt            *string        `json:"next_sync_at"`
 	SchedulerLastError    string         `json:"scheduler_last_error,omitempty"`
+	// SchedulerQueued reports a scheduled run waiting for another job to
+	// finish; SchedulerPending a follow-up run requested while one executes;
+	// SchedulerStartedAt when the executing run began.
+	SchedulerQueued    bool    `json:"scheduler_queued,omitempty"`
+	SchedulerPending   bool    `json:"scheduler_pending,omitempty"`
+	SchedulerStartedAt *string `json:"scheduler_started_at,omitempty"`
 }
 
 // SyncRunStatus represents the API-visible details for a sync run.
@@ -130,8 +153,6 @@ type SyncRunStatus struct {
 	MessagesUpdated   int64               `json:"messages_updated"`
 	ErrorsCount       int64               `json:"errors_count"`
 	ErrorMessage      *string             `json:"error_message"`
-	CursorBefore      *string             `json:"cursor_before"`
-	CursorAfter       *string             `json:"cursor_after"`
 	SkippedCount      int64               `json:"skipped_count,omitzero"`
 	ItemErrors        []SyncRunItemStatus `json:"item_errors,omitempty"`
 }
@@ -160,8 +181,10 @@ type ErrorResponse struct {
 // VectorHealth reports the vector subsystem state in health responses so
 // daemon status is visible while background init runs (or after it fails).
 type VectorHealth struct {
-	Status string `json:"status"`
-	Error  string `json:"error,omitempty"`
+	Status        string `json:"status"`
+	Error         string `json:"error,omitempty"`
+	TextEnabled   *bool  `json:"text_enabled,omitzero" nullable:"false"`
+	VisualEnabled *bool  `json:"visual_enabled,omitzero" nullable:"false"`
 }
 
 // OperationHealth reports the archive operation currently holding the
@@ -341,12 +364,20 @@ type hybridSearchResponse struct {
 	Mode             string                  `json:"mode"`
 	Returned         int                     `json:"returned"`
 	PoolSaturated    bool                    `json:"pool_saturated"`
+	Accelerator      string                  `json:"accelerator,omitempty"`
 	HasMore          bool                    `json:"has_more"`
 	Generation       hybridGenerationSummary `json:"generation"`
 	TookMS           int64                   `json:"took_ms"`
+	Timings          hybridSearchTimings     `json:"timings"`
 	ScopeLabel       string                  `json:"scope_label,omitempty"`
 	ScopeSourceCount int                     `json:"scope_source_count,omitzero"`
 	Results          []hybridSearchItem      `json:"results"`
+}
+
+type hybridSearchTimings struct {
+	QueryEmbeddingMS int64 `json:"query_embedding_ms"`
+	RetrievalMS      int64 `json:"retrieval_ms"`
+	HydrationMS      int64 `json:"hydration_ms"`
 }
 
 type similarSearchResponse struct {
@@ -399,14 +430,27 @@ type scoreBreakdown struct {
 	SubjectBoosted bool     `json:"subject_boosted,omitzero"`
 }
 
-// writeJSON writes a JSON response.
+// encodeFailureBody is written when a response value cannot be encoded. It
+// is a literal so it cannot fail the same way.
+const encodeFailureBody = `{"error":"internal_error","message":"Failed to encode response"}`
+
+// writeJSON writes a JSON response. The body is encoded before the status
+// line so an encoding failure becomes a 500 with an error body instead of a
+// success status followed by a truncated or empty body.
 func writeJSON(w http.ResponseWriter, status int, data any) {
+	body, err := marshalAPIJSONBytes(data)
 	w.Header().Set("Content-Type", applicationJSONMediaType)
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	if err != nil {
+		slog.Error("encode API response", "status", status, "error", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, encodeFailureBody)
+		return
+	}
 	w.WriteHeader(status)
-	// Headers already sent; if Encode fails mid-stream (broken pipe,
-	// non-serializable value) there's no meaningful recovery beyond
-	// truncating the response body.
-	_ = marshalAPIJSON(w, data)
+	// A write error here means the client went away; nothing to recover.
+	// #nosec G705 -- The body is JSON-encoded, served as application/json, and marked nosniff.
+	_, _ = w.Write(body)
 }
 
 // writeError writes an error response.
@@ -558,7 +602,9 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	stats, err := s.getStats(r.Context())
+	stats, asOf, stale, err := s.statsSnapshots.get(
+		r.Context(), s.importContext, "", s.statsSnapshotWait, s.getStats,
+	)
 	if err != nil {
 		if s.writeIfContextError(w, err) {
 			return
@@ -568,32 +614,34 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Vector stats are best-effort: log errors but still include
-	// whatever partial stats came back.
+	// Vector stats are best-effort and bounded: log errors but still
+	// include whatever partial stats came back.
 	_, backend, _ := s.vectorComponents()
-	vs, vsErr := vector.CollectStats(r.Context(), backend)
+	vectorCtx, cancelVector := context.WithTimeout(r.Context(), s.vectorStatsTimeout)
+	vs, vsErr := vector.CollectStats(vectorCtx, backend)
+	vectorTimedOut := errors.Is(vectorCtx.Err(), context.DeadlineExceeded)
+	cancelVector()
 	if vsErr != nil {
 		s.logger.Warn("vector stats", "error", vsErr)
 	}
 
 	resp := statsResponseFromStore(stats)
+	resp.Stale = stale
+	resp.AsOf = asOf
+	resp.VectorStatsUnavailable = vectorTimedOut
 	resp.VectorSearch = vs
 	s.refreshVectorStatus(r.Context())
 	if status, _ := s.VectorStatus(); status != VectorStatusDisabled {
 		resp.VectorStatus = string(status)
-		// Per-lane statuses mirror the shared status only for lanes the
-		// configuration actually enables (the daemon passes cfg.Vector at
-		// construction, so this holds during initialization too). Blanket
-		// mirroring advertised visual tools on text-only deployments and
-		// vice versa.
 		_, _, vectorCfg := s.vectorComponents()
+		lanes := vectorLaneCapabilitiesForConfig(vectorCfg)
 		resp.VectorTextStatus = string(VectorStatusDisabled)
-		if vectorCfg.Enabled {
+		if lanes.TextEnabled {
 			resp.VectorTextStatus = string(status)
 			resp.VectorTextMessageTypes = slices.Clone(vectorCfg.Embed.Scope.BuildScope().MessageTypes)
 		}
 		resp.VectorVisualStatus = string(VectorStatusDisabled)
-		if vectorCfg.Multimodal.Enabled {
+		if lanes.VisualEnabled {
 			resp.VectorVisualStatus = string(status)
 			// Visual init can fail while text search stays healthy: the
 			// shared status settles ready with no visual runtime installed.
@@ -1047,6 +1095,7 @@ func (s *Server) handleHybridSearch(
 		return
 	}
 
+	hydrationStarted := time.Now()
 	pageStart := min(offset, len(hits))
 	pageEnd := min(pageStart+pageSize, len(hits))
 	hasMore := pageEnd < len(hits)
@@ -1105,12 +1154,14 @@ func (s *Server) handleHybridSearch(
 	if includeMatches {
 		s.enrichHybridMatches(ctx, backend, vectorCfg, meta.Generation.ID, meta.QueryVector, items, minScore)
 	}
+	hydrationDuration := time.Since(hydrationStarted)
 
 	writeJSON(w, http.StatusOK, hybridSearchResponse{
 		Query:            q,
 		Mode:             mode,
 		Returned:         len(items),
 		PoolSaturated:    meta.PoolSaturated,
+		Accelerator:      meta.Accelerator,
 		HasMore:          hasMore,
 		ScopeLabel:       scope.displayName(),
 		ScopeSourceCount: len(scope.sourceIDs()),
@@ -1121,7 +1172,12 @@ func (s *Server) handleHybridSearch(
 			Fingerprint: meta.Generation.Fingerprint,
 			State:       string(meta.Generation.State),
 		},
-		TookMS:  time.Since(start).Milliseconds(),
+		TookMS: time.Since(start).Milliseconds(),
+		Timings: hybridSearchTimings{
+			QueryEmbeddingMS: meta.QueryEmbeddingDuration.Milliseconds(),
+			RetrievalMS:      meta.RetrievalDuration.Milliseconds(),
+			HydrationMS:      hydrationDuration.Milliseconds(),
+		},
 		Results: items,
 	})
 }
@@ -1428,8 +1484,11 @@ func (s *Server) handleSourceStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sourceType := r.URL.Query().Get("source_type")
-	sources, err := statusStore.ListSources(sourceType)
+	sources, err := statusStore.ListSourcesContext(r.Context(), sourceType)
 	if err != nil {
+		if r.Context().Err() != nil {
+			return
+		}
 		s.logger.Error("failed to list sources for status",
 			"source_type", sourceType,
 			"error", err,
@@ -1440,8 +1499,14 @@ func (s *Server) handleSourceStatus(w http.ResponseWriter, r *http.Request) {
 
 	statuses := make([]SourceStatus, 0, len(sources))
 	for _, source := range sources {
-		status, err := s.sourceStatus(statusStore, source)
+		if r.Context().Err() != nil {
+			return
+		}
+		status, err := s.sourceStatus(r.Context(), statusStore, source)
 		if err != nil {
+			if r.Context().Err() != nil {
+				return
+			}
 			s.logger.Error("failed to build source sync status",
 				"source_id", source.ID,
 				"source_type", source.SourceType,
@@ -1457,7 +1522,7 @@ func (s *Server) handleSourceStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, SourceStatusResponse{Sources: statuses})
 }
 
-func (s *Server) sourceStatus(statusStore SourceStatusStore, source *store.Source) (SourceStatus, error) {
+func (s *Server) sourceStatus(ctx context.Context, statusStore SourceStatusStore, source *store.Source) (SourceStatus, error) {
 	status := SourceStatus{
 		ID:         source.ID,
 		SourceType: source.SourceType,
@@ -1471,12 +1536,12 @@ func (s *Server) sourceStatus(statusStore SourceStatusStore, source *store.Sourc
 		status.LastSyncAt = nullableTimePtr(source.LastSyncAt.Time)
 	}
 
-	active, err := statusStore.GetActiveSync(source.ID)
+	active, err := statusStore.GetActiveSyncReadOnly(ctx, source.ID)
 	if err != nil && !errors.Is(err, store.ErrSyncRunNotFound) {
 		return SourceStatus{}, fmt.Errorf("get active sync: %w", err)
 	}
 	status.ActiveSync = syncRunStatus(active)
-	if err := s.hydrateSyncRunStatus(statusStore, status.ActiveSync); err != nil {
+	if err := s.hydrateSyncRunStatus(ctx, statusStore, status.ActiveSync); err != nil {
 		return SourceStatus{}, err
 	}
 	scheduling := classifySourceScheduling(source.SourceType, source.Identifier)
@@ -1497,6 +1562,7 @@ func (s *Server) sourceStatus(statusStore SourceStatusStore, source *store.Sourc
 				if !scheduled.NextRun.IsZero() {
 					status.NextSyncAt = nullableTimePtr(scheduled.NextRun)
 				}
+				applySchedulerQueueState(&status, scheduled.Queued, scheduled.Pending, scheduled.StartedAt)
 				break
 			}
 		case sourceScheduleNonSchedulable:
@@ -1505,7 +1571,7 @@ func (s *Server) sourceStatus(statusStore SourceStatusStore, source *store.Sourc
 	switch {
 	case scheduling.kind == sourceScheduleNonSchedulable:
 		status.SyncUnavailableReason = "source_not_schedulable"
-	case status.ActiveSync != nil || schedulerRunning:
+	case status.ActiveSync != nil || schedulerRunning || status.SchedulerQueued || status.SchedulerPending:
 		status.SyncUnavailableReason = "sync_already_running"
 	case s.scheduler == nil:
 		status.SyncUnavailableReason = "scheduler_unavailable"
@@ -1515,21 +1581,21 @@ func (s *Server) sourceStatus(statusStore SourceStatusStore, source *store.Sourc
 		status.CanSync = true
 	}
 
-	latest, err := statusStore.GetLatestSync(source.ID)
+	latest, err := statusStore.GetLatestSyncContext(ctx, source.ID)
 	if err != nil && !errors.Is(err, store.ErrSyncRunNotFound) {
 		return SourceStatus{}, fmt.Errorf("get latest sync: %w", err)
 	}
 	status.LatestSync = syncRunStatus(latest)
-	if err := s.hydrateSyncRunStatus(statusStore, status.LatestSync); err != nil {
+	if err := s.hydrateSyncRunStatus(ctx, statusStore, status.LatestSync); err != nil {
 		return SourceStatus{}, err
 	}
 
-	lastSuccessful, err := statusStore.GetLastSuccessfulSync(source.ID)
+	lastSuccessful, err := statusStore.GetLastSuccessfulSyncContext(ctx, source.ID)
 	if err != nil && !errors.Is(err, store.ErrSyncRunNotFound) {
 		return SourceStatus{}, fmt.Errorf("get last successful sync: %w", err)
 	}
 	status.LastSuccessfulSync = syncRunStatus(lastSuccessful)
-	if err := s.hydrateSyncRunStatus(statusStore, status.LastSuccessfulSync); err != nil {
+	if err := s.hydrateSyncRunStatus(ctx, statusStore, status.LastSuccessfulSync); err != nil {
 		return SourceStatus{}, err
 	}
 
@@ -1552,23 +1618,32 @@ func (s *Server) applyGenericJobStatus(status *SourceStatus, jobName string) boo
 		if !job.NextRun.IsZero() {
 			status.NextSyncAt = nullableTimePtr(job.NextRun)
 		}
+		applySchedulerQueueState(status, job.Queued, job.Pending, job.StartedAt)
 		return job.Running
 	}
 	return false
 }
 
-func (s *Server) hydrateSyncRunStatus(statusStore SourceStatusStore, status *SyncRunStatus) error {
+func applySchedulerQueueState(status *SourceStatus, queued, pending bool, startedAt time.Time) {
+	status.SchedulerQueued = queued
+	status.SchedulerPending = pending
+	if !startedAt.IsZero() {
+		status.SchedulerStartedAt = nullableTimePtr(startedAt)
+	}
+}
+
+func (s *Server) hydrateSyncRunStatus(ctx context.Context, statusStore SourceStatusStore, status *SyncRunStatus) error {
 	if status == nil {
 		return nil
 	}
 
-	skippedCount, err := statusStore.CountSyncRunItems(status.ID, store.SyncRunItemStatusSkipped)
+	skippedCount, err := statusStore.CountSyncRunItemsContext(ctx, status.ID, store.SyncRunItemStatusSkipped)
 	if err != nil {
 		return fmt.Errorf("count skipped sync items: %w", err)
 	}
 	status.SkippedCount = skippedCount
 
-	items, err := statusStore.ListSyncRunItems(status.ID, store.SyncRunItemStatusError, sourceStatusItemErrorLimit)
+	items, err := statusStore.ListSyncRunItemsContext(ctx, status.ID, store.SyncRunItemStatusError, sourceStatusItemErrorLimit)
 	if err != nil {
 		return fmt.Errorf("list sync item errors: %w", err)
 	}
@@ -1596,12 +1671,6 @@ func syncRunStatus(run *store.SyncRun) *SyncRunStatus {
 	}
 	if run.ErrorMessage.Valid {
 		status.ErrorMessage = new(run.ErrorMessage.String)
-	}
-	if run.CursorBefore.Valid {
-		status.CursorBefore = new(run.CursorBefore.String)
-	}
-	if run.CursorAfter.Valid {
-		status.CursorAfter = new(run.CursorAfter.String)
 	}
 	return status
 }
@@ -1769,33 +1838,8 @@ func (s *Server) handleUploadToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Atomic write via temp file
-	tmpFile, err := os.CreateTemp(tokensDir, ".token-*.tmp")
-	if err != nil {
-		s.logger.Error("failed to create temp file", "error", err)
-		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to save token")
-		return
-	}
-	tmpPath := tmpFile.Name()
-
-	if _, err := tmpFile.Write(data); err != nil {
-		_ = tmpFile.Close()
-		_ = os.Remove(tmpPath)
-		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to write token")
-		return
-	}
-	if err := tmpFile.Close(); err != nil {
-		_ = os.Remove(tmpPath)
-		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to close token file")
-		return
-	}
-	if err := fileutil.SecureChmod(tmpPath, 0600); err != nil {
-		_ = os.Remove(tmpPath)
-		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to set token permissions")
-		return
-	}
-	if err := os.Rename(tmpPath, tokenPath); err != nil {
-		_ = os.Remove(tmpPath)
+	if err := fileutil.SecureReplaceFile(tokenPath, data, 0o600); err != nil {
+		s.logger.Error("failed to save token", "error", err)
 		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to save token")
 		return
 	}
@@ -1926,17 +1970,27 @@ func (s *Server) handleAddAccount(w http.ResponseWriter, r *http.Request) {
 // ============================================================================
 
 type QueryRequest struct {
-	SQL string `json:"sql"`
+	SQL   string `json:"sql"`
+	Fresh *bool  `json:"fresh,omitempty"`
 }
 
 // ErrSQLQueryEngineUnavailable is returned when a raw SQL request has no
 // analytics engine. Callers outside the API package use this sentinel so the
 // handler can preserve its 503 engine-unavailable response.
 var ErrSQLQueryEngineUnavailable = errors.New("SQL query requires DuckDB engine (analytics cache may not be built)")
+var ErrCacheBuildUnavailable = errors.New("analytics cache build unavailable")
 
 // handleQuery executes a raw SQL query against DuckDB views.
 // POST /api/v1/query.
 func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
+	s.handleSQLQuery(w, r, false)
+}
+
+func (s *Server) handleArchiveQuery(w http.ResponseWriter, r *http.Request) {
+	s.handleSQLQuery(w, r, true)
+}
+
+func (s *Server) handleSQLQuery(w http.ResponseWriter, r *http.Request, archiveOnly bool) {
 	var req QueryRequest
 	dec := jsontext.NewDecoder(r.Body)
 	if err := json.UnmarshalDecode(dec, &req); err != nil {
@@ -1958,9 +2012,51 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "not_read_only", err.Error())
 		return
 	}
+	fresh := false
+	if req.Fresh != nil {
+		fresh = *req.Fresh
+	}
+	if values, present := r.URL.Query()["fresh"]; present {
+		if len(values) != 1 {
+			writeError(w, http.StatusBadRequest, "invalid_fresh", "Specify fresh once")
+			return
+		}
+		parsed, err := strconv.ParseBool(values[0])
+		if err != nil || (req.Fresh != nil && parsed != *req.Fresh) {
+			writeError(w, http.StatusBadRequest, "invalid_fresh", "Invalid or conflicting fresh value")
+			return
+		}
+		fresh = parsed
+	}
 
-	result, err := s.runSQLQuery(r.Context(), req.SQL)
+	// Startup already owns cache recovery. Keep serving an installed SQL
+	// engine, but do not start a duplicate build while it is unavailable.
+	if s.analyticsCacheInitializingForContext(r.Context()) {
+		if _, usable := s.queryEngineForContext(r.Context()).(query.SQLQuerier); !usable {
+			writeError(w, http.StatusServiceUnavailable, "engine_unavailable", "Analytics engine is initializing")
+			return
+		}
+	}
+
+	var result *query.QueryResult
+	var accepted *CacheBuildAccepted
+	var err error
+	if archiveOnly {
+		if s.archiveSQLQueryRunner == nil {
+			err = ErrSQLQueryEngineUnavailable
+		} else {
+			result, accepted, err = s.archiveSQLQueryRunner(r.Context(), req.SQL, fresh)
+		}
+	} else if s.sqlQueryRunner != nil {
+		result, accepted, err = s.sqlQueryRunner(r.Context(), req.SQL, fresh)
+	} else {
+		result, err = s.runSQLQuery(r.Context(), req.SQL)
+	}
 	if err != nil {
+		if errors.Is(err, ErrCacheBuildUnavailable) {
+			writeError(w, http.StatusServiceUnavailable, "cache_build_unavailable", err.Error())
+			return
+		}
 		if errors.Is(err, ErrSQLQueryEngineUnavailable) {
 			writeError(w, http.StatusServiceUnavailable,
 				"engine_unavailable",
@@ -1977,16 +2073,30 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "query_error", err.Error())
 		return
 	}
+	if accepted != nil {
+		writeJSON(w, http.StatusAccepted, accepted)
+		return
+	}
 
 	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) handleCacheBuildStatus(w http.ResponseWriter, r *http.Request) {
+	if s.cacheBuildStatusReader == nil {
+		writeError(w, http.StatusServiceUnavailable, "cache_build_unavailable", "Analytics cache build status unavailable")
+		return
+	}
+	status, ok := s.cacheBuildStatusReader(r.PathValue("job_id"))
+	if !ok {
+		writeError(w, http.StatusNotFound, "cache_build_not_found", "Analytics cache build not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, status)
 }
 
 func (s *Server) runSQLQuery(ctx context.Context, sql string) (*query.QueryResult, error) {
 	if s.analyticsInitializingForContext(ctx) {
 		return nil, ErrSQLQueryEngineUnavailable
-	}
-	if s.sqlQueryRunner != nil {
-		return s.sqlQueryRunner(ctx, sql)
 	}
 	querier, ok := s.queryEngineForContext(ctx).(query.SQLQuerier)
 	if !ok {
@@ -2155,7 +2265,7 @@ func viewTypeString(v query.ViewType) string {
 
 // Accepted values for enum query parameters, surfaced in 400 messages.
 var (
-	aggregateSortFields = []string{"count", "size", "attachment_size", "name"}
+	aggregateSortFields = []string{"count", "size", "attachment_size", nameKey}
 	messageSortFields   = []string{activityDateField, "size", "subject"}
 	textSortFields      = []string{"last_message", "count", "name"}
 	sortDirections      = []string{"asc", apiSortDirectionDesc}
@@ -3695,6 +3805,12 @@ func (s *Server) handleFastSearch(w http.ResponseWriter, r *http.Request) {
 	result, err := engine.SearchFastWithStats(r.Context(), q, queryStr, filter, statsGroupBy, limit, offset)
 	if err != nil {
 		if s.writeIfContextError(w, err) {
+			return
+		}
+		if query.IsEncodingError(err) {
+			s.logger.Error("fast search hit invalid UTF-8 in the analytics cache", "error", err)
+			writeError(w, http.StatusInternalServerError, "cache_encoding_error",
+				"The analytics cache contains invalid UTF-8. Run 'msgvault build-cache --full-rebuild' and retry.")
 			return
 		}
 		s.logger.Error("fast search failed", "query", queryStr, "error", err)

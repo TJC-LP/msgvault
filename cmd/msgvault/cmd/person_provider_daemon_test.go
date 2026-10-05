@@ -7,12 +7,14 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
@@ -20,6 +22,7 @@ import (
 	"go.kenn.io/msgvault/internal/api"
 	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/peoplesweep"
+	"go.kenn.io/msgvault/internal/personenrollment"
 	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/testutil"
 )
@@ -45,6 +48,7 @@ func (s *inProcessPersonProviderDaemonStore) RunCLICommand(
 	deps.newChecker = func(
 		config peoplesweep.Config,
 		consent personProviderStore,
+		_ personProviderSetupDeps,
 	) (personProviderChecker, error) {
 		registry, err := peoplesweep.NewDriverRegistry(s.httpClient, nil, nil)
 		if err != nil {
@@ -124,8 +128,8 @@ func TestSavedPersonProviderCheckForwardsExactCredentialThroughDaemon(t *testing
 	frontend := *daemonConfig
 	frontend.People.Sweep = peopleConfig
 	frontend.Remote = config.RemoteConfig{URL: server.URL, AllowInsecure: true}
-	withStoreResolverConfig(t, &frontend)
-	deps := defaultPersonProviderCommandDeps()
+	testCtx := withStoreResolverConfig(t, &frontend)
+	deps := defaultPersonProviderCommandDeps(testCtx)
 	callerHasKey := false
 	deps.setup.lookupEnv = func(name string) (string, bool) {
 		assert.Equal(keyName, name)
@@ -133,7 +137,7 @@ func TestSavedPersonProviderCheckForwardsExactCredentialThroughDaemon(t *testing
 	}
 	var output bytes.Buffer
 	command := &cobra.Command{Use: "setup"}
-	command.SetContext(t.Context())
+	command.SetContext(testCtx)
 	command.SetOut(&output)
 	command.SetErr(&output)
 	require.Error(executeSavedPersonProviderCheck(command, deps, "onboarded", "", &output))
@@ -236,20 +240,20 @@ func TestPersonProviderRealDaemonSyntheticCheckAndRevoke(t *testing.T) {
 
 	frontendConfig := *daemonConfig
 	frontendConfig.Remote = config.RemoteConfig{URL: daemonHTTP.URL, AllowInsecure: true}
-	withStoreResolverConfig(t, &frontendConfig)
+	testCtx := withStoreResolverConfig(t, &frontendConfig)
 	const environmentSecretCanary = "caller-key-never-in-daemon-request"
 	t.Setenv("TEST_PROVIDER_KEY", environmentSecretCanary)
 	deps := defaultPersonProviderCommandDeps()
 
-	reverifyOutput, err := executePersonProviderCommand(t, deps, "reverify", "--yes")
+	reverifyOutput, err := executePersonProviderCommandContext(testCtx, t, deps, "reverify", "--yes")
 	require.NoError(err)
 	assert.Contains(reverifyOutput, "People inference provider disclosure")
 	assert.Contains(reverifyOutput, provider.URL+"/v1")
 	captured := <-requests
-	consentOutput, err := executePersonProviderCommand(t, deps, "consent", "--yes", "--json")
+	consentOutput, err := executePersonProviderCommandContext(testCtx, t, deps, "consent", "--yes", "--json")
 	require.NoError(err)
 	assert.Contains(consentOutput, `"active":true`)
-	output, err := executePersonProviderCommand(t, deps, "check", "--json")
+	output, err := executePersonProviderCommandContext(testCtx, t, deps, "check", "--json")
 	require.NoError(err)
 	assert.JSONEq(`{
 		"ok":true,
@@ -279,9 +283,9 @@ func TestPersonProviderRealDaemonSyntheticCheckAndRevoke(t *testing.T) {
 	assert.NotContains(daemonLogs.String(), environmentSecretCanary)
 	<-requests
 
-	_, err = executePersonProviderCommand(t, deps, "revoke", "--json")
+	_, err = executePersonProviderCommandContext(testCtx, t, deps, "revoke", "--json")
 	require.NoError(err)
-	output, err = executePersonProviderCommand(t, deps, "check", "--json")
+	output, err = executePersonProviderCommandContext(testCtx, t, deps, "check", "--json")
 	require.NoError(err)
 	assert.JSONEq(`{
 		"ok":true,
@@ -338,9 +342,9 @@ func TestPersonProviderStoredCheckKeepsSecretOutOfDaemonMetadata(t *testing.T) {
 
 	frontendConfig := *daemonConfig
 	frontendConfig.Remote = config.RemoteConfig{URL: daemonHTTP.URL, AllowInsecure: true}
-	withStoreResolverConfig(t, &frontendConfig)
+	testCtx := withStoreResolverConfig(t, &frontendConfig)
 	deps := defaultPersonProviderCommandDeps()
-	output, err := executePersonProviderCommand(t, deps, "check", "stored", "--json")
+	output, err := executePersonProviderCommandContext(testCtx, t, deps, "check", "stored", "--json")
 	require.NoError(err)
 	assert.NotContains(output, secretCanary)
 
@@ -363,3 +367,173 @@ func mustJSON(t *testing.T, value any) []byte {
 var _ api.CLIRunner = (*inProcessPersonProviderDaemonStore)(nil)
 var _ api.MessageStore = (*inProcessPersonProviderDaemonStore)(nil)
 var _ personProviderStore = (*store.Store)(nil)
+
+// Exercise the adapter installed by serve, not just the underlying Store.
+func TestPeopleInferenceSettingsWithDaemonStore(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	providerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal("/v1/chat/completions", r.URL.Path)
+		_, _ = io.WriteString(w, `{"model":"test-model","choices":[{"message":{"content":"{\"ok\":true}"},"finish_reason":"stop"}]}`)
+	}))
+	defer providerServer.Close()
+	configured := config.NewDefaultConfig()
+	configured.HomeDir = t.TempDir()
+	configured.Data.DataDir = configured.HomeDir
+	require.NoError(configured.Save())
+	st := testutil.NewSQLiteTestStore(t)
+	before, err := config.ReadConfigFile(configured.ConfigFilePath())
+	require.NoError(err)
+	provider := configuredPersonProvider(personProviderTestConfig())
+	provider.Endpoint = providerServer.URL + "/v1"
+	provider.Auth, provider.Credential, provider.CredentialEnv = peoplesweep.AuthNone, peoplesweep.CredentialNone, ""
+	created, err := personenrollment.NewService(configured.ConfigFilePath(), st).CreateProfile(before.ETag, "local", provider)
+	require.NoError(err)
+	srv := api.NewServerWithOptions(api.ServerOptions{
+		Config: configured, Store: &storeAPIAdapter{store: st}, Logger: slog.New(slog.DiscardHandler),
+		OperationGate: api.NewSerialOperationGate(),
+	})
+	const profilePath = "/api/v1/settings/people-inference/providers/local"
+	request := func(method, path, body string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(method, path, strings.NewReader(body))
+		r.RemoteAddr = "127.0.0.1:12345"
+		r.Header.Set("If-Match", created.ETag)
+		r.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		srv.Router().ServeHTTP(response, r)
+		return response
+	}
+	checked := request(http.MethodPost, profilePath+"/check", "")
+	require.Equal(http.StatusOK, checked.Code, checked.Body.String())
+	consented := request(http.MethodPost, profilePath+"/consent", fmt.Sprintf(`{"confirmed":true,"fingerprint":%q}`, created.Fingerprint))
+	require.Equal(http.StatusOK, consented.Code, consented.Body.String())
+	var status api.PeopleInferenceSettingsResponse
+	require.NoError(json.Unmarshal(consented.Body.Bytes(), &status))
+	var local *api.PeopleInferenceProfileSetting
+	for i := range status.Profiles {
+		if status.Profiles[i].Name == "local" {
+			local = &status.Profiles[i]
+		}
+	}
+	require.NotNil(local)
+	assert.True(local.Checked)
+	assert.True(local.ConsentActive)
+	removed := request(http.MethodDelete, profilePath, "")
+	require.Equal(http.StatusOK, removed.Code, removed.Body.String())
+	active, err := st.HasActivePersonInferenceConsent(t.Context(), created.Fingerprint)
+	require.NoError(err)
+	assert.False(active)
+	verified, err := st.HasSuccessfulPersonInferenceCheck(t.Context(), created.Fingerprint)
+	require.NoError(err)
+	assert.False(verified)
+}
+
+func TestPersonProviderRemoveRevokesRunningPolicyThroughDaemon(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	var calls atomic.Int64
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal("/v1/chat/completions", r.URL.Path)
+		calls.Add(1)
+		_, _ = io.WriteString(w, `{"model":"running-model","choices":[{"message":{"content":"{\"ok\":true}"},"finish_reason":"stop"}]}`)
+	}))
+	defer provider.Close()
+	startup := config.NewDefaultConfig()
+	startup.HomeDir = t.TempDir()
+	startup.Data.DataDir = startup.HomeDir
+	startup.People.Sweep = personProviderTestConfig()
+	beta := configuredPersonProvider(startup.People.Sweep)
+	beta.Model, beta.Endpoint = "running-model", provider.URL+"/v1"
+	beta.Auth, beta.Credential, beta.CredentialEnv = peoplesweep.AuthNone, peoplesweep.CredentialNone, ""
+	startup.People.Sweep.Providers["beta"] = beta
+	startup.People.Sweep.Provider.Name = "beta"
+	runningProfile, err := startup.People.Sweep.Profile()
+	require.NoError(err)
+	saved := *startup
+	saved.People.Sweep.Providers = maps.Clone(startup.People.Sweep.Providers)
+	beta.Model = "saved-model"
+	saved.People.Sweep.Providers["beta"] = beta
+	savedProfile, err := saved.People.Sweep.Profile()
+	require.NoError(err)
+	require.NotEqual(runningProfile.Fingerprint, savedProfile.Fingerprint)
+	saved.People.Sweep.Provider.Name = "default"
+	require.NoError(saved.Save())
+	st := testutil.NewSQLiteTestStore(t)
+	for _, profile := range []peoplesweep.ProviderProfile{runningProfile, savedProfile} {
+		_, err = st.EnsurePersonInferenceProfile(t.Context(), profile)
+		require.NoError(err)
+		require.NoError(st.RecordPersonInferenceCheck(t.Context(), store.PersonInferenceCheck{
+			ProfileFingerprint: profile.Fingerprint, CheckedAt: time.Now(),
+			DriverVersion: profile.DriverVersion, OutputMode: profile.OutputMode, ModelVersion: profile.Model,
+		}))
+		_, _, err = st.GrantPersonInferenceConsent(t.Context(), profile.Fingerprint, "test")
+		require.NoError(err)
+	}
+	adapter := &storeAPIAdapter{store: st}
+	srv := api.NewServerWithOptions(api.ServerOptions{
+		Config: startup, Store: adapter, Logger: slog.New(slog.DiscardHandler),
+		DaemonVersion: Version, OperationGate: api.NewSerialOperationGate(),
+	})
+	daemon := httptest.NewServer(srv.Router())
+	defer daemon.Close()
+	writeStatsHTTPDaemonRuntime(t, startup.Data.DataDir, daemon)
+	testCtx := withStoreResolverConfig(t, &saved)
+	deps := defaultPersonProviderCommandDeps()
+	// Execute the old subprocess route in-process if removal still uses it.
+	// Both paths use the real command/store; the test never launches a host daemon.
+	deps.proxy = func(command *cobra.Command, args []string, _ map[string]string) error {
+		argv, err := daemonCLIArgsFromCobra(command, args)
+		if err != nil {
+			return err
+		}
+		_, err = executePersonProviderCommand(t, localPersonProviderDeps(saved.People.Sweep, st, nil), argv[2:]...)
+		return err
+	}
+	runner, err := newProductionStructuredRunner(startup, st)
+	require.NoError(err)
+	request := peoplesweep.StructuredRequest{
+		ProgramID: "removal-test", ProgramVersion: "1", InputText: "synthetic input", SchemaName: "removal_test",
+		Sources:         []peoplesweep.SourceDescriptor{{Class: peoplesweep.SourceConversationText, ObservedOn: "2025-06-01"}},
+		JSONSchema:      []byte(`{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false}`),
+		MaxOutputTokens: 16,
+	}
+	_, err = runner.RunStructured(t.Context(), request)
+	require.NoError(err)
+	require.Equal(int64(1), calls.Load())
+	// Reject a stale config revision without revoking either policy.
+	before, err := config.ReadConfigFile(saved.ConfigFilePath())
+	require.NoError(err)
+	require.NoError(os.WriteFile(saved.ConfigFilePath(), append(before.Content, []byte("\n# concurrent edit\n")...), 0o600))
+	deps.removeWithDaemon = func(ctx context.Context, name, _ string) error {
+		return removePersonProviderWithDaemon(ctx, name, before.ETag)
+	}
+	_, err = executePersonProviderCommandContext(testCtx, t, deps, "remove", "beta")
+	require.ErrorContains(err, "config file changed")
+	for _, profile := range []peoplesweep.ProviderProfile{runningProfile, savedProfile} {
+		active, err := st.HasActivePersonInferenceConsent(t.Context(), profile.Fingerprint)
+		require.NoError(err)
+		assert.True(active, profile.Model)
+	}
+	deps.removeWithDaemon = removePersonProviderWithDaemon
+	output, err := executePersonProviderCommandContext(testCtx, t, deps, "remove", "beta", "--json")
+	require.NoError(err)
+	var removed personProviderRemoveOutput
+	require.NoError(json.Unmarshal([]byte(output), &removed))
+	assert.Equal(personProviderRemoveOutput{Name: "beta", Removed: true, DaemonRestartRequired: true}, removed)
+	snapshot, err := config.ReadConfigFile(saved.ConfigFilePath())
+	require.NoError(err)
+	current, err := config.LoadConfigFile(snapshot, saved.HomeDir)
+	require.NoError(err)
+	assert.NotContains(current.People.Sweep.Providers, "beta")
+	for _, profile := range []peoplesweep.ProviderProfile{runningProfile, savedProfile} {
+		active, err := st.HasActivePersonInferenceConsent(t.Context(), profile.Fingerprint)
+		require.NoError(err)
+		assert.False(active, profile.Model)
+		checked, err := st.HasSuccessfulPersonInferenceCheck(t.Context(), profile.Fingerprint)
+		require.NoError(err)
+		assert.False(checked, profile.Model)
+	}
+	_, err = runner.RunStructured(t.Context(), request)
+	require.Error(err)
+	assert.Equal(int64(1), calls.Load(), "removal must prevent further provider requests")
+}

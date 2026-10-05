@@ -50,6 +50,7 @@ GO_INSTALL_BIN := $(shell go env GOPATH)/bin
 endif
 GOLANGCI_LINT_BIN := $(GO_INSTALL_BIN)/golangci-lint
 CI_TOOLS_BIN := $(shell git rev-parse --path-format=absolute --git-path ci-tools/bin)
+CUSTOM_GCL_BIN := $(CI_TOOLS_BIN)/custom-gcl$(shell go env GOEXE)
 GOVULNCHECK_BIN := $(CI_TOOLS_BIN)/govulncheck
 
 # Build tags for the PostgreSQL test lane (test-pg). Must be the full build set:
@@ -70,7 +71,7 @@ PG_TEST_TAGS := fts5 sqlite_vec pgvector
 # in both configurations, so test-pg-both runs just these in the shipped-build
 # configuration. Verified by `make pg-shipped-only-check`, which re-derives the
 # closure from `go list`.
-PG_SHIPPED_ONLY_PKGS := ./cmd/msgvault ./cmd/msgvault/cmd ./internal/api ./internal/mcp ./internal/scheduler ./internal/store ./internal/vector/chunkmatch ./internal/vector/document ./internal/vector/embed ./internal/vector/hybrid ./internal/vector/pgvector ./scripts/contextual-retrieval-eval
+PG_SHIPPED_ONLY_PKGS := ./cmd/msgvault ./cmd/msgvault/cmd ./internal/api ./internal/daemonclient ./internal/mcp ./internal/scheduler ./internal/store ./internal/vector/chunkmatch ./internal/vector/document ./internal/vector/embed ./internal/vector/hybrid ./internal/vector/pgvector ./scripts/contextual-retrieval-eval
 
 OPENAPI_ARTIFACTS := api/openapi.yaml pkg/client/openapi.yaml pkg/client/generated
 WEB_INSTALL_STAMP := web/node_modules/.msgvault-install-stamp
@@ -87,23 +88,38 @@ export GOLANGCI_LINT_CACHE
 # serialize one another while duplicate runners in one worktree can wait.
 GOLANGCI_LINT_TMP ?= $(GOLANGCI_LINT_CACHE)/tmp
 
-.PHONY: build build-release install clean test test-unsharded test-shards test-v test-pg test-pg-shipped test-pg-shipped-unsharded test-pg-both pg-shipped-only-check require-test-db fmt lint-tools lint lint-ci vuln-tools vulncheck testify-helper-check tidy openapi api-generate openapi-check api-check web-install web-generate web-check web-test web-test-browser web-e2e web-build web-embed web-assets-check smoke-web-release shootout run-shootout install-hooks bench vcard-registry-check vcard-registry-update docs-install docs-build docs-serve docs-check docs-fixture-test docs-fixture-check docs-fixture-smoke docs-web-screenshots docs-screenshots docs-assets-branch docs-generated-assets-branch docs-deploy-staging docs-deploy help
+.PHONY: build build-release install clean test test-unsharded test-shards test-v test-pg test-pg-shipped test-pg-shipped-unsharded test-pg-both pg-shipped-only-check require-test-db fmt lint-tools custom-gcl lint lint-ci vuln-tools vulncheck testify-helper-check tidy openapi api-generate openapi-check api-check web-install web-generate web-check web-test web-test-browser web-e2e web-build web-embed web-assets-check smoke-web-release shootout run-shootout install-hooks bench vcard-registry-check vcard-registry-update docs-install docs-build docs-serve docs-check docs-fixture-test docs-fixture-check docs-fixture-smoke docs-web-screenshots docs-screenshots docs-assets-branch docs-generated-assets-branch docs-deploy-staging docs-deploy help
 
 # Build the binary (debug)
 build: web-embed
+ifeq ($(shell go env GOOS),linux)
+	CGO_ENABLED=0 go build -trimpath -buildvcs=false -o msgvault-codex-bridge ./cmd/msgvault-codex-bridge
+	chmod 755 msgvault-codex-bridge
+	@bridge_digest=$$(sha256sum msgvault-codex-bridge | cut -d' ' -f1); \
+		CGO_ENABLED=1 go build -tags "$(BUILD_TAGS)" -ldflags="$(LDFLAGS) -X go.kenn.io/msgvault/internal/peoplesweep.codexBridgeSHA256=$$bridge_digest" -o msgvault ./cmd/msgvault
+else
 	CGO_ENABLED=1 go build -tags "$(BUILD_TAGS)" -ldflags="$(LDFLAGS)" -o msgvault ./cmd/msgvault
+endif
 	@chmod +x msgvault
 
 # Build with optimizations (release)
 build-release: web-embed
+ifeq ($(shell go env GOOS),linux)
+	CGO_ENABLED=0 go build -trimpath -buildvcs=false -o msgvault-codex-bridge ./cmd/msgvault-codex-bridge
+	chmod 755 msgvault-codex-bridge
+	@bridge_digest=$$(sha256sum msgvault-codex-bridge | cut -d' ' -f1); \
+		CGO_ENABLED=1 go build -tags "$(BUILD_TAGS)" -ldflags="$(LDFLAGS_RELEASE) -X go.kenn.io/msgvault/internal/peoplesweep.codexBridgeSHA256=$$bridge_digest" -trimpath -o msgvault ./cmd/msgvault
+else
 	CGO_ENABLED=1 go build -tags "$(BUILD_TAGS)" -ldflags="$(LDFLAGS_RELEASE)" -trimpath -o msgvault ./cmd/msgvault
+endif
 	@chmod +x msgvault
 
 # Install to ~/.local/bin, $GOBIN, or $GOPATH/bin
-install: web-embed
-	@if [ -d "$(HOME)/.local/bin" ]; then \
+install: build
+	@set -e; if [ -d "$(HOME)/.local/bin" ]; then \
 		echo "Installing to ~/.local/bin/msgvault"; \
-		CGO_ENABLED=1 go build -tags "$(BUILD_TAGS)" -ldflags="$(LDFLAGS)" -o "$(HOME)/.local/bin/msgvault" ./cmd/msgvault; \
+		install -m 755 msgvault "$(HOME)/.local/bin/msgvault"; \
+		if [ "$$(go env GOOS)" = linux ]; then install -m 755 msgvault-codex-bridge "$(HOME)/.local/bin/msgvault-codex-bridge"; fi; \
 	else \
 		INSTALL_DIR="$${GOBIN:-$$(go env GOBIN)}"; \
 		if [ -z "$$INSTALL_DIR" ]; then \
@@ -112,12 +128,13 @@ install: web-embed
 		fi; \
 		mkdir -p "$$INSTALL_DIR"; \
 		echo "Installing to $$INSTALL_DIR/msgvault"; \
-		CGO_ENABLED=1 go build -tags "$(BUILD_TAGS)" -ldflags="$(LDFLAGS)" -o "$$INSTALL_DIR/msgvault" ./cmd/msgvault; \
+		install -m 755 msgvault "$$INSTALL_DIR/msgvault"; \
+		if [ "$$(go env GOOS)" = linux ]; then install -m 755 msgvault-codex-bridge "$$INSTALL_DIR/msgvault-codex-bridge"; fi; \
 	fi
 
 # Clean build artifacts
 clean:
-	rm -f msgvault msgvault.exe mimeshootout
+	rm -f msgvault msgvault.exe msgvault-codex-bridge mimeshootout
 	rm -rf bin/
 
 # Scale the SQLite suite when both CPU and memory budgets allow it. An explicit
@@ -275,7 +292,7 @@ api-generate:
 	set -e; tmp="$$(mktemp)"; trap 'rm -f "$$tmp"' EXIT; go run ./cmd/msgvault openapi > "$$tmp"; if [ -f api/openapi.yaml ] && cmp -s "$$tmp" api/openapi.yaml; then rm "$$tmp"; else mv "$$tmp" api/openapi.yaml; fi; trap - EXIT
 	set -e; tmp="$$(mktemp)"; trap 'rm -f "$$tmp"' EXIT; go run ./cmd/msgvault openapi --version 3.0 --format yaml > "$$tmp"; if [ -f pkg/client/openapi.yaml ] && cmp -s "$$tmp" pkg/client/openapi.yaml; then rm "$$tmp"; else mv "$$tmp" pkg/client/openapi.yaml; fi; trap - EXIT
 	cd pkg/client/generated && find . -maxdepth 1 -type f -name '*.go' ! -name 'generate.go' -delete && go tool -modfile=../../../tools/oapi-codegen/go.mod oapi-codegen -config config.yaml ../openapi.yaml
-	go run ./internal/codegenfix/cmd pkg/client/generated/types.go
+	go run ./internal/codegenfix/cmd pkg/client/generated/types.go pkg/client/generated/client.go
 
 openapi-check: api-generate
 	@git diff --exit-code -- $(OPENAPI_ARTIFACTS) || (echo "OpenAPI generated assets are stale; run 'make api-generate' and commit the changes." >&2; exit 1)
@@ -309,13 +326,15 @@ web-check: web-install
 web-test:
 	cd web && bun run test
 
-web-test-browser:
+# test:browser runs everything under web/tests, including tests/e2e specs
+# whose fixtures spawn the repo-root msgvault daemon, so the binary must
+# exist before Playwright starts. Same invariant as web-e2e below.
+web-test-browser: build
 	cd web && bun run test:browser
 
-# Task 20 browser gates use the same digest-pinned Playwright environment as
-# web-test-browser in CI. Traces, screenshots, and video are retained only for
-# failures by web/playwright.config.ts.
-web-e2e:
+# Browser gates use the same digest-pinned Playwright environment as CI.
+# Build the real daemon and embedded UI before Playwright test timeouts start.
+web-e2e: build
 	cd web && bun run test:e2e
 
 web-build: web-generate
@@ -346,18 +365,25 @@ smoke-web-release:
 fmt:
 	go fmt ./...
 
-# Install the pinned linter used by CI.
+# Install the pinned linter used by CI; lint-ci runs this first, so skip it when already installed.
 lint-tools:
+	@if [ "$$("$(GOLANGCI_LINT_BIN)" version --short 2>/dev/null)" = "$(GOLANGCI_LINT_VERSION:v%=%)" ]; then exit 0; fi; \
 	go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
 
+# Build golangci-lint with the plugins in .custom-gcl.yml into the
+# repository-owned tool path. Strip repo-local Git variables so a build run
+# from the commit hook does not inherit GIT_DIR.
+custom-gcl: lint-tools
+	@mkdir -p "$(CI_TOOLS_BIN)"
+	@unset_args=$$(git rev-parse --local-env-vars 2>/dev/null | sed 's/^/-u /' | tr '\n' ' '); \
+	env $$unset_args GOFLAGS=-buildvcs=false "$(GOLANGCI_LINT_BIN)" custom \
+		--destination "$(CI_TOOLS_BIN)" --name custom-gcl \
+		--version "$(GOLANGCI_LINT_VERSION)"
+
 # Run linter (auto-fix)
-lint:
-	@if ! command -v golangci-lint >/dev/null 2>&1; then \
-		echo "golangci-lint not found. Install: https://golangci-lint.run/usage/install/" >&2; \
-		exit 1; \
-	fi
+lint: custom-gcl
 	@mkdir -p "$(GOLANGCI_LINT_TMP)"
-	TMPDIR="$(GOLANGCI_LINT_TMP)" golangci-lint run --fix ./...
+	TMPDIR="$(GOLANGCI_LINT_TMP)" "$(CUSTOM_GCL_BIN)" run --fix ./...
 
 # Check the shared Huma API contract.
 huma-check:
@@ -366,9 +392,9 @@ huma-check:
 .PHONY: huma-check
 
 # Run linter (CI, no auto-fix)
-lint-ci: lint-tools testify-helper-check
+lint-ci: custom-gcl testify-helper-check
 	@mkdir -p "$(GOLANGCI_LINT_TMP)"
-	TMPDIR="$(GOLANGCI_LINT_TMP)" "$(GOLANGCI_LINT_BIN)" run ./...
+	TMPDIR="$(GOLANGCI_LINT_TMP)" "$(CUSTOM_GCL_BIN)" run ./...
 	@if [ -n "$$GITHUB_PATH" ]; then \
 		$(MAKE) --no-print-directory vuln-tools; \
 		printf '%s\n' "$(CI_TOOLS_BIN)" >> "$$GITHUB_PATH"; \
@@ -383,7 +409,7 @@ vuln-tools:
 vulncheck: vuln-tools
 	"$(GOVULNCHECK_BIN)" -tags "$(BUILD_TAGS)" ./...
 
-# Enforce testify helper usage in assertion-heavy tests
+# Enforce testify helper usage and named sub-second polling budgets in tests
 testify-helper-check:
 	go run ./cmd/testify-helper-check -tags="$(BUILD_TAGS)" ./...
 
@@ -461,13 +487,18 @@ docs-assets-branch:
 docs-generated-assets-branch:
 	bash docs/screenshots/update-generated-assets-branch.sh
 
+# Build locally so the sibling website/ directory is available to both deploys.
 # Deploy docs to Vercel staging
 docs-deploy-staging:
-	cd docs && vercel
+	cd docs && vercel pull --yes --environment=preview
+	cd docs && vercel build
+	cd docs && vercel deploy --prebuilt
 
 # Deploy docs to Vercel production
 docs-deploy:
-	cd docs && vercel --prod
+	cd docs && vercel pull --yes --environment=production
+	cd docs && vercel build --prod
+	cd docs && vercel deploy --prebuilt --prod
 
 # Build the MIME shootout tool
 shootout:
@@ -493,7 +524,7 @@ help:
 	@echo "  lint           - Run linter (auto-fix)"
 	@echo "  lint-ci        - Run linter (CI, no auto-fix; also runs testify-helper-check)"
 	@echo "  vulncheck      - Run the pinned Go vulnerability scanner"
-	@echo "  testify-helper-check - Enforce testify helper usage in assertion-heavy tests"
+	@echo "  testify-helper-check - Enforce testify helpers and polling budgets in tests"
 	@echo "  tidy           - Tidy go.mod"
 	@echo "  vcard-registry-check - Network-check IANA registry drift (manual; not CI)"
 	@echo "  vcard-registry-update - Update the vendored IANA vCard registry"

@@ -194,3 +194,92 @@ func TestGrantAllowsExactOriginalTriple(t *testing.T) {
 	assert.True(t, g.Allows(PermissionDraftCreate, original),
 		"exact original (ID, Type, Identifier) triple must be allowed")
 }
+
+func TestDraftPermissionsRemainIndependent(t *testing.T) {
+	assertions := assert.New(t)
+	src := SourceRef{ID: 1, Type: "imap", Identifier: "alice@example.com"}
+	for _, permission := range []Permission{PermissionDraftCreate, PermissionDraftEdit, PermissionDraftDelete} {
+		grant := Grant{Permissions: []Permission{permission}, Sources: []SourceRef{src}}
+		assertions.True(grant.Allows(permission, src))
+		for _, other := range []Permission{PermissionDraftCreate, PermissionDraftEdit, PermissionDraftDelete} {
+			if other == permission {
+				continue
+			}
+			assertions.False(grant.Allows(other, src))
+		}
+	}
+	assertions.Equal(PermissionDraftEdit, mustKnownPermission(t, "draft.edit"))
+	assertions.Equal(PermissionDraftDelete, mustKnownPermission(t, "draft.delete"))
+}
+
+func TestCalendarEventReadPermissionCanBeIssued(t *testing.T) {
+	assertions := assert.New(t)
+	requirements := require.New(t)
+	permission := PermissionCalendarEventRead
+	assertions.Equal(permission, mustKnownPermission(t, string(permission)))
+
+	source := SourceRef{ID: 1, Type: "gcal", Identifier: "person@example.com/team@example.com"}
+	_, _, grant, err := NewRegistry().Issue("calendar-details", []Permission{permission}, []SourceRef{source})
+	requirements.NoError(err)
+	assertions.True(grant.Allows(permission, source))
+}
+
+func TestCalendarPermissionsRemainIndependent(t *testing.T) {
+	assertions := assert.New(t)
+	source := SourceRef{ID: 1, Type: "gcal", Identifier: "person@example.com/team@example.com"}
+	permissions := []Permission{
+		PermissionCalendarRead,
+		PermissionCalendarEventRead,
+		PermissionCalendarWrite,
+		PermissionCalendarInvite,
+	}
+	for _, permission := range permissions {
+		grant := Grant{Permissions: []Permission{permission}, Sources: []SourceRef{source}}
+		assertions.True(grant.Allows(permission, source))
+		for _, other := range permissions {
+			if other != permission {
+				assertions.False(grant.Allows(other, source), "%s must not imply %s", permission, other)
+			}
+		}
+	}
+}
+
+func mustKnownPermission(t *testing.T, name string) Permission {
+	t.Helper()
+	permission, ok := KnownPermission(name)
+	require.True(t, ok)
+	return permission
+}
+
+func TestGrantSenderKeysAreFrozenAndDeepCopied(t *testing.T) {
+	requirements := require.New(t)
+	assertions := assert.New(t)
+	r := NewRegistry()
+	senders := []string{"alice@example.com", "alias@example.com"}
+	source := SourceRef{ID: 5, Type: "imap", Identifier: "imap://alice@example.com", SenderKeys: senders}
+	id, secret, issued, err := r.Issue("sender-test", []Permission{PermissionDraftCreate}, []SourceRef{source})
+	requirements.NoError(err)
+	senders[0] = "changed@example.com"
+	issued.Sources[0].SenderKeys[0] = "mutated@example.com"
+
+	lookup, ok := r.Lookup(secret)
+	requirements.True(ok)
+	assertions.Equal("alice@example.com", lookup.Sources[0].SenderKeys[0])
+	assertions.True(lookup.AllowsSender(PermissionDraftCreate, SourceRef{Type: source.Type, Identifier: source.Identifier}, "alice@example.com"))
+	assertions.False(lookup.AllowsSender(PermissionDraftCreate, source, "changed@example.com"))
+
+	listed := r.List()
+	listed[0].Sources[0].SenderKeys[0] = "list-mutated@example.com"
+	again, ok := r.Lookup(secret)
+	requirements.True(ok)
+	assertions.Equal("alice@example.com", again.Sources[0].SenderKeys[0])
+	assertions.Equal(id, again.ID)
+}
+
+func TestGrantWithNoSenderKeysHasNoSenderAuthority(t *testing.T) {
+	g := Grant{
+		Permissions: []Permission{PermissionDraftCreate},
+		Sources:     []SourceRef{{Type: "imap", Identifier: "imap://alice@example.com"}},
+	}
+	assert.False(t, g.AllowsSender(PermissionDraftCreate, SourceRef{Type: "imap", Identifier: "imap://alice@example.com"}, "alice@example.com"))
+}

@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"slices"
 
+	"github.com/cenkalti/backoff/v7"
 	"github.com/doordash-oss/oapi-codegen-dd/v3/pkg/runtime"
 	"go.kenn.io/msgvault/internal/vector"
 	apiclient "go.kenn.io/msgvault/pkg/client"
@@ -141,6 +142,17 @@ func CLIResponseError(resp any, err error) error {
 	return responseError(resp, err, []int{http.StatusOK}, handleCLIErrorBody)
 }
 
+// CLIResponseWithStatuses keeps CLI error wording while allowing an endpoint
+// to return an accepted asynchronous operation alongside ordinary results.
+func CLIResponseWithStatuses[R any](
+	c *Client, successStatuses []int,
+	request func(*apiclient.Client) (R, error),
+) (R, error) {
+	return generatedResponse(c, request, func(resp any, err error) error {
+		return responseError(resp, err, successStatuses, handleCLIErrorBody)
+	})
+}
+
 // APIResponse executes a generated request and validates its response.
 func APIResponse[R any](
 	c *Client,
@@ -213,21 +225,29 @@ func generatedResponse[R any](
 		return zero, err
 	}
 	waiter := &operationBusyWaiter{c: c}
-	for {
+	ctx := c.requestContext()
+	resp, err := backoff.Retry(ctx, func() (R, error) {
 		resp, err := request(client)
 		checkErr := checkResponse(resp, err)
 		if checkErr == nil {
 			return resp, nil
 		}
-		waitCtx := c.requestContext()
-		if waiter.wait(waitCtx, checkErr) {
-			continue
+		if err := ctx.Err(); err != nil {
+			return zero, backoff.Permanent(err)
 		}
-		if err := waitCtx.Err(); err != nil {
-			return zero, err
+		if _, busy := errors.AsType[*OperationInProgressError](checkErr); !busy {
+			return zero, backoff.Permanent(checkErr)
 		}
 		return zero, checkErr
+	}, backoff.WithBackOff(backoff.NewConstantBackOff(operationBusyRetryDelay)),
+		backoff.WithMaxTries(0), backoff.WithMaxElapsedTime(0), backoff.WithNotify(waiter.notify))
+	if err == nil {
+		return resp, nil
 	}
+	if ctx.Err() != nil {
+		return zero, ctx.Err()
+	}
+	return zero, backoff.AsRetryError(err).LastErr
 }
 
 func responseError(

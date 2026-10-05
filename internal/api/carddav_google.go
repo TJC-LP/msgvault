@@ -20,7 +20,7 @@ import (
 )
 
 func normalizeCardDAVAccountRequest(req CardDAVAccountRequest) CardDAVAccountRequest {
-	if req.Provider == "google" {
+	if req.Provider == cardDAVProviderGoogle {
 		req.BaseURL = carddav.GoogleDiscoveryURL
 		req.Username = strings.ToLower(strings.TrimSpace(req.Username))
 	}
@@ -28,11 +28,12 @@ func normalizeCardDAVAccountRequest(req CardDAVAccountRequest) CardDAVAccountReq
 }
 
 func cardDAVCredentialMatchesConfig(credential carddav.Credential, cfg config.CardDAVConfig) bool {
-	return credential.Google == (cfg.Provider == "google") && credential.OAuthApp == cfg.OAuthApp
+	return credential.OAuthApp == cfg.OAuthApp &&
+		((cfg.Provider == "" && !credential.Google) || (cfg.Provider == cardDAVProviderGoogle && credential.Google))
 }
 
 func (c *CardDAVController) credentialForRequest(ctx context.Context, req CardDAVAccountRequest) (carddav.Credential, error) {
-	credential := carddav.Credential{BaseURL: req.BaseURL, Username: req.Username, Google: req.Provider == "google", OAuthApp: req.OAuthApp}
+	credential := carddav.Credential{BaseURL: req.BaseURL, Username: req.Username, Google: req.Provider == cardDAVProviderGoogle, OAuthApp: req.OAuthApp}
 	if credential.Google {
 		return credential, nil
 	}
@@ -41,9 +42,13 @@ func (c *CardDAVController) credentialForRequest(ctx context.Context, req CardDA
 	return credential, err
 }
 
-func (c *CardDAVController) serviceForCredential(credential carddav.Credential) (cardDAVCandidate, error) {
+func (c *CardDAVController) serviceForCredential(credential carddav.Credential, configured config.CardDAVConfig) (cardDAVCandidate, error) {
 	if !credential.Google {
-		return c.factory(c.store, credential.BaseURL, credential.Username, credential.Password)
+		candidate, err := c.factory(c.store, configured, credential.Password)
+		if err != nil {
+			return nil, err
+		}
+		return c.scopedCandidate(candidate, credential.ConnectionGeneration), nil
 	}
 	if credential.BaseURL != carddav.GoogleDiscoveryURL {
 		return nil, errors.New("use Google's discovery URL for Google Contacts")
@@ -61,7 +66,7 @@ func (c *CardDAVController) serviceForCredential(credential carddav.Credential) 
 	if err != nil {
 		return nil, err
 	}
-	return carddav.NewGoogleService(c.store, client), nil
+	return carddav.NewGoogleService(c.store, client).ForConnection(c.connection(), credential.ConnectionGeneration), nil
 }
 
 func (c *CardDAVController) googleBearerToken(ctx context.Context, credential carddav.Credential) (string, error) {

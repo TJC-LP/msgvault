@@ -2,7 +2,13 @@ import { fireEvent, render, screen, waitFor, within } from '@testing-library/sve
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { createAPIClient } from '../../api/client';
-import type { OperationsSnapshot, OperationsURLState } from '../../operations/models';
+import { OPERATION_KIND_LABELS } from '../../operations/labels';
+import type {
+  OperationKind,
+  OperationLane,
+  OperationsSnapshot,
+  OperationsURLState
+} from '../../operations/models';
 import { chooseSelectOption } from '../../../test/kit-ui';
 import OperationsWorkspace from './OperationsWorkspace.svelte';
 
@@ -99,6 +105,8 @@ function snapshot(overrides: Partial<OperationsSnapshot> = {}): OperationsSnapsh
     nextCursor: null,
     statusReadable: true,
     historyReadable: true,
+    statusUpdatedAt: null,
+    statusRefreshing: false,
     initialLoading: false,
     backgroundLoading: false,
     paging: false,
@@ -119,61 +127,154 @@ function controller(current: OperationsSnapshot = snapshot()) {
   return {
     snapshot: current,
     refresh: vi.fn(async () => undefined),
+    refreshStatus: vi.fn(async () => true),
     loadMore: vi.fn(async () => undefined),
     restart: vi.fn(async () => undefined),
     runAction: vi.fn(async () => 'succeeded' as const)
   };
 }
 
+const off = (kind: OperationKind, lane: OperationLane, related?: string) => ({
+  lane, kind, configured: false, history_availability: 'available' as const, supported_actions: [],
+  ...(related ? { related_status: related } : {})
+});
+
+function renderKinds(kinds: Array<ReturnType<typeof off>>, props: Record<string, unknown> = {}) {
+  const lanes = ['messages', 'person_facts', 'contacts', 'documents', 'visual_attachments'] as const;
+  const statusLanes = lanes.map((lane) => ({ lane, kinds: kinds.filter((kind) => kind.lane === lane) }));
+  return render(OperationsWorkspace, {
+    controller: controller(snapshot({ statusLanes: statusLanes as never })) as never,
+    state: urlState(),
+    ...props
+  });
+}
+
 afterEach(() => vi.unstubAllGlobals());
 
 describe('OperationsWorkspace', () => {
-  it('renders exact public lanes, explicit per-kind availability and semantic run summaries', () => {
-    const rendered = render(OperationsWorkspace, {
-      controller: controller() as never,
-      state: urlState()
-    });
+  it('lists every lane with one row per kind and no History available text', () => {
+    render(OperationsWorkspace, { controller: controller() as never, state: urlState() });
+    const region = screen.getByRole('region', { name: 'Operation lanes' });
+    expect(within(region).getAllByRole('heading', { level: 2 }).map((heading) => heading.textContent))
+      .toEqual(['Messages', 'Facts', 'Contacts', 'Documents', 'Attachments']);
+    expect(within(screen.getByRole('list', { name: 'Messages' })).getAllByRole('listitem')).toHaveLength(2);
+    const embedding = screen.getByRole('listitem', { name: 'Message embedding' });
+    expect(within(embedding).getByText('Running')).toBeDefined();
+    expect(within(embedding).getByText('History unavailable')).toBeDefined();
+    expect(region.textContent).not.toContain('History available');
+    expect(within(screen.getByRole('listitem', { name: 'Person fact sweep' })).getByText('Off')).toBeDefined();
+    expect(within(screen.getByRole('listitem', { name: 'Person embedding' })).getByText('No runs yet')).toBeDefined();
+  });
 
-    const cards = screen.getByRole('region', { name: 'Operation lanes' });
-    expect(within(cards).getAllByRole('heading', { level: 2 }).map((heading) => heading.textContent)).toEqual([
-      'Messages', 'Facts', 'Contacts', 'Documents', 'Attachments'
+  it('leaves focus where the person moved it while a status refresh was pending', async () => {
+    let finish!: (value: boolean) => void;
+    const stub = controller();
+    stub.refreshStatus.mockImplementation(() => new Promise<boolean>((resolve) => { finish = resolve; }));
+    render(OperationsWorkspace, { controller: stub as never, state: urlState() });
+    const refresh = screen.getByRole('button', { name: 'Refresh operation status' });
+    refresh.focus();
+    await fireEvent.click(refresh);
+    expect(stub.refreshStatus).toHaveBeenCalledOnce();
+
+    const reload = screen.getByRole('button', { name: 'Reload run history' });
+    reload.focus();
+    finish(true);
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(document.activeElement).toBe(reload);
+  });
+
+  it('shows Status unavailable for a lane without kinds', () => {
+    renderKinds([]);
+    expect(screen.getAllByText('Status unavailable')).toHaveLength(5);
+  });
+
+  it.each([
+    ['message_embedding', 'messages', { settingsCategory: 'search', settingsAuthority: 'semantic_search' }],
+    ['person_embedding', 'person_facts', { settingsCategory: 'search', settingsAuthority: 'person_embeddings' }],
+    ['visual_embedding', 'visual_attachments', { settingsCategory: 'search', settingsAuthority: 'visual_attachments' }],
+    ['person_enrichment', 'person_facts', { settingsCategory: 'enrichment', settingsAuthority: '' }],
+    ['person_sweep', 'person_facts', { settingsCategory: 'people', settingsAuthority: '' }]
+  ] as const)('sends an Off %s row to Settings', async (kind, lane, target) => {
+    const onSetUp = vi.fn();
+    renderKinds([off(kind, lane)], { onSetUp });
+    const row = screen.getByRole('listitem', { name: OPERATION_KIND_LABELS[kind] });
+    expect(within(row).getByText('Off')).toBeDefined();
+    await fireEvent.click(within(row).getByRole('button', { name: `Set up ${OPERATION_KIND_LABELS[kind]}` }));
+    expect(onSetUp).toHaveBeenCalledWith(target);
+  });
+
+  it.each([
+    ['document_extraction', 'Configured in config.toml on the daemon host.', 'Document indexing setup',
+      'https://msgvault.io/docs/usage/document-indexing/#configure-the-policy'],
+    ['document_embedding', 'Configured in config.toml on the daemon host. Also needs semantic search.',
+      'Document search setup',
+      'https://msgvault.io/docs/usage/document-indexing/#semantic-and-hybrid-document-search']
+  ] as const)('explains host configuration for an Off %s row', (kind, text, linkName, href) => {
+    renderKinds([off(kind, 'documents')]);
+    const row = screen.getByRole('listitem', { name: OPERATION_KIND_LABELS[kind] });
+    expect(within(row).queryByRole('button', { name: /^Set up/ })).toBeNull();
+    expect(within(row).getByText(text, { exact: false })).toBeDefined();
+    const link = within(row).getByRole('link', { name: linkName });
+    expect(link.getAttribute('href')).toBe(href);
+    expect(link.getAttribute('target')).toBe('_blank');
+    expect(link.getAttribute('rel')).toBe('noreferrer');
+  });
+
+  it('keeps the related-status button and no Set up for Off CardDAV and source rows', () => {
+    renderKinds([
+      off('carddav_sync', 'contacts', 'getCardDAVStatus'),
+      off('source_sync', 'messages', 'listSourceStatus')
     ]);
-    expect(rendered.container.textContent).not.toContain('Person facts');
-    expect(rendered.container.textContent).not.toContain('Visual attachments');
-    expect(within(cards).getByText('Source sync')).toBeDefined();
-    expect(within(cards).getByText('Message embedding')).toBeDefined();
-    expect(within(cards).getByText('Person fact sweep')).toBeDefined();
-    expect(within(cards).getByText('Not configured')).toBeDefined();
-    expect(within(cards).getByText('History unavailable')).toBeDefined();
-    expect(within(cards).getAllByText('Active').length).toBeGreaterThan(0);
-    expect(within(cards).getAllByText('Latest').length).toBeGreaterThan(0);
-    expect(within(cards).getAllByText('Last successful').length).toBeGreaterThan(0);
-    expect(within(cards).getAllByText(/Running|Succeeded/).length).toBeGreaterThan(0);
+    expect(screen.getByRole('button', { name: 'Open CardDAV settings' })).toBeDefined();
+    expect(screen.getByRole('button', { name: 'Open Sources status' })).toBeDefined();
+    expect(screen.queryByRole('button', { name: /^Set up/ })).toBeNull();
   });
 
-  it('claims no recorded runs only when history is available', () => {
-    const current = snapshot();
-    const statusLanes = current.statusLanes.map((lane) => ({
-      ...lane,
-      kinds: lane.kinds.map((kind) => kind.kind === 'message_embedding'
-        ? { ...kind, active: undefined, latest: undefined, latest_successful: undefined }
-        : kind)
-    }));
-    render(OperationsWorkspace, {
-      controller: controller(snapshot({ statusLanes })) as never,
-      state: urlState()
-    });
-
-    const unavailable = screen.getByRole('region', { name: 'Message embedding' });
+  it('claims no runs only when history is available', () => {
+    renderKinds([
+      { ...off('message_embedding', 'messages'), configured: true, history_availability: 'unavailable' } as never,
+      { ...off('carddav_sync', 'contacts'), configured: true }
+    ]);
+    const unavailable = screen.getByRole('listitem', { name: 'Message embedding' });
     expect(within(unavailable).getByText('History unavailable')).toBeDefined();
-    expect(within(unavailable).queryByText('No recorded runs')).toBeNull();
-
-    const availableEmpty = screen.getByRole('region', { name: 'CardDAV sync' });
-    expect(within(availableEmpty).getByText('History available')).toBeDefined();
-    expect(within(availableEmpty).getByText('No recorded runs')).toBeDefined();
+    expect(within(unavailable).queryByText('No runs yet')).toBeNull();
+    expect(within(screen.getByRole('listitem', { name: 'CardDAV sync' })).getByText('No runs yet')).toBeDefined();
   });
 
-  it('keeps advertised authority links and actions on lane status cards', async () => {
+  it('shows an active run instead of Off for a kind that is not configured', () => {
+    const active = {
+      id: 'x', kind: 'message_embedding' as const, lane: 'messages' as const, state: 'queued' as const,
+      started_at: '2026-08-30T12:00:00Z', counters: []
+    };
+    renderKinds([{ ...off('message_embedding', 'messages'), active } as never]);
+    const row = screen.getByRole('listitem', { name: 'Message embedding' });
+    expect(within(row).getByText('Queued')).toBeDefined();
+    expect(within(row).queryByText('Off')).toBeNull();
+  });
+
+  it('shows when the last success differs from the latest run', () => {
+    const partial = {
+      id: 'x', kind: 'source_sync' as const, lane: 'messages' as const, state: 'partial' as const,
+      started_at: '2026-08-30T12:00:00Z', counters: []
+    };
+    const success = { ...partial, id: 'y', state: 'succeeded' as const, started_at: '2026-08-29T12:00:00Z' };
+    renderKinds([{
+      ...off('source_sync', 'messages'), configured: true, latest: partial, latest_successful: success
+    } as never]);
+    const row = screen.getByRole('listitem', { name: 'Source sync' });
+    expect(within(row).getByText('Partial')).toBeDefined();
+    expect(within(row).getByText(/Last succeeded/)).toBeDefined();
+  });
+
+  it('omits Last succeeded when the latest run succeeded', () => {
+    render(OperationsWorkspace, { controller: controller() as never, state: urlState() });
+    const row = screen.getByRole('listitem', { name: 'Source sync' });
+    expect(within(row).getByText('Succeeded')).toBeDefined();
+    expect(within(row).queryByText(/Last succeeded/)).toBeNull();
+  });
+
+  it('keeps advertised authority links and actions on lane status rows', async () => {
     const onNavigate = vi.fn();
     const actions = controller();
     render(OperationsWorkspace, {
@@ -182,17 +283,16 @@ describe('OperationsWorkspace', () => {
       onNavigate
     });
 
-    const cards = screen.getByRole('region', { name: 'Operation lanes' });
-    await fireEvent.click(within(cards).getByRole('button', { name: 'Open Sources status' }));
+    const lanes = screen.getByRole('region', { name: 'Operation lanes' });
+    await fireEvent.click(within(lanes).getByRole('button', { name: 'Open Sources status' }));
     expect(onNavigate).toHaveBeenCalledWith('listSourceStatus');
-    await fireEvent.click(within(cards).getByRole('button', { name: 'Start CardDAV sync' }));
+    await fireEvent.click(within(lanes).getByRole('button', { name: 'Start CardDAV sync' }));
     expect(actions.runAction).toHaveBeenCalledWith('carddav_sync');
-    expect(within(cards).getByRole('button', { name: 'Resume visual index' })).toBeDefined();
-    expect(within(cards).queryByRole('button', { name: 'Build visual index' })).toBeNull();
+    expect(within(lanes).getByRole('button', { name: 'Resume visual index' })).toBeDefined();
+    expect(within(lanes).queryByRole('button', { name: 'Build visual index' })).toBeNull();
   });
 
-  it('passes the authoritative unconfigured document state to its related status panel', async () => {
-    const onConfigure = vi.fn();
+  it('explains host configuration in the unconfigured document panel without a request', async () => {
     const fetchFn = vi.fn<typeof fetch>();
     const statusLanes = snapshot().statusLanes.map((lane) => ({
       ...lane,
@@ -203,12 +303,16 @@ describe('OperationsWorkspace', () => {
     render(OperationsWorkspace, {
       controller: controller(snapshot({ statusLanes })) as never,
       client: createAPIClient(fetchFn),
-      state: urlState({ operationStatus: 'getDocumentIndexStatus' }),
-      onConfigure
+      state: urlState({ operationStatus: 'getDocumentIndexStatus' })
     });
 
-    await fireEvent.click(await screen.findByRole('button', { name: 'Open document index settings' }));
-    expect(onConfigure).toHaveBeenCalledWith('getDocumentIndexStatus');
+    const panel = await screen.findByRole('region', { name: 'Document index status' });
+    expect(within(panel).getByText('Off')).toBeDefined();
+    expect(within(panel).getByText('Configured in config.toml on the daemon host.', { exact: false })).toBeDefined();
+    const link = within(panel).getByRole('link', { name: 'Document indexing setup' });
+    expect(link.getAttribute('target')).toBe('_blank');
+    expect(link.getAttribute('rel')).toBe('noreferrer');
+    expect(within(panel).queryByRole('button', { name: 'Open document index settings' })).toBeNull();
     expect(fetchFn).not.toHaveBeenCalled();
   });
 
@@ -255,12 +359,45 @@ describe('OperationsWorkspace', () => {
     const rows = within(table).getAllByRole('row').slice(1);
     expect(rows[0]!.textContent).toContain('Document extraction');
     expect(rows[0]!.textContent).toContain('2 seconds');
-    expect(rows[0]!.textContent).toContain('2 failed writes');
+    expect(rows[0]!.textContent).toContain('2 writes failed');
     expect(rows[1]!.textContent).toContain('Source sync');
     expect(rows[1]!.textContent).toContain('1 minute 5 seconds');
 
     await fireEvent.click(within(rows[0]!).getByRole('button', { name: 'Open Document extraction run' }));
     expect(onStateChange).toHaveBeenCalledWith({ operationRunID: RUN_TWO });
+  });
+
+  it('shows triggers, counters, and failure sentences in the runs table', () => {
+    const failed = run({ id: RUN_TWO, state: 'failed', trigger: undefined,
+      counters: [
+        { name: 'processed', unit: 'messages', value: 20 }, { name: 'added', unit: 'messages', value: 20 },
+        { name: 'updated', unit: 'messages', value: 0 }, { name: 'item_errors', unit: 'messages', value: 0 }
+      ],
+      error: { code: 'source_sync_failed', message: 'Source sync failed.' } });
+    render(OperationsWorkspace, {
+      controller: controller(snapshot({ rows: [failed], unavailableKinds: [] })) as never,
+      state: urlState()
+    });
+    const row = within(screen.getByRole('table', { name: 'Operation history' })).getAllByRole('row')[1]!;
+    expect(row.textContent).toContain('—');
+    expect(row.textContent).toContain('20 messages processed · 20 added');
+    expect(row.textContent).not.toContain('item errors');
+    expect(row.textContent).toContain('Failed');
+    expect(row.textContent).toContain('Source sync failed.');
+  });
+
+  it('leads the run detail error with the server sentence and keeps every counter', () => {
+    const detail = { ...run({ state: 'failed', counters: [{ name: 'item_errors', unit: 'messages', value: 0 }],
+      error: { code: 'source_sync_failed', message: 'Source sync failed.' } }), supported_actions: [] };
+    render(OperationsWorkspace, {
+      controller: controller(snapshot({ detail })) as never,
+      state: urlState({ operationRunID: RUN_ONE })
+    });
+    const error = screen.getByRole('alert', { name: 'Operation error' });
+    expect(error.firstElementChild?.textContent).toBe('Source sync failed.');
+    expect(within(error).getByText('Code: source_sync_failed').tagName).toBe('CODE');
+    expect(screen.getByText('Item errors')).toBeDefined();
+    expect(screen.getByText('0 messages')).toBeDefined();
   });
 
   it('renders only allowlisted detail, fixed error, related authority and advertised actions', async () => {
@@ -282,7 +419,7 @@ describe('OperationsWorkspace', () => {
     });
 
     const detail = screen.getByRole('region', { name: 'Operation run detail' });
-    expect(within(detail).getByText('timeout')).toBeDefined();
+    expect(within(detail).getByText('Code: timeout')).toBeDefined();
     expect(within(detail).getByText('The operation timed out.')).toBeDefined();
     expect(within(detail).getByRole('button', { name: 'Open Sources status' })).toBeDefined();
     expect(within(detail).getByRole('button', { name: 'Start CardDAV sync' })).toBeDefined();
@@ -438,6 +575,22 @@ describe('OperationsWorkspace', () => {
     expect(screen.queryByRole('region', { name: 'Operation lanes' })).toBeNull();
     await fireEvent.keyDown(window, { key: 'Escape' });
     expect(onStateChange).toHaveBeenCalledWith({ operationRunID: null });
+  });
+
+  it('shows one visible level-one heading in the narrow detail view', () => {
+    vi.stubGlobal('matchMedia', () => ({
+      matches: true,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn()
+    }));
+    render(OperationsWorkspace, {
+      controller: controller(snapshot({ detail: null, detailLoading: true })) as never,
+      state: urlState({ operationRunID: RUN_ONE })
+    });
+
+    const headings = screen.getAllByRole('heading', { level: 1 });
+    expect(headings.map((heading) => heading.textContent?.trim())).toEqual(['Operation detail']);
+    expect(headings[0]!.closest('.kit-sr-only')).toBeNull();
   });
 
   it.each([

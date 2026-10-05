@@ -2,6 +2,7 @@
   import {
     Button,
     DateRangePicker,
+    RefreshControl,
     SelectDropdown,
     resolveRange,
     type RangeSelection
@@ -16,19 +17,23 @@
     resolveOperationFocusAnchor,
     type OperationFocusAnchor
   } from '../../operations/focus';
-  import type {
-    OperationAction,
-    OperationKind,
-    OperationRunDetail as OperationRunDetailModel,
-    OperationsURLState
-  } from '../../operations/models';
-  import OperationLaneCards from './OperationLaneCards.svelte';
+  import type { OperationAction, OperationKind, OperationsURLState } from '../../operations/models';
+  import {
+    OPERATION_KIND_LABELS,
+    OPERATION_LANE_LABELS,
+    RELATED_STATUS_LABELS,
+    type OperationSettingsTarget,
+    type RelatedStatus
+  } from '../../operations/labels';
   import OperationRelatedStatus from './OperationRelatedStatus.svelte';
   import OperationRunDetail from './OperationRunDetail.svelte';
   import OperationRunTable from './OperationRunTable.svelte';
+  import OperationStatusList from './OperationStatusList.svelte';
+  import PageHeader from '../shell/PageHeader.svelte';
 
-  type RelatedStatus = NonNullable<OperationRunDetailModel['related_status']>;
-  type Controller = Pick<OperationsController, 'snapshot' | 'refresh' | 'loadMore' | 'restart' | 'runAction'>;
+  type Controller = Pick<
+    OperationsController, 'snapshot' | 'refresh' | 'refreshStatus' | 'loadMore' | 'restart' | 'runAction'
+  >;
 
   let {
     controller,
@@ -37,7 +42,8 @@
     onStateChange = () => undefined,
     onNavigate = () => undefined,
     onAnnounce = () => undefined,
-    onConfigure = () => undefined
+    onConfigure = () => undefined,
+    onSetUp = () => undefined
   }: {
     controller: Controller;
     client?: APIClient;
@@ -45,7 +51,8 @@
     onStateChange?: (patch: Partial<OperationsURLState>) => void;
     onNavigate?: (target: RelatedStatus) => void;
     onAnnounce?: (message: string) => void;
-    onConfigure?: (target: OperationStatusAuthority) => void;
+    onConfigure?: () => void;
+    onSetUp?: (target: OperationSettingsTarget) => void;
   } = $props();
 
   let root = $state<HTMLElement>();
@@ -60,23 +67,11 @@
 
   const laneOptions = [
     { value: '', label: 'All lanes' },
-    { value: 'messages', label: 'Messages' },
-    { value: 'person_facts', label: 'Facts' },
-    { value: 'contacts', label: 'Contacts' },
-    { value: 'documents', label: 'Documents' },
-    { value: 'visual_attachments', label: 'Attachments' }
+    ...Object.entries(OPERATION_LANE_LABELS).map(([value, label]) => ({ value, label }))
   ];
   const kindOptions = [
     { value: '', label: 'All kinds' },
-    { value: 'source_sync', label: 'Source sync' },
-    { value: 'message_embedding', label: 'Message embedding' },
-    { value: 'person_sweep', label: 'Person fact sweep' },
-    { value: 'person_embedding', label: 'Person embedding' },
-    { value: 'person_enrichment', label: 'Person enrichment' },
-    { value: 'carddav_sync', label: 'CardDAV sync' },
-    { value: 'document_extraction', label: 'Document extraction' },
-    { value: 'document_embedding', label: 'Document embedding' },
-    { value: 'visual_embedding', label: 'Visual embedding' }
+    ...Object.entries(OPERATION_KIND_LABELS).map(([value, label]) => ({ value, label }))
   ];
   const stateOptions = [
     { value: '', label: 'All states' },
@@ -87,26 +82,10 @@
     { value: 'failed', label: 'Failed' },
     { value: 'cancelled', label: 'Cancelled' }
   ];
-  const kindLabels: Record<OperationKind, string> = {
-    source_sync: 'Source sync',
-    message_embedding: 'Message embedding',
-    person_sweep: 'Person fact sweep',
-    person_embedding: 'Person embedding',
-    person_enrichment: 'Person enrichment',
-    carddav_sync: 'CardDAV sync',
-    document_extraction: 'Document extraction',
-    document_embedding: 'Document embedding',
-    visual_embedding: 'Visual embedding'
-  };
   const actionSuccess: Record<OperationAction, string> = {
     carddav_sync: 'CardDAV sync request completed; current operation state was refreshed.',
     visual_build: 'Visual index build request completed; current operation state was refreshed.',
     visual_resume: 'Visual index resume request completed; current operation state was refreshed.'
-  };
-  const relatedStatusLabels: Record<OperationStatusAuthority, string> = {
-    getDocumentIndexStatus: 'Open Document index status',
-    getDocumentVectorStatus: 'Open Document vector status',
-    getVisualAttachmentStatus: 'Open Visual attachment status'
   };
 
   onMount(() => {
@@ -147,11 +126,15 @@
     return undefined;
   }
 
+  function relatedStatusButton(target: OperationStatusAuthority): string {
+    return `Open ${RELATED_STATUS_LABELS[target]}`;
+  }
+
   function navigateStatus(target: RelatedStatus, button: HTMLButtonElement): void {
     if (target === 'getDocumentIndexStatus' || target === 'getDocumentVectorStatus' ||
       target === 'getVisualAttachmentStatus') {
       const buttons = Array.from(root?.querySelectorAll<HTMLButtonElement>('button') ?? []);
-      const targetButtons = buttons.filter((candidate) => candidate.ariaLabel === relatedStatusLabels[target]);
+      const targetButtons = buttons.filter((candidate) => candidate.ariaLabel === relatedStatusButton(target));
       statusFocus = {
         target,
         ordinal: Math.max(0, targetButtons.indexOf(button)),
@@ -167,7 +150,7 @@
     await tick();
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
     const buttons = Array.from(root?.querySelectorAll<HTMLButtonElement>('button') ?? []);
-    const targetButtons = buttons.filter((button) => button.ariaLabel === relatedStatusLabels[focus.target]);
+    const targetButtons = buttons.filter((button) => button.ariaLabel === relatedStatusButton(focus.target));
     (targetButtons[focus.ordinal] ?? buttons[focus.slot])?.focus();
     statusFocus = undefined;
   }
@@ -204,6 +187,19 @@
       operationStartedFrom: range.from ? `${range.from}T00:00:00Z` : '',
       operationStartedBefore: range.to ? nextDayUTC(range.to) : ''
     });
+  }
+
+  async function refreshStatus(): Promise<void> {
+    const control = root?.querySelector<HTMLElement>('.kit-refresh-control');
+    const hadFocus = Boolean(control?.contains(document.activeElement));
+    await controller.refreshStatus();
+    // Kit disables the button while busy, and a disabled button drops focus.
+    // Restore it only if the person has not moved focus elsewhere meanwhile.
+    if (!hadFocus) return;
+    await tick();
+    const active = document.activeElement;
+    if (active && active !== document.body && !control?.contains(active)) return;
+    control?.querySelector<HTMLButtonElement>('button')?.focus();
   }
 
   async function runAction(action: OperationAction): Promise<void> {
@@ -250,7 +246,7 @@
   {#if current.unavailableKinds.length > 0}
     <div class="notice" role="status" aria-label="Unavailable operation history">
       {#each current.unavailableKinds as unavailable (unavailable.kind)}
-        <span>{kindLabels[unavailable.kind]} history is unavailable.</span>
+        <span>{OPERATION_KIND_LABELS[unavailable.kind]} history is unavailable.</span>
       {/each}
     </div>
   {/if}
@@ -280,10 +276,11 @@
     {/key}
   {:else if narrow && urlState.operationRunID !== null}
     <section class="focused-detail" aria-label="Operation detail focused content">
-      <header class="focused-header">
-        <h1>Operation detail</h1>
-        <Button size="sm" surface="soft" label="Back to operation history" onclick={() => void closeDetail()} />
-      </header>
+      <PageHeader title="Operation detail">
+        {#snippet actions()}
+          <Button size="sm" surface="soft" label="Back to operation history" onclick={() => void closeDetail()} />
+        {/snippet}
+      </PageHeader>
       {@render operationNotices()}
       {#if current.detailLoading}
         <p role="status" aria-label="Operation detail loading">Loading operation detail…</p>
@@ -301,17 +298,24 @@
       {/if}
     </section>
   {:else}
-    <header class="workspace-header">
-      <div><p>Archive operations</p><h1>Operations</h1></div>
-      <Button size="sm" surface="soft" label="Refresh operations" disabled={current.backgroundLoading} onclick={() => void controller.refresh()} />
-    </header>
+    <PageHeader title="Operations" description="Background work and its history.">
+      {#snippet actions()}
+        <RefreshControl
+          label="Refresh operation status"
+          lastUpdatedAt={current.statusUpdatedAt}
+          busy={current.statusRefreshing}
+          onRefresh={() => void refreshStatus()}
+        />
+      {/snippet}
+    </PageHeader>
 
     {#if current.statusReadable}
-      <OperationLaneCards
+      <OperationStatusList
         lanes={current.statusLanes}
         actionPending={current.actionPending}
         onNavigate={navigateStatus}
         onAction={(action) => void runAction(action)}
+        {onSetUp}
       />
     {/if}
 
@@ -326,6 +330,7 @@
       {#if urlState.operationStartedFrom || urlState.operationStartedBefore}
         <Button size="sm" surface="soft" label="Clear operation dates" onclick={() => patchFilter({ operationStartedFrom: '', operationStartedBefore: '' })} />
       {/if}
+      <Button size="sm" surface="soft" label="Reload run history" disabled={current.backgroundLoading} onclick={() => void controller.refresh()} />
     </section>
 
     {@render operationNotices()}
@@ -370,11 +375,8 @@
 </main>
 
 <style>
-  .operations-workspace { display: grid; align-content: start; gap: var(--space-4); min-width: 0; min-height: 0; padding: var(--space-5) var(--space-6); overflow: auto; }
-  .workspace-header { display: flex; align-items: center; justify-content: space-between; gap: var(--space-4); }
-  .focused-header { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); }
-  .workspace-header p, h1, .notice { margin: 0; }
-  .workspace-header p { color: var(--status-warning-ink); font-size: var(--font-size-2xs); font-weight: 800; letter-spacing: .1em; text-transform: uppercase; }
+  .operations-workspace { display: grid; align-content: start; gap: var(--space-4); min-width: 0; min-height: 0; padding: var(--space-5) var(--page-gutter) var(--space-4); overflow: auto; }
+  .notice { margin: 0; }
   .filters { display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-2); }
   .content { display: grid; min-width: 0; min-height: 0; }
   .content.has-detail { grid-template-columns: minmax(520px, 1fr) minmax(340px, .6fr); gap: var(--space-4); }
@@ -385,8 +387,7 @@
   .focused-detail { min-height: 0; background: var(--bg-surface); }
 
   @media (max-width: 760px) {
-    .operations-workspace { padding: var(--space-3); }
-    .workspace-header, .filters { align-items: stretch; flex-direction: column; }
+    .filters { align-items: stretch; flex-direction: column; }
     .filters :global(.kit-select-dropdown), .filters :global(.kit-date-range) { width: 100%; }
   }
 </style>

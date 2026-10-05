@@ -286,8 +286,8 @@ func operationGateMiddleware(gate OperationGate, authorized func(*http.Request) 
 				return
 			}
 			security, _ := securityFromRequest(r)
-			delegated := security.auth.Mode == AuthModeDelegated
-			shouldGate, label, err := operationGateRequest(r, delegated)
+			auth := security.auth
+			shouldGate, label, err := operationGateRequest(r, auth)
 			if err != nil {
 				if errors.Is(err, errCLIRunGateInspectionBodyTooLarge) {
 					writeError(w, http.StatusRequestEntityTooLarge, "request_too_large",
@@ -362,9 +362,16 @@ func writeOperationGateBusy(w http.ResponseWriter, r *http.Request, gate Operati
 // DELETE /api/v1/agent-tokens/{id} uses a dynamic path; its exemption is
 // handled by the strings.HasPrefix check in operationGateRequest below.
 var operationGateExemptPaths = map[string]bool{
+	// Calendar control acquires the gate after parsing, authorization, and preview.
+	"/api/v1/calendar/control": true,
+	// Scoring coordinates the gate around local mutations, never provider I/O.
+	"/api/v1/identity/scoring/run":     true,
+	"/api/v1/identity/scoring/consent": true,
+	"/api/v1/identity/scoring/revoke":  true,
 	"/api/v1/carddav/google/authorize": true,
 	"/api/v1/carddav/google/callback":  true,
 	queryEndpointPath:                  true,
+	archiveQueryEndpointPath:           true,
 	sessionPath:                        true,
 	agentTokensPath:                    true,
 	sessionLoginPath:                   true,
@@ -451,7 +458,7 @@ func readOnlyPostRouteRequest(r *http.Request) bool {
 	return pattern != ""
 }
 
-func operationGateRequest(r *http.Request, delegated bool) (bool, string, error) {
+func operationGateRequest(r *http.Request, auth requestAuthentication) (bool, string, error) {
 	if r.URL.Path == DaemonShutdownPath {
 		return false, "", nil
 	}
@@ -465,6 +472,12 @@ func operationGateRequest(r *http.Request, delegated bool) (bool, string, error)
 	if readOnlyPostRouteRequest(r) {
 		return false, "", nil
 	}
+	// Provider handlers take the gate only for their local mutations. Device
+	// authorization and synthetic network checks must not block archive work.
+	if r.Method == http.MethodPost && (r.URL.Path == "/api/v1/settings/people-inference/codex/login" ||
+		(strings.HasPrefix(r.URL.Path, "/api/v1/settings/people-inference/providers/") && strings.HasSuffix(r.URL.Path, "/check"))) {
+		return false, "", nil
+	}
 	if r.URL.Path == "/api/v1/cli/repair-message" {
 		label, skip, err := cliRepairMessageGateDecision(r)
 		if err != nil {
@@ -476,7 +489,7 @@ func operationGateRequest(r *http.Request, delegated bool) (bool, string, error)
 		return true, label, nil
 	}
 	if r.URL.Path == "/api/v1/cli/run" {
-		label, skip, err := cliRunGateDecision(r, delegated)
+		label, skip, err := cliRunGateDecision(r, auth)
 		if err != nil {
 			return false, "", err
 		}
@@ -516,6 +529,8 @@ func cliRepairMessageGateDecision(r *http.Request) (label string, skip bool, err
 // cliRunReadOnlyCommands are proxied CLI commands that only read. Keys are
 // the leading command-path words of CLIRunRequest args (flags follow them).
 var cliRunReadOnlyCommands = map[string]bool{
+	"draft-get":        true,
+	"draft-send-as":    true,
 	"logs":             true,
 	"list-deletions":   true,
 	"show-deletion":    true,
@@ -533,7 +548,7 @@ var cliRunSelfGatedCommands = map[string]bool{
 	"backup create": true,
 }
 
-func cliRunGateDecision(r *http.Request, delegated bool) (label string, skip bool, err error) {
+func cliRunGateDecision(r *http.Request, auth requestAuthentication) (label string, skip bool, err error) {
 	if r == nil || r.Body == nil {
 		return "", false, nil
 	}
@@ -552,10 +567,9 @@ func cliRunGateDecision(r *http.Request, delegated bool) (label string, skip boo
 		Args []string `json:"args"`
 	}
 	if json.Unmarshal(body, &req) == nil && len(req.Args) > 0 {
-		// Delegated callers may only reach draft-reply; any other command is
-		// rejected by the handler before it does any work, so do not take a
-		// gate slot or surface a label to the owner.
-		if delegated && !IsCLIRunDraftReply(req.Args) {
+		// Delegated callers are admitted by the same command and permission
+		// predicate as the handler, so rejected work never takes a gate slot.
+		if auth.Mode == AuthModeDelegated && !delegatedCLIRunAdmitted(req.Args, auth.Grant) {
 			return "", true, nil
 		}
 		command := cliRunCommandWords(req.Args)
@@ -566,7 +580,7 @@ func cliRunGateDecision(r *http.Request, delegated bool) (label string, skip boo
 			return "msgvault " + command, false, nil
 		}
 	}
-	if delegated {
+	if auth.Mode == AuthModeDelegated {
 		// Unparseable or empty-args body: the handler rejects it; do not gate.
 		return "", true, nil
 	}

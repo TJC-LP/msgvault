@@ -19,6 +19,7 @@ import (
 )
 
 func TestRepairMessageResolvesExactTargetAndSourceScope(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 	env := newTestEnv(t)
@@ -47,6 +48,7 @@ func TestRepairMessageResolvesExactTargetAndSourceScope(t *testing.T) {
 }
 
 func TestRepairMessageLeavesSentAttributionToIdentityDiscovery(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	env := newTestEnv(t)
 	source := env.CreateSource(t)
@@ -70,7 +72,32 @@ func TestRepairMessageLeavesSentAttributionToIdentityDiscovery(t *testing.T) {
 		"identity attribution comes from confirmed identities, not the SENT label")
 }
 
+func TestRepairMessagePreservesMetadata(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct{ name, stored string }{
+		{"object", `{"custom":{"keep":true},"email_in_reply_to":"<parent@example.test>"}`},
+		{"malformed", `{"partial":true,`},
+		{"array", `[{"old":"value"}]`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			require := require.New(t)
+			env := newTestEnv(t)
+			source := env.CreateSource(t)
+			id := seedRepairRow(t, env.Store, source.ID, "gmail-metadata", "old-thread", "old")
+			require.NoError(env.Store.SetMessageMetadata(id, sql.NullString{Valid: true, String: tc.stored}))
+			env.Mock.Messages["gmail-metadata"] = repairRaw("gmail-metadata", "provider-thread", "repaired", "body", nil)
+			_, err := env.Syncer.RepairMessage(t.Context(), RepairRequest{Reference: "gmail-metadata", SourceID: source.ID})
+			require.NoError(err)
+			var encoded string
+			require.NoError(env.Store.DB().QueryRow(`SELECT metadata FROM messages WHERE id = ?`, id).Scan(&encoded))
+			assert.Equal(t, tc.stored, encoded)
+		})
+	}
+}
+
 func TestRepairMessageRejectsAmbiguousNumericInterpretations(t *testing.T) {
+	t.Parallel()
 	env := newTestEnv(t)
 	source := env.CreateSource(t)
 	internal := seedRepairRow(t, env.Store, source.ID, "provider-a", "thread-a", "A")
@@ -85,6 +112,7 @@ func TestRepairMessageRejectsAmbiguousNumericInterpretations(t *testing.T) {
 }
 
 func TestRepairMessageRejectsNonGmailAndInvalidSourceScope(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	env := newTestEnv(t)
 	imapSource, err := env.Store.GetOrCreateSource("imap", "imap@example.com")
@@ -99,6 +127,7 @@ func TestRepairMessageRejectsNonGmailAndInvalidSourceScope(t *testing.T) {
 }
 
 func TestRepairMessageRejectsAuthenticatedMailboxMismatchBeforeFetch(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 	env := newTestEnv(t)
@@ -123,6 +152,7 @@ func TestRepairMessageRejectsAuthenticatedMailboxMismatchBeforeFetch(t *testing.
 }
 
 func TestRepairMessageRejectsUndescribedProviderLabelWithoutErasingLabels(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	env := newTestEnv(t)
 	source := env.CreateSource(t)
@@ -143,6 +173,7 @@ func TestRepairMessageRejectsUndescribedProviderLabelWithoutErasingLabels(t *tes
 }
 
 func TestRepairMessageProviderMIMESourcePartCollisionRollsBack(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	env := newTestEnv(t)
 	source := env.CreateSource(t)
@@ -175,6 +206,7 @@ func TestRepairMessageProviderMIMESourcePartCollisionRollsBack(t *testing.T) {
 }
 
 func TestRepairMessageStoreFailurePreservesPreexistingMIMEBlob(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	env := newTestEnv(t)
 	source := env.CreateSource(t)
@@ -216,6 +248,7 @@ func (a *cancelingLabelsAPI) ListLabels(ctx context.Context) ([]*gmail.Label, er
 }
 
 func TestRepairMessageChecksCancellationBeforeAttachmentPublication(t *testing.T) {
+	t.Parallel()
 	env := newTestEnv(t)
 	source := env.CreateSource(t)
 	internalID := seedRepairRow(t, env.Store, source.ID, "gmail-a", "thread-a", "old")
@@ -234,6 +267,7 @@ func TestRepairMessageChecksCancellationBeforeAttachmentPublication(t *testing.T
 }
 
 func TestRepairMessagePreStoreFailuresLeaveArchiveUnchanged(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name      string
 		configure func(t *testing.T, env *TestEnv, source *store.Source, internalID int64)
@@ -305,6 +339,7 @@ func (a *identityRaceAPI) ListLabels(ctx context.Context) ([]*gmail.Label, error
 }
 
 func TestRepairMessageIdentityRaceLeavesArchiveRowsUnchanged(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	env := newTestEnv(t)
 	source := env.CreateSource(t)
@@ -325,6 +360,7 @@ func TestRepairMessageIdentityRaceLeavesArchiveRowsUnchanged(t *testing.T) {
 }
 
 func TestRepairMessagePreservesConversationParticipants(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	env := newTestEnv(t)
 	source := env.CreateSource(t)
@@ -356,6 +392,7 @@ func TestRepairMessagePreservesConversationParticipants(t *testing.T) {
 }
 
 func TestRepairMessageReplacesOnlyTargetSnapshot(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 	env := newTestEnv(t)

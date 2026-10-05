@@ -202,7 +202,7 @@ type settingDefinition struct {
 	// daemon-side resources (such as environment variable names) which a
 	// remote session must never control.
 	localOnly             bool
-	secret                func(*config.Config) string
+	secret                func(*Server, *config.Config) string
 	serverSecret          func(context.Context, *Server, *config.Config) bool
 	credentialID          string
 	credentialEndpoint    func(*config.Config) string
@@ -217,10 +217,11 @@ var settingsCatalog = []settingDefinition{
 	liveStringSetting("web.density", "browser", []string{"compact", "comfortable"}, func(c *config.Config) string { return c.Web.Density }),
 	readOnlyStringSetting("server.bind_addr", "server", func(c *config.Config) string { return c.Server.BindAddr }),
 	readOnlyIntSetting("server.api_port", "server", func(c *config.Config) int { return c.Server.APIPort }),
-	readOnlySecretSetting("server.api_key", "server", func(c *config.Config) string { return c.Server.APIKey }),
+	readOnlySecretSetting("server.api_key", "server", func(s *Server, _ *config.Config) string { return s.cfg.Server.AuthenticationKey() }),
 	readOnlyBoolSetting("server.allow_insecure", "server", func(c *config.Config) bool { return c.Server.AllowInsecure }),
 	readOnlyStringArraySetting("server.trusted_proxies", "server", func(c *config.Config) []string { return c.Server.TrustedProxies }),
 	stringSetting("server.daemon_idle_timeout", "server", nil, func(c *config.Config) string { return c.Server.DaemonIdleTimeout.String() }),
+	boolSetting("server.daemon_auto_start", "server", func(c *config.Config) bool { return c.Server.DaemonAutoStartEnabled() }),
 	stringSetting("server.daemon_auto_restart", "server", []string{config.DaemonAutoRestartNewer, config.DaemonAutoRestartNever, config.DaemonAutoRestartAlways}, func(c *config.Config) string { return c.Server.DaemonAutoRestart }),
 	stringSetting("analytics.engine", "archive", []string{"auto", "sql", "duckdb"}, func(c *config.Config) string { return c.Analytics.Engine }),
 	boolSetting("analytics.auto_build_cache", "archive", func(c *config.Config) bool { return c.Analytics.AutoBuildCache }),
@@ -292,6 +293,10 @@ var settingsCatalog = []settingDefinition{
 	intSetting("vector.search.k_per_signal", "search", func(c *config.Config) int { return c.Vector.Search.KPerSignal }),
 	numberSetting("vector.search.subject_boost", "search", func(c *config.Config) float64 { return c.Vector.Search.SubjectBoost }),
 	intSetting("vector.search.max_page_size_hybrid", "search", func(c *config.Config) int { return c.Vector.Search.MaxPageSizeHybridClamp() }),
+	stringSetting("vector.search.sqlite_accelerator", "search", []string{"auto", "exact"}, func(c *config.Config) string { return c.Vector.Search.SQLiteAccelerator }),
+	intSetting("vector.search.ann_nprobe", "search", func(c *config.Config) int { return c.Vector.Search.ANNNProbe }),
+	intSetting("vector.search.ann_oversample", "search", func(c *config.Config) int { return c.Vector.Search.ANNOversample }),
+	intSetting("vector.search.ann_threads", "search", func(c *config.Config) int { return c.Vector.Search.ANNThreads }),
 	configuredBoolSetting("vector.preprocess.strip_quotes", "search", func(c *config.Config) bool { return c.Vector.Preprocess.StripQuotesEnabled() }, func(c *config.Config) bool { return c.Vector.Preprocess.StripQuotes == nil }),
 	configuredBoolSetting("vector.preprocess.strip_signatures", "search", func(c *config.Config) bool { return c.Vector.Preprocess.StripSignaturesEnabled() }, func(c *config.Config) bool { return c.Vector.Preprocess.StripSignatures == nil }),
 	configuredBoolSetting("vector.preprocess.strip_html", "search", func(c *config.Config) bool { return c.Vector.Preprocess.StripHTMLEnabled() }, func(c *config.Config) bool { return c.Vector.Preprocess.StripHTML == nil }),
@@ -307,6 +312,8 @@ var settingsCatalog = []settingDefinition{
 	stringSetting("slack.schedule", settingsGroupSources, nil, func(c *config.Config) string { return c.Slack.Schedule }),
 	stringArraySetting("slack.channels", settingsGroupSources, func(c *config.Config) []string { return c.Slack.Channels }),
 	stringArraySetting("slack.exclude_channels", settingsGroupSources, func(c *config.Config) []string { return c.Slack.ExcludeChannels }),
+	configuredBoolSetting("slack.dms", settingsGroupSources, func(c *config.Config) bool { return c.Slack.DMsEnabled() }, func(c *config.Config) bool { return c.Slack.DMs == nil }),
+	configuredBoolSetting("slack.group_dms", settingsGroupSources, func(c *config.Config) bool { return c.Slack.GroupDMsEnabled() }, func(c *config.Config) bool { return c.Slack.GroupDMs == nil }),
 	configuredBoolSetting("beeper.media", settingsGroupAttachments, func(c *config.Config) bool { return c.Beeper.MediaEnabled() }, func(c *config.Config) bool { return c.Beeper.Media == nil }),
 	stringSetting("beeper.media_scope", settingsGroupAttachments, []string{"all", "direct", "none"}, func(c *config.Config) string { return effectiveMediaScope(c.Beeper.MediaScope) }),
 	intSetting("beeper.media_max_participants", settingsGroupAttachments, func(c *config.Config) int { return c.Beeper.MediaMaxParticipants }),
@@ -341,8 +348,12 @@ var settingsCatalog = []settingDefinition{
 	readOnlyCardDAVSecretSetting(),
 	boolSetting("integrations.tasks.enabled", "integrations", func(c *config.Config) bool { return c.Integrations.Tasks.Enabled }),
 	stringSetting("integrations.tasks.endpoint", "integrations", nil, func(c *config.Config) string { return c.Integrations.Tasks.Endpoint }),
-	secretSetting("integrations.tasks.api_key", "integrations", func(c *config.Config) string { return c.Integrations.Tasks.APIKey }),
+	secretSetting("integrations.tasks.api_key", "integrations", func(_ *Server, c *config.Config) string { return c.Integrations.Tasks.APIKey }),
 	stringSetting("integrations.tasks.default_project", "integrations", nil, func(c *config.Config) string { return c.Integrations.Tasks.DefaultProject }),
+	boolSetting("integrations.kata.enabled", "integrations", func(c *config.Config) bool { return c.Integrations.Kata.Enabled }),
+	stringSetting("integrations.kata.endpoint", "integrations", nil, func(c *config.Config) string { return c.Integrations.Kata.Endpoint }),
+	secretSetting("integrations.kata.api_key", "integrations", func(_ *Server, c *config.Config) string { return c.Integrations.Kata.APIKey }),
+	stringSetting("integrations.kata.default_project", "integrations", nil, func(c *config.Config) string { return c.Integrations.Kata.DefaultProject }),
 }
 
 func (s *Server) registerSettingsRoutes(api huma.API) {
@@ -376,6 +387,7 @@ func (s *Server) registerSettingsRoutes(api huma.API) {
 	registerRawHumaRoute(api, patch, s.handlePatchSettings)
 	s.registerProviderCredentialSettingsRoutes(api)
 	s.registerPersonEnrichmentSettingsRoute(api)
+	s.registerPeopleInferenceSettingsRoute(api)
 }
 
 func addSettingsETagHeader(response *huma.Response) {
@@ -441,7 +453,7 @@ func readOnlyStringArraySetting(key, group string, read func(*config.Config) []s
 	return definition
 }
 
-func readOnlySecretSetting(key, group string, value func(*config.Config) string) settingDefinition {
+func readOnlySecretSetting(key, group string, value func(*Server, *config.Config) string) settingDefinition {
 	definition := secretSetting(key, group, value)
 	definition.localOnly = true
 	return definition
@@ -487,7 +499,7 @@ func stringArraySetting(key, group string, read func(*config.Config) []string) s
 	return settingDefinition{key: key, group: group, kind: "string_array", restartRequired: true, read: func(c *config.Config) any { return read(c) }}
 }
 
-func secretSetting(key, group string, value func(*config.Config) string) settingDefinition {
+func secretSetting(key, group string, value func(*Server, *config.Config) string) settingDefinition {
 	return settingDefinition{key: key, group: group, kind: "secret", restartRequired: true, secret: value}
 }
 
@@ -605,7 +617,7 @@ func (s *Server) handlePatchSettings(w http.ResponseWriter, r *http.Request) {
 	if restartRequired {
 		s.settingsPendingRestart.Store(true)
 	}
-	loaded, err := config.LoadConfigFile(snapshot, "")
+	loaded, err := s.cfg.ReloadConfigFile(snapshot)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "settings_read_failed", "Could not read settings")
 		return
@@ -690,10 +702,7 @@ func (s *Server) readPersistedSettings() (config.ConfigFile, *config.Config, err
 	if err != nil {
 		return config.ConfigFile{}, nil, err
 	}
-	if !snapshot.Exists {
-		return snapshot, config.NewDefaultConfig(), nil
-	}
-	loaded, err := config.LoadConfigFile(snapshot, "")
+	loaded, err := s.cfg.ReloadConfigFile(snapshot)
 	if err != nil {
 		return config.ConfigFile{}, nil, err
 	}
@@ -738,7 +747,7 @@ func (s *Server) buildSettingsResponse(
 		} else if definition.serverSecret != nil {
 			setting.Secret = &SecretSettingState{Configured: definition.serverSecret(ctx, s, cfg)}
 		} else if definition.secret != nil {
-			value := definition.secret(cfg)
+			value := definition.secret(s, cfg)
 			setting.Secret = &SecretSettingState{Configured: value != "", Hint: secretHint(value)}
 		} else {
 			setting.Value = settingValue(definition.kind, definition.read(cfg))
@@ -774,6 +783,12 @@ var credentialBindings = []credentialBinding{
 		credentialKey:   "integrations.tasks.api_key",
 		currentEndpoint: func(c *config.Config) string { return c.Integrations.Tasks.Endpoint },
 		credentialSet:   func(c *config.Config) bool { return c.Integrations.Tasks.APIKey != "" },
+	},
+	{
+		endpointKey:     "integrations.kata.endpoint",
+		credentialKey:   "integrations.kata.api_key",
+		currentEndpoint: func(c *config.Config) string { return c.Integrations.Kata.Endpoint },
+		credentialSet:   func(c *config.Config) bool { return c.Integrations.Kata.APIKey != "" },
 	},
 }
 

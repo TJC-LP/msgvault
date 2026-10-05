@@ -142,7 +142,7 @@ type paginatedListMessages struct {
 
 // newTestHandlers creates a handlers instance with the given mock engine.
 func newTestHandlers(eng query.Engine) *handlers {
-	return &handlers{engine: eng}
+	return &handlers{engine: eng, downloads: &downloadCache{}}
 }
 
 type listAccountsTrackingEngine struct {
@@ -1394,6 +1394,13 @@ func TestSearchMessageBodies_HybridUsesDaemonSearcher(t *testing.T) {
 				},
 				HasMore:       true,
 				PoolSaturated: true,
+				Accelerator:   "vec1_ivf_opq",
+				TookMS:        12,
+				Timings: HybridSearchTimings{
+					QueryEmbeddingMS: 2,
+					RetrievalMS:      7,
+					HydrationMS:      3,
+				},
 				Generation: hybridGenerationSummary{
 					ID:          7,
 					Model:       "fake",
@@ -1423,6 +1430,7 @@ func TestSearchMessageBodies_HybridUsesDaemonSearcher(t *testing.T) {
 	assert.True(gotReq.IncludeMatches, "include matches")
 	assert.InDelta(0.75, gotReq.MinScore, 0.001, "min score")
 	assert.Equal(searchModeHybrid, resp.Mode, "response mode")
+	assert.Equal("vec1_ivf_opq", resp.Accelerator)
 	assert.True(resp.HasMore, "has_more")
 	require.Len(resp.Data, 1, "data")
 	assert.Equal(int64(102), resp.Data[0].ID, "message id")
@@ -1434,6 +1442,12 @@ func TestSearchMessageBodies_HybridUsesDaemonSearcher(t *testing.T) {
 	require.NotNil(resp.Data[0].Matches[0].Score, "match score")
 	assert.InDelta(0.88, *resp.Data[0].Matches[0].Score, 0.001, "match score")
 	assert.Equal(int64(7), resp.Generation.ID, "generation")
+	assert.Equal(int64(12), resp.TookMS, "total timing")
+	assert.Equal(HybridSearchTimings{
+		QueryEmbeddingMS: 2,
+		RetrievalMS:      7,
+		HydrationMS:      3,
+	}, resp.Timings, "phase timings")
 }
 
 func TestSearchMessageBodies_HybridDaemonFilterOnlyGuidance(t *testing.T) {
@@ -1454,6 +1468,27 @@ func TestSearchMessageBodies_HybridDaemonFilterOnlyGuidance(t *testing.T) {
 	assert.Contains(t, text, "search_metadata", "filter-only guidance")
 	assert.NotContains(t, text, "mode=fts", "mode=fts is not a valid mode for search_message_bodies")
 	assert.False(t, searcherCalled, "filter-only query must fail before remote search")
+}
+
+func TestSearchMessageBodies_HybridResponseIncludesPhaseTimings(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	h := &handlers{
+		engine: &querytest.MockEngine{},
+		hybridSearcher: hybridSearcherFunc(func(context.Context, HybridSearchRequest) (*HybridSearchResult, error) {
+			return &HybridSearchResult{Generation: HybridGeneration{State: "active"}}, nil
+		}),
+	}
+
+	result := callToolDirect(t, "semantic_search_messages", h.semanticSearchMessages, map[string]any{
+		"query": "semantic terms",
+		"mode":  searchModeHybrid,
+	})
+	require.False(result.isError, "unexpected error: %s", resultText(t, result))
+	var payload map[string]json.RawMessage
+	require.NoError(json.Unmarshal([]byte(resultText(t, result)), &payload))
+	assert.Contains(payload, "took_ms")
+	assert.Contains(payload, "timings")
 }
 
 func TestAttachVectorChunkMatches_HTMLOnlyUsesEmbeddingCorpus(t *testing.T) {
@@ -3467,10 +3502,10 @@ func (f *fakeBackend) ScoreMessageChunks(_ context.Context, gen vector.Generatio
 	}
 	return nil, nil
 }
-func (f *fakeBackend) FusedSearch(_ context.Context, req vector.FusedRequest) ([]vector.FusedHit, bool, error) {
+func (f *fakeBackend) FusedSearch(_ context.Context, req vector.FusedRequest) ([]vector.FusedHit, vector.SearchMetadata, error) {
 	f.fusedCalls++
 	if f.fusedErr != nil {
-		return nil, false, f.fusedErr
+		return nil, vector.SearchMetadata{}, f.fusedErr
 	}
 	hits := f.fusedHits
 	if hits == nil {
@@ -3484,7 +3519,7 @@ func (f *fakeBackend) FusedSearch(_ context.Context, req vector.FusedRequest) ([
 			}
 		}
 	}
-	return hits, len(hits) >= req.Limit, nil
+	return hits, vector.SearchMetadata{PoolSaturated: len(hits) >= req.Limit}, nil
 }
 func (f *fakeBackend) CreateGeneration(_ context.Context, _ string, _ int, _ string) (vector.GenerationID, error) {
 	return 0, errors.New("not implemented")
@@ -4053,7 +4088,7 @@ func TestServeHTTPWithOptions_ContextCancellation(t *testing.T) {
 	}()
 
 	// Give the goroutine a moment to start the listener.
-	time.Sleep(50 * time.Millisecond)
+	time.Sleep(50 * time.Millisecond) //nolint:kennlint // gives the real TCP listener time to start
 	cancel()
 
 	select {
@@ -4285,4 +4320,25 @@ func TestGetMessagePreservesBrowserURL(t *testing.T) {
 	h := newTestHandlers(&querytest.MockEngine{Messages: map[int64]*query.MessageDetail{42: {ID: 42, WebURL: link}}})
 	result := runTool[map[string]any](t, "get_message", h.getMessage, map[string]any{"id": float64(42)})
 	assert.Equal(t, link, result["web_url"])
+}
+
+func TestGetStats_AccountLastSyncAt(t *testing.T) {
+	checks := assert.New(t)
+	must := require.New(t)
+	syncedAt := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
+	eng := &querytest.MockEngine{
+		Stats: &query.TotalStats{AccountCount: 2},
+		Accounts: []query.AccountInfo{
+			{ID: 1, Identifier: "synced@example.com", LastSyncAt: &syncedAt},
+			{ID: 2, Identifier: "never@example.com"},
+		},
+	}
+	r := callToolDirect(t, "get_stats", newTestHandlers(eng).getStats, map[string]any{})
+	var raw struct {
+		Accounts []map[string]json.RawMessage `json:"accounts"`
+	}
+	must.NoError(json.Unmarshal([]byte(resultText(t, r)), &raw))
+	must.Len(raw.Accounts, 2)
+	checks.JSONEq(`"2026-03-04T05:06:07Z"`, string(raw.Accounts[0]["LastSyncAt"]))
+	checks.NotContains(raw.Accounts[1], "LastSyncAt", "unknown sync time is omitted, not null")
 }

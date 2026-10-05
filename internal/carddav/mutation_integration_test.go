@@ -185,7 +185,7 @@ func seededMutationService(t *testing.T, fixture *mutationFixture) (*Service, *s
 	server := httptest.NewServer(fixture.handler(t))
 	t.Cleanup(server.Close)
 	service, st, book := newPullService(t, server, false)
-	service.client.requestTimeout = 250 * time.Millisecond
+	service.dav().client.requestTimeout = 250 * time.Millisecond
 	var personID int64
 	err := st.DB().QueryRow(st.Rebind(`INSERT INTO persons (vcard_uid, display_name)
 		VALUES (?, ?) RETURNING id`), "person", "Alice Example").Scan(&personID)
@@ -326,7 +326,7 @@ func TestTimedOutCreateRecoveryAdoptsResourceMaterializedByPull(t *testing.T) {
 
 	require.Error(service.PublishPerson(t.Context(), personID))
 	assert.Equal(1, fixture.puts)
-	service.client.requestTimeout = 2 * time.Second
+	service.dav().client.requestTimeout = 2 * time.Second
 	_, err := service.Sync(t.Context(), SyncOptions{Full: true})
 	require.NoError(err)
 	assert.Equal(1, fixture.puts, "create recovery after pull must not replay PUT")
@@ -374,7 +374,7 @@ func TestCreateRecoveryAcceptsOneConditional412OnlyAfterCanonicalProof(t *testin
 	}))
 	t.Cleanup(server.Close)
 	service, st, personID, _ := seededMutationServiceForServer(t, server)
-	service.client.requestTimeout = 250 * time.Millisecond
+	service.dav().client.requestTimeout = 250 * time.Millisecond
 
 	require.Error(service.PublishPerson(t.Context(), personID))
 	require.NoError(service.PublishPerson(t.Context(), personID))
@@ -623,7 +623,7 @@ func TestUnpublishRemoteImportWithoutPublicationPreservesSource(t *testing.T) {
 	remoteBody := []byte("BEGIN:VCARD\r\nVERSION:4.0\r\nUID:remote-import\r\nFN:Remote Import\r\nEND:VCARD\r\n")
 	fixture := &mutationFixture{body: remoteBody, etag: `"remote-import"`}
 	service, st, _, book := seededMutationService(t, fixture)
-	account, err := st.GetCardDAVAccountContext(t.Context())
+	account, err := st.GetCardDAVAccountByIDContext(t.Context(), store.DefaultCardDAVAccountID)
 	require.NoError(err)
 	href := book.CanonicalURL + "remote-import.vcf"
 	_, err = st.ApplyCardDAVSyncPlanContext(t.Context(), store.CardDAVSyncPlan{
@@ -751,7 +751,7 @@ func TestRetryAfterRollsBackIntentAndClampsGateToOneHour(t *testing.T) {
 	publication, getErr := st.GetCardDAVPublicationContext(t.Context(), personID)
 	require.NoError(getErr)
 	assert.Empty(publication.PendingOperation)
-	gate, getErr := st.GetCardDAVRetryAfterContext(t.Context())
+	gate, getErr := st.GetCardDAVRetryAfterContext(t.Context(), store.DefaultCardDAVAccountID)
 	require.NoError(getErr)
 	require.NotNil(gate)
 	assert.WithinDuration(before.Add(time.Hour), *gate, 5*time.Second)
@@ -782,7 +782,7 @@ func TestNon429RetryAfterRollsBackIntentAndPersistsGate(t *testing.T) {
 	publication, getErr := st.GetCardDAVPublicationContext(t.Context(), personID)
 	required.NoError(getErr)
 	assertions.Empty(publication.PendingOperation)
-	gate, getErr := st.GetCardDAVRetryAfterContext(t.Context())
+	gate, getErr := st.GetCardDAVRetryAfterContext(t.Context(), store.DefaultCardDAVAccountID)
 	required.NoError(getErr)
 	required.NotNil(gate)
 	assertions.WithinDuration(before.Add(17*time.Second), *gate, 5*time.Second)
@@ -872,7 +872,7 @@ func TestCanonicalGet429PersistsGateAndPreservesAmbiguousUpdateIntent(t *testing
 	resource, getErr := st.GetCardDAVResourceContext(t.Context(), book.ID, book.CanonicalURL+"person.vcf")
 	require.NoError(getErr)
 	assert.Equal(beforeResource.MappingRevision+1, resource.MappingRevision)
-	gate, getErr := st.GetCardDAVRetryAfterContext(t.Context())
+	gate, getErr := st.GetCardDAVRetryAfterContext(t.Context(), store.DefaultCardDAVAccountID)
 	require.NoError(getErr)
 	require.NotNil(gate)
 	assert.WithinDuration(before.Add(time.Hour), *gate, 5*time.Second)
@@ -907,7 +907,7 @@ func TestRecoveryGet429PersistsGateAndPreservesPendingIntent(t *testing.T) {
 	require.NoError(getErr)
 	assert.Equal(store.CardDAVMutationUpdate, publication.PendingOperation)
 	assert.NotEmpty(publication.OutgoingBody)
-	gate, getErr := st.GetCardDAVRetryAfterContext(t.Context())
+	gate, getErr := st.GetCardDAVRetryAfterContext(t.Context(), store.DefaultCardDAVAccountID)
 	require.NoError(getErr)
 	require.NotNil(gate)
 	assert.WithinDuration(before.Add(time.Hour), *gate, 5*time.Second)
@@ -926,7 +926,7 @@ func TestPull429PersistsAccountRetryGate(t *testing.T) {
 	require.ErrorAs(err, &status)
 	assert.Equal(http.StatusTooManyRequests, status.StatusCode)
 	assert.Equal(1, fixture.reports)
-	gate, getErr := st.GetCardDAVRetryAfterContext(t.Context())
+	gate, getErr := st.GetCardDAVRetryAfterContext(t.Context(), store.DefaultCardDAVAccountID)
 	require.NoError(getErr)
 	require.NotNil(gate)
 	assert.WithinDuration(before.Add(time.Hour), *gate, 5*time.Second)
@@ -958,17 +958,13 @@ func TestConcurrent429sPreserveLongestAccountRetryGate(t *testing.T) {
 	service, st, book := newPullService(t, server, false)
 	shortResult := make(chan error, 1)
 	go func() {
-		_, err := service.doRequest(t.Context(), Request{
-			Method: http.MethodGet, URL: book.CanonicalURL + "short.vcf",
-		})
+		_, _, err := service.fetchCanonical(t.Context(), book.CanonicalURL+"short.vcf")
 		shortResult <- err
 	}()
 	<-shortStarted
 	before := time.Now()
 
-	_, longErr := service.doRequest(t.Context(), Request{
-		Method: http.MethodGet, URL: book.CanonicalURL + "long.vcf",
-	})
+	_, _, longErr := service.fetchCanonical(t.Context(), book.CanonicalURL+"long.vcf")
 	var longStatus *StatusError
 	require.ErrorAs(longErr, &longStatus)
 	assert.Equal(http.StatusTooManyRequests, longStatus.StatusCode)
@@ -978,7 +974,7 @@ func TestConcurrent429sPreserveLongestAccountRetryGate(t *testing.T) {
 	require.ErrorAs(shortErr, &shortStatus)
 	assert.Equal(http.StatusTooManyRequests, shortStatus.StatusCode)
 
-	gate, err := st.GetCardDAVRetryAfterContext(t.Context())
+	gate, err := st.GetCardDAVRetryAfterContext(t.Context(), store.DefaultCardDAVAccountID)
 	require.NoError(err)
 	require.NotNil(gate)
 	assert.WithinDuration(before.Add(time.Hour), *gate, 5*time.Second)

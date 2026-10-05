@@ -17,9 +17,11 @@ import (
 // last_modified backfill alone is a full messages-table scan — seconds of
 // startup on a large archive).
 const (
-	migrationAttachmentsContentHashUnique = "attachments_content_hash_unique_index"
-	migrationAttachmentOccurrenceUnique   = "attachment_occurrence_unique_indexes_v1"
-	migrationMessagesLastModifiedBackfill = "messages_last_modified_backfill"
+	migrationMeetingProjectionV1            = "meeting_projection_v1"
+	migrationAttachmentsContentHashUnique   = "attachments_content_hash_unique_index"
+	migrationAttachmentOccurrenceUnique     = "attachment_occurrence_unique_indexes_v1"
+	migrationMessagesLastModifiedBackfill   = "messages_last_modified_backfill"
+	migrationMessagesLastModifiedNullRepair = "messages_last_modified_null_repair"
 	// v3: messageIdentityAttributionMatch became envelope-authoritative and
 	// gated email identifier matches on the sender lacking a primary email.
 	// Archives that ran v2 reconciled under the old predicate, so the rename
@@ -88,6 +90,7 @@ const (
 	// origin, and an attempt records why a brief call produced no version.
 	migrationPersonFactClaimOriginBrief     = "person_fact_claim_origin_brief_v1"
 	migrationPersonSweepAttemptBriefFailure = "person_sweep_attempt_brief_failure_v1"
+	migrationCardDAVMultipleAccounts        = "carddav_multiple_accounts_v1"
 	migrationCardDAVInferenceExportState    = "carddav_inference_export_state_v1"
 )
 

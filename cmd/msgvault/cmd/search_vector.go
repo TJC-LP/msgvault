@@ -1,10 +1,13 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"math"
 	"os"
-	"text/tabwriter"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -15,6 +18,11 @@ import (
 // remote server or local daemon. It preserves the historical CLI renderer while
 // keeping vector backend ownership inside the daemon.
 func runHybridSearch(cmd *cobra.Command, queryStr, mode string, explain bool) error {
+	state := invocationFromCommand(cmd)
+	if state == nil || state.logger == nil {
+		return errors.New("invocation state is unavailable")
+	}
+	logger := state.logger
 	s, _, err := OpenHTTPStore(cmd.Context())
 	if err != nil {
 		return fmt.Errorf("open store: %w", err)
@@ -79,41 +87,65 @@ func outputHybridResultsTable(resp *daemonclient.CLIHybridSearch, explain bool) 
 		fmt.Println("No messages found.")
 		fmt.Printf("\nGeneration #%d (%s, fingerprint=%q)\n",
 			resp.Generation.ID, resp.Generation.State, resp.Generation.Fingerprint)
+		outputHybridTimings(resp, explain)
 		return nil
 	}
 
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	if explain {
-		_, _ = fmt.Fprintln(w, "ID\tDATE\tFROM\tSUBJECT\tRRF\tBM25\tVEC")
-		_, _ = fmt.Fprintln(w, "──\t────\t────\t───────\t───\t────\t───")
-	} else {
-		_, _ = fmt.Fprintln(w, "ID\tDATE\tFROM\tSUBJECT")
-		_, _ = fmt.Fprintln(w, "──\t────\t────\t───────")
-	}
-	for _, r := range resp.Results {
-		date := r.SentAt.Format("2006-01-02")
-		from := truncate(r.FromEmail, 30)
-		subject := truncate(r.Subject, 50)
-		if r.SubjectBoosted {
-			subject += " *"
-		}
-		if explain {
-			_, _ = fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s\t%s\t%s\n",
-				r.ID, date, from, subject,
-				formatOptionalScorePtr(r.RRFScore),
-				formatOptionalScorePtr(r.BM25Score),
-				formatOptionalScorePtr(r.VectorScore))
-		} else {
-			_, _ = fmt.Fprintf(w, "%d\t%s\t%s\t%s\n",
-				r.ID, date, from, subject)
-		}
-	}
-	if err := w.Flush(); err != nil {
-		return fmt.Errorf("flush table output: %w", err)
+	if err := writeHybridResultsTable(os.Stdout, resp.Results, explain); err != nil {
+		return err
 	}
 	fmt.Printf("\n%s (generation #%d %s, fingerprint=%q)\n",
 		formatShowingResults(len(resp.Results)), resp.Generation.ID, resp.Generation.State, resp.Generation.Fingerprint)
+	outputHybridTimings(resp, explain)
 	return nil
+}
+
+func writeHybridResultsTable(out io.Writer, results []daemonclient.CLIHybridSearchResult, explain bool) error {
+	return writeHybridResultsTableWidth(out, results, explain, searchTableTerminalWidth(out))
+}
+
+func writeHybridResultsTableWidth(out io.Writer, results []daemonclient.CLIHybridSearchResult, explain bool, width int) error {
+	headers := []string{"ID", "DATE", "FROM", "SUBJECT"}
+	if explain {
+		headers = append(headers, "RRF", "BM25", "VEC")
+	}
+	rows := make([][]searchTableCell, 0, len(results))
+	for _, r := range results {
+		from := r.FromEmail
+		if strings.TrimSpace(from) == "" {
+			from = summaryFromDisplay(r.Message)
+		}
+		subject := searchTableCell{text: summaryTableText(r.Subject, r.Message.Snippet)}
+		if r.SubjectBoosted {
+			subject.marker = " *"
+		}
+		row := []searchTableCell{
+			{text: strconv.FormatInt(r.ID, 10)},
+			{text: r.SentAt.Format("2006-01-02")},
+			{text: normalizeSearchTableText(from)},
+			subject,
+		}
+		if explain {
+			row = append(row,
+				searchTableCell{text: formatOptionalScorePtr(r.RRFScore)},
+				searchTableCell{text: formatOptionalScorePtr(r.BM25Score)},
+				searchTableCell{text: formatOptionalScorePtr(r.VectorScore)},
+			)
+		}
+		rows = append(rows, row)
+	}
+	return writeSearchTable(out, headers, rows, width)
+}
+
+func outputHybridTimings(resp *daemonclient.CLIHybridSearch, explain bool) {
+	if !explain {
+		return
+	}
+	if resp.Accelerator != "" {
+		fmt.Printf("Accelerator: %s\n", resp.Accelerator)
+	}
+	fmt.Printf("Timings: total=%dms query_embedding=%dms retrieval=%dms hydration=%dms\n",
+		resp.TookMS, resp.Timings.QueryEmbeddingMS, resp.Timings.RetrievalMS, resp.Timings.HydrationMS)
 }
 
 func outputHybridResultsJSON(resp *daemonclient.CLIHybridSearch, explain bool) error {
@@ -140,7 +172,7 @@ func outputHybridResultsJSON(resp *daemonclient.CLIHybridSearch, explain bool) e
 		}
 		rows[i] = row
 	}
-	return printJSON(map[string]any{
+	output := map[string]any{
 		"generation": map[string]any{
 			"id":          resp.Generation.ID,
 			"model":       resp.Generation.Model,
@@ -150,8 +182,14 @@ func outputHybridResultsJSON(resp *daemonclient.CLIHybridSearch, explain bool) e
 		},
 		"pool_saturated": resp.PoolSaturated,
 		"returned_count": resp.ReturnedCount,
+		"took_ms":        resp.TookMS,
+		"timings":        resp.Timings,
 		"results":        rows,
-	})
+	}
+	if resp.Accelerator != "" {
+		output["accelerator"] = resp.Accelerator
+	}
+	return printJSON(output)
 }
 
 func formatOptionalScorePtr(v *float64) string {

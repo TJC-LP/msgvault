@@ -394,6 +394,27 @@ func TestListAccounts(t *testing.T) {
 	assert.Equal(t, "test@gmail.com", accounts[0].Identifier)
 }
 
+func TestListAccountsLastSyncAt(t *testing.T) {
+	checks := assert.New(t)
+	must := require.New(t)
+	env := newTestEnv(t)
+
+	accounts, err := env.Engine.ListAccounts(env.Ctx)
+	must.NoError(err, "ListAccounts before sync")
+	must.Len(accounts, 1)
+	checks.Nil(accounts[0].LastSyncAt, "never-synced source has no last sync time")
+
+	syncedAt := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
+	_, err = env.DB.Exec(`UPDATE sources SET last_sync_at = ? WHERE id = ?`, syncedAt, accounts[0].ID)
+	must.NoError(err, "set last_sync_at")
+
+	accounts, err = env.Engine.ListAccounts(env.Ctx)
+	must.NoError(err, "ListAccounts after sync")
+	must.Len(accounts, 1)
+	must.NotNil(accounts[0].LastSyncAt)
+	checks.True(syncedAt.Equal(*accounts[0].LastSyncAt), "last sync time %v", accounts[0].LastSyncAt)
+}
+
 func TestGetTotalStats(t *testing.T) {
 	assert := assert.New(t)
 	env := newTestEnv(t)
@@ -1840,6 +1861,63 @@ func TestSQLiteMessageSummariesIncludeSourceID(t *testing.T) {
 	assert.Equal(sourceID, detail.SourceID)
 }
 
+// TestGetMessageSummariesByIDs_ChunksLargeIDSetsAndPreservesOrder is the
+// regression for the SQLite bound-parameter ceiling: one id is one bound
+// parameter in this query's IN-list, and a caller hydrating a large ranked
+// result set (eval's dense vector/hybrid modes at a large -n) can ask for far
+// more ids than SQLite's default 32766-parameter-per-statement limit allows
+// in a single call. Requesting more ids than messageSummaryIDChunk must still
+// return every one of them, in the caller's own order — not chunk order —
+// since that order is the search rank the caller reassembles by. The label
+// hydration that follows the base query binds ids into its own IN-list too,
+// so a message on each side of the chunk boundary carries a label to prove
+// that pass is chunked as well, not just the base fetch.
+func TestGetMessageSummariesByIDs_ChunksLargeIDSetsAndPreservesOrder(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	env := newTestEnv(t)
+	sourceID := env.AddSource(dbtest.SourceOpts{Identifier: "chunk-source"})
+	conversationID := env.AddConversation(dbtest.ConversationOpts{SourceID: sourceID})
+
+	const total = messageSummaryIDChunk + 3
+	ids := make([]int64, total)
+	for i := range total {
+		ids[i] = env.AddMessage(dbtest.MessageOpts{
+			SourceID:       sourceID,
+			ConversationID: conversationID,
+			Subject:        fmt.Sprintf("chunk-regression-%d", i),
+		})
+	}
+
+	firstChunkLabel := env.AddLabel(dbtest.LabelOpts{SourceID: sourceID, Name: "first-chunk"})
+	env.AddMessageLabel(ids[0], firstChunkLabel)
+	lastChunkLabel := env.AddLabel(dbtest.LabelOpts{SourceID: sourceID, Name: "second-chunk"})
+	env.AddMessageLabel(ids[total-1], lastChunkLabel)
+
+	// Reverse the request order so a bug that silently reassembled results in
+	// chunk (insertion) order rather than caller order would fail loudly.
+	requested := make([]int64, total)
+	for i, id := range ids {
+		requested[total-1-i] = id
+	}
+
+	hydrated, err := env.Engine.GetMessageSummariesByIDs(env.Ctx, requested)
+	require.NoError(err, "GetMessageSummariesByIDs")
+	require.Len(hydrated, total, "every id across the chunk boundary must come back")
+	for i, m := range hydrated {
+		assert.Equal(requested[i], m.ID, "result order must match the caller's request order, not chunk order")
+	}
+
+	byID := make(map[int64]MessageSummary, len(hydrated))
+	for _, m := range hydrated {
+		byID[m.ID] = m
+	}
+	assert.Equal([]string{"first-chunk"}, byID[ids[0]].Labels,
+		"a message hydrated in the first label chunk must carry its label")
+	assert.Equal([]string{"second-chunk"}, byID[ids[total-1]].Labels,
+		"a message hydrated in the second label chunk must carry its label too")
+}
+
 func TestGetTotalStats_SearchScopeCountsMatchingLabelsAndSources(t *testing.T) {
 	env := newTestEnv(t)
 	source2 := env.AddSource(dbtest.SourceOpts{
@@ -2339,11 +2417,16 @@ func TestGetDeletionTargetsByMessageIDs_ExcludesNonQualifying(t *testing.T) {
 	_, err = env.DB.Exec(`INSERT INTO messages (id, conversation_id, source_id, source_message_id, message_type, sent_at) VALUES (?, 1, 1, 'chat-1', ?, '2024-01-07')`, 907, store.MessageTypeGoogleChat)
 	require.NoError(err, "insert Gmail Chat message")
 
-	targets, err := env.Engine.GetDeletionTargetsByMessageIDs(env.Ctx, []int64{1, 901, 902, 903, 904, 905, 907})
+	_, err = env.DB.Exec(`INSERT INTO sources (id, source_type, identifier) VALUES (98, 'msmail', 'm@example.com'), (97, 'imap', 'i@example.com')`)
+	require.NoError(err, "insert msmail and imap sources")
+	_, err = env.DB.Exec(`INSERT INTO messages (id, conversation_id, source_id, source_message_id, message_type, sent_at) VALUES (908, 1, 98, 'AAMk-1', 'email', '2024-01-08'), (909, 1, 97, 'INBOX|1', 'email', '2024-01-09')`)
+	require.NoError(err, "insert msmail and imap messages")
+
+	targets, err := env.Engine.GetDeletionTargetsByMessageIDs(env.Ctx, []int64{1, 901, 902, 903, 904, 905, 907, 908, 909})
 	require.NoError(err, "resolve mixed ids")
 	ids, err := deletionTargetSourceMessageIDs(targets, nil)
 	require.NoError(err)
-	assert.ElementsMatch([]string{"msg1", "legacy-empty"}, ids, "non-Gmail, Gmail Chat, source-deleted, dedup-deleted, and provider-ID-less messages must be dropped")
+	assert.ElementsMatch([]string{"msg1", "legacy-empty", "AAMk-1"}, ids, "WhatsApp, IMAP, Gmail Chat, source-deleted, dedup-deleted, and provider-ID-less messages must be dropped")
 }
 
 func TestGetDeletionTargetsByMessageIDs_LargeSelectionExceedsSingleQueryLimit(t *testing.T) {

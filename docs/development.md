@@ -28,15 +28,19 @@ make install
 
 ### Windows
 
-Use the PowerShell build helper from the repository root. It provides the same
-debug and release builds as the Make targets and selects the host architecture
-automatically:
+Use the PowerShell helper from the repository root to compile the Go binary.
+It selects the host architecture automatically and embeds assets already in
+`internal/web/dist`; it does not build the browser application.
+
+For a binary with the Web UI, first run `make web-embed` in an MSYS2 shell
+with GNU Make, Bun, and Node.js available. This builds and validates the browser
+assets. Then run the PowerShell helper:
 
 ```powershell
-# Debug build (equivalent to make build)
+# Debug Go build
 .\scripts\build.ps1
 
-# Optimized, stripped build (equivalent to make build-release)
+# Optimized, stripped Go build
 .\scripts\build.ps1 -Release
 ```
 
@@ -86,7 +90,9 @@ Defaults identify a development build.
 
 Image builds run checks against a temporary empty archive: database
 initialization, a DuckDB query, and the embedded Web UI and its JavaScript
-asset. `scripts/smoke-container.sh` repeats these checks in the loaded image
+asset. The runtime smoke also starts from environment variables without a
+config file and verifies that its minted daemon key survives a restart.
+`scripts/smoke-container.sh` repeats these checks in the loaded image
 with networking disabled. These commands build and check local artifacts; they
 do not publish them.
 
@@ -111,6 +117,27 @@ All Go test runs need `-tags "fts5 sqlite_vec"`; the Make targets supply these
 automatically. Use `assert` and `require` from testify, with expected values
 first. See [AGENTS.md](https://github.com/kenn-io/msgvault/blob/main/AGENTS.md)
 for repository testing rules.
+
+### Timing waits
+
+Use `testing/synctest` bubbles for work owned by the test process, including
+goroutines, channels, timers, tickers, and fakes. Advance virtual time with
+`synctest.Sleep` and wait for durable state with `synctest.Wait`.
+
+Keep real budgets for PostgreSQL and SQLite locks, database clocks, network
+requests, subprocesses, DuckDB, and operating-system events. Name retained
+sub-second testify budgets so their event and owner are clear.
+
+The helper check rejects bare totals below one second in `Eventually`,
+`Eventuallyf`, `EventuallyWithT`, `EventuallyWithTf`, `Never`, and `Neverf`.
+Named budgets and variables stay outside this rule. Virtual sleeps are valid
+inside a bubble. CI runs this check on Ubuntu, so Windows-only test files still
+need Windows validation.
+
+`make lint` and `make lint-ci` build a pinned golangci-lint with Kit's
+`kennlint` plugin and run its `sleeptest` check. The check rejects `time.Sleep`
+in tests outside a `synctest.Test` bubble. A kept real wait carries
+`//nolint:kennlint // <what it waits for>` on the sleep line.
 
 ### PostgreSQL tests
 
@@ -182,12 +209,88 @@ CI's explicit `test-unsharded` and package-shard jobs keep their existing layout
 # Format code
 make fmt
 
-# Run linter (requires golangci-lint)
+# Run linter (builds the pinned golangci-lint with Kit's plugin; needs git)
 make lint
 
 # Check for issues
 go vet ./...
 ```
+
+## Profile Web UI search
+
+Inspect the `Server-Timing` headers on successful `/api/v1/explore` responses in
+browser developer tools. Failed requests may contain only the phases completed
+before the error. Durations are milliseconds:
+
+| Metric | Work measured |
+| --- | --- |
+| `candidates` | Resolve the search candidate pool, including the search phases below |
+| `lexical` | Count full-text matches and fetch bounded, ranked message IDs |
+| `embedding` | Embed the semantic or hybrid query |
+| `retrieval` | Retrieve vector or fused results; `desc` names the accelerator path |
+| `projection` | Build result rows from the analytical cache |
+| `identities` | Hydrate identity matches for the returned rows |
+
+The `candidates` duration includes `lexical`, `embedding`, and `retrieval` work;
+do not add those subphases to it. A reused semantic candidate snapshot skips
+embedding and retrieval, so those metrics are absent. Group requests to
+`/api/v1/explore/groups` report `grouping` for the analytical aggregation.
+
+Run the synthetic HTTP benchmark to measure candidate resolution through the
+real SQLite full-text index and DuckDB result projection:
+
+```bash
+go test -tags 'fts5 sqlite_vec' ./internal/api -run '^$' \
+  -bench '^BenchmarkExploreFullText$' -benchtime=3x -count=3 -benchmem
+```
+
+It creates an isolated 20,000-message archive and measures rare, common, and
+candidate-limited queries. Setup and a warm-up request are excluded. Compare
+the same fixture and machine before and after a change; these timings do not
+predict latency on a larger archive.
+
+For analytical grouping and domain drill-downs, build the larger synthetic
+cache once in an empty scratch directory, then reuse it:
+
+```bash
+explore_bench_root=$(mktemp -d)
+go test -tags 'fts5 sqlite_vec' ./internal/query -run '^$' \
+  -bench '^BenchmarkExploreScaleBuild$' -benchtime=1x \
+  -args -relationship-bench-root="$explore_bench_root"
+go test -tags 'fts5 sqlite_vec' ./internal/query -run '^$' \
+  -bench '^BenchmarkExploreScaleQueries$' -benchtime=4x \
+  -args -relationship-bench-root="$explore_bench_root"
+```
+
+This fixture has 2,562,000 messages and 71,486 people. The query benchmark
+reports the first request and the median of later requests separately. It uses
+the default interactive memory limit; DuckDB can spill work to temporary disk.
+Add `-relationship-bench-memory=8GB` for diagnostic comparisons with older
+queries that exceed that limit. Add
+`-relationship-bench-profile` to write DuckDB operator profiles into the scratch
+directory. Run timing comparisons without other heavy workloads, and retain
+the same memory limit and thread settings. This fixture uses uniform senders
+and one chat roster; it does not model real participant skew or attachments.
+
+To separate local vector retrieval from embedding-provider latency, run:
+
+```bash
+go test -tags 'fts5 sqlite_vec' ./internal/vector/sqlitevec -run '^$' \
+  -bench '^BenchmarkVectorRetrieval$' -benchtime=3x -count=3 -benchmem
+```
+
+This benchmark uses 100,000 synthetic messages with one 64-dimensional vector
+each. It measures exact semantic retrieval and rare/common hybrid retrieval,
+without an accelerator, embedding calls, or HTTP result projection. Use the
+request timing headers to determine which phase needs attention on a real
+archive before comparing it with this narrower benchmark.
+
+## Evaluate search quality
+
+Use [`msgvault eval`](cli-reference.md#eval) to compare keyword, semantic, and
+hybrid results against queries and relevance ratings you supply. Keep the
+archive, topics, and ratings the same when comparing runs. The command reports
+ranking quality and query timings; it does not create the ratings for you.
 
 ## vCard registry maintenance
 

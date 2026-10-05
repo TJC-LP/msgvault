@@ -41,6 +41,7 @@ import type { SettingsNavigationAuthority } from '../carddav/navigation';
 export type EntryRow = GeneratedEntryRow;
 export type ExploreCacheUnavailable = GeneratedExploreCacheUnavailableResponse;
 export type ExploreFilter = GeneratedExploreFilter;
+export type ExploreFilterDimension = ExploreFilter['dimension'];
 export type ExploreFileFact = GeneratedExploreFileFact;
 export type ExploreFilesResponse = GeneratedExploreFilesHTTPResponse;
 export type FileMetadata = GeneratedFileMetadataResponse;
@@ -167,6 +168,7 @@ export interface ExploreURLState {
   operationRunID: string | null;
   operationStatus: '' | OperationStatusAuthority;
   settingsAuthority: '' | SettingsNavigationAuthority;
+  settingsCategory: string;
   columns: ExploreColumn[];
   columnWidths: Partial<Record<ExploreColumn, number>>;
   activeRow: string | null;

@@ -3,10 +3,16 @@
     listSourceStatus as generatedListSourceStatus,
     triggerSync as generatedTriggerSync,
   } from '../../api/generated/api/api';
-  import { Button, Chip, Spinner, Table, TableHeaderCell, type ChipTone } from '@kenn-io/kit-ui';
+  import { Button, Chip, IconButton, Table, TableHeaderCell } from '@kenn-io/kit-ui';
+  import ChevronDown from '@lucide/svelte/icons/chevron-down';
+  import ChevronRight from '@lucide/svelte/icons/chevron-right';
   import { onDestroy, onMount } from 'svelte';
+  import { SvelteSet } from 'svelte/reactivity';
   import type { APIClient } from '../../api/client';
   import { scheduleSummary } from '../../settings/cron';
+  import { sourceTypeLabel, syncStatusChip, syncUnavailableLabel } from '../../sources/labels';
+  import { formatDateTime } from '../../util/format';
+  import PageHeader from '../shell/PageHeader.svelte';
   import type {
     SourceStatus as GeneratedSourceStatus,
     SyncRunStatus as GeneratedSyncRunStatus,
@@ -19,17 +25,23 @@
   const STALE_LAST_RESULT_MS = 24 * 60 * 60 * 1000;
   let {
     client,
+    requestTimeoutMs = 20_000,
     maxAwaitingPolls = 6,
+    maxLockHoldPolls = 8,
     now = () => new Date(),
     onOpenOperations = () => undefined,
   }: {
     client: APIClient;
+    requestTimeoutMs?: number;
     maxAwaitingPolls?: number;
+    maxLockHoldPolls?: number;
     now?: () => Date;
     onOpenOperations?: () => void;
   } = $props();
   let sources = $state<Source[]>([]);
+  const expanded = new SvelteSet<number>();
   let loading = $state(true);
+  let lockStatusStale = $state(false);
   let statusError = $state('');
   let triggerError = $state('');
   let triggering = $state<string>();
@@ -41,12 +53,15 @@
   let awaitingSourceID = $state<number>();
   let awaitingBaselineRunID: number | undefined;
   let awaitingAttempts = 0;
+  let lockHoldPolls = 0;
+  let hasLoadedStatus = false;
   let awaitingState = $state<'idle' | 'awaiting' | 'not_observed'>('idle');
   let disposed = false;
   onMount(() => {
     const visibilityChanged = (): void => {
       if (document.hidden) {
         stopPolling();
+        loading = false;
       } else {
         pollDelay = MIN_POLL_MS;
         void load();
@@ -84,39 +99,45 @@
   function isOnDemandSource(source: Source): boolean {
     return source.source_type === 'meeting_import';
   }
-  // allowIdle bypasses the active-sync gate below for error-path retries:
-  // a status-load failure must be able to reschedule itself even when no
-  // source is actively syncing and no accepted run is being awaited, or an
-  // initial/inactive-source failure would be unrecoverable until remount.
-  function schedulePoll(delay: number, allowIdle = false): void {
+  // Later status failures may retry in the background. A failed first load
+  // waits for the user's Retry action so its error stays visible.
+  function schedulePoll(delay: number, allowIdle = false, lockHold = false): void {
     if (disposed || document.hidden) return;
     if (
       !allowIdle &&
-      !sources.some((source) => source.active_sync || schedulerHoldsSyncLock(source)) &&
+      !sources.some((source) => source.active_sync || (schedulerHoldsSyncLock(source) && lockHoldPolls < maxLockHoldPolls)) &&
       awaitingSourceID === undefined
     )
       return;
     if (timer !== undefined) clearTimeout(timer);
     timer = setTimeout(() => {
       timer = undefined;
+      if (lockHold) lockHoldPolls += 1;
       void load();
     }, delay);
   }
   async function load(): Promise<void> {
-    if (disposed || document.hidden) return;
+    if (disposed) return;
+    if (document.hidden) {
+      loading = false;
+      return;
+    }
+    if (sources.length === 0) loading = true;
     const requestGeneration = ++generation;
     controller?.abort();
     const requestController = new AbortController();
     controller = requestController;
+    const signal = AbortSignal.any([requestController.signal, AbortSignal.timeout(requestTimeoutMs)]);
     try {
       const { data, error: responseError } = await generatedListSourceStatus(undefined, {
         ...client,
-        signal: requestController.signal,
+        signal,
       });
       if (requestGeneration !== generation || disposed) return;
       if (!data) throw new Error(messageFor(responseError, 'Unable to load source status.'));
       const next = data.sources ?? [];
       let nextDelay: number | undefined;
+      let lockHoldPoll = false;
       let advanced = false;
       const nextProgress = new Map<number, number>();
       for (const source of next) {
@@ -148,19 +169,43 @@
           pollDelay = Math.min(MAX_POLL_MS, pollDelay * 2);
         }
       }
-      if (next.some((source) => source.active_sync)) {
+      const hasActiveSync = next.some((source) => source.active_sync);
+      const hasLockHold = next.some(schedulerHoldsSyncLock);
+      if (hasActiveSync) {
+        lockHoldPolls = 0;
+        lockStatusStale = false;
         pollDelay = advanced ? MIN_POLL_MS : Math.min(MAX_POLL_MS, pollDelay * 2);
         nextDelay = pollDelay;
-      } else if (next.some(schedulerHoldsSyncLock)) {
+      } else if (hasLockHold && lockHoldPolls < maxLockHoldPolls) {
+        lockStatusStale = false;
         pollDelay = Math.min(MAX_POLL_MS, pollDelay * 2);
         nextDelay = pollDelay;
+        lockHoldPoll = true;
+      } else if (hasLockHold) {
+        lockStatusStale = true;
+      } else {
+        lockHoldPolls = 0;
+        lockStatusStale = false;
       }
       sources = next;
       statusError = '';
-      if (nextDelay !== undefined) schedulePoll(nextDelay);
+      hasLoadedStatus = true;
+      if (nextDelay !== undefined) {
+        schedulePoll(nextDelay, false, lockHoldPoll);
+      }
     } catch (cause) {
-      if (requestController.signal.aborted || requestGeneration !== generation || disposed) return;
-      statusError = cause instanceof Error ? cause.message : 'Unable to load source status.';
+      if (requestGeneration !== generation || disposed || requestController.signal.aborted) return;
+      if (signal.aborted && signal.reason?.name === 'TimeoutError') {
+        statusError = 'Loading source status timed out. The server may be busy; retry in a moment.';
+      } else {
+        statusError = cause instanceof Error ? cause.message : 'Unable to load source status.';
+      }
+      if (!hasLoadedStatus) return;
+      if (lockHoldPolls >= maxLockHoldPolls && sources.some(schedulerHoldsSyncLock) &&
+        !sources.some((source) => source.active_sync) && awaitingSourceID === undefined) {
+        lockStatusStale = true;
+        return;
+      }
       if (awaitingSourceID !== undefined) {
         awaitingAttempts += 1;
         if (awaitingAttempts >= maxAwaitingPolls) {
@@ -175,7 +220,8 @@
       } else {
         const nextDelay = pollDelay;
         pollDelay = Math.min(MAX_POLL_MS, pollDelay * 2);
-        schedulePoll(nextDelay, true);
+        schedulePoll(nextDelay, true, sources.some(schedulerHoldsSyncLock) &&
+          !sources.some((source) => source.active_sync));
       }
     } finally {
       if (requestGeneration === generation) {
@@ -188,12 +234,16 @@
     if (!source.can_sync || triggering) return;
     triggering = source.identifier;
     triggerError = '';
+    const signal = AbortSignal.timeout(requestTimeoutMs);
     try {
       const {
         data,
         error: responseError,
         response,
-      } = await generatedTriggerSync({ account: source.identifier }, { source_type: source.source_type }, client);
+      } = await generatedTriggerSync({ account: source.identifier }, { source_type: source.source_type }, {
+        ...client,
+        signal,
+      });
       if (response.status !== 202 || !data) {
         throw new Error(messageFor(responseError, `Unable to start sync for ${source.identifier}.`));
       }
@@ -205,7 +255,9 @@
       awaitingState = 'awaiting';
       await load();
     } catch (cause) {
-      triggerError = cause instanceof Error ? cause.message : `Unable to start sync for ${source.identifier}.`;
+      triggerError = signal.aborted
+        ? 'Starting sync timed out. Check source status before trying again.'
+        : cause instanceof Error ? cause.message : `Unable to start sync for ${source.identifier}.`;
       schedulePoll(MIN_POLL_MS);
     } finally {
       triggering = undefined;
@@ -214,25 +266,17 @@
   function label(source: Source): string {
     return source.display_name || source.identifier;
   }
-  function statusLabel(run: SyncRun | null): string {
-    if (!run) return 'Never';
-    if (run.status === 'completed') return 'Completed';
-    if (run.status === 'failed') return 'Failed';
-    return run.status.replaceAll('_', ' ');
-  }
-  function statusTone(run: SyncRun): ChipTone {
-    if (run.status === 'completed') return 'success';
-    if (run.status === 'failed') return 'danger';
-    return 'info';
-  }
   function resultTimestamp(run: SyncRun | null | undefined): string | undefined {
     return run?.completed_at ?? run?.started_at;
   }
-  function formatTimestamp(value: string | null | undefined): string {
-    if (!value) return 'Not available';
-    const date = new Date(value);
-    if (!Number.isFinite(date.getTime())) return value;
-    return new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' }).format(date);
+  function hasDetails(source: Source): boolean {
+    return Boolean(
+      source.latest_sync?.error_message || source.latest_sync?.item_errors?.length || source.scheduler_last_error
+    );
+  }
+  function toggleDetails(id: number): void {
+    if (expanded.has(id)) expanded.delete(id);
+    else expanded.add(id);
   }
   function staleLastResult(source: Source): boolean {
     const resultAt = source.latest_sync?.completed_at ?? source.latest_sync?.started_at;
@@ -245,45 +289,78 @@
       ? value.message
       : fallback;
   }
+  function refresh(): void {
+    stopPolling(false);
+    lockHoldPolls = 0;
+    lockStatusStale = false;
+    statusError = '';
+    pollDelay = MIN_POLL_MS;
+    void load();
+  }
 </script>
 
 <main class="sources" aria-label="Sources">
-  <header>
-    <div>
-      <p>Archive workspace</p>
-      <h1>Sources</h1>
-    </div>
-    <div class="header-actions">
-      <span>Status and incremental sync</span>
-      <Button size="sm" surface="soft" label="View source operations" onclick={onOpenOperations} />
-    </div>
-  </header>
-  {#if statusError}<p class="notice notice--error" role="alert">{statusError}</p>{/if}
-  {#if triggerError}<p class="notice notice--error" role="alert">{triggerError}</p>{/if}
+  <PageHeader title="Sources" description="Accounts and imports in your archive, and when they last synced.">
+    {#snippet actions()}
+      <Button size="sm" surface="soft" label="Sync history" onclick={onOpenOperations} />
+    {/snippet}
+  </PageHeader>
+  {#if statusError}<div class="notice notice--error" role="alert">
+      <span>{statusError}</span>
+      <Button size="sm" surface="soft" label="Retry" onclick={refresh} />
+    </div>{/if}
+  {#if triggerError}<div class="notice notice--error" role="alert">
+      <span>{triggerError}</span>
+      <Button size="sm" surface="soft" label="Refresh" onclick={refresh} />
+    </div>{/if}
+  {#if lockStatusStale}<div class="notice" role="status">
+      <span>Automatic refresh paused. Source status may be stale.</span>
+      <Button size="sm" surface="soft" label="Refresh" onclick={refresh} />
+    </div>{/if}
   {#if awaitingState === 'awaiting'}<p class="notice" role="status">Awaiting accepted sync run…</p>
-  {:else if awaitingState === 'not_observed'}<p class="notice notice--error" role="status">
-      sync_start_not_observed
-    </p>{/if}
+  {:else if awaitingState === 'not_observed'}<div class="notice" role="status">
+      <span>The sync was requested, but it hasn't started yet. Refresh to check again.</span>
+      <Button size="sm" surface="soft" label="Refresh" onclick={refresh} />
+    </div>{/if}
   {#if loading}<p role="status">Loading source status…</p>
-  {:else if sources.length === 0}<p class="notice" role="status">No archived sources are available.</p>
+  {:else if sources.length === 0}{#if !statusError}<p class="notice" role="status">No archived sources are available.</p>{/if}
   {:else}
     <Table ariaLabel="Source status" zebra={false} class="source-table">
       {#snippet header()}
         <TableHeaderCell label="Source" />
         <TableHeaderCell label="Schedule" />
-        <TableHeaderCell label="Latest result" />
+        <TableHeaderCell label="Status" />
         <TableHeaderCell label="Last successful sync" />
         <TableHeaderCell label="Action" />
       {/snippet}
       {#each sources as source (source.id)}
+        {@const detailID = `source-${source.id}-details`}
+        {@const chip = syncStatusChip(source)}
+        {@const latestAt = resultTimestamp(source.latest_sync)}
         <tr>
           <td>
             <div class="source-cell">
-              <strong class="source-name">{label(source)}</strong>
-              <span>{source.source_type} · {source.identifier}</span>
+              <div class="source-title">
+                {#if hasDetails(source)}
+                  <IconButton
+                    size="sm"
+                    ariaLabel={`Show details for ${label(source)}`}
+                    ariaExpanded={expanded.has(source.id)}
+                    ariaControls={expanded.has(source.id) ? detailID : undefined}
+                    onclick={() => toggleDetails(source.id)}
+                  >
+                    {#if expanded.has(source.id)}<ChevronDown size={14} aria-hidden="true" />{:else}<ChevronRight
+                        size={14}
+                        aria-hidden="true"
+                      />{/if}
+                  </IconButton>
+                {/if}
+                <strong class="source-name">{label(source)}</strong>
+              </div>
+              <span>{[sourceTypeLabel(source.source_type), source.identifier].filter(Boolean).join(' · ')}</span>
               <span
-                >Updated <time datetime={source.updated_at} title={source.updated_at}
-                  >{formatTimestamp(source.updated_at)}</time
+                >Updated <time datetime={source.updated_at} title={formatDateTime(source.updated_at, 'long')}
+                  >{formatDateTime(source.updated_at)}</time
                 ></span
               >
             </div>
@@ -293,64 +370,43 @@
               {#if source.scheduled}
                 {#if source.schedule}
                   <strong title={source.schedule}>{scheduleSummary(source.schedule)}</strong>
-                  <span class="schedule-expression" data-mono>{source.schedule}</span>
                 {:else}
                   <strong>Schedule unavailable</strong>
                 {/if}
                 {#if source.next_sync_at}
                   <span
-                    >Next <time datetime={source.next_sync_at} title={source.next_sync_at}
-                      >{formatTimestamp(source.next_sync_at)}</time
+                    >Next <time datetime={source.next_sync_at} title={formatDateTime(source.next_sync_at, 'long')}
+                      >{formatDateTime(source.next_sync_at)}</time
                     ></span
                   >
                 {/if}
               {:else if isOnDemandSource(source)}
                 <span>On demand · imported through the API</span>
               {:else}<span>Not scheduled</span>{/if}
-              {#if source.scheduler_last_error}<span class="error-copy">Scheduler: {source.scheduler_last_error}</span
-                >{/if}
             </div>
           </td>
           <td>
             <div class="cell-stack">
+              <Chip size="sm" tone={chip.tone} uppercase={false}>{chip.label}</Chip>
               {#if source.active_sync}
-                <span class="working"><Spinner size={12} label={`Syncing ${label(source)}`} /> Syncing</span>
                 <strong>{source.active_sync.messages_processed.toLocaleString()} processed</strong>
                 <span
                   >{source.active_sync.messages_added.toLocaleString()} added · {source.active_sync.errors_count.toLocaleString()}
                   errors</span
                 >
-              {:else if source.latest_sync}
-                <Chip size="sm" tone={statusTone(source.latest_sync)} uppercase={false}
-                  >{statusLabel(source.latest_sync)}</Chip
-                >
-                {@const latestAt = resultTimestamp(source.latest_sync)}
-                {#if latestAt}<time datetime={latestAt} title={latestAt}>{formatTimestamp(latestAt)}</time>{/if}
-                {#if staleLastResult(source)}<span class="reason">stale_last_result</span>{/if}
-                {#if source.latest_sync.error_message}<span class="error-copy">{source.latest_sync.error_message}</span
-                  >{/if}
-                {#if source.latest_sync.item_errors?.length}
-                  <details open>
-                    <summary
-                      >{source.latest_sync.item_errors.length} item {source.latest_sync.item_errors.length === 1
-                        ? 'error'
-                        : 'errors'}</summary
-                    >
-                    {#each source.latest_sync.item_errors as item (`${item.source_message_id}:${item.phase}:${item.created_at}`)}
-                      <span class="error-copy">{item.error_message}</span>
-                    {/each}
-                  </details>
-                {/if}
-              {:else}<strong>No prior sync result</strong>{/if}
+              {:else if latestAt}
+                <time datetime={latestAt} title={formatDateTime(latestAt, 'long')}>{formatDateTime(latestAt)}</time>
+                {#if staleLastResult(source)}<span class="stale">This result may be out of date.</span>{/if}
+              {/if}
             </div>
           </td>
           <td>
             {#if source.last_successful_sync?.completed_at}
               <time
                 datetime={source.last_successful_sync.completed_at}
-                title={source.last_successful_sync.completed_at}
+                title={formatDateTime(source.last_successful_sync.completed_at, 'long')}
               >
-                {formatTimestamp(source.last_successful_sync.completed_at)}
+                {formatDateTime(source.last_successful_sync.completed_at)}
               </time>
             {:else}
               <span>No successful sync result</span>
@@ -369,10 +425,30 @@
             {:else if isOnDemandSource(source)}
               <span>On-demand API source</span>
             {:else}
-              <span class="reason">{source.sync_unavailable_reason ?? 'sync_unavailable'}</span>
+              {@const reason = source.sync_unavailable_reason ?? 'sync_unavailable'}
+              <span class="reason" title={reason}>{syncUnavailableLabel(reason)}</span>
             {/if}
           </td>
         </tr>
+        {#if expanded.has(source.id) && hasDetails(source)}
+          <tr class="detail-row" id={detailID}>
+            <td colspan="5">
+              <div class="details">
+                {#if source.latest_sync?.error_message}<p class="error-copy">{source.latest_sync.error_message}</p>{/if}
+                {#if source.scheduler_last_error}<p class="error-copy">Scheduler: {source.scheduler_last_error}</p>{/if}
+                {#if source.latest_sync?.item_errors?.length}
+                  {@const count = source.latest_sync.item_errors.length}
+                  <p>{count} item {count === 1 ? 'error' : 'errors'}</p>
+                  <ul>
+                    {#each source.latest_sync.item_errors as item (`${item.source_message_id}:${item.phase}:${item.created_at}`)}
+                      <li class="error-copy">{item.error_message}</li>
+                    {/each}
+                  </ul>
+                {/if}
+              </div>
+            </td>
+          </tr>
+        {/if}
       {/each}
     </Table>
   {/if}
@@ -385,31 +461,8 @@
     flex: 1;
     flex-direction: column;
     gap: var(--space-4);
-    padding: var(--space-5) var(--space-6);
+    padding: var(--space-5) var(--page-gutter) var(--space-4);
   }
-  header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: var(--space-4);
-  }
-  .header-actions {
-    display: flex;
-    align-items: center;
-    gap: var(--space-3);
-  }
-  header p,
-  h1 {
-    margin: 0;
-  }
-  header p {
-    color: var(--status-warning-ink);
-    font-size: var(--font-size-2xs);
-    font-weight: 800;
-    letter-spacing: 0.1em;
-    text-transform: uppercase;
-  }
-  header span,
   td span,
   td time {
     color: var(--text-muted);
@@ -440,7 +493,7 @@
   }
   .source-cell,
   .cell-stack,
-  details {
+  .details {
     display: grid;
     min-width: 0;
     gap: var(--space-1);
@@ -449,29 +502,41 @@
     color: var(--text-primary);
     font-size: var(--font-size-md);
   }
-  .schedule-expression {
-    color: var(--text-muted);
-    font-size: var(--font-size-xs);
-  }
-  .working {
+  .source-title {
     display: flex;
+    min-width: 0;
     align-items: center;
-    gap: var(--space-2);
-    color: var(--accent-teal);
+    gap: var(--space-1);
+  }
+  .details {
+    padding: var(--space-2) var(--space-3);
+  }
+  .details p,
+  .details ul {
+    margin: 0;
+  }
+  .details ul {
+    padding-left: var(--space-5);
   }
   .action-cell {
     text-align: right;
     white-space: nowrap;
   }
-  .reason,
+  td .reason {
+    color: var(--text-muted);
+  }
+  td .stale {
+    color: var(--status-warning-ink);
+  }
   .error-copy {
     color: var(--text-danger);
+    font-size: var(--font-size-sm);
   }
   .notice {
     padding: var(--space-3);
-    border: 1px solid var(--accent-amber);
+    border: 1px solid var(--border-default);
     border-radius: var(--radius-md);
-    background: var(--status-warning-bg);
+    background: var(--bg-subtle);
   }
   .notice--error {
     border-color: var(--accent-red);

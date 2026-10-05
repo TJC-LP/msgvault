@@ -10,6 +10,7 @@ import (
 // simply does not work end-to-end, with no compile-time signal — so the
 // Slack commands' presence is asserted explicitly.
 func TestCLIRunCommandAllowedSlackCommands(t *testing.T) {
+	t.Parallel()
 	for _, args := range [][]string{
 		{"add-slack"},
 		{"sync-slack"},
@@ -25,11 +26,26 @@ func TestCLIRunCommandAllowedSlackCommands(t *testing.T) {
 }
 
 func TestCLIRunCommandAllowedNotionMeetingsCommands(t *testing.T) {
+	t.Parallel()
 	for _, args := range [][]string{
 		{"add-notion-meetings"},
 		{"add-notion-meetings", "notion-personal"},
 		{"sync-notion-meetings"},
 		{"sync-notion-meetings", "notion-personal", "--full"},
+	} {
+		t.Run(args[0], func(t *testing.T) {
+			assert.True(t, cliRunCommandAllowed(args), "%v must be runnable via the daemon CLI", args)
+		})
+	}
+}
+
+func TestCLIRunCommandAllowedMuesliCommands(t *testing.T) {
+	t.Parallel()
+	for _, args := range [][]string{
+		{"add-muesli"},
+		{"add-muesli", "mac"},
+		{"sync-muesli"},
+		{"sync-muesli", "mac", "--full"},
 	} {
 		t.Run(args[0], func(t *testing.T) {
 			assert.True(t, cliRunCommandAllowed(args), "%v must be runnable via the daemon CLI", args)

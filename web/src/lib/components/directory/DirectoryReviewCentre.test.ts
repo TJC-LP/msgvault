@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/svelte';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { createAPIClient } from '../../api/client';
@@ -23,6 +23,9 @@ function candidate(id: number, state = 'candidate'): IdentityMatchCandidate {
     basis: 'stable_provider_id',
     source: 'synthetic',
     state,
+    review_token: `token-${id}-${state}`,
+    actionable: state === 'candidate',
+    application_pending: false,
     evidence: [],
     created_at: '2026-08-01T10:00:00Z',
     updated_at: '2026-08-02T11:00:00Z'
@@ -48,11 +51,53 @@ function renderReview(controller: DirectoryReviewController) {
     controller,
     relationshipController: new RelationshipReviewController(controller.apiClient),
     factController: new FactLedgerController(controller.apiClient),
+    client: controller.apiClient,
     directoryPersonID: null
   });
 }
 
 describe('DirectoryReviewCentre', () => {
+  it.each([
+    { action: 'Link identities', state: 'accepted' },
+    { action: 'Keep separate', state: 'rejected' }
+  ])('closes a stale $action decision until the refreshed evidence is reviewed again', async ({ action, state }) => {
+    const tokens: string[] = [];
+    const refreshed = { ...candidate(17), review_token: 'fresh-token', source_ref: 'Refreshed source evidence' };
+    const controller = new DirectoryReviewController(createAPIClient(vi.fn<typeof fetch>(async (input) => {
+      const request = requestOf(input);
+      if (request.method === 'POST') {
+        tokens.push((await request.json()).review_token);
+        if (tokens.length === 1) {
+          return Response.json({ error: 'identity_match_review_stale', message: 'Changed' }, { status: 409 });
+        }
+        return Response.json({ candidate: candidate(17, state), identity_revision: 5, cache_state: 'ready' });
+      }
+      return page([refreshed]);
+    })));
+    controller.rows = [candidate(17)];
+    renderReview(controller);
+
+    await fireEvent.click(screen.getByRole('button', { name: action }));
+    await fireEvent.input(screen.getByRole('textbox', { name: 'Decision notes' }), {
+      target: { value: 'Retain this review note' }
+    });
+    await fireEvent.click(within(screen.getByRole('dialog', { name: action })).getByRole('button', { name: action }));
+
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    expect(screen.getByRole('alert').textContent).toContain('Review the refreshed evidence before deciding.');
+    expect(screen.getByText('Refreshed source evidence')).toBeDefined();
+    expect(tokens).toEqual(['token-17-candidate']);
+    const trigger = screen.getByRole('button', { name: action });
+    await waitFor(() => expect(document.activeElement).toBe(trigger));
+
+    await fireEvent.click(trigger);
+    expect(screen.getByRole('textbox', { name: 'Decision notes' })).toHaveProperty('value', 'Retain this review note');
+    expect(tokens).toEqual(['token-17-candidate']);
+    await fireEvent.click(within(screen.getByRole('dialog', { name: action })).getByRole('button', { name: action }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    expect(tokens).toEqual(['token-17-candidate', 'fresh-token']);
+  });
+
   it('selects the read-only imported relationship queue without identity requests', async () => {
     const calls: Array<{ method: string; path: string; status: string | null }> = [];
     const fetchFn = vi.fn<typeof fetch>(async (input) => {
@@ -63,7 +108,11 @@ describe('DirectoryReviewCentre', () => {
     });
     const review = new DirectoryReviewController(createAPIClient(fetchFn));
     const relationships = new RelationshipReviewController(createAPIClient(fetchFn));
-    render(DirectoryReviewCentre, { controller: review, relationshipController: relationships });
+    render(DirectoryReviewCentre, {
+      controller: review,
+      relationshipController: relationships,
+      client: review.apiClient
+    });
 
     await fireEvent.click(screen.getByRole('radio', { name: 'Imported relationships' }));
 
@@ -100,6 +149,28 @@ describe('DirectoryReviewCentre', () => {
     expect(requests.filter((request) => new URL(request.url).pathname.endsWith('/accept'))).toHaveLength(1);
   });
 
+  it('marks each hidden review heading as the focus target of its section', async () => {
+    const fetchFn = vi.fn<typeof fetch>(async () => page([candidate(17)]));
+    const apiClient = createAPIClient(fetchFn);
+    const controller = new DirectoryReviewController(apiClient);
+    await controller.loadIdentityPage();
+    render(DirectoryReviewCentre, {
+      controller,
+      relationshipController: new RelationshipReviewController(apiClient),
+      factController: new FactLedgerController(apiClient),
+      client: apiClient,
+      directoryPersonID: null
+    });
+
+    for (const name of ['Identity matches', 'Facts', 'Imported relationships']) {
+      if (name !== 'Identity matches') await fireEvent.click(screen.getByRole('radio', { name }));
+      const heading = await screen.findByRole('heading', { name, level: 2 });
+      expect(heading.className).toContain('review-heading');
+      expect(heading.getAttribute('tabindex')).toBe('-1');
+      expect(heading.closest('[data-review-section]')).not.toBeNull();
+    }
+  });
+
   it('changes identity state through the controller and commits the URL filter', async () => {
     const requests: Request[] = [];
     const commit = vi.fn();
@@ -114,8 +185,10 @@ describe('DirectoryReviewCentre', () => {
     renderReview(controller);
 
     expect(screen.getByRole('radiogroup', { name: 'Review type' })).toBeDefined();
-    expect(screen.getByRole('radiogroup', { name: 'Identity review state' })).toBeDefined();
-    await fireEvent.click(screen.getByRole('radio', { name: 'Conflict' }));
+    const show = screen.getByRole('combobox', { name: /^Identity review state/ });
+    expect(show.textContent).toContain('Show: Candidate');
+    await fireEvent.click(show);
+    await fireEvent.click(screen.getByRole('option', { name: 'Conflict' }));
 
     await screen.findByRole('heading', { name: 'Identity match 22' });
     expect(controller.reviewKind).toBe('identity');
@@ -146,15 +219,16 @@ describe('DirectoryReviewCentre', () => {
         controller,
         relationshipController: new RelationshipReviewController(apiClient),
         factController,
+        client: apiClient,
         directoryPersonID: null
       });
 
       if (mode === 'selection') {
-        await fireEvent.click(screen.getByRole('radio', { name: 'Fact review' }));
+        await fireEvent.click(screen.getByRole('radio', { name: 'Facts' }));
       }
 
-      expect(screen.getByRole('region', { name: 'Fact review' })).toBeDefined();
-      expect(screen.getByText('Choose a person in Directory to inspect their fact ledger')).toBeDefined();
+      expect(screen.getByRole('region', { name: 'Facts' })).toBeDefined();
+      expect(screen.getByText('Choose a person to see the facts recorded about them.')).toBeDefined();
       expect(screen.queryByRole('button', { name: /accept|reject|unsure|link identities|keep separate/i })).toBeNull();
       expect(fetchFn).not.toHaveBeenCalled();
       if (mode === 'selection') expect(commit).toHaveBeenCalledWith({ reviewKind: 'fact' });
@@ -246,7 +320,7 @@ describe('DirectoryReviewCentre', () => {
     {
       name: 'identity review to fact review',
       target: { reviewKind: 'fact' as const, identityState: 'candidate' as const },
-      focusHeading: 'Fact review'
+      focusHeading: 'Facts'
     },
     {
       name: 'candidate review to conflict review',
@@ -279,6 +353,7 @@ describe('DirectoryReviewCentre', () => {
       controller,
       relationshipController: new RelationshipReviewController(apiClient),
       factController,
+      client: apiClient,
       directoryPersonID: null
     });
 
@@ -370,7 +445,7 @@ describe('DirectoryReviewCentre', () => {
 
     await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Link identities' })).toBeNull());
     const row = screen.getByRole('article', { name: 'Identity match 17' });
-    expect(row.textContent).toContain('accepted');
+    expect(row.textContent).toContain('Accepted');
     expect(screen.getByRole('status').textContent).toContain('Identity match accepted.');
     expect(screen.getByRole('alert').textContent).toContain('Reload failed');
     await waitFor(() => expect(document.activeElement).toBe(row));

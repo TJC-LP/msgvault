@@ -54,6 +54,22 @@ test('review cards expose the complete server-supplied synthetic evidence', asyn
     .toContainText('Both synthetic endpoints expose the same provider identifier.');
 });
 
+test('identity decisions submit the review token returned with the candidate', async ({ page }) => {
+  const fixture = await installDirectoryReviewArchive(page);
+  await page.goto(reviewURL());
+
+  const card = page.getByRole('article', { name: 'Identity match 17' });
+  await card.getByRole('button', { name: 'Link identities' }).click();
+  const decision = page.getByRole('dialog', { name: 'Link identities' });
+  const request = page.waitForRequest((candidate) =>
+    candidate.method() === 'POST' && new URL(candidate.url()).pathname.endsWith('/17/review/accept'));
+  await decision.getByRole('button', { name: 'Link identities' }).click();
+
+  expect((await request).postDataJSON()).toMatchObject({ review_token: 'review-17-candidate' });
+  await expect(card).toBeHidden();
+  expect(fixture.requests.filter((item) => item.path.endsWith('/17/review/accept'))).toHaveLength(1);
+});
+
 test('ordinary accept and reject keep keyboard focus connected as rows leave the queue', async ({ page }) => {
   await installDirectoryReviewArchive(page);
   await page.goto(reviewURL());
@@ -70,12 +86,14 @@ test('ordinary accept and reject keep keyboard focus connected as rows leave the
   const acceptDialog = page.getByRole('dialog', { name: 'Link identities' });
   await acceptDialog.getByLabel('Decision notes').fill('Synthetic provider IDs match.');
   const acceptedRequest = page.waitForRequest((request) =>
-    request.method() === 'POST' && new URL(request.url()).pathname.endsWith('/17/accept'));
+    request.method() === 'POST' && new URL(request.url()).pathname.endsWith('/17/review/accept'));
   const acceptSubmit = acceptDialog.getByRole('button', { name: 'Link identities' });
   await acceptSubmit.focus();
   await expect(acceptSubmit).toBeFocused();
   await page.keyboard.press('Enter');
-  expect((await acceptedRequest).postDataJSON()).toEqual({ notes: 'Synthetic provider IDs match.' });
+  expect((await acceptedRequest).postDataJSON()).toEqual({
+    review_token: 'review-17-candidate', notes: 'Synthetic provider IDs match.'
+  });
   await expect(acceptCard).toBeHidden();
   await expect(page.getByRole('heading', { name: 'Identity matches' })).toBeFocused();
 
@@ -87,32 +105,38 @@ test('ordinary accept and reject keep keyboard focus connected as rows leave the
   const rejectDialog = page.getByRole('dialog', { name: 'Keep separate' });
   await rejectDialog.getByLabel('Decision notes').fill('Synthetic endpoints belong to different people.');
   const rejectedRequest = page.waitForRequest((request) =>
-    request.method() === 'POST' && new URL(request.url()).pathname.endsWith('/18/reject'));
+    request.method() === 'POST' && new URL(request.url()).pathname.endsWith('/18/review/reject'));
   const rejectSubmit = rejectDialog.getByRole('button', { name: 'Keep separate' });
   await rejectSubmit.focus();
   await expect(rejectSubmit).toBeFocused();
   await page.keyboard.press('Enter');
-  expect((await rejectedRequest).postDataJSON()).toEqual({ notes: 'Synthetic endpoints belong to different people.' });
+  expect((await rejectedRequest).postDataJSON()).toEqual({
+    review_token: 'review-18-candidate', notes: 'Synthetic endpoints belong to different people.'
+  });
   await expect(rejectCard).toBeHidden();
   await expect(page.getByRole('heading', { name: 'Identity matches' })).toBeFocused();
 
-  const candidateFilter = page.getByRole('radio', { name: 'Candidate' });
-  await candidateFilter.focus();
-  await expect(candidateFilter).toBeFocused();
-  await page.keyboard.press('ArrowRight');
-  await page.keyboard.press('ArrowRight');
-  await expect(page.getByRole('radio', { name: 'Accepted' })).toBeFocused();
-  await expect(page.getByRole('radio', { name: 'Accepted' })).toBeChecked();
+  const show = page.getByRole('combobox', { name: /^Identity review state/ });
+  await expect(show).toHaveText('Show: Candidate');
+  await show.focus();
+  await expect(show).toBeFocused();
+  await page.keyboard.press('Enter');
+  await page.keyboard.press('ArrowDown');
+  await page.keyboard.press('ArrowDown');
+  await page.keyboard.press('Enter');
+  await expect(show).toBeFocused();
+  await expect(show).toHaveText('Show: Accepted');
   const acceptedCard = page.getByRole('article', { name: 'Identity match 17' });
-  await expect(acceptedCard).toContainText('accepted');
+  await expect(acceptedCard).toContainText('Accepted');
   await expect(acceptedCard.getByRole('button', { name: /Link identities|Keep separate/ })).toHaveCount(0);
   await expect(page).toHaveURL(/identityState%22%3A%22accepted/);
 
-  await page.keyboard.press('ArrowRight');
-  await expect(page.getByRole('radio', { name: 'Rejected' })).toBeFocused();
-  await expect(page.getByRole('radio', { name: 'Rejected' })).toBeChecked();
+  await page.keyboard.press('Enter');
+  await page.keyboard.press('ArrowDown');
+  await page.keyboard.press('Enter');
+  await expect(show).toHaveText('Show: Rejected');
   const rejectedCard = page.getByRole('article', { name: 'Identity match 18' });
-  await expect(rejectedCard).toContainText('rejected');
+  await expect(rejectedCard).toContainText('Rejected');
   await expect(rejectedCard).toContainText('Synthetic endpoints belong to different people.');
   await expect(page).toHaveURL(/identityState%22%3A%22rejected/);
 });
@@ -133,7 +157,7 @@ test('pending decisions block Escape and global shortcuts, while failure retains
   await expect(acceptSubmit).toBeFocused();
   await page.keyboard.press('Enter');
   await expect.poll(() => fixture.requests.filter((request) =>
-    request.method === 'POST' && request.path.endsWith('/17/accept')).length).toBe(1);
+    request.method === 'POST' && request.path.endsWith('/17/review/accept')).length).toBe(1);
   await expect(acceptDialog.getByRole('button', { name: 'Cancel' })).toBeDisabled();
   await expect(acceptDialog.getByRole('button', { name: 'Close identity decision' })).toHaveCount(0);
 
@@ -162,14 +186,14 @@ test('pending decisions block Escape and global shortcuts, while failure retains
   await expect(rejectDialog.getByRole('alert')).toContainText('Synthetic decision service unavailable.');
   await expect(notes).toHaveValue('Retain this synthetic review note.');
   expect(fixture.requests.filter((request) =>
-    request.method === 'POST' && request.path.endsWith('/18/reject'))).toHaveLength(1);
+    request.method === 'POST' && request.path.endsWith('/18/review/reject'))).toHaveLength(1);
 
   await rejectSubmit.focus();
   await expect(rejectSubmit).toBeFocused();
   await page.keyboard.press('Enter');
   await expect(rejectCard).toBeHidden();
   expect(fixture.requests.filter((request) =>
-    request.method === 'POST' && request.path.endsWith('/18/reject'))).toHaveLength(2);
+    request.method === 'POST' && request.path.endsWith('/18/review/reject'))).toHaveLength(2);
 });
 
 for (const profile of [
@@ -186,10 +210,11 @@ for (const profile of [
 
     await expect(page).toHaveURL(new RegExp(`directoryPersonID%22%3A${profile.id}`));
     await expect(page.getByRole('heading', { name: profile.name })).toBeVisible();
+    await page.getByRole('tab', { name: 'Maintenance' }).click();
     await expect(page.getByText('No merge history on this page.')).toBeVisible();
     await expect(page.getByRole('table', { name: 'Person merge history' })).toHaveCount(0);
     expect(fixture.requests.filter((request) => request.path.endsWith('/merge'))).toHaveLength(0);
-    expect(fixture.requests.filter((request) => request.path.endsWith('/19/accept'))).toHaveLength(1);
+    expect(fixture.requests.filter((request) => request.path.endsWith('/19/review/accept'))).toHaveLength(1);
   });
 }
 
@@ -227,8 +252,9 @@ for (const completionTarget of [
   expect(mergeRequests[0]!.headers['if-match']).toBe('"person-7-r4", "person-9-r2"');
   expect(mergeRequests[0]!.headers['idempotency-key'])
     .toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
-  expect(fixture.requests.filter((request) => request.path.endsWith('/19/accept'))).toHaveLength(1);
+  expect(fixture.requests.filter((request) => request.path.endsWith('/19/review/accept'))).toHaveLength(1);
 
+  await page.getByRole('tab', { name: 'Maintenance' }).click();
   const history = page.getByRole('table', { name: 'Person merge history' });
   await expect(history).toBeVisible();
   expect(fixture.requests.filter((request) => request.path.endsWith('/snapshot'))).toHaveLength(0);
@@ -285,6 +311,7 @@ for (const completionTarget of [
   await expect(page.getByRole('heading', { name: completionTarget.heading })).toBeVisible();
 
   if (completionTarget.id === 7) {
+    await page.getByRole('tab', { name: 'Maintenance' }).click();
     const updatedHistory = page.getByRole('table', { name: 'Person merge history' });
     await expect(updatedHistory).toBeVisible();
     await updatedHistory.getByRole('button', { name: 'Inspect merge 41' }).focus();
@@ -293,7 +320,7 @@ for (const completionTarget of [
   }
 });
 
-test('Fact review is a keyboard-readable private ledger with honest unavailable gates', async ({ page }) => {
+test('Facts is a keyboard-readable private ledger with honest unavailable gates', async ({ page }) => {
   const fixture = await installDirectoryReviewArchive(page);
   await page.goto(reviewURL());
   await expect(page.getByRole('article', { name: 'Identity match 17' })).toBeVisible();
@@ -302,14 +329,15 @@ test('Fact review is a keyboard-readable private ledger with honest unavailable 
   await identityReview.focus();
   await expect(identityReview).toBeFocused();
   await page.keyboard.press('ArrowRight');
-  await expect(page.getByRole('radio', { name: 'Fact review' })).toBeFocused();
-  await expect(page.getByRole('radio', { name: 'Fact review' })).toBeChecked();
-  const fact = page.getByRole('region', { name: 'Fact review' });
-  await expect(fact).toContainText('Choose a person in Directory to inspect their fact ledger');
+  await expect(page.getByRole('radio', { name: 'Facts' })).toBeFocused();
+  await expect(page.getByRole('radio', { name: 'Facts' })).toBeChecked();
+  const fact = page.getByRole('region', { name: 'Facts' });
+  await expect(fact).toContainText('Choose a person to see the facts recorded about them.');
   expect(fixture.requests.filter((request) => request.path.includes('fact-'))).toHaveLength(0);
 
   await page.goto(reviewURL('fact', 'candidate', 42));
-  await expect(fact).toContainText('Person ID 42');
+  await expect(fact).toContainText('Archive Person');
+  await expect(fact).not.toContainText('Person ID');
   await expect(fact).toContainText('Fact candidate decisions are unavailable until a generated candidate contract is installed.');
   await expect(fact).toContainText('A dated last-time-we-talked brief is unavailable until the server exposes a generated brief contract.');
   for (const action of ['Accept', 'Reject', 'Unsure', 'Run']) {
@@ -383,9 +411,43 @@ test('Fact review is a keyboard-readable private ledger with honest unavailable 
   await expect(page.getByRole('heading', { name: 'Archive Person' })).toBeVisible();
   const factReadsBeforeBack = fixture.requests.filter((request) => request.path.includes('fact')).length;
   await page.goBack();
-  await expect(fact).toContainText('Person ID 42');
+  await expect(fact).toContainText('Archive Person');
   await expect.poll(() => fixture.requests.filter((request) => request.path.includes('fact')).length)
     .toBe(factReadsBeforeBack + 5);
+});
+
+test('Facts person picker chooses a person from Directory and keeps the choice in the URL', async ({ page }) => {
+  await installDirectoryReviewArchive(page);
+  await page.goto(reviewURL('fact'));
+
+  const fact = page.getByRole('region', { name: 'Facts' });
+  await fact.getByRole('button', { name: /^Person(:|$)/ }).click();
+  await page.getByRole('combobox', { name: 'Person' }).fill('Synthetic');
+  await page.getByRole('option', { name: 'Synthetic One' }).click();
+
+  await expect(fact.getByRole('button', { name: 'Person: Synthetic One' })).toBeVisible();
+  await expect(fact).toContainText('Synthetic One');
+  expect(parseExploreURLState(new URL(page.url()).search).directoryPersonID).toBe(7);
+});
+
+test('a keyboard change of the Show filter outlines the review section that holds focus', async ({ page }) => {
+  await installDirectoryReviewArchive(page);
+  await page.goto(reviewURL('relationship'));
+
+  const section = page.getByRole('region', { name: 'Imported relationships' });
+  const show = section.getByRole('combobox', { name: /^Imported relationship review state/ });
+  await show.focus();
+  await page.keyboard.press('Enter');
+  await page.keyboard.press('ArrowDown');
+  await page.keyboard.press('Enter');
+  await expect(show).toHaveText('Show: Accepted');
+  await expect(section.getByRole('heading', { name: 'Imported relationships' })).toBeFocused();
+
+  const outlineStyle = await section.evaluate((element) => getComputedStyle(element).outlineStyle);
+  expect(outlineStyle).not.toBe('none');
+
+  await show.focus();
+  expect(await section.evaluate((element) => getComputedStyle(element).outlineStyle)).toBe('none');
 });
 
 test('imported relationship reviews are safe, read-only, keyboard navigable, and URL-restorable', async ({ page }) => {
@@ -398,7 +460,7 @@ test('imported relationship reviews are safe, read-only, keyboard navigable, and
   await expect(card).toContainText('urn:uuid:synthetic-related-person');
   await expect(card).toContainText('friend');
   await expect(card).toContainText('uri');
-  await expect(card).toContainText('pending');
+  await expect(card).toContainText('Pending');
   await expect(card).toContainText('vcard_import');
   await expect(card.locator('a')).toHaveCount(0);
   for (const action of ['Accept', 'Reject', 'Unsure']) {
@@ -414,10 +476,13 @@ test('imported relationship reviews are safe, read-only, keyboard navigable, and
     'forbidden-credential-marker'
   ]) expect(rendered).not.toContain(marker);
 
-  const pending = page.getByRole('radio', { name: 'Pending' });
-  await pending.focus();
-  await page.keyboard.press('ArrowRight');
-  await expect(page.getByRole('radio', { name: 'Accepted' })).toBeChecked();
+  const show = page.getByRole('combobox', { name: /^Imported relationship review state/ });
+  await expect(show).toHaveText('Show: Pending');
+  await show.focus();
+  await page.keyboard.press('Enter');
+  await page.keyboard.press('ArrowDown');
+  await page.keyboard.press('Enter');
+  await expect(show).toHaveText('Show: Accepted');
   await expect(heading).toBeFocused();
   await expect(page.getByText('No imported relationship reviews in Accepted.')).toBeVisible();
   expect(fixture.relationshipRequests.at(-1)).toEqual({
@@ -425,8 +490,10 @@ test('imported relationship reviews are safe, read-only, keyboard navigable, and
   });
 
   fixture.failNextRelationshipRead();
-  await page.getByRole('radio', { name: 'Accepted' }).focus();
-  await page.keyboard.press('ArrowRight');
+  await show.focus();
+  await page.keyboard.press('Enter');
+  await page.keyboard.press('ArrowDown');
+  await page.keyboard.press('Enter');
   const retry = page.getByRole('button', { name: 'Retry imported relationship reviews' });
   await expect(retry).toBeVisible();
   await expect(page.getByRole('alert')).not.toContainText('forbidden-remote-error-marker');
@@ -437,7 +504,7 @@ test('imported relationship reviews are safe, read-only, keyboard navigable, and
   expect(fixture.relationshipRequests.filter((request) => request.status === 'rejected')).toHaveLength(2);
 
   await page.goBack();
-  await expect(page.getByRole('radio', { name: 'Accepted' })).toBeChecked();
+  await expect(show).toHaveText('Show: Accepted');
   await expect(heading).toBeFocused();
   await page.goBack();
   await expect(card).toBeVisible();

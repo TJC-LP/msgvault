@@ -27,6 +27,7 @@ import (
 	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/vector"
 	"go.kenn.io/msgvault/internal/vector/embed"
+	"go.kenn.io/msgvault/internal/vector/hybrid"
 	"go.kenn.io/msgvault/internal/vector/personsearch"
 	"go.kenn.io/msgvault/internal/vector/sqlitevec"
 )
@@ -357,7 +358,8 @@ func setupVectorFeaturesFixture(
 		apply(c)
 	}
 	require.NoError(t, c.Save())
-	withTestConfig(t, c)
+	testCtx := withTestConfig(t, c)
+	_ = testCtx
 
 	s, err := store.Open(mainPath)
 	require.NoError(t, err)
@@ -366,10 +368,10 @@ func setupVectorFeaturesFixture(
 	if c.Vector.People.Enabled {
 		semanticProfile, err := c.Vector.SemanticPersonEmbeddingProfile()
 		require.NoError(t, err)
-		_, err = s.EnsurePersonSemanticEmbeddingProfile(t.Context(), semanticProfile)
+		_, err = s.EnsurePersonSemanticEmbeddingProfile(testCtx, semanticProfile)
 		require.NoError(t, err)
 		_, _, err = s.GrantPersonSemanticEmbeddingConsent(
-			t.Context(), semanticProfile.Fingerprint, "test",
+			testCtx, semanticProfile.Fingerprint, "test",
 		)
 		require.NoError(t, err)
 	}
@@ -380,22 +382,22 @@ func setupVectorFeaturesFixture(
 		RetentionPosture: "standard", TrainingPosture: "opted-out",
 		AllowedMediaTypes: []string{"application/pdf"}, PolicyJSON: []byte(`{"policy":1}`),
 	}
-	_, err = s.EnsureDocumentExtractionProfile(t.Context(), profile)
+	_, err = s.EnsureDocumentExtractionProfile(testCtx, profile)
 	require.NoError(t, err)
 	_, err = s.DB().Exec(s.Rebind(`UPDATE document_index_state SET target_profile_id = ? WHERE singleton = 1`), profile.ID)
 	require.NoError(t, err)
-	spec, err := configuredDocumentVectorSpec(t.Context(), s)
+	spec, err := configuredDocumentVectorSpec(testCtx, s)
 	require.NoError(t, err)
-	documentConsent, err := configuredDocumentVectorConsentSpec(spec)
+	documentConsent, err := configuredDocumentVectorConsentSpec(spec, invocationFromContext(testCtx))
 	require.NoError(t, err)
-	queryConsent, err := configuredDocumentVectorQueryConsentSpec(spec)
+	queryConsent, err := configuredDocumentVectorQueryConsentSpec(spec, invocationFromContext(testCtx))
 	require.NoError(t, err)
 	for _, consentSpec := range []store.DocumentVectorConsentSpec{documentConsent, queryConsent} {
-		_, _, err = s.RecordDocumentVectorConsent(t.Context(), consentSpec, time.Now())
+		_, _, err = s.RecordDocumentVectorConsent(testCtx, consentSpec, time.Now())
 		require.NoError(t, err)
 	}
 
-	vf, err := setupVectorFeatures(t.Context(), s, mainPath, readOnly)
+	vf, err := setupVectorFeatures(testCtx, s, mainPath, readOnly)
 	require.NoError(t, err)
 	require.NotNil(t, vf)
 	t.Cleanup(func() { _ = vf.Close() })
@@ -571,7 +573,9 @@ func TestSetupVectorFeaturesUsesStoredCredentialSnapshotWithoutEnvironment(t *te
 	}))
 	t.Cleanup(provider.Close)
 	var storedETag string
+	var tokensDir string
 	vf := setupVectorFeaturesFixture(t, vector.APIFormatOpenAI, false, func(c *config.Config) {
+		tokensDir = c.TokensDir()
 		c.Vector.Embeddings.Endpoint = provider.URL
 		c.Vector.Embeddings.APIKeyEnv = "TEXT_EMBEDDING_KEY"
 		empty, err := providercredentials.Read(c.TokensDir())
@@ -581,7 +585,7 @@ func TestSetupVectorFeaturesUsesStoredCredentialSnapshotWithoutEnvironment(t *te
 		require.NoError(t, err)
 		storedETag = stored.ETag
 	})
-	_, err := providercredentials.Put(cfg.TokensDir(), storedETag,
+	_, err := providercredentials.Put(tokensDir, storedETag,
 		providercredentials.VectorEmbeddingsID, provider.URL, "stored-after-startup")
 	require.NoError(t, err)
 
@@ -1141,4 +1145,70 @@ func TestNewProgressPrinter_DoesNotBypassThrottleAfterInitialTotal(t *testing.T)
 
 	lines := strings.Split(strings.TrimRight(buf.String(), "\n"), "\n")
 	require.Len(t, lines, 1, "progress emitted %d lines, want 1 throttled line after initial total:\n%s", len(lines), buf.String())
+}
+
+// Pin a pre-Kit generation, including its stored vector. Adopting the HTTP
+// client must neither schedule a rebuild nor replace the persisted identity.
+func TestKitMigrationReusesExistingGenerationForIndexAndSearch(t *testing.T) {
+	ctx := t.Context()
+	backend := openTestBackend(t)
+	const fingerprint = "legacy-model:4:p1-111111:c32768:e1"
+	cfg := vector.Config{Embeddings: vector.EmbeddingsConfig{Model: "legacy-model", Dimension: 4}}
+	cfg.ApplyDefaults()
+	require.Equal(t, fingerprint, cfg.GenerationFingerprint())
+	generation, err := backend.CreateGeneration(ctx, "legacy-model", 4, fingerprint)
+	require.NoError(t, err)
+	require.NoError(t, backend.Upsert(ctx, generation, []vector.Chunk{{MessageID: 1, Vector: []float32{1, 0, 0, 0}}}))
+	require.NoError(t, backend.ActivateGeneration(ctx, generation, true))
+
+	got, rebuilding, err := pickEmbedGeneration(ctx, backend, embedGenerationOpts{
+		Model: cfg.Embeddings.Model, Dimension: 4, Fingerprint: cfg.GenerationFingerprint(), Stderr: openStderrSink(t),
+	})
+	require.NoError(t, err)
+	assert.Equal(t, generation, got)
+	assert.False(t, rebuilding)
+
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		var request struct {
+			Input []string `json:"input"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			http.Error(w, "invalid request", http.StatusBadRequest)
+			return
+		}
+		assert.Equal(t, []string{"find existing message"}, request.Input)
+		_, _ = w.Write([]byte(`{"data":[{"index":0,"embedding":[1,0,0,0]}]}`))
+	}))
+	t.Cleanup(server.Close)
+	client := embed.NewClient(embed.Config{Endpoint: server.URL, Model: cfg.Embeddings.Model, Dimension: 4})
+	engine := hybrid.NewEngine(backend, nil, client, hybrid.Config{ExpectedFingerprint: cfg.GenerationFingerprint()})
+	hits, metadata, err := engine.Search(ctx, hybrid.SearchRequest{Mode: hybrid.ModeVector, FreeText: "find existing message", Limit: 10})
+	require.NoError(t, err)
+	require.Len(t, hits, 1)
+	assert.Equal(t, int64(1), hits[0].MessageID)
+	assert.Equal(t, generation, metadata.Generation.ID)
+	assert.Equal(t, fingerprint, metadata.Generation.Fingerprint)
+	assert.Equal(t, int32(1), requests.Load(), "only the query is embedded")
+	building, err := backend.BuildingGeneration(ctx)
+	require.NoError(t, err)
+	assert.Nil(t, building)
+
+	for _, change := range []struct {
+		name  string
+		apply func(*vector.Config)
+	}{
+		{"model", func(c *vector.Config) { c.Embeddings.Model = "other-model" }},
+		{"recipe", func(c *vector.Config) { c.Embeddings.MaxInputChars++ }},
+	} {
+		t.Run(change.name, func(t *testing.T) {
+			changed := cfg
+			change.apply(&changed)
+			_, err := vector.ResolveActiveForFingerprint(ctx, backend, changed.GenerationFingerprint())
+			require.ErrorIs(t, err, vector.ErrIndexStale)
+			_, _, err = pickEmbedGeneration(ctx, backend, embedGenerationOpts{Model: changed.Embeddings.Model, Dimension: 4, Fingerprint: changed.GenerationFingerprint(), Stderr: openStderrSink(t)})
+			require.ErrorIs(t, err, vector.ErrIndexStale)
+		})
+	}
 }

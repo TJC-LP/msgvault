@@ -40,6 +40,9 @@ argument is supplied. Guilds run sequentially in stable source order, and one
 guild failure does not prevent later guilds from running.`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if invocationFromContext(cmd.Context()) != nil && deps.bind != nil {
+				deps = deps.bind(cmd.Context())
+			}
 			selector := ""
 			if len(args) == 1 {
 				selector = args[0]
@@ -49,6 +52,7 @@ guild failure does not prevent later guilds from running.`,
 	}
 	cmd.Flags().BoolVar(&opts.Full, "full", false, "ignore stored cursors and re-fetch all available history")
 	cmd.Flags().StringVar(&opts.After, "after", "", "exclusive lower bound (YYYY-MM-DD or RFC3339)")
+	addManualSyncCacheFlags(cmd)
 	return cmd
 }
 

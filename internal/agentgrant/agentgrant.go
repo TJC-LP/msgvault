@@ -15,11 +15,23 @@ import (
 type Permission string
 
 const (
-	PermissionDraftCreate Permission = "draft.create"
+	PermissionDraftCreate       Permission = "draft.create"
+	PermissionDraftEdit         Permission = "draft.edit"
+	PermissionDraftDelete       Permission = "draft.delete"
+	PermissionCalendarRead      Permission = "calendar.read"
+	PermissionCalendarEventRead Permission = "calendar.event.read"
+	PermissionCalendarWrite     Permission = "calendar.write"
+	PermissionCalendarInvite    Permission = "calendar.invite"
 )
 
 var knownPermissions = map[string]Permission{
-	string(PermissionDraftCreate): PermissionDraftCreate,
+	string(PermissionDraftCreate):       PermissionDraftCreate,
+	string(PermissionDraftEdit):         PermissionDraftEdit,
+	string(PermissionDraftDelete):       PermissionDraftDelete,
+	string(PermissionCalendarRead):      PermissionCalendarRead,
+	string(PermissionCalendarEventRead): PermissionCalendarEventRead,
+	string(PermissionCalendarWrite):     PermissionCalendarWrite,
+	string(PermissionCalendarInvite):    PermissionCalendarInvite,
 }
 
 func KnownPermission(s string) (Permission, bool) {
@@ -34,6 +46,7 @@ type SourceRef struct {
 	ID         int64
 	Type       string
 	Identifier string
+	SenderKeys []string
 }
 
 type Grant struct {
@@ -44,9 +57,13 @@ type Grant struct {
 	CreatedAt   time.Time
 }
 
+func (g Grant) HasPermission(p Permission) bool {
+	return slices.Contains(g.Permissions, p)
+}
+
 // Allows returns true only when p is in the grant AND some SourceRef matches Type and Identifier.
 func (g Grant) Allows(p Permission, src SourceRef) bool {
-	if !slices.Contains(g.Permissions, p) {
+	if !g.HasPermission(p) {
 		return false
 	}
 	for _, s := range g.Sources {
@@ -55,6 +72,39 @@ func (g Grant) Allows(p Permission, src SourceRef) bool {
 		}
 	}
 	return false
+}
+
+// AllowsSender reports whether the grant permits one canonical sender on a
+// source. An empty SenderKeys set grants no sender authority.
+func (g Grant) AllowsSender(p Permission, src SourceRef, senderKey string) bool {
+	if senderKey == "" || !g.HasPermission(p) {
+		return false
+	}
+	for _, source := range g.Sources {
+		if source.Type == src.Type && source.Identifier == src.Identifier && slices.Contains(source.SenderKeys, senderKey) {
+			return true
+		}
+	}
+	return false
+}
+
+func cloneGrant(g Grant) Grant {
+	clone := Grant{
+		ID:          g.ID,
+		Label:       g.Label,
+		Permissions: append([]Permission(nil), g.Permissions...),
+		CreatedAt:   g.CreatedAt,
+		Sources:     make([]SourceRef, len(g.Sources)),
+	}
+	for i, source := range g.Sources {
+		clone.Sources[i] = SourceRef{
+			ID:         source.ID,
+			Type:       source.Type,
+			Identifier: source.Identifier,
+			SenderKeys: append([]string(nil), source.SenderKeys...),
+		}
+	}
+	return clone
 }
 
 const secretBytes = 32
@@ -136,10 +186,10 @@ func (r *Registry) Issue(label string, perms []Permission, sources []SourceRef) 
 	}
 
 	r.mu.Lock()
-	r.entries[id] = entry{digest: digest, grant: g}
+	r.entries[id] = entry{digest: digest, grant: cloneGrant(g)}
 	r.mu.Unlock()
 
-	return id, secretPlain, g, nil
+	return id, secretPlain, cloneGrant(g), nil
 }
 
 func (r *Registry) Lookup(secret string) (Grant, bool) {
@@ -150,14 +200,7 @@ func (r *Registry) Lookup(secret string) (Grant, bool) {
 
 	for _, e := range r.entries {
 		if subtle.ConstantTimeCompare(digest[:], e.digest[:]) == 1 {
-			g := e.grant
-			return Grant{
-				ID:          g.ID,
-				Label:       g.Label,
-				Permissions: append([]Permission(nil), g.Permissions...),
-				Sources:     append([]SourceRef(nil), g.Sources...),
-				CreatedAt:   g.CreatedAt,
-			}, true
+			return cloneGrant(e.grant), true
 		}
 	}
 	return Grant{}, false
@@ -168,14 +211,7 @@ func (r *Registry) List() []Grant {
 	defer r.mu.Unlock()
 	var out []Grant
 	for _, e := range r.entries {
-		g := e.grant
-		out = append(out, Grant{
-			ID:          g.ID,
-			Label:       g.Label,
-			Permissions: append([]Permission(nil), g.Permissions...),
-			Sources:     append([]SourceRef(nil), g.Sources...),
-			CreatedAt:   g.CreatedAt,
-		})
+		out = append(out, cloneGrant(e.grant))
 	}
 	return out
 }

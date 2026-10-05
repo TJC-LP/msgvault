@@ -462,18 +462,20 @@ type CLICacheBuildEvent struct {
 }
 
 type CLISyncRequest struct {
-	Full        bool
-	Email       string
-	SourceID    int64
-	SourceIDSet bool
-	Query       string
-	NoResume    bool
-	Before      string
-	After       string
-	Limit       int
-	OperationID string
-	Folders     []string
-	SkipFolders []string
+	Full         bool
+	BuildCache   bool
+	NoBuildCache bool
+	Email        string
+	SourceID     int64
+	SourceIDSet  bool
+	Query        string
+	NoResume     bool
+	Before       string
+	After        string
+	Limit        int
+	OperationID  string
+	Folders      []string
+	SkipFolders  []string
 }
 
 type CLISyncEvent struct {
@@ -528,6 +530,7 @@ type CLIAddCalendarPlanRequest struct {
 	OAuthApp         string `json:"oauth_app,omitempty"`
 	OAuthAppExplicit bool   `json:"oauth_app_explicit,omitzero"`
 	Headless         bool   `json:"headless,omitzero"`
+	Write            bool   `json:"write,omitzero"`
 }
 
 type CLIAddCalendarPlanResponse struct {
@@ -580,13 +583,13 @@ type CLIDeleteStagedPlanResponse struct {
 	ScopeEscalationHeadline   string   `json:"scope_escalation_headline,omitempty"`
 	ScopeEscalationBodyLines  []string `json:"scope_escalation_body_lines,omitempty"`
 	ScopeEscalationCancelHint string   `json:"scope_escalation_cancel_hint,omitempty"`
-	// ScopeEscalationAccount and ScopeEscalationOAuthApp let the frontend
-	// CLI run the confirmed scope-upgrade authorization client-side before
-	// proxying, instead of opening a browser in the daemon subprocess.
-	ScopeEscalationAccount  string `json:"scope_escalation_account,omitempty"`
-	ScopeEscalationOAuthApp string `json:"scope_escalation_oauth_app,omitempty"`
-	BlockedError            string `json:"blocked_error,omitempty"`
-	RemoteDeleteEnvVar      string `json:"remote_delete_env_var,omitempty"`
+	// ScopeEscalationAccount, ScopeEscalationSourceType and ScopeEscalationOAuthApp
+	// let the frontend CLI authorize before starting the daemon subprocess.
+	ScopeEscalationAccount    string `json:"scope_escalation_account,omitempty"`
+	ScopeEscalationSourceType string `json:"scope_escalation_source_type,omitempty"`
+	ScopeEscalationOAuthApp   string `json:"scope_escalation_oauth_app,omitempty"`
+	BlockedError              string `json:"blocked_error,omitempty"`
+	RemoteDeleteEnvVar        string `json:"remote_delete_env_var,omitempty"`
 }
 
 type CLIDeletionManifestResponse struct {
@@ -699,6 +702,16 @@ type CLIQueryMessageSummary query.MessageSummary
 
 type cliAccountsResponse struct {
 	Accounts []cliAccountResponse `json:"accounts"`
+	// Stale reports message counts served from an earlier snapshot because
+	// fresh counts did not finish in time; AsOf says when it was taken.
+	Stale bool      `json:"stale,omitempty"`
+	AsOf  time.Time `json:"as_of,omitzero"`
+}
+
+// sourceMessageCounter is implemented by stores that count every source's
+// messages in one pass.
+type sourceMessageCounter interface {
+	CountMessagesBySourceContext(ctx context.Context) (map[int64]store.SourceMessageCounts, error)
 }
 
 type cliCollectionsResponse struct {
@@ -1083,6 +1096,27 @@ func parseCLISyncRequest(r *http.Request, full bool) (CLISyncRequest, *apiHTTPEr
 		Before: values.Get("before"),
 		After:  values.Get("after"),
 	}
+	for _, flag := range []struct {
+		name  string
+		value *bool
+	}{
+		{name: "build-cache", value: &req.BuildCache},
+		{name: "no-build-cache", value: &req.NoBuildCache},
+	} {
+		if raw, present := values[flag.name]; present {
+			if len(raw) != 1 {
+				return CLISyncRequest{}, newAPIHTTPError(http.StatusBadRequest, "invalid_cache_flags", "Cache flags must appear once")
+			}
+			parsed, err := strconv.ParseBool(raw[0])
+			if err != nil {
+				return CLISyncRequest{}, newAPIHTTPError(http.StatusBadRequest, "invalid_cache_flags", "Cache flags must be booleans")
+			}
+			*flag.value = parsed
+		}
+	}
+	if req.BuildCache && req.NoBuildCache {
+		return CLISyncRequest{}, newAPIHTTPError(http.StatusBadRequest, "invalid_cache_flags", "--build-cache and --no-build-cache are mutually exclusive")
+	}
 	if rawSourceID, sourceIDSet := values["source_id"]; sourceIDSet {
 		if len(rawSourceID) != 1 {
 			return CLISyncRequest{}, newAPIHTTPError(
@@ -1310,7 +1344,7 @@ func (s *Server) handleCLIRun(w http.ResponseWriter, r *http.Request) {
 	}
 	auth := s.requestAuthentication(r)
 	if auth.Mode == AuthModeDelegated {
-		if !IsCLIRunDraftReply(req.Args) {
+		if !delegatedCLIRunAdmitted(req.Args, auth.Grant) {
 			writeError(w, http.StatusBadRequest, "command_not_allowed", "command is not allowed through the daemon CLI runner")
 			return
 		}
@@ -1353,7 +1387,7 @@ func (s *Server) handleCLIRun(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) cliRunEnvAllowedForCommand(args []string, name string) bool {
-	if IsCLIRunDraftReply(args) {
+	if IsCLIRunDraftCreate(args) || IsCLIRunDraftLifecycle(args) || IsCLIRunDraftSendAs(args) {
 		return false
 	}
 	if len(args) >= 3 && args[0] == cliRunPersonCommand {
@@ -1594,7 +1628,18 @@ func cliRunCommandAllowed(args []string) bool {
 	if len(args) == 0 {
 		return false
 	}
-	if IsCLIRunDraftReply(args) {
+	// Internal subprocess commands are callable only by their owning public
+	// command on the daemon host, never through the generic HTTP runner.
+	if len(args) > 1 && strings.HasPrefix(args[1], "__") {
+		return false
+	}
+	if IsCLIRunDraftCreate(args) {
+		return len(args) >= 2
+	}
+	if IsCLIRunDraftSendAs(args) {
+		return len(args) >= 2
+	}
+	if IsCLIRunDraftLifecycle(args) {
 		return len(args) >= 2
 	}
 	if args[0] == "backup" {
@@ -1647,9 +1692,11 @@ func cliRunCommandAllowed(args []string) bool {
 		"add-beeper",
 		"add-calendar",
 		"add-circleback",
+		"add-plaud",
 		"add-discord",
 		"add-granola",
 		"add-imap",
+		"add-muesli",
 		"add-notion-meetings",
 		"add-o365",
 		"add-slack",
@@ -1673,6 +1720,7 @@ func cliRunCommandAllowed(args []string) bool {
 		"import-eml",
 		"import-emlx",
 		"import-gvoice",
+		"import-imazing-csv",
 		"import-imessage",
 		"import-mbox",
 		"import-messenger",
@@ -1697,8 +1745,10 @@ func cliRunCommandAllowed(args []string) bool {
 		"sync-beeper",
 		"sync-calendar",
 		"sync-circleback",
+		"sync-plaud",
 		"sync-discord",
 		"sync-granola",
+		"sync-muesli",
 		"sync-notion-meetings",
 		"sync-slack",
 		"sync-synctech-sms",
@@ -1950,7 +2000,7 @@ func isLowerSHA256(value string) bool {
 func newCLINDJSONEventWriter[T any](w http.ResponseWriter) func(T) error {
 	w.Header().Set("Content-Type", "application/x-ndjson")
 	w.Header().Set("Cache-Control", "no-store")
-	enc := jsontext.NewEncoder(w)
+	enc := jsontext.NewEncoder(w, jsontext.AllowInvalidUTF8(true))
 	flusher, _ := w.(http.Flusher)
 	return func(event T) error {
 		if err := json.MarshalEncode(enc, event, json.Deterministic(true)); err != nil {
@@ -2526,8 +2576,28 @@ func (s *Server) handleCLIAccounts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var grouped map[int64]store.SourceMessageCounts
+	var response cliAccountsResponse
+	if counter, ok := s.store.(sourceMessageCounter); ok {
+		grouped, response.AsOf, response.Stale, err = s.accountCountSnapshots.get(
+			r.Context(), s.importContext, "", s.statsSnapshotWait, counter.CountMessagesBySourceContext,
+		)
+		if err != nil {
+			if s.writeIfContextError(w, err) {
+				return
+			}
+			s.logger.Error("failed to count CLI account messages", "error", err)
+			writeError(w, http.StatusInternalServerError, "internal_error", "Failed to list accounts")
+			return
+		}
+	}
+
 	accounts := make([]cliAccountResponse, 0, len(sources))
 	for _, src := range sources {
+		if grouped != nil {
+			accounts = append(accounts, newCLIAccountResponse(src, grouped[src.ID].Live, grouped[src.ID].SourceDeleted))
+			continue
+		}
 		count, err := cliStore.CountMessagesForSource(src.ID)
 		if err != nil {
 			s.logger.Error("failed to count CLI account messages",
@@ -2546,27 +2616,32 @@ func (s *Server) handleCLIAccounts(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, "internal_error", "Failed to list accounts")
 			return
 		}
-		account := cliAccountResponse{
-			ID:                 src.ID,
-			Email:              src.Identifier,
-			Type:               src.SourceType,
-			MessageCount:       count,
-			SourceDeletedCount: sourceDeleted,
-		}
-		if src.DisplayName.Valid {
-			account.DisplayName = src.DisplayName.String
-		}
-		if src.OAuthApp.Valid {
-			account.OAuthApp = src.OAuthApp.String
-		}
-		if src.LastSyncAt.Valid {
-			lastSync := src.LastSyncAt.Time.UTC()
-			account.LastSync = &lastSync
-		}
-		accounts = append(accounts, account)
+		accounts = append(accounts, newCLIAccountResponse(src, count, sourceDeleted))
 	}
 
-	writeJSON(w, http.StatusOK, cliAccountsResponse{Accounts: accounts})
+	response.Accounts = accounts
+	writeJSON(w, http.StatusOK, response)
+}
+
+func newCLIAccountResponse(src *store.Source, count, sourceDeleted int64) cliAccountResponse {
+	account := cliAccountResponse{
+		ID:                 src.ID,
+		Email:              src.Identifier,
+		Type:               src.SourceType,
+		MessageCount:       count,
+		SourceDeletedCount: sourceDeleted,
+	}
+	if src.DisplayName.Valid {
+		account.DisplayName = src.DisplayName.String
+	}
+	if src.OAuthApp.Valid {
+		account.OAuthApp = src.OAuthApp.String
+	}
+	if src.LastSyncAt.Valid {
+		lastSync := src.LastSyncAt.Time.UTC()
+		account.LastSync = &lastSync
+	}
+	return account
 }
 
 func (s *Server) updateCLIAccount(
@@ -2948,47 +3023,16 @@ func (s *Server) handleCLIIdentityDiscover(w http.ResponseWriter, r *http.Reques
 			))
 			return
 		}
-		configured, configErr := s.cfg.FastmailSourceFor(cliStore, source.ID)
-		if configErr != nil {
-			wrappedConfigErr := fmt.Errorf("resolve [[fastmail]] configuration for source %d: %w", source.ID, configErr)
-			classifiedConfigErr := opserr.Invalid(wrappedConfigErr)
-			if errors.Is(configErr, config.ErrFastmailSourceLookup) {
-				classifiedConfigErr = opserr.Internal(wrappedConfigErr)
+		externalEvidence, resolveErr = s.discoverProviderIdentityEvidence(r.Context(), cliStore, source)
+		if resolveErr != nil {
+			if s.writeIfContextError(w, resolveErr) {
+				return
 			}
 			writeAPIHTTPError(w, s.operationError(
-				classifiedConfigErr,
-				identityOperationErrorPolicy,
-				"Failed to discover identities",
+				resolveErr, identityOperationErrorPolicy, "Failed to discover identities",
 			))
 			return
 		}
-		if configured == nil {
-			account := source.Identifier
-			if source.DisplayName.Valid && strings.TrimSpace(source.DisplayName.String) != "" {
-				account = strings.TrimSpace(source.DisplayName.String)
-			}
-			writeAPIHTTPError(w, s.operationError(
-				opserr.Invalid(fmt.Errorf(
-					"source %d (%s) has no matching [[fastmail]] configuration",
-					source.ID,
-					account,
-				)),
-				identityOperationErrorPolicy,
-				"Failed to discover identities",
-			))
-			return
-		}
-		inventory := s.fastmailInventoryFactory(configured.APIToken)
-		records, inventoryErr := inventory.ListIdentityRecords(r.Context())
-		if inventoryErr != nil {
-			writeAPIHTTPError(w, s.operationError(
-				opserr.Internal(fmt.Errorf("fastmail identity inventory request failed: %w", inventoryErr)),
-				identityOperationErrorPolicy,
-				"Failed to discover identities",
-			))
-			return
-		}
-		externalEvidence = provideridentity.Evidence(records)
 		req.SourceSelector = identityops.SourceSelector{SourceID: source.ID}
 	}
 
@@ -3030,6 +3074,57 @@ func (s *Server) handleCLIIdentityDiscover(w http.ResponseWriter, r *http.Reques
 	if err := writeEvent(identityops.DiscoverEvent{Type: "result", Result: &result}); err != nil {
 		s.logger.Error("failed to stream CLI identity discovery result", "error", err)
 	}
+}
+
+// discoverProviderIdentityEvidence reads evidence from the selected source's provider.
+func (s *Server) discoverProviderIdentityEvidence(
+	ctx context.Context, cliStore CLIStore, source *store.Source,
+) ([]identityops.ExternalEvidence, error) {
+	if source.SourceType == "gmail" {
+		if s.gmailProfileAddress == nil {
+			return nil, opserr.Invalid(errors.New(
+				"authenticated Gmail profile discovery is unavailable on this daemon",
+			))
+		}
+		address, err := s.gmailProfileAddress(ctx, source)
+		if err != nil {
+			if credentialErr, ok := errors.AsType[*provideridentity.GmailCredentialError](err); ok {
+				if remediation := credentialErr.Remediation(); remediation != "" {
+					return nil, opserr.Invalid(errors.New(remediation))
+				}
+			}
+			return nil, opserr.Internal(fmt.Errorf("authenticated Gmail profile discovery failed: %w", err))
+		}
+		evidence, err := provideridentity.GmailProfileEvidence(source, address)
+		if err != nil {
+			return nil, opserr.Invalid(err)
+		}
+		return evidence, nil
+	}
+
+	configured, err := s.cfg.FastmailSourceFor(cliStore, source.ID)
+	if err != nil {
+		wrapped := fmt.Errorf("resolve [[fastmail]] configuration for source %d: %w", source.ID, err)
+		if errors.Is(err, config.ErrFastmailSourceLookup) {
+			return nil, opserr.Internal(wrapped)
+		}
+		return nil, opserr.Invalid(wrapped)
+	}
+	if configured == nil {
+		account := source.Identifier
+		if source.DisplayName.Valid && strings.TrimSpace(source.DisplayName.String) != "" {
+			account = strings.TrimSpace(source.DisplayName.String)
+		}
+		return nil, opserr.Invalid(fmt.Errorf(
+			"source %d (%s) has no matching [[fastmail]] configuration", source.ID, account,
+		))
+	}
+	inventory := s.fastmailInventoryFactory(configured.APIToken)
+	records, err := inventory.ListIdentityRecords(ctx)
+	if err != nil {
+		return nil, opserr.Internal(fmt.Errorf("fastmail identity inventory request failed: %w", err))
+	}
+	return provideridentity.Evidence(records), nil
 }
 
 func identityDiscoveryTerminalError(err error) identityops.DiscoverError {

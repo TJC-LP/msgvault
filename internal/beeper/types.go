@@ -93,6 +93,8 @@ type Chat struct {
 	Type         string           `json:"type"` // "single" | "group"
 	Participants ChatParticipants `json:"participants"`
 	LastActivity time.Time        `json:"lastActivity"`
+	// Draft is the composer draft as sent: absent, null, or an object.
+	Draft jsontext.Value `json:"draft"`
 }
 
 // Reaction is one participant's reaction to a message.
@@ -106,6 +108,7 @@ type Reaction struct {
 // Transcription is an attachment transcription (voice notes).
 type Transcription struct {
 	Transcription string `json:"transcription"`
+	Language      string `json:"language"`
 }
 
 // Attachment is a media attachment on a message. The id is typically an
@@ -214,10 +217,31 @@ type ImportOptions struct {
 	// Progress, if non-nil, is called after each chat with a human-readable
 	// status line. Safe to leave nil (silent mode).
 	Progress func(msg string) `json:"-"`
+	// ShouldStop, if non-nil, is polled during chat enumeration and at message
+	// page boundaries in backfill, incremental, reconciliation, and tail-probe
+	// walks. Once it reports true the run stops at that boundary, checkpoints
+	// its cursors, keeps unvisited chats discoverable, and completes normally so
+	// the next run resumes. Scheduled runs use it for their time budget and to
+	// yield to queued work.
+	ShouldStop func() bool `json:"-"`
+	// StopAt bounds each provider request for scheduled imports. The parent
+	// import context remains live so a spent budget completes as resumable work.
+	StopAt time.Time `json:"-"`
+	// Scheduled keeps a source's re-anchor marker in place after verification;
+	// only a successful manual verification may clear that operator-visible
+	// marker.
+	Scheduled bool `json:"-"`
+}
+
+func (o ImportOptions) stopRequested() bool {
+	return (!o.StopAt.IsZero() && !time.Now().Before(o.StopAt)) || (o.ShouldStop != nil && o.ShouldStop())
 }
 
 type ImportSummary struct {
-	Duration          time.Duration
+	Duration time.Duration
+	// Stopped reports that ShouldStop ended the run before every chat was
+	// visited; the remaining work resumes on the next run.
+	Stopped           bool
 	SourceID          int64
 	ChatsProcessed    int64
 	MessagesProcessed int64
@@ -255,6 +279,9 @@ type ImportSummary struct {
 	AttachmentsDownloaded int64
 	AttachmentsPending    int64
 	AttachmentsSkipped    int64
+	// AttachmentsUnavailable counts media the source reported as permanently
+	// gone (e.g. expired WhatsApp media). Their markers are terminal.
+	AttachmentsUnavailable int64
 	// AttachmentsOverCap is the size-specific subset of AttachmentsSkipped.
 	// AttachmentsOverCapBytes saturates while summing declared sizes or the
 	// minimum observed streamed size. AttachmentsOverCapUnknownSize is nonzero

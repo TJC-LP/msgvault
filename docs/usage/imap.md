@@ -5,7 +5,7 @@ description: Archive IMAP mail efficiently, choose folders, and repair stored la
 ---
 
 Archive mail from an IMAP account, then keep it current without downloading
-unchanged messages again. Start with [IMAP account setup](/docs/setup/#add-an-imap-account)
+unchanged messages again. Start with [IMAP account setup](../setup.md#add-an-imap-account)
 if you have not connected the account yet.
 
 ```bash
@@ -179,11 +179,12 @@ msgvault sync-full you@example.com --noresume
 Leave out folder filters for a complete account scan. `repair-labels` cannot
 recover memberships that the archive has never observed.
 
-## Reply drafts
+## Drafts
 
-Create a reply in your IMAP Drafts folder, then review and send it from your
-usual mail application. Msgvault never sends email. Draft creation is disabled
-until an operator grants it for one exact IMAP source on the daemon host.
+Create a fresh message or a reply in your IMAP Drafts folder, then review and
+send it from your usual mail application. Msgvault never sends email. Draft
+creation is disabled until an operator grants it for one exact IMAP source on
+the daemon host.
 
 1. Run `msgvault list-accounts` to find the source ID. Confirm the Drafts
     folder's exact name with `msgvault list-folders <account>`.
@@ -214,18 +215,36 @@ until an operator grants it for one exact IMAP source on the daemon host.
     If your address is missing, confirm it with
     `msgvault identity add --source-id 42 you@example.com`.
 
-1. Find the parent email's local message ID with search, then create the draft:
+1. Find the parent email's local message ID with search, then create a reply:
 
     ```bash
-    msgvault draft-reply 123 --from you@example.com \
+    msgvault draft-reply 123 --all --from you@example.com \
       --body 'Thanks for the update. I will review it tomorrow.' --json
     ```
 
-The parent must belong to the granted IMAP source and have its original email
-stored in the archive. Msgvault composes a plain-text reply using the parent's
-threading headers. `--from` must be a confirmed identity for that source, and
-`--body` is required; `--body=` creates an empty draft. The IMAP server must
-support UIDPLUS, which returns a receipt that identifies the stored draft.
+    Omit `--all` for a direct reply. Use `--account <account>` or
+    `--source-id <id>` to select a different live IMAP destination. An offline
+    parent requires one of those selectors.
+
+1. Create a new message by selecting its live source and repeating recipient
+    flags as needed:
+
+    ```bash
+    msgvault draft-compose --source-id 42 --from you@example.com \
+      --to recipient@example.com --cc copy@example.com \
+      --bcc private@example.com --subject 'Project update' --body 'Draft text'
+    ```
+
+The parent must have its original email stored in the archive. Reply-all uses
+Reply-To or From, then visible To and Cc recipients. It removes confirmed
+identities for the selected destination and never reads a parent's Bcc as a
+reply recipient. `--from` must be a confirmed identity for that source, and it
+can be omitted when one eligible identity remains. The IMAP server must support
+UIDPLUS, which returns a receipt that identifies the stored draft.
+
+For delegated callers, the token freezes the allowed sender identities when an
+owner issues it. A draft From header is a local choice and does not prove
+provider send-as permission.
 
 A successful result reports `status: "created"`, the archived `message_id`, and
 the remote mailbox receipt. The draft is marked `\Draft` and stored locally with
@@ -244,6 +263,130 @@ outcome to decide what to do next:
 | `append_rejected`                           | Check that the configured folder exists and permits writes.                                                                                          |
 | `remote_unknown` or `accepted_unidentified` | Inspect the Drafts folder before retrying; the draft may already exist.                                                                              |
 | `remote_accepted_local_failed`              | The server accepted the draft, but the local save failed. Use the reported `operation_ref` and mailbox receipt to inspect it before another request. |
+
+## Manage a created draft
+
+The creation result includes an opaque `draft_id` and revision `1`. Read the
+archived draft and its current revision through the daemon:
+
+```bash
+msgvault draft-get <draft-id> --json
+```
+
+`draft-get` never connects to IMAP or changes pending operations. It also reads
+discarded drafts and works when the source's draft mutation grant is disabled
+or its provider configuration is unavailable.
+
+### Edit or delete the provider draft
+
+Use the current revision from `draft-get` or the last successful operation:
+
+```bash
+msgvault draft-edit <draft-id> --revision 1 --body 'Updated text' --json
+msgvault draft-delete <draft-id> --revision 2 --json
+msgvault draft-recover <draft-id> --revision 1 --json
+```
+
+Edit and delete require the same daemon-host `[[imap.drafts]]` grant and provider
+configuration as draft creation. Policy changes take effect after a daemon
+restart. Recovery uses the same policy after it checks the delegated action
+grant. None of these commands sends mail.
+
+Editing supports plain-text drafts without attachments. `--body=` sets an empty
+body. The edit preserves the From, To, Cc, Bcc, Reply-To, Subject, In-Reply-To, and
+References headers. Msgvault appends one replacement, records the new revision,
+removes the exact old UID, and confirms that it is absent.
+
+Delete removes the exact provider draft and marks the managed draft
+`discarded` after confirming its absence. The local archived content remains
+readable with `draft-get`; ordinary archive garbage collection retains it.
+A discarded draft cannot be edited. Repeating delete with its current revision
+returns `already_discarded`.
+
+### Provider checks before a change
+
+Msgvault refuses stale revisions, UIDVALIDITY changes, external moves, a missing
+`\Draft` flag, an existing `\Deleted` flag, or missing UIDPLUS before writing.
+Edits also reject multipart drafts. An active source sync returns `sync_active`;
+retry after it finishes.
+
+When the mailbox supplies CONDSTORE metadata, msgvault uses the exact UID's
+positive MODSEQ to guard its singleton `UID STORE`, then verifies that UID's
+flags. If the server does not advertise CONDSTORE, msgvault runs a fresh `SELECT`
+and exact-UID `FETCH` immediately before the nonconditional `UID STORE`.
+When CONDSTORE is advertised, missing or zero mailbox or message MODSEQ metadata
+refuses the change before writing with `modseq_unusable`. This also applies to
+`NOMODSEQ` mailboxes: the current IMAP parser cannot distinguish that response
+from missing metadata.
+
+Every removal path checks the mailbox generation and requires both `\Draft` and
+`\Deleted` again before `UID EXPUNGE`, then confirms exact-UID absence.
+`UID EXPUNGE` itself is not conditional, so another client can still change flags
+after the last check.
+
+### Recover an interrupted edit or delete
+
+Recovery uses only the original receipt and a replacement receipt already saved
+on the managed draft row. It checks the requested revision, source type and
+identifier, mailbox UIDVALIDITY, exact UID, and current draft flags before it
+publishes or removes anything. A pending edit without a known replacement
+returns `unknown_replacement` without opening an IMAP connection.
+
+```bash
+msgvault draft-recover <draft-id> --revision 1 --json
+```
+
+If another client already removed the exact original UID, recovery records that
+absence and finishes the Store transition locally. A known unpublished
+replacement is published from its saved bytes, then the original is removed
+with the existing conditional `UID STORE` and `UID EXPUNGE` sequence. Recovery
+never searches a mailbox, adopts a moved copy, calls APPEND, or rolls back a
+publication. Once a replacement is published locally, cleanup of the original
+can finish even if another client has since sent or deleted the replacement.
+Only an unpublished replacement must still be a live draft.
+
+`draft.edit` authorizes active and pending edits. `draft.delete` authorizes
+discarded and pending deletes. A delegated token must also name the exact source
+type and identifier. Wrong actions, sources, or revisions return before draft
+content, policy errors, locks, or provider work are disclosed.
+
+If the original already has `\Deleted`, recovery returns `already_deleted`
+without a provider write. This includes removal interrupted after `UID STORE`
+succeeded. Repeating recovery cannot clear that state: use an IMAP client to
+expunge the exact original UID in the recorded mailbox and UIDVALIDITY, then run
+`draft-recover` with the revision from the recovery output or `draft-get`.
+Recovery may have published a replacement locally and advanced the revision
+before cleanup was refused. For a published edit, remove the original
+copy, not the replacement. Check the receipt before expunging; do not purge all
+deleted messages in the mailbox. Saved cancellation evidence does not establish
+who set the flag, so automatic removal of an already-deleted UID is outside this
+command's scope.
+
+If cleanup fails after publication, the new revision and pending evidence stay
+saved. Recovery can retry when the original is still an undeleted draft or is
+confirmed absent; an already-deleted original needs the manual step above.
+A generation or SELECT refusal before `UID STORE` leaves the pending code,
+receipts, timestamp, and revision unchanged. Output keeps the saved
+`pending_code`. Refused results use `refusal_code`; pending cleanup results use
+`observation.code` for the current provider result.
+
+### If an edit or delete does not finish
+
+- A delete failure before any remote write clears the pending claim. After
+  resolving the reported problem, retry with the same revision.
+- An uncertain APPEND or removal returns a nonzero result with the saved
+  candidate and available receipt evidence. The operation stays pending and
+  blocks further changes. Inspect the provider state before any manual
+  reconciliation; general recovery for uncertain writes is not available.
+- If `draft-get <draft-id> --json` reports `pending_code: "removed"`, removal was
+  confirmed and saved, but local completion is still pending. `draft-recover` is
+  the preferred local completion route. Run it with the revision from that
+  read; it finishes locally without another remote write. You can also repeat
+  the matching `draft-edit` or `draft-delete` command with that revision. The
+  source policy still applies. For an edit, `--body` must match the already
+  published replacement after MIME normalization. A `removed` observation in
+  an error response alone is not enough;
+  `draft-get` must report the saved pending code.
 
 ## Keep edited outgoing mail current
 

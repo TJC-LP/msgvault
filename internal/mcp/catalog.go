@@ -4,11 +4,14 @@ import (
 	"context"
 	"encoding/json/jsontext"
 	"encoding/json/v2"
+	"fmt"
 	"slices"
 	"sort"
+	"sync"
 
 	"github.com/google/jsonschema-go/jsonschema"
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
+	"go.kenn.io/msgvault/internal/daemonclient"
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/vector/visual"
@@ -16,6 +19,7 @@ import (
 )
 
 const (
+	schemaTypeArray    = "array"
 	schema202012       = "https://json-schema.org/draft/2020-12/schema"
 	maxJSONSafeInteger = float64(9007199254740991)
 )
@@ -26,9 +30,15 @@ const (
 	toolSecurityRead toolSecurityClass = iota
 	toolSecurityWrite
 	toolSecurityProfileWrite
+	toolSecurityIdentityDecision
+	toolSecurityIdentityScoring
+	toolSecurityPersonMerge
+	toolSecurityCardDAVWrite
+	toolSecurityCalendarWrite
 )
 
 type catalogCapabilities struct {
+	sqlQuery        bool
 	semanticSearch  bool
 	vectorInMessage bool
 	similarMessages bool
@@ -37,6 +47,10 @@ type catalogCapabilities struct {
 	directoryPeople bool
 	visualSearch    bool
 	savedViews      bool
+	meetings        bool
+	personAgenda    bool
+	identityReview  bool
+	personCardDAV   bool
 }
 
 func visualSearchAvailable(capabilities catalogCapabilities) bool {
@@ -57,7 +71,7 @@ func searchVisualAttachmentsDefinition() toolDefinition {
 			toolArgPersonID:      safeIDSchema("Only attachments related to this durable person ID"),
 			toolArgParticipantID: safeIDSchema("Only attachments related to this observed participant, translated through its durable person when bound"),
 			"directions": {
-				Type: "array", Description: "Optional union of from_person, to_person, and group; requires a person reference",
+				Type: schemaTypeArray, Description: "Optional union of from_person, to_person, and group; requires a person reference",
 				Items: direction,
 			},
 			"source_id":      safeIDSchema("Only attachments from this source ID"),
@@ -106,6 +120,7 @@ func (d toolDefinition) bind(h *handlers) func(context.Context, toolRequest) (*t
 
 func capabilitiesFor(opts ServeOptions) catalogCapabilities {
 	return catalogCapabilities{
+		sqlQuery:        opts.ArchiveSQLQuerier != nil,
 		semanticSearch:  opts.HybridEngine != nil || opts.HybridSearcher != nil,
 		vectorInMessage: opts.HybridEngine != nil && opts.Backend != nil,
 		similarMessages: opts.Backend != nil || opts.SimilarSearcher != nil,
@@ -114,36 +129,50 @@ func capabilitiesFor(opts ServeOptions) catalogCapabilities {
 		directoryPeople: opts.DirectoryBackend != nil,
 		visualSearch:    opts.VisualSearcher != nil,
 		savedViews:      opts.SavedViews != nil,
+		meetings:        opts.Meetings != nil,
+		personAgenda:    opts.PersonAgendaBackend != nil,
+		identityReview:  opts.IdentityReview != nil,
+		personCardDAV:   opts.PersonCardDAV != nil,
 	}
 }
 
 // stableOperationCatalogs owns the immutable schemas registered with the SDK.
-// The SDK v1.7 schema cache keys explicit schemas by pointer identity, so a
-// stateless server must reuse these roots instead of rebuilding them per HTTP
-// request. There are only 256 possible capability keys, which also keeps
-// the shared SDK cache boundary fixed.
-var stableOperationCatalogs = buildOperationCatalogs()
+// The SDK schema cache keys explicit schemas by pointer identity, so reuse the
+// catalog roots for capabilities that are actually served. Build each catalog
+// only when used so unused combinations do not delay startup or retain schemas.
+var stableOperationCatalogs operationCatalogCache
 
-func buildOperationCatalogs() map[catalogCapabilities][]toolDefinition {
-	catalogs := make(map[catalogCapabilities][]toolDefinition, 256)
-	for mask := range 256 {
-		capabilities := catalogCapabilities{
-			directoryPeople: mask&0b10000000 != 0,
-			semanticSearch:  mask&0b01000000 != 0,
-			vectorInMessage: mask&0b00100000 != 0,
-			similarMessages: mask&0b00010000 != 0,
-			documentSearch:  mask&0b00001000 != 0,
-			people:          mask&0b00000100 != 0,
-			visualSearch:    mask&0b00000010 != 0,
-			savedViews:      mask&0b00000001 != 0,
+type operationCatalogCache struct {
+	catalogs sync.Map // map[catalogCapabilities][]toolDefinition
+}
+
+func (c *operationCatalogCache) get(capabilities catalogCapabilities) []toolDefinition {
+	if definitions, ok := c.catalogs.Load(capabilities); ok {
+		if cached, ok := definitions.([]toolDefinition); ok {
+			return cached
 		}
-		catalogs[capabilities] = buildOperationCatalog(capabilities)
 	}
-	return catalogs
+	definitions := buildOperationCatalog(capabilities)
+	actual, _ := c.catalogs.LoadOrStore(capabilities, definitions)
+	if cached, ok := actual.([]toolDefinition); ok {
+		return cached
+	}
+	return definitions
 }
 
 func operationCatalog(opts ServeOptions, _ *handlers) []toolDefinition {
-	return slices.Clone(stableOperationCatalogs[capabilitiesFor(opts)])
+	definitions := []toolDefinition{}
+	if !opts.CalendarOnly {
+		definitions = slices.Clone(stableOperationCatalogs.get(capabilitiesFor(opts)))
+		if opts.IdentityScoring != nil {
+			definitions = append(definitions, stableIdentityScoringDefinitions...)
+		}
+	}
+	if opts.Calendar != nil {
+		definitions = append(definitions, stableCalendarTools()...)
+	}
+	sort.Slice(definitions, func(i, j int) bool { return definitions[i].name < definitions[j].name })
+	return definitions
 }
 
 func buildOperationCatalog(capabilities catalogCapabilities) []toolDefinition {
@@ -152,17 +181,30 @@ func buildOperationCatalog(capabilities catalogCapabilities) []toolDefinition {
 		createSavedViewDefinition(nil),
 		deleteSavedViewDefinition(nil),
 		exportAttachmentDefinition(nil),
+		exportEMLDefinition(),
 		findSimilarMessagesDefinition(nil),
 		getAttachmentDefinition(nil),
 		getMessageDefinition(nil),
+		getIdentityMatchDefinition(),
+		getPersonMergeContextDefinition(),
+		getCardDAVPublicationDefinition(),
+		previewCardDAVPublicationDefinition(),
+		getCardDAVSyncStatusDefinition(),
+		getMeetingContextDefinition(nil),
+		getMeetingMetricsDefinition(nil),
 		getPersonNotesDefinition(nil),
 		getPersonProfileDefinition(nil),
 		getPersonRelationshipDefinition(nil),
+		getPersonAgendaDefinition(),
 		getSavedViewDefinition(nil),
 		getStatsDefinition(nil),
 		listMessagesDefinition(nil),
+		listThreadDefinition(),
+		listIdentityMatchesDefinition(),
+		listMeetingActionItemsDefinition(nil),
 		listDirectoryPeopleDefinition(nil),
 		listSavedViewsDefinition(nil),
+		querySQLDefinition(),
 		runSavedViewDefinition(nil),
 		searchByDomainsDefinition(nil),
 		searchDocumentsDefinition(nil),
@@ -176,6 +218,11 @@ func buildOperationCatalog(capabilities catalogCapabilities) []toolDefinition {
 		semanticSearchMessagesDefinition(nil, capabilities.semanticSearch),
 		stageDeletionDefinition(nil),
 		promotePersonDefinition(nil),
+		acceptIdentityMatchDefinition(),
+		mergePersonDefinition(),
+		approveCardDAVPublicationDefinition(),
+		syncCardDAVDefinition(),
+		rejectIdentityMatchDefinition(),
 		updatePersonNotesDefinition(nil),
 		updateSavedViewDefinition(nil),
 	}
@@ -190,6 +237,25 @@ func buildOperationCatalog(capabilities catalogCapabilities) []toolDefinition {
 		return available[i].name < available[j].name
 	})
 	return available
+}
+
+func querySQLDefinition() toolDefinition {
+	result := outputSchemaFor[query.QueryResult]()
+	result.Schema = ""
+	accepted := outputSchemaFor[daemonclient.CacheBuildAccepted]()
+	accepted.Schema = ""
+	definition := readDefinition(
+		ToolQuerySQL,
+		"Run read-only SQL against the analytics cache. Files outside the cache and network access are unavailable. Set fresh to request a coalesced background refresh; an accepted build returns a job ID instead of rows.",
+		closedObject(map[string]*jsonschema.Schema{
+			"sql":   stringSchema("One read-only SQL statement"),
+			"fresh": booleanSchema("Request a background cache check including writes committed before this request"),
+		}, "sql"),
+		&jsonschema.Schema{Schema: schema202012, Type: "object", OneOf: []*jsonschema.Schema{result, accepted}},
+		(*handlers).querySQL,
+	)
+	definition.availability = func(capabilities catalogCapabilities) bool { return capabilities.sqlQuery }
+	return definition
 }
 
 func readDefinition(
@@ -247,6 +313,17 @@ func destructiveWriteDefinition(
 	return definition
 }
 
+func explicitlyConfirmedWriteDefinition(
+	name, description string,
+	inputSchema, outputSchema *jsonschema.Schema,
+	handler catalogToolHandler,
+	security toolSecurityClass,
+) toolDefinition {
+	definition := destructiveWriteDefinition(name, description, inputSchema, outputSchema, handler)
+	definition.security = security
+	return definition
+}
+
 func alwaysAvailable(catalogCapabilities) bool { return true }
 
 func similarMessagesAvailable(c catalogCapabilities) bool { return c.similarMessages }
@@ -258,6 +335,10 @@ func peopleAvailable(c catalogCapabilities) bool { return c.people }
 func directoryPeopleAvailable(c catalogCapabilities) bool { return c.directoryPeople }
 
 func savedViewsAvailable(c catalogCapabilities) bool { return c.savedViews }
+
+func meetingsAvailable(c catalogCapabilities) bool { return c.meetings }
+
+func personAgendaAvailable(c catalogCapabilities) bool { return c.personAgenda }
 
 func toolAnnotations(readOnly bool) *sdkmcp.ToolAnnotations {
 	falseValue := false
@@ -542,12 +623,83 @@ func getMessageDefinition(_ *handlers) toolDefinition {
 	)
 }
 
+func chunkInputSchemas(object string) (offset, length *jsonschema.Schema) {
+	offset = nonNegativeIntegerSchema("Byte offset of the "+object+" to start this chunk at (default 0). Request offset += length until complete is true.", 0)
+	length = boundedIntegerSchema(fmt.Sprintf("Maximum bytes in this chunk (1-%d, default %d)", maxChunkBytes, defaultChunkBytes), 1, maxChunkBytes)
+	length.Default = jsontext.Value(defaultValueString(defaultChunkBytes))
+	return offset, length
+}
+
+const chunkDownloadDescription = " Start at offset 0, then pass the returned sha256 with every nonzero offset and keep the same identifier and account. " +
+	"Downloads retain a snapshot for 5 minutes, with at most 8 snapshots and 256 MiB total per server (256 MiB per object). " +
+	"If the snapshot expires or is evicted, restart at offset 0 without sha256."
+
+func exportEMLDefinition() toolDefinition {
+	offset, length := chunkInputSchemas("message")
+	return readDefinition(
+		ToolExportEML,
+		"Export one archived email as its original .eml bytes, exactly as the provider delivered them, in base64 chunks. "+
+			"Pass exactly one of id (msgvault message ID) or source_message_id (provider ID, such as a Gmail message ID); "+
+			"add account when a provider ID exists in more than one account. "+
+			"Call from offset 0, then offset += length until complete is true; concatenate the decoded chunks and verify them against size and sha256 (of the whole message). "+
+			"last_sync_at is the account's latest sync activity: provider messages newer than it may not be archived yet. "+
+			"Messages without stored original MIME (chat and calendar sources, some imports) return raw_mime_unavailable. "+
+			"Gmail, IMAP (including Outlook over IMAP), and mbox/eml/emlx/maildir imports hold the bytes msgvault received; "+
+			"PST imports hold MIME rebuilt from Outlook data (source_type pst)."+chunkDownloadDescription,
+		closedObject(map[string]*jsonschema.Schema{
+			"id":               safeIDSchema("msgvault message ID"),
+			toolArgSourceMsgID: stringSchema("Provider message ID"),
+			toolArgAccount:     stringSchema("Account identifier (email address) that narrows a source_message_id lookup"),
+			toolArgOffset:      offset,
+			toolArgLength:      length,
+			"sha256":           stringSchema("Whole-object sha256 returned by the first chunk; required for offset greater than zero"),
+		}),
+		outputSchemaFor[exportEMLResponse](),
+		(*handlers).exportEML,
+	)
+}
+
+func listThreadDefinition() toolDefinition {
+	limit := boundedIntegerSchema(fmt.Sprintf("Messages per page (1-%d, default %d)", query.ThreadMaxLimit, query.ThreadDefaultLimit), 1, query.ThreadMaxLimit)
+	limit.Default = jsontext.Value(defaultValueString(query.ThreadDefaultLimit))
+	return readDefinition(
+		ToolListThread,
+		"List visible archived messages in one conversation in chronological order (sent_at, undated last, then id). "+
+			"Pass exactly one of id or source_message_id (any message in the thread) or thread_id (provider conversation ID, such as a Gmail threadId); "+
+			"add account when a provider ID exists in more than one account. "+
+			"Page with offset until has_more is false; total counts the whole conversation. "+
+			"has_raw marks messages whose original .eml can be fetched with export_eml. "+
+			"Messages deleted from the provider stay listed with deleted_from_source_at. "+
+			"last_sync_at is the account's latest sync activity: newer replies may not be archived yet. "+
+			"Hidden duplicates are excluded; last_sync_at does not establish conversation completeness.",
+		closedObject(map[string]*jsonschema.Schema{
+			"id":               safeIDSchema("msgvault ID of any message in the conversation"),
+			toolArgSourceMsgID: stringSchema("Provider ID of any message in the conversation"),
+			toolArgThreadID:    stringSchema("Provider conversation ID"),
+			toolArgAccount:     stringSchema("Account identifier (email address) that narrows a provider-ID lookup"),
+			toolArgOffset:      nonNegativeIntegerSchema("Messages to skip (default 0)", 0),
+			toolArgLimit:       limit,
+		}),
+		outputSchemaFor[query.ThreadPage](),
+		(*handlers).listThread,
+	)
+}
+
 func getAttachmentDefinition(_ *handlers) toolDefinition {
+	// No defaults here: the SDK applies schema defaults to arguments, and
+	// either argument being present selects chunk mode.
+	offset, length := chunkInputSchemas("attachment")
+	offset.Default, length.Default = nil, nil
 	return readDefinition(
 		ToolGetAttachment,
-		"Get attachment content by attachment ID. Returns metadata as text and the file content as an embedded resource blob. Use get_message first to find attachment IDs.",
+		"Get attachment content by attachment ID. Returns metadata as text and the file content as an embedded resource blob. Use get_message first to find attachment IDs. "+
+			"Pass offset or length to download in base64 chunks instead (no embedded resource): call from offset 0, then offset += length until complete is true, "+
+			"and verify the decoded concatenation against size and sha256. Full embedded responses are limited to 50 MiB."+chunkDownloadDescription,
 		closedObject(map[string]*jsonschema.Schema{
 			toolArgAttachmentID: safeIDSchema("Attachment ID (from get_message response)"),
+			toolArgOffset:       offset,
+			toolArgLength:       length,
+			"sha256":            stringSchema("Whole-object sha256 returned by the first chunk; required for offset greater than zero"),
 		}, toolArgAttachmentID),
 		outputSchemaFor[getAttachmentResponse](),
 		(*handlers).getAttachment,
@@ -718,11 +870,11 @@ func searchDocumentsDefinition(_ *handlers) toolDefinition {
 		closedObject(map[string]*jsonschema.Schema{
 			toolArgQuery: stringSchema("Document content or filename query; terms are ANDed"),
 			"source_ids": {
-				Type: "array", Description: "Optional source ID scope",
+				Type: schemaTypeArray, Description: "Optional source ID scope",
 				Items: safeIDSchema("Source ID"),
 			},
 			"message_types": {
-				Type: "array", Description: "Optional containing message type scope",
+				Type: schemaTypeArray, Description: "Optional containing message type scope",
 				Items: stringSchema("Containing message type"),
 			},
 			toolArgAttachmentID:  safeIDSchema("Optional exact attachment occurrence ID"),
@@ -730,7 +882,7 @@ func searchDocumentsDefinition(_ *handlers) toolDefinition {
 			toolArgPersonID:      safeIDSchema("Optional durable person ID"),
 			toolArgParticipantID: safeIDSchema("Optional observed participant ID; translated through its durable person when bound"),
 			"directions": {
-				Type: "array", Description: "Optional union of from_person, to_person, and group; requires a person reference",
+				Type: schemaTypeArray, Description: "Optional union of from_person, to_person, and group; requires a person reference",
 				Items: direction,
 			},
 			toolArgAfter:      stringSchema("Only messages on or after YYYY-MM-DD"),
@@ -760,14 +912,14 @@ func searchPersonFilesDefinition(_ *handlers) toolDefinition {
 		closedObject(map[string]*jsonschema.Schema{
 			toolArgPersonID: safeIDSchema("Durable person ID"),
 			"directions": {
-				Type: "array", Description: "Optional union of from_person, to_person, and group",
+				Type: schemaTypeArray, Description: "Optional union of from_person, to_person, and group",
 				Items: direction,
 			},
 			toolArgAfter:  stringSchema("Only messages on or after YYYY-MM-DD"),
 			toolArgBefore: stringSchema("Only messages before YYYY-MM-DD"),
 			"filename":    stringSchema("Case-insensitive filename substring filter"),
 			"mime_families": {
-				Type: "array", Description: "Optional stable MIME-family filter",
+				Type: schemaTypeArray, Description: "Optional stable MIME-family filter",
 				Items: mimeFamily,
 			},
 			toolArgLimit:  limit,
@@ -794,6 +946,12 @@ type getAttachmentResponse struct {
 	Filename string `json:"filename"`
 	MIMEType string `json:"mime_type"`
 	Size     int64  `json:"size"`
+	// Chunk fields are present only when the call passed offset or length.
+	Offset     *int64  `json:"offset,omitzero"`
+	Length     *int64  `json:"length,omitzero"`
+	SHA256     *string `json:"sha256,omitzero"`
+	Complete   *bool   `json:"complete,omitzero"`
+	DataBase64 *string `json:"data_base64,omitzero"`
 }
 
 type exportAttachmentResponse struct {

@@ -97,7 +97,7 @@ var settingsGroups = []SettingGroup{
 var settingsMetadata = map[string]settingMetadata{
 	"carddav.provider":        {"CardDAV provider", "Google Contacts or a server using a password.", "carddav"},
 	"carddav.oauth_app":       {"CardDAV OAuth app", "Named Google OAuth application used for contacts.", "carddav"},
-	"web.default_search_mode": {"Default search mode", "Search mode the web app opens with.", ""},
+	"web.default_search_mode": {"Default search mode", "Used when a tab opens without a search mode in its link. Your current search keeps its mode.", ""},
 	"web.theme":               {"Theme", "Light, dark, or follow the system.", ""},
 	"web.density":             {"Density", "Spacing of tables and toolbars.", ""},
 
@@ -107,6 +107,7 @@ var settingsMetadata = map[string]settingMetadata{
 	"server.allow_insecure":      {"Allow insecure access", "Allow connections from other machines without an API key.", "listener"},
 	"server.trusted_proxies":     {"Trusted proxies", "IP addresses or ranges allowed to forward HTTPS details for a request.", "listener"},
 	"server.daemon_idle_timeout": {"Idle timeout", "How long a background daemon waits with nothing to do before it stops.", "lifecycle"},
+	"server.daemon_auto_start":   {"Automatic start", "Allow local commands to start or replace the daemon. Disable when a supervisor manages the service.", "lifecycle"},
 	"server.daemon_auto_restart": {"Automatic restart", "When the CLI restarts a running daemon after its binary changes.", "lifecycle"},
 	"log.enabled":                {"Persistent logs", "Write structured logs to the daemon log directory.", "logging"},
 	"log.level":                  {"Log level", "Lowest severity written to the log. Empty uses the default.", "logging"},
@@ -175,6 +176,10 @@ var settingsMetadata = map[string]settingMetadata{
 	"vector.search.k_per_signal":         {"Candidates per signal", "Results each signal contributes before merging.", "ranking"},
 	"vector.search.subject_boost":        {"Subject boost", "Extra weight for matches in the subject line.", "ranking"},
 	"vector.search.max_page_size_hybrid": {"Maximum hybrid page size", "Largest page a hybrid search returns.", "ranking"},
+	"vector.search.sqlite_accelerator":   {"SQLite search accelerator", "Use the SQLite approximate index when it is ready, or always scan exact vectors.", "ranking"},
+	"vector.search.ann_nprobe":           {"ANN probe count", "SQLite index partitions searched for each semantic query.", "ranking"},
+	"vector.search.ann_oversample":       {"ANN oversampling", "Extra approximate candidates reranked with exact vector distance.", "ranking"},
+	"vector.search.ann_threads":          {"ANN build threads", "Maximum native worker threads used while optimizing a SQLite index.", "ranking"},
 
 	"vector.preprocess.strip_quotes":        {"Strip quoted replies", "Remove quoted earlier messages before embedding.", "preprocess"},
 	"vector.preprocess.strip_signatures":    {"Strip signatures", "Remove detected signatures before embedding.", "preprocess"},
@@ -191,8 +196,10 @@ var settingsMetadata = map[string]settingMetadata{
 	"beeper.rate_limit_qps":   {"Beeper requests per second", "Request rate limit for Beeper.", sourceTypeBeeper},
 	"slack.enabled":           {"Scheduled Slack sync", "Sync Slack channels on the schedule below.", sourceTypeSlack},
 	"slack.schedule":          {"Slack schedule", "When Slack sync runs.", sourceTypeSlack},
-	"slack.channels":          {"Included Slack channels", "Channel names to sync. Direct messages are always included.", sourceTypeSlack},
+	"slack.channels":          {"Included Slack channels", "Channel names to sync. One-to-one and group DMs follow their own settings.", sourceTypeSlack},
 	"slack.exclude_channels":  {"Excluded Slack channels", "Channel names to skip.", sourceTypeSlack},
+	"slack.dms":               {"Slack direct messages", "Sync one-to-one direct messages. Turning this off pauses sync; archived messages stay.", sourceTypeSlack},
+	"slack.group_dms":         {"Slack group DMs", "Sync group direct messages. Turning this off pauses sync; archived messages stay.", sourceTypeSlack},
 	"carddav.base_url":        {"CardDAV server URL", "Server this archive syncs contacts with.", "carddav"},
 	"carddav.username":        {"CardDAV username", "Account used to sign in to the CardDAV server.", "carddav"},
 	"carddav.schedule":        {"CardDAV schedule", "When contact sync runs.", "carddav"},
@@ -225,6 +232,10 @@ var settingsMetadata = map[string]settingMetadata{
 	"integrations.tasks.endpoint":        {"Task endpoint", "Where the task service listens.", ""},
 	"integrations.tasks.api_key":         {"Task API key", "Bearer key the daemon sends to the task service.", ""},
 	"integrations.tasks.default_project": {"Default task project", "Project used when creating or looking up tasks.", ""},
+	"integrations.kata.enabled":          {"Kata person agendas", "Show live Kata tasks linked to people.", ""},
+	"integrations.kata.endpoint":         {"Kata endpoint", "Where the Kata service listens. Required when enabled.", ""},
+	"integrations.kata.api_key":          {"Kata API key", "Bearer key the daemon sends to Kata.", ""},
+	"integrations.kata.default_project":  {"Kata project", "Existing Kata project used for person agendas.", ""},
 }
 
 // settingsValidation carries format and range rules. A hint says how to
@@ -267,6 +278,9 @@ var settingsValidation = map[string]SettingValidation{
 	"vector.search.k_per_signal":          atLeast(1),
 	"vector.search.subject_boost":         atLeast(0),
 	"vector.search.max_page_size_hybrid":  withOff(atLeast(1), "No limit", strconv.Itoa(vector.DefaultMaxPageSizeHybrid)),
+	"vector.search.ann_nprobe":            numberRange(1, 65_536),
+	"vector.search.ann_oversample":        numberRange(1, 128),
+	"vector.search.ann_threads":           numberRange(1, vector.MaxANNThreads),
 
 	"beeper.schedule": cronValidation(false),
 	"slack.schedule":  cronValidation(false),
@@ -292,6 +306,7 @@ var settingsValidation = map[string]SettingValidation{
 	"people.enrichment.batch_size":     atLeast(1),
 	"people.enrichment.lease_duration": {Hint: "Duration such as 5m or 1h.", Required: true},
 	"integrations.tasks.endpoint":      {Hint: "HTTPS URL, loopback HTTP URL, or a Unix socket you own."},
+	"integrations.kata.endpoint":       {Hint: "HTTPS URL, loopback HTTP URL, or a Unix socket you own."},
 }
 
 func atLeast(minimum float64) SettingValidation {

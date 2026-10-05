@@ -4,7 +4,7 @@
     getDocumentVectorStatus as generatedGetDocumentVectorStatus,
     getVisualAttachmentStatus as generatedGetVisualAttachmentStatus,
   } from '../../api/generated/api/api';
-  import { Button, StatusDot } from '@kenn-io/kit-ui';
+  import { Button, Chip, StatusDot } from '@kenn-io/kit-ui';
   import { onMount } from 'svelte';
 
   import type { APIClient } from '../../api/client';
@@ -14,6 +14,8 @@
     Status as GeneratedVisualStatus,
   } from '../../api/generated/models';
   import type { OperationStatusAuthority } from '../../explore/models';
+  import { DOCUMENT_INDEX_SETUP, DOCUMENT_SEARCH_SETUP } from '../../operations/labels';
+  import OperationHostSetup from './OperationHostSetup.svelte';
 
   type DocumentStatus = GeneratedDocumentIndexStatusResponse;
   type DocumentVectorStatus = GeneratedDocumentVectorOperationsResponse;
@@ -30,7 +32,7 @@
     authority: OperationStatusAuthority;
     configured?: boolean;
     onClose?: () => void;
-    onConfigure?: (authority: OperationStatusAuthority) => void;
+    onConfigure?: () => void;
   } = $props();
 
   let loading = $state(true);
@@ -49,12 +51,6 @@
     getDocumentIndexStatus: 'Document index needs configuration',
     getDocumentVectorStatus: 'Document vectors need configuration',
     getVisualAttachmentStatus: 'Visual attachments need configuration'
-  };
-
-  const settingsLabels: Record<OperationStatusAuthority, string> = {
-    getDocumentIndexStatus: 'Open document index settings',
-    getDocumentVectorStatus: 'Open document vector settings',
-    getVisualAttachmentStatus: 'Open visual attachment settings'
   };
 
   onMount(() => {
@@ -99,7 +95,7 @@
 
 <section class="related-status" aria-label={labels[authority]}>
   <header>
-    <div><p>Live authority</p><h1>{labels[authority]}</h1></div>
+    <h1>{labels[authority]}</h1>
     <Button size="sm" surface="soft" label="Back to operations" onclick={onClose} />
   </header>
 
@@ -107,9 +103,15 @@
     <p role="status">Loading {labels[authority].toLowerCase()}…</p>
   {:else if configured === false}
     <div class="summary" aria-label={`${labels[authority]} configuration`}>
-      <p><span aria-hidden="true"><StatusDot status="unclean" /></span>{configurationLabels[authority]}</p>
+      <p><Chip size="sm" tone="muted" uppercase={false}>Off</Chip> {configurationLabels[authority]}</p>
     </div>
-    <Button label={settingsLabels[authority]} onclick={() => onConfigure(authority)} />
+    {#if authority === 'getVisualAttachmentStatus'}
+      <Button label="Open visual attachment settings" onclick={() => onConfigure()} />
+    {:else}
+      <OperationHostSetup
+        setup={authority === 'getDocumentIndexStatus' ? DOCUMENT_INDEX_SETUP : DOCUMENT_SEARCH_SETUP}
+      />
+    {/if}
   {:else if failed}
     <div class="notice notice--error" role="alert">
       <span>Unable to load {labels[authority].toLowerCase()}.</span>
@@ -130,7 +132,7 @@
       {/if}
     </div>
     {#if !status.profile_exists || !status.profile_enabled || !status.exact_consent}
-      <Button label="Open document index settings" onclick={() => onConfigure(authority)} />
+      <OperationHostSetup setup={DOCUMENT_INDEX_SETUP} />
     {/if}
   {:else if documentVectorStatus}
     <div class="summary" aria-label="Document vector status summary">
@@ -148,7 +150,7 @@
       {/if}
     </div>
     {#if !documentVectorStatus.enabled || !documentVectorStatus.configured}
-      <Button label="Open document vector settings" onclick={() => onConfigure(authority)} />
+      <OperationHostSetup setup={DOCUMENT_SEARCH_SETUP} />
     {/if}
   {:else if visualStatus}
     <div class="summary" aria-label="Visual attachment status summary">
@@ -161,13 +163,13 @@
 </section>
 
 <style>
-  .related-status { display: grid; align-content: start; gap: var(--space-4); min-height: 0; padding: var(--space-5) var(--space-6); overflow: auto; }
+  .related-status { display: grid; align-content: start; gap: var(--space-4); min-height: 0; padding: var(--space-5) var(--page-gutter) var(--space-4); overflow: auto; }
   header { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); }
-  header p, h1, .summary p { margin: 0; }
-  header p { color: var(--status-warning-ink); font-size: var(--font-size-2xs); font-weight: 800; letter-spacing: .1em; text-transform: uppercase; }
+  h1, .summary p { margin: 0; }
+  h1 { color: var(--text-primary); font-size: var(--font-size-xl); font-weight: 650; line-height: 1.25; }
   .summary { display: grid; gap: var(--space-3); padding: var(--space-4); border: 1px solid var(--border-default); border-radius: var(--radius-md); background: var(--bg-surface); }
   .summary p { display: flex; align-items: center; gap: var(--space-2); color: var(--text-muted); }
   .notice { padding: var(--space-3); border: 1px solid var(--border-default); border-radius: var(--radius-md); }
   .notice--error { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); border-color: var(--status-error-ink); background: var(--status-error-bg); color: var(--status-error-ink); }
-  @media (max-width: 760px) { .related-status { padding: var(--space-3); } header { align-items: stretch; flex-direction: column; } }
+  @media (max-width: 760px) { header { align-items: stretch; flex-direction: column; } }
 </style>

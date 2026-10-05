@@ -1,5 +1,5 @@
 ---
-last_edited: "2026-09-09"
+last_edited: "2026-09-26"
 title: Importing Local Email
 description: Bring local email archives into msgvault, or backfill older Gmail and IMAP messages.
 ---
@@ -62,6 +62,24 @@ msgvault import-pst you@outlook.com backup.pst --no-resume
 | `--no-attachments` | `false` | Skip writing attachments to disk |
 
 PST imports are resumable. msgvault records a content-based archive fingerprint so an interrupted import resumes only when the file still matches the checkpointed archive.
+
+On `main`, the importer keeps existing transport threading headers and fills
+missing `Message-ID`, `In-Reply-To`, and `References` fields from the PST's
+stored email metadata (MAPI properties). It groups replies by archived email
+identifiers after importing all folders, so replies can precede their parents
+in the file. Messages with no usable threading identifiers keep the existing
+fallback grouping.
+
+To repair missing identifiers from an earlier import, rerun the same PST with
+the same identifier and `--no-resume`:
+
+```bash
+msgvault import-pst owner@example.com /path/to/archive.pst --no-resume
+```
+
+The rerun fills missing header metadata and reconciles conversations. It keeps
+existing raw messages, bodies, attachments, and conflicting stored identifiers.
+Existing messages count as skipped and receive their folder labels as usual.
 
 ## import-mbox
 
@@ -306,7 +324,7 @@ Both layouts are supported. The importer discovers all `.mbox` and `.imapmbox` d
 Apple Mail stores its data at `~/Library/Mail/` on macOS. The auto-discover mode reads `~/Library/Accounts/Accounts4.sqlite` (the macOS accounts database) to map V10 directory GUIDs to email addresses. You can also use a Time Machine backup or a copy of the Mail directory from another machine.
 
 !!! note
-    Apple Mail stores IMAP and Gmail messages whose attachments have not been downloaded as `.partial.emlx` files. The message body in these files is complete, so they are imported normally — only the uncached attachment parts are absent. When both `N.emlx` and `N.partial.emlx` exist for the same message, the fully-downloaded copy is used. The import summary reports how many partial files were imported.
+    Apple Mail stores IMAP and Gmail messages with larger attachments as `.partial.emlx` files: the message body is complete, and the attachments live in a sibling `Attachments/` directory. The importer restores cached top-level attachments; nested attachments are not restored. Re-import to add newly downloaded attachments to existing messages; messages that already hold every cached attachment are skipped, not rewritten. See [import-emlx](../cli-reference.md#import-emlx) for limits and warnings. When both `N.emlx` and `N.partial.emlx` exist for the same message, the fully-downloaded copy is used. The import summary reports how many partial files were read and how many attachments the run added to the archive.
 
 ## Deduplication
 

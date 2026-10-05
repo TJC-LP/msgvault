@@ -3,9 +3,10 @@ package cmd
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"strconv"
 	"strings"
-	"text/tabwriter"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -145,6 +146,11 @@ Examples:
 }
 
 func runHTTPSearch(cmd *cobra.Command, queryStr string) error {
+	state := invocationFromCommand(cmd)
+	if state == nil || state.logger == nil {
+		return errors.New("invocation state is unavailable")
+	}
+	logger := state.logger
 	s, info, err := OpenHTTPStore(cmd.Context())
 	if err != nil {
 		return fmt.Errorf("open store: %w", err)
@@ -201,13 +207,9 @@ func runHTTPSearch(cmd *cobra.Command, queryStr string) error {
 		// Pre-0.18 daemons built the index synchronously inside the request.
 		fmt.Fprintf(os.Stderr, "Built search index (%d messages indexed).\n", resp.IndexedMessages)
 	}
-	switch resp.IndexState {
-	case "building":
+	if resp.IndexState == "building" {
 		fmt.Fprintln(os.Stderr,
-			"Note: the search index is being rebuilt in the background; results may be incomplete until it finishes.")
-	case "checking":
-		fmt.Fprintln(os.Stderr,
-			"Note: search index completeness is still being verified in the background; results may be incomplete until it finishes.")
+			"Note: the search index is rebuilding or awaiting a rebuild in the background; results may be incomplete until it finishes.")
 	}
 	if searchCollection != "" {
 		label := resp.ScopeLabel
@@ -243,24 +245,47 @@ func runHTTPSearch(cmd *cobra.Command, queryStr string) error {
 	return outputSearchResultsTable(resp.Results)
 }
 
-// nil error return mirrors outputSearchResultsJSON so callers can return
-// either uniformly; tabwriter output never fails.
 func outputSearchResultsTable(results []query.MessageSummary) error {
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	_, _ = fmt.Fprintln(w, "ID\tDATE\tFROM\tSUBJECT\tSIZE")
-	_, _ = fmt.Fprintln(w, "──\t────\t────\t───────\t────")
+	return writeSearchResultsTable(os.Stdout, results)
+}
 
+func writeSearchResultsTable(out io.Writer, results []query.MessageSummary) error {
+	return writeSearchResultsTableWidth(out, results, searchTableTerminalWidth(out))
+}
+
+func writeSearchResultsTableWidth(out io.Writer, results []query.MessageSummary, width int) error {
+	rows := make([][]searchTableCell, 0, len(results))
 	for _, msg := range results {
-		date := msg.SentAt.Format("2006-01-02")
-		from := truncate(summaryFromDisplay(msg), 30)
-		subject := truncate(msg.Subject, 50)
-		size := formatSize(msg.SizeEstimate)
-		_, _ = fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s\n", msg.ID, date, from, subject, size)
+		rows = append(rows, []searchTableCell{
+			{text: strconv.FormatInt(msg.ID, 10)},
+			{text: msg.SentAt.Format("2006-01-02")},
+			{text: normalizeSearchTableText(summaryFromDisplay(msg))},
+			{text: summaryTableText(msg.Subject, msg.Snippet)},
+			{text: formatSummarySize(msg.SizeEstimate)},
+		})
 	}
-
-	_ = w.Flush()
-	fmt.Printf("\n%s\n", formatShowingResults(len(results)))
+	if err := writeSearchTable(out, []string{"ID", "DATE", "FROM", "SUBJECT", "SIZE"}, rows, width); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(out, "\n%s\n", formatShowingResults(len(results))); err != nil {
+		return fmt.Errorf("write search result count: %w", err)
+	}
 	return nil
+}
+
+func summaryTableText(subject, snippet string) string {
+	text := normalizeSearchTableText(subject)
+	if text == "" {
+		text = normalizeSearchTableText(snippet)
+	}
+	return text
+}
+
+func formatSummarySize(size int64) string {
+	if size <= 0 {
+		return "-"
+	}
+	return formatSize(size)
 }
 
 func summaryFromDisplay(msg query.MessageSummary) string {

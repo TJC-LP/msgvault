@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/doordash-oss/oapi-codegen-dd/v3/pkg/runtime"
@@ -99,41 +100,44 @@ func TestNew_DefaultTimeout(t *testing.T) {
 }
 
 func TestRunCLISyncStreamsWithoutAbsoluteClientTimeout(t *testing.T) {
-	assert := assert.New(t)
-	require := require.New(t)
+	synctest.Test(t, func(t *testing.T) {
+		assert := assert.New(t)
+		require := require.New(t)
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal(http.MethodPost, r.Method, "method")
-		assert.Equal("/api/v1/cli/sync-full", r.URL.Path, "path")
-		assert.Equal(apiprotocol.ClientClassCLI, r.Header.Get(apiprotocol.ClientClassHeader), "client class")
+		srv := httptest.NewTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.Equal(http.MethodPost, r.Method, "method")
+			assert.Equal("/api/v1/cli/sync-full", r.URL.Path, "path")
+			assert.Equal(apiprotocol.ClientClassCLI, r.Header.Get(apiprotocol.ClientClassHeader), "client class")
 
-		w.Header().Set("Content-Type", "application/x-ndjson")
-		_, _ = w.Write([]byte(`{"type":"stdout","data":"begin\n"}` + "\n"))
-		if flusher, ok := w.(http.Flusher); ok {
-			flusher.Flush()
-		}
-		time.Sleep(50 * time.Millisecond)
-		_, _ = w.Write([]byte(`{"type":"complete"}` + "\n"))
-	}))
-	t.Cleanup(srv.Close)
+			w.Header().Set("Content-Type", "application/x-ndjson")
+			_, _ = w.Write([]byte(`{"type":"stdout","data":"begin\n"}` + "\n"))
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+			time.Sleep(50 * time.Millisecond)
+			_, _ = w.Write([]byte(`{"type":"complete"}` + "\n"))
+		}))
+		httpClient := srv.Client()
 
-	st, err := New(Config{
-		URL:           srv.URL,
-		AllowInsecure: true,
-		Timeout:       10 * time.Millisecond,
-		HTTPClient:    srv.Client(),
-		RequestMode:   RequestModeCLI,
+		st, err := New(Config{
+			URL:           "http://127.0.0.1",
+			AllowInsecure: true,
+			Timeout:       10 * time.Millisecond,
+			HTTPClient:    httpClient,
+			RequestMode:   RequestModeCLI,
+		})
+		require.NoError(err, "New")
+		st.httpClient.Timeout = 10 * time.Millisecond
+
+		var output strings.Builder
+		err = st.RunCLISync(context.Background(), CLISyncRequest{Full: true}, func(stream, data string) error {
+			assert.Equal("stdout", stream, "stream")
+			_, _ = output.WriteString(data)
+			return nil
+		})
+		require.NoError(err, "streaming CLI sync should not use http.Client.Timeout as an absolute body-read timeout")
+		assert.Equal("begin\n", output.String(), "streamed output")
 	})
-	require.NoError(err, "New")
-
-	var output strings.Builder
-	err = st.RunCLISync(context.Background(), CLISyncRequest{Full: true}, func(stream, data string) error {
-		assert.Equal("stdout", stream, "stream")
-		_, _ = output.WriteString(data)
-		return nil
-	})
-	require.NoError(err, "streaming CLI sync should not use http.Client.Timeout as an absolute body-read timeout")
-	assert.Equal("begin\n", output.String(), "streamed output")
 }
 
 func TestLegacyAdapterUsesClientRootContext(t *testing.T) {
@@ -173,14 +177,11 @@ func TestLegacyAdapterUsesClientRootContext(t *testing.T) {
 	}
 	cancel()
 
-	require.Eventually(func() bool {
-		select {
-		case <-requestCanceled:
-			return true
-		default:
-			return false
-		}
-	}, 2*time.Second, 10*time.Millisecond, "root cancellation reaches HTTP request")
+	select {
+	case <-requestCanceled:
+	case <-time.After(2 * time.Second):
+		require.FailNow("root cancellation reaches HTTP request")
+	}
 	require.Error(<-done, "canceled compatibility request")
 }
 
@@ -251,6 +252,71 @@ func TestRunCLISyncRejectsOldDaemonBeforeStartingSourceScopedSync(t *testing.T) 
 	}, func(string, string) error { return nil })
 	require.ErrorContains(t, err, "requires daemon API schema 2.4.0")
 	assert.Zero(t, syncCalls, "source-scoped sync must not start on an older daemon")
+}
+
+func TestRunCLISyncCacheFlagsRequireCompatibleDaemon(t *testing.T) {
+	for _, mode := range []struct {
+		name string
+		full bool
+	}{
+		{name: "sync"},
+		{name: "sync-full", full: true},
+	} {
+		for _, test := range []struct {
+			name        string
+			version     string
+			build       bool
+			skip        bool
+			healthError bool
+			wantError   string
+		}{
+			{name: "default on older daemon", version: "2.30.0"},
+			{name: "build on older daemon", version: "2.30.0", build: true, wantError: "upgrade the daemon"},
+			{name: "skip on older daemon", version: "2.30.0", skip: true, wantError: "upgrade the daemon"},
+			{name: "build on supported daemon", version: "2.31.0", build: true},
+			{name: "skip on supported daemon", version: "2.31.0", skip: true},
+			{name: "health unavailable", build: true, healthError: true, wantError: "check daemon sync cache flags capability"},
+		} {
+			t.Run(mode.name+"/"+test.name, func(t *testing.T) {
+				assertions := assert.New(t)
+				requirements := require.New(t)
+				var syncCalls, healthCalls atomic.Int32
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.URL.Path == "/api/v1/health" {
+						healthCalls.Add(1)
+						if test.healthError {
+							http.Error(w, "health unavailable", http.StatusBadGateway)
+							return
+						}
+						writeJSONResponse(t, w, map[string]any{"status": "ok", "api_schema_version": test.version})
+						return
+					}
+					syncCalls.Add(1)
+					assertions.Equal("/api/v1/cli/"+mode.name, r.URL.Path)
+					assertions.Equal(http.MethodPost, r.Method)
+					assertions.Equal(test.build, r.URL.Query().Get("build-cache") == "true")
+					assertions.Equal(test.skip, r.URL.Query().Get("no-build-cache") == "true")
+					w.Header().Set("Content-Type", "application/x-ndjson")
+					_, _ = w.Write([]byte("{\"type\":\"complete\"}\n"))
+				}))
+				t.Cleanup(srv.Close)
+				st := newTestStore(srv, "")
+				err := st.RunCLISync(t.Context(), CLISyncRequest{
+					Full: mode.full, BuildCache: test.build, NoBuildCache: test.skip,
+				}, nil)
+				if test.wantError != "" {
+					requirements.ErrorContains(err, test.wantError)
+					assertions.Zero(syncCalls.Load(), "unsupported flags must fail before sync starts")
+				} else {
+					requirements.NoError(err)
+					assertions.Equal(int32(1), syncCalls.Load())
+				}
+				if !test.build && !test.skip {
+					assertions.Zero(healthCalls.Load(), "default sync needs no cache flag capability check")
+				}
+			})
+		}
+	}
 }
 
 func TestRunCLICommandStreamsOutput(t *testing.T) {
@@ -492,6 +558,7 @@ func TestPlanCLIDeleteStagedUsesGeneratedClientAdapter(t *testing.T) {
 			"scope_escalation_body_lines":  []string{"Batch deletion requires elevated Gmail permissions."},
 			"scope_escalation_cancel_hint": "Cancelled.",
 			"scope_escalation_account":     "alice@example.com",
+			"scope_escalation_source_type": "gmail",
 			"scope_escalation_oauth_app":   "acme",
 			"remote_delete_env_var":        "MSGVAULT_ENABLE_REMOTE_DELETE",
 		}), "encode response") {
@@ -519,6 +586,7 @@ func TestPlanCLIDeleteStagedUsesGeneratedClientAdapter(t *testing.T) {
 	assert.Equal("permanent", got.ConfirmationMode, "confirmation mode")
 	assert.Equal([]string{"batch-123"}, got.PlannedBatchIDs, "planned batch ids")
 	assert.Equal("fp-client", got.PlanFingerprint, "plan fingerprint")
+	assert.Equal("gmail", got.ScopeEscalationSourceType, "authorization provider")
 	assert.True(got.NeedsScopeEscalation, "needs scope escalation")
 	assert.Equal("PERMISSION UPGRADE REQUIRED", got.ScopeEscalationHeadline, "scope headline")
 	assert.Equal([]string{"Batch deletion requires elevated Gmail permissions."}, got.ScopeEscalationBodyLines, "scope body")
@@ -1021,71 +1089,6 @@ func TestGetStatsUsesGeneratedClientAdapter(t *testing.T) {
 	assert.Equal(int64(10), stats.LabelCount, "LabelCount")
 	assert.Equal(int64(5), stats.AttachmentCount, "AttachmentCount")
 	assert.Equal(int64(1024), stats.DatabaseSize, "DatabaseSize")
-}
-
-func TestVectorSearchAvailable(t *testing.T) {
-	tests := []struct {
-		name string
-		body string
-		want bool
-	}{
-		{
-			name: "status initializing is capable",
-			body: `{"vector_status":"initializing"}`,
-			want: true,
-		},
-		{
-			name: "status ready is capable",
-			body: `{"vector_status":"ready","vector_search":{"enabled":true}}`,
-			want: true,
-		},
-		{
-			name: "status stale is capable",
-			body: `{"vector_status":"stale"}`,
-			want: true,
-		},
-		{
-			name: "status error is capable",
-			body: `{"vector_status":"error"}`,
-			want: true,
-		},
-		{
-			name: "status disabled is not capable",
-			body: `{"vector_status":"disabled"}`,
-			want: false,
-		},
-		{
-			name: "old daemon without status falls back to enabled flag",
-			body: `{"vector_search":{"enabled":true}}`,
-			want: true,
-		},
-		{
-			name: "old daemon without status and disabled flag is not capable",
-			body: `{"vector_search":{"enabled":false}}`,
-			want: false,
-		},
-		{
-			name: "old daemon without vector fields is not capable",
-			body: `{}`,
-			want: false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				assert.Equal(t, "/api/v1/stats", r.URL.Path, "path")
-				w.Header().Set("Content-Type", "application/json")
-				_, _ = w.Write([]byte(tt.body))
-			}))
-			defer srv.Close()
-
-			s := newTestStore(srv, "key")
-			got, err := s.VectorSearchAvailable(context.Background())
-			require.NoError(t, err, "VectorSearchAvailable")
-			assert.Equal(t, tt.want, got, "capable")
-		})
-	}
 }
 
 func TestGetCLIStats_Success(t *testing.T) {
@@ -1818,14 +1821,11 @@ func TestRunCLIRepairMessagePropagatesCancellation(t *testing.T) {
 	go func() {
 		done <- s.RunCLIRepairMessage(ctx, generated.CLIRepairMessageRequest{Audit: &audit}, nil)
 	}()
-	require.Eventually(t, func() bool {
-		select {
-		case <-repairStarted:
-			return true
-		default:
-			return false
-		}
-	}, 2*time.Second, 10*time.Millisecond)
+	select {
+	case <-repairStarted:
+	case <-time.After(2 * time.Second):
+		require.FailNow(t, "repair request did not start")
+	}
 	cancel()
 
 	require.ErrorIs(t, <-done, context.Canceled)

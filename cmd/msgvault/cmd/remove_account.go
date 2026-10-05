@@ -17,6 +17,7 @@ import (
 	imaplib "go.kenn.io/msgvault/internal/imap"
 	"go.kenn.io/msgvault/internal/microsoft"
 	"go.kenn.io/msgvault/internal/oauth"
+	"go.kenn.io/msgvault/internal/plaud"
 	"go.kenn.io/msgvault/internal/slack"
 	"go.kenn.io/msgvault/internal/sourceops"
 	"go.kenn.io/msgvault/internal/store"
@@ -122,6 +123,12 @@ func confirmRemoveAccount(r io.Reader, w io.Writer) (bool, error) {
 }
 
 func runRemoveAccountLocal(cmd *cobra.Command, args []string) error {
+	state := invocationFromCommand(cmd)
+	if state == nil || state.cfg == nil {
+		return errors.New("configuration is unavailable")
+	}
+	cfg := state.cfg
+	logger := state.logger
 	yes, err := cmd.Flags().GetBool("yes")
 	if err != nil {
 		return fmt.Errorf("read --yes flag: %w", err)
@@ -135,7 +142,7 @@ func runRemoveAccountLocal(cmd *cobra.Command, args []string) error {
 		return usageErr(cmd, err)
 	}
 
-	s, cleanup, err := openWritableStoreAndInit()
+	s, cleanup, err := openWritableStoreAndInitForInvocation(state)
 	if err != nil {
 		return err
 	}
@@ -344,6 +351,12 @@ func runRemoveAccountLocal(cmd *cobra.Command, args []string) error {
 				"Warning: could not remove Microsoft Graph token: %v\n", err,
 			)
 		}
+	case sourceTypeMSMail:
+		if err := newGraphMailManager(state).DeleteToken(source.Identifier); err != nil {
+			fmt.Fprintf(os.Stderr,
+				"Warning: could not remove Microsoft Graph mail token: %v\n", err,
+			)
+		}
 	case sourceTypeDiscord:
 		// Discord credential cleanup is part of the lifecycle-locked cascade
 		// above so a concurrent guild registration cannot lose its bot token.
@@ -370,6 +383,11 @@ func runRemoveAccountLocal(cmd *cobra.Command, args []string) error {
 					"Warning: could not remove Slack token: %v\n", err,
 				)
 			}
+		}
+	case sourceTypePlaud:
+		mgr := plaud.NewManager("", cfg.TokensDir(), logger)
+		if err := mgr.DeleteToken(source.Identifier); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not remove Plaud token: %v\n", err)
 		}
 	case sourceTypeCircleback:
 		circlebackMgr := circleback.NewManager("", cfg.TokensDir(), logger)

@@ -15,6 +15,8 @@ const idleStatus = {
 function run(id: number, state: 'running' | 'succeeded' = 'running', updated = 0) {
   return {
     id,
+    account_id: 1,
+    connection: 'default',
     trigger: 'manual' as const,
     full: false,
     state,
@@ -56,7 +58,7 @@ afterEach(() => {
 });
 
 describe('CardDAVController', () => {
-  it('loads status, books, and page-zero history independently', async () => {
+  it('keeps history available when status fails without requesting runtime books', async () => {
     const requests: Request[] = [];
     const fetchFn = vi.fn<typeof fetch>(async (input) => {
       const request = requestOf(input);
@@ -74,15 +76,14 @@ describe('CardDAVController', () => {
     await controller.load();
 
     expect(requests.map((request) => new URL(request.url).pathname).sort()).toEqual([
-      '/api/v1/carddav/books',
       '/api/v1/carddav/runs',
       '/api/v1/carddav/status'
     ]);
     expect(new URL(requests.find((request) => new URL(request.url).pathname.endsWith('/runs'))!.url).searchParams.get('limit')).toBe('25');
     expect(controller.status).toBeUndefined();
     expect(controller.statusError).toBe('Unable to load CardDAV status.');
-    expect(controller.books.map(({ id, name }) => ({ id, name }))).toEqual([{ id: 3, name: 'Synthetic book 3' }]);
-    expect(controller.books[0]).not.toHaveProperty('url');
+    expect(controller.books).toEqual([]);
+    expect(controller.booksLoading).toBe(false);
     expect(controller.runs).toEqual([]);
     expect(controller.runsError).toBeNull();
     controller.destroy();
@@ -99,7 +100,7 @@ describe('CardDAVController', () => {
         if (statusReads === 1) return Response.json(idleStatus);
         return Response.json({ error: 'unavailable' }, { status: 503 });
       }
-      if (path.endsWith('/books')) return Response.json({ books: [] });
+      if (path.endsWith('/books')) return Response.json({ books: [book(3)] });
       if (path.endsWith('/runs')) return Response.json({ runs: [] });
       posts += 1;
       return Response.json({ run: run(1) });
@@ -112,8 +113,107 @@ describe('CardDAVController', () => {
 
     expect(controller.statusError).toBe('Unable to load CardDAV status.');
     expect(controller.canSync).toBe(false);
+    expect(controller.books.map(({ id, name }) => ({ id, name }))).toEqual([{ id: 3, name: 'Synthetic book 3' }]);
     await controller.sync(false);
     expect(posts).toBe(0);
+    controller.destroy();
+  });
+
+  it.each(['before books settle', 'after books settle'])('loads books when a recovery poll supersedes a status retry that finishes %s', async (completion) => {
+    vi.useFakeTimers();
+    const retryStatus = deferredResponse();
+    const books = deferredResponse();
+    let statusReads = 0;
+    let bookReads = 0;
+    const fetchFn = vi.fn<typeof fetch>(async (input) => {
+      const request = requestOf(input);
+      const path = new URL(request.url).pathname;
+      if (path.endsWith('/status')) {
+        statusReads += 1;
+        if (statusReads === 1) return Response.json({ ...idleStatus, available: false, active: run(8) });
+        if (statusReads === 2) return retryStatus.promise;
+        return Response.json({ ...idleStatus, active: run(8) });
+      }
+      if (path.endsWith('/books')) {
+        bookReads += 1;
+        return books.promise;
+      }
+      if (path.endsWith('/runs')) return Response.json({ runs: [] });
+      throw new Error(`Unexpected ${request.method} ${path}`);
+    });
+    const controller = new CardDAVController(createAPIClient(fetchFn));
+    await controller.load();
+    expect(bookReads).toBe(0);
+
+    const retry = controller.retryStatus();
+    document.dispatchEvent(new Event('visibilitychange'));
+    await vi.advanceTimersByTimeAsync(500);
+    expect(controller.status?.available).toBe(true);
+    expect(bookReads).toBe(1);
+    expect(controller.booksLoading).toBe(true);
+
+    if (completion === 'before books settle') {
+      retryStatus.resolve(Response.json({ ...idleStatus, available: false, active: run(8) }));
+      await retry;
+      expect(controller.booksLoading).toBe(true);
+    }
+    books.resolve(Response.json({ books: [book(3)] }));
+    await vi.advanceTimersByTimeAsync(0);
+    if (completion === 'after books settle') {
+      retryStatus.resolve(Response.json({ ...idleStatus, available: false, active: run(8) }));
+      await retry;
+    }
+
+    expect(controller.books.map(({ id, name }) => ({ id, name }))).toEqual([{ id: 3, name: 'Synthetic book 3' }]);
+    expect(controller.booksLoading).toBe(false);
+    expect(controller.booksError).toBeNull();
+    expect(bookReads).toBe(1);
+    controller.destroy();
+  });
+
+  it('loads books on polled availability recovery and allows retry after a failed book read', async () => {
+    vi.useFakeTimers();
+    let available = false;
+    let running = true;
+    let failBooks = true;
+    let bookReads = 0;
+    const fetchFn = vi.fn<typeof fetch>(async (input) => {
+      const request = requestOf(input);
+      const path = new URL(request.url).pathname;
+      if (path.endsWith('/status')) return Response.json({ ...idleStatus, available, ...(running ? { active: run(8) } : {}) });
+      if (path.endsWith('/books')) {
+        bookReads += 1;
+        return failBooks
+          ? Response.json({ error: 'unavailable' }, { status: 503 })
+          : Response.json({ books: [book(3)] });
+      }
+      if (path.endsWith('/runs')) return Response.json({ runs: [] });
+      throw new Error(`Unexpected ${request.method} ${path}`);
+    });
+    const controller = new CardDAVController(createAPIClient(fetchFn));
+    await controller.load();
+    await vi.advanceTimersByTimeAsync(500);
+    expect(bookReads).toBe(0);
+
+    available = true;
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(controller.booksError).toBe('Unable to load CardDAV address books.');
+    expect(controller.booksLoading).toBe(false);
+    expect(controller.canSetBookRoles).toBe(false);
+
+    failBooks = false;
+    await controller.retryBooks();
+    expect(controller.books.map(({ id }) => id)).toEqual([3]);
+    expect(controller.booksError).toBeNull();
+    expect(controller.canSetBookRoles).toBe(true);
+    expect(bookReads).toBe(2);
+
+    available = false;
+    running = false;
+    document.dispatchEvent(new Event('visibilitychange'));
+    await vi.advanceTimersByTimeAsync(500);
+    expect(controller.status?.active).toBeUndefined();
+    expect(bookReads).toBe(2);
     controller.destroy();
   });
 
@@ -657,4 +757,98 @@ describe('CardDAVController', () => {
     expect(controller.nextBeforeID).toBe(11);
     controller.destroy();
   });
+});
+
+it('uses an explicit selected connection for manual sync while keeping books and history global', async () => {
+  const requests: Request[] = [];
+  const client = createAPIClient(async (input) => {
+    const request = requestOf(input);
+    requests.push(request);
+    const url = new URL(request.url);
+    if (request.method === 'POST') return Response.json({ books: 0, created: 0, updated: 0, removed: 0 });
+    if (url.pathname.endsWith('/status')) return Response.json(idleStatus);
+    if (url.pathname.endsWith('/books')) return Response.json({ books: [] });
+    return Response.json({ runs: [] });
+  });
+  const controller = new CardDAVController(client);
+  await controller.load();
+  await controller.sync(false, 'work');
+  expect(
+    await requests
+      .find((r) => r.method === 'POST')!
+      .clone()
+      .json()
+  ).toEqual({ full: false, connection: 'work' });
+  expect(
+    requests.filter((r) => r.method === 'GET').every((r) => !new URL(r.url).searchParams.has('connection'))
+  ).toBe(true);
+  controller.destroy();
+});
+
+it('scopes selected status, books, history and sync requests to their connection', async () => {
+  const requests: Request[] = [];
+  const client = createAPIClient(async (input) => {
+    const request = requestOf(input);
+    requests.push(request);
+    const url = new URL(request.url);
+    if (request.method === 'POST') return Response.json({ books: 0, created: 0, updated: 0, removed: 0 });
+    if (url.pathname.endsWith('/status')) return Response.json(idleStatus);
+    if (url.pathname.endsWith('/books')) return Response.json({ books: [] });
+    return Response.json({ runs: [] });
+  });
+  const controller = new CardDAVController(client, undefined, 'work');
+  await controller.load();
+  await controller.sync(false);
+  expect(
+    await requests
+      .find((r) => r.method === 'POST')!
+      .clone()
+      .json()
+  ).toEqual({ full: false, connection: 'work' });
+  expect(
+    requests
+      .filter((r) => r.method === 'GET')
+      .every((r) => new URL(r.url).searchParams.get('connection') === 'work')
+  ).toBe(true);
+  controller.destroy();
+});
+
+it.each(['partial', 'failed'] as const)('names a connection whose sync is %s', async (status) => {
+  let bookReads = 0;
+  const client = createAPIClient(async (input) => {
+    const request = requestOf(input);
+    const path = new URL(request.url).pathname;
+    if (request.method === 'POST')
+      return Response.json({
+        books: 1,
+        created: 1,
+        updated: 0,
+        removed: 0,
+        status,
+        connections: [
+          {
+            connection: 'work',
+            status,
+            error_code: 'sync_failed',
+            error_message: 'private upstream detail',
+            books: 1,
+            created: 1,
+            updated: 0,
+            removed: 0
+          }
+        ]
+      });
+    if (path.endsWith('/books')) bookReads += 1;
+    return Response.json(
+      path.endsWith('/status') ? idleStatus : path.endsWith('/books') ? { books: [] } : { runs: [] }
+    );
+  });
+  const controller = new CardDAVController(client);
+  await controller.load();
+  await controller.sync(false);
+  expect(controller.syncError).toContain('work');
+  expect(controller.syncError).not.toContain('private upstream');
+  expect(controller.syncStatus).toBeNull();
+  expect(bookReads).toBe(status === 'partial' ? 2 : 1);
+  controller.destroy();
 });

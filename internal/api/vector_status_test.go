@@ -34,6 +34,7 @@ func testServerOptions(t *testing.T, backend vector.Backend) ServerOptions {
 }
 
 func TestVectorStatusDerivedFromOptions(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name string
 		opts ServerOptions
@@ -62,6 +63,7 @@ func TestVectorStatusDerivedFromOptions(t *testing.T) {
 }
 
 func TestSetVectorFeaturesTransitionsToReady(t *testing.T) {
+	t.Parallel()
 	opts := testServerOptions(t, nil)
 	opts.VectorStatus = VectorStatusInitializing
 	srv := NewServerWithOptions(opts)
@@ -77,6 +79,7 @@ func TestSetVectorFeaturesTransitionsToReady(t *testing.T) {
 }
 
 func TestSetVectorInitErrorTransitionsToError(t *testing.T) {
+	t.Parallel()
 	opts := testServerOptions(t, nil)
 	opts.VectorStatus = VectorStatusInitializing
 	srv := NewServerWithOptions(opts)
@@ -89,6 +92,7 @@ func TestSetVectorInitErrorTransitionsToError(t *testing.T) {
 }
 
 func TestSetVectorInitErrorNilIsNoOp(t *testing.T) {
+	t.Parallel()
 	opts := testServerOptions(t, nil)
 	opts.VectorStatus = VectorStatusInitializing
 	srv := NewServerWithOptions(opts)
@@ -101,6 +105,7 @@ func TestSetVectorInitErrorNilIsNoOp(t *testing.T) {
 }
 
 func TestSetVectorStaleTransitionsToStale(t *testing.T) {
+	t.Parallel()
 	opts := testServerOptions(t, &minimalVectorBackend{})
 	srv := NewServerWithOptions(opts)
 
@@ -112,6 +117,7 @@ func TestSetVectorStaleTransitionsToStale(t *testing.T) {
 }
 
 func TestSetVectorStaleEmptyIsNoOp(t *testing.T) {
+	t.Parallel()
 	opts := testServerOptions(t, &minimalVectorBackend{})
 	srv := NewServerWithOptions(opts)
 
@@ -123,6 +129,7 @@ func TestSetVectorStaleEmptyIsNoOp(t *testing.T) {
 }
 
 func TestSimilarSearchStale503(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 	opts := testServerOptions(t, nil)
@@ -145,6 +152,7 @@ func TestSimilarSearchStale503(t *testing.T) {
 }
 
 func TestHealthReportsStaleVectorStatus(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 	opts := testServerOptions(t, nil)
@@ -194,6 +202,7 @@ func (b *resolvingVectorBackend) ActiveGeneration(context.Context) (vector.Gener
 // matches the configured one again (e.g. after a --full-rebuild), /health flips
 // back to ready without a daemon restart.
 func TestHealthClearsStaleAfterReactivation(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -227,6 +236,7 @@ func TestHealthClearsStaleAfterReactivation(t *testing.T) {
 // latch must hold through health checks and clear only on reinit
 // (SetVectorFeatures).
 func TestScopeDriftStaleSurvivesRefresh(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -262,6 +272,7 @@ func TestScopeDriftStaleSurvivesRefresh(t *testing.T) {
 // search entry point must consult the stale status itself and 503 with
 // index_stale instead of serving the wrongly-scoped index.
 func TestVectorSearchEndpointsGateOnScopeDrift(t *testing.T) {
+	t.Parallel()
 	newDriftedServer := func(t *testing.T) *Server {
 		t.Helper()
 		cfg := vector.Config{}
@@ -315,6 +326,7 @@ func TestVectorSearchEndpointsGateOnScopeDrift(t *testing.T) {
 // re-resolves the scope and latches the stale status. The check is
 // throttled to at most once per interval.
 func TestVectorSearchPreflightDetectsScopeDrift(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -357,6 +369,7 @@ func TestVectorSearchPreflightDetectsScopeDrift(t *testing.T) {
 // resolution once, and a resolution error neither blocks the search nor
 // changes the status.
 func TestVectorSearchPreflightThrottlesScopeCheck(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 
 	cfg := vector.Config{}
@@ -391,6 +404,7 @@ func TestVectorSearchPreflightThrottlesScopeCheck(t *testing.T) {
 // and flip the status. The check is throttled, and only a fingerprint
 // mismatch flips it — a matching index stays ready.
 func TestHealthFlipsReadyToStaleAfterForeignActivation(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -442,6 +456,7 @@ func TestHealthFlipsReadyToStaleAfterForeignActivation(t *testing.T) {
 // next poll rather than waiting for a vector search or coverage request to
 // fire the preflight.
 func TestHealthDetectsScopeDrift(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -474,6 +489,7 @@ func TestHealthDetectsScopeDrift(t *testing.T) {
 // TestHealthKeepsStaleWhenStillMismatched verifies the refresh leaves the stale
 // status in place while the active generation's fingerprint still mismatches.
 func TestHealthKeepsStaleWhenStillMismatched(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -497,6 +513,7 @@ func TestHealthKeepsStaleWhenStillMismatched(t *testing.T) {
 }
 
 func TestSetVectorFeaturesConcurrentReads(t *testing.T) {
+	t.Parallel()
 	opts := testServerOptions(t, nil)
 	opts.VectorStatus = VectorStatusInitializing
 	srv := NewServerWithOptions(opts)
@@ -517,6 +534,7 @@ func TestSetVectorFeaturesConcurrentReads(t *testing.T) {
 }
 
 func TestSimilarSearchStatusAware503(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name        string
 		status      VectorStatus
@@ -556,6 +574,7 @@ func TestSimilarSearchStatusAware503(t *testing.T) {
 }
 
 func TestHybridSearchInitializing503(t *testing.T) {
+	t.Parallel()
 	opts := testServerOptions(t, nil)
 	opts.VectorStatus = VectorStatusInitializing
 	opts.Store = &mockStore{}
@@ -574,6 +593,7 @@ func TestHybridSearchInitializing503(t *testing.T) {
 }
 
 func TestHealthReportsVectorStatus(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name       string
 		status     VectorStatus
@@ -612,7 +632,87 @@ func TestHealthReportsVectorStatus(t *testing.T) {
 	}
 }
 
+func TestAuthenticatedHealthReportsVectorLanes(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name       string
+		cfg        vector.Config
+		status     VectorStatus
+		wantText   bool
+		wantVisual bool
+		wantVector bool
+	}{
+		{
+			name:       "text only",
+			cfg:        vector.Config{Enabled: true},
+			status:     VectorStatusReady,
+			wantText:   true,
+			wantVisual: false,
+			wantVector: true,
+		},
+		{
+			name: "visual only",
+			cfg: vector.Config{Multimodal: vector.MultimodalConfig{
+				Enabled: true,
+			}},
+			status:     VectorStatusReady,
+			wantText:   false,
+			wantVisual: true,
+			wantVector: true,
+		},
+		{
+			name:       "both disabled",
+			cfg:        vector.Config{},
+			status:     VectorStatusDisabled,
+			wantVector: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert := assert.New(t)
+			require := require.New(t)
+			opts := testServerOptions(t, nil)
+			opts.Config.Server.APIKey = "secret-key"
+			opts.VectorCfg = tt.cfg
+			opts.VectorStatus = tt.status
+			srv := NewServerWithOptions(opts)
+
+			publicRec := httptest.NewRecorder()
+			srv.Router().ServeHTTP(publicRec, httptest.NewRequest(http.MethodGet, "/health", nil))
+			require.Equal(http.StatusOK, publicRec.Code)
+			var public map[string]any
+			require.NoError(json.Unmarshal(publicRec.Body.Bytes(), &public))
+			publicVector, ok := public["vector"].(map[string]any)
+			if tt.wantVector {
+				require.True(ok, "public health should include vector status")
+				assert.NotContains(publicVector, "text_enabled")
+				assert.NotContains(publicVector, "visual_enabled")
+			} else {
+				assert.False(ok, "disabled health should omit vector status")
+			}
+
+			authReq := httptest.NewRequest(http.MethodGet, "/api/v1/health", nil)
+			authReq.Header.Set("X-Api-Key", "secret-key")
+			authRec := httptest.NewRecorder()
+			srv.Router().ServeHTTP(authRec, authReq)
+			require.Equal(http.StatusOK, authRec.Code)
+			var authenticated HealthResponse
+			require.NoError(json.Unmarshal(authRec.Body.Bytes(), &authenticated))
+			if !tt.wantVector {
+				assert.Nil(authenticated.Vector, "disabled authenticated health should omit vector status")
+				return
+			}
+			require.NotNil(authenticated.Vector)
+			require.NotNil(authenticated.Vector.TextEnabled)
+			require.NotNil(authenticated.Vector.VisualEnabled)
+			assert.Equal(tt.wantText, *authenticated.Vector.TextEnabled)
+			assert.Equal(tt.wantVisual, *authenticated.Vector.VisualEnabled)
+		})
+	}
+}
+
 func TestStatsReportsVectorStatus(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name   string
 		status VectorStatus
@@ -643,6 +743,7 @@ func TestStatsReportsVectorStatus(t *testing.T) {
 }
 
 func TestStatsReportsTextVectorMessageScope(t *testing.T) {
+	t.Parallel()
 	srv, _ := newTestServerWithMockStore(t)
 	vectorCfg := vector.Config{Enabled: true}
 	vectorCfg.Embed.Scope.MessageTypes = []string{"sms", "mms"}
@@ -663,6 +764,7 @@ func TestStatsReportsTextVectorMessageScope(t *testing.T) {
 // server was built without one, so clients can distinguish live-SQL
 // fallback from cache-backed aggregates.
 func TestHealthReportsAnalyticsMode(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 	opts := testServerOptions(t, nil)

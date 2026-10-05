@@ -101,6 +101,71 @@ func testWorkspace(t *testing.T) *fakeSlack {
 // replies (the root re-upserts in place).
 const totalWorkspaceMessages = 13
 
+func TestImportPublicChannelsWithoutSearch(t *testing.T) {
+	requirements := require.New(t)
+	assertions := assert.New(t)
+	f := testWorkspace(t)
+	f.scopes = "channels:read,channels:history,users:read,users:read.email"
+	f.searchMissingScope = true
+	f.onSearch = func(string, int) { assertions.Fail("token without search scope must not search") }
+	f.convs = append(f.convs, &fakeConv{
+		ID: "C03", Name: "announcements", Kind: "public", NotMember: true,
+		Members: []string{"UALICE"},
+		Msgs:    []fakeMsg{{TS: ts(40), User: "UALICE", Text: "public announcement"}},
+	})
+	imp, opts := testImporter(t, f)
+	now := tsBase.Add(24 * time.Hour)
+	imp.now = func() time.Time { return now }
+
+	sum, err := imp.Import(context.Background(), opts)
+	requirements.NoError(err)
+	assertions.Equal(2, sum.ConversationsProcessed)
+	var count int
+	requirements.NoError(imp.store.DB().QueryRow(`SELECT COUNT(*) FROM messages`).Scan(&count))
+	assertions.Equal(11, count, "public messages and replies, including an unjoined channel")
+	requirements.NoError(imp.store.DB().QueryRow(`SELECT COUNT(*) FROM conversations WHERE source_conversation_id IN ('C02', 'G01', 'D01')`).Scan(&count))
+	assertions.Zero(count, "private conversations must not enter the archive")
+
+	// The first reply to an old, previously unthreaded message cannot be
+	// found through an incremental history window. It requires a new walk.
+	f.convs[0].Msgs[0].Replies = []fakeMsg{{TS: ts(1500), ThreadTS: ts(0), User: "UALICE", Text: "late public reply"}}
+	now = now.Add(2 * time.Hour)
+	sum, err = imp.Import(context.Background(), opts)
+	requirements.NoError(err)
+	assertions.Positive(sum.RepliesFetched)
+	requirements.NoError(imp.store.DB().QueryRow(`SELECT COUNT(*) FROM messages`).Scan(&count))
+	assertions.Equal(12, count)
+
+	_, err = imp.Import(context.Background(), opts)
+	requirements.NoError(err)
+	requirements.NoError(imp.store.DB().QueryRow(`SELECT COUNT(*) FROM messages`).Scan(&count))
+	assertions.Equal(12, count, "re-reading threads must not duplicate messages")
+}
+
+func TestImportWithoutSearchResumesLimitedThreadWalk(t *testing.T) {
+	requirements := require.New(t)
+	f := testWorkspace(t)
+	f.convs = f.convs[:1]
+	f.scopes = "channels:read,channels:history,users:read,users:read.email"
+	f.searchMissingScope = true
+	imp, opts := testImporter(t, f)
+	now := tsBase.Add(24 * time.Hour)
+	imp.now = func() time.Time { return now }
+	_, err := imp.Import(context.Background(), opts)
+	requirements.NoError(err)
+	f.convs[0].Msgs[0].Replies = []fakeMsg{{TS: ts(1500), ThreadTS: ts(0), User: "UALICE", Text: "late reply"}}
+	f.convs[0].Msgs = append(f.convs[0].Msgs, fakeMsg{TS: ts(1501), User: "UALICE", Text: "new root"})
+	now = now.Add(2 * time.Hour)
+	opts.Limit = 3
+	for range 20 {
+		_, err = imp.Import(context.Background(), opts)
+		requirements.NoError(err)
+	}
+	var count int
+	requirements.NoError(imp.store.DB().QueryRow(`SELECT COUNT(*) FROM messages`).Scan(&count))
+	assert.Equal(t, 12, count, "resumed thread walks must leave room for new channel messages")
+}
+
 func testImporter(t *testing.T, f *fakeSlack) (*Importer, ImportOptions) {
 	t.Helper()
 	prevInterval := checkpointMinInterval
@@ -113,6 +178,171 @@ func testImporter(t *testing.T, f *fakeSlack) (*Importer, ImportOptions) {
 	st := testutil.NewTestStore(t)
 	imp := NewImporter(st, client, "T01")
 	return imp, ImportOptions{TeamID: "T01", UserID: "UME", NoMedia: true}
+}
+
+func TestIncludeConversationSelectionPolicy(t *testing.T) {
+	tests := []struct {
+		name string
+		conv Conversation
+		opts ImportOptions
+		want bool
+	}{
+		{name: "default dm", conv: Conversation{IsIM: true}, want: true},
+		{name: "excluded dm", conv: Conversation{IsIM: true}, opts: ImportOptions{ExcludeDMs: true}},
+		{name: "default group dm", conv: Conversation{IsMpim: true}, want: true},
+		{name: "excluded group dm", conv: Conversation{IsMpim: true}, opts: ImportOptions{ExcludeGroupDMs: true}},
+		{name: "included channel", conv: Conversation{Name: "general"}, opts: ImportOptions{IncludeChannels: []string{"general"}}, want: true},
+		{name: "excluded channel", conv: Conversation{Name: "general"}, opts: ImportOptions{ExcludeChannels: []string{"general"}}},
+		{name: "private channel unaffected by dm toggle", conv: Conversation{Name: "private", IsPrivate: true}, opts: ImportOptions{ExcludeDMs: true, ExcludeGroupDMs: true}, want: true},
+		{name: "dm ignores channel names", conv: Conversation{Name: "general", IsIM: true}, opts: ImportOptions{IncludeChannels: []string{"general"}, ExcludeDMs: true}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, includeConversation(&tt.conv, &tt.opts))
+		})
+	}
+}
+
+func TestImportSkipsExcludedDMsAndGroupDMs(t *testing.T) {
+	assertions := assert.New(t)
+	requirements := require.New(t)
+	f := testWorkspace(t)
+	historyCalls := map[string]int{}
+	f.onHistory = func(channelID string) { historyCalls[channelID]++ }
+	imp, opts := testImporter(t, f)
+	opts.ExcludeDMs = true
+	opts.ExcludeGroupDMs = true
+
+	sum, err := imp.Import(context.Background(), opts)
+	requirements.NoError(err)
+	assertions.Equal(2, sum.ConversationsProcessed)
+	assertions.Zero(historyCalls["D01"])
+	assertions.Zero(historyCalls["G01"])
+
+	var conversations int
+	requirements.NoError(imp.store.DB().QueryRow(imp.store.Rebind(
+		`SELECT COUNT(*) FROM conversations WHERE source_conversation_id IN (?, ?)`),
+		"D01", "G01").Scan(&conversations))
+	assertions.Zero(conversations)
+}
+
+func TestImportPrivateChannelsAndDMsAreIndependent(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		excludeDMs bool
+		want       []string
+	}{
+		{name: "keep DMs", want: []string{"C01", "D01", "G01"}},
+		{name: "public only", excludeDMs: true, want: []string{"C01"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			requirements := require.New(t)
+			f := testWorkspace(t)
+			imp, opts := testImporter(t, f)
+			opts.ExcludePrivateChannels = true
+			opts.ExcludeDMs = tt.excludeDMs
+			opts.ExcludeGroupDMs = tt.excludeDMs
+			_, err := imp.Import(t.Context(), opts)
+			requirements.NoError(err)
+			var ids []string
+			rows, err := imp.store.DB().Query(`SELECT source_conversation_id FROM conversations ORDER BY source_conversation_id`)
+			requirements.NoError(err)
+			defer func() { requirements.NoError(rows.Close()) }()
+			for rows.Next() {
+				var id string
+				requirements.NoError(rows.Scan(&id))
+				ids = append(ids, id)
+			}
+			requirements.NoError(rows.Err())
+			assert.Equal(t, tt.want, ids)
+		})
+	}
+}
+
+func TestExcludedDMRetainsResumeStateAndThreadDebt(t *testing.T) {
+	assertions := assert.New(t)
+	requirements := require.New(t)
+	f := newFakeSlack(t)
+	f.users = []map[string]any{
+		{"id": "UME", "name": "me", "profile": map[string]any{"email": "me@example.com"}},
+		{"id": "UALICE", "name": "alice", "profile": map[string]any{"email": "alice@example.com"}},
+	}
+	rootTS := ts(0)
+	f.convs = []*fakeConv{{
+		ID: "D01", Kind: "im", IMUser: "UALICE",
+		Msgs: []fakeMsg{{
+			TS: rootTS, User: "UALICE", Text: "root",
+			Replies: []fakeMsg{
+				{TS: ts(1), ThreadTS: rootTS, User: "UME", Text: "reply one"},
+				{TS: ts(2), ThreadTS: rootTS, User: "UALICE", Text: "reply two"},
+			},
+		}},
+	}}
+	imp, opts := testImporter(t, f)
+	limited := opts
+	limited.Limit = 1
+	_, err := imp.Import(context.Background(), limited)
+	requirements.NoError(err)
+	src, err := imp.store.GetOrCreateSource(sourceTypeSlack, "T01:UME")
+	requirements.NoError(err)
+	before := requireResumeState(t, imp, src.ID).Conversations["D01"]
+	requirements.NotNil(before)
+	requirements.NotEmpty(before.PendingThreads)
+	beforeCopy := *before
+	beforeCopy.PendingThreads = append([]PendingThread(nil), before.PendingThreads...)
+
+	f.mu.Lock()
+	f.historyCalls = 0
+	f.mu.Unlock()
+	excluded := opts
+	excluded.ExcludeDMs = true
+	sum, err := imp.Import(context.Background(), excluded)
+	requirements.NoError(err)
+	assertions.Zero(sum.ConversationsProcessed)
+	assertions.Zero(f.historyCalls)
+	after := requireResumeState(t, imp, src.ID).Conversations["D01"]
+	requirements.NotNil(after)
+	assertions.Equal(beforeCopy, *after)
+}
+
+func TestReincludedDMRepaysThreadDebt(t *testing.T) {
+	assertions := assert.New(t)
+	requirements := require.New(t)
+	f := newFakeSlack(t)
+	f.users = []map[string]any{
+		{"id": "UME", "name": "me", "profile": map[string]any{"email": "me@example.com"}},
+		{"id": "UALICE", "name": "alice", "profile": map[string]any{"email": "alice@example.com"}},
+	}
+	rootTS := ts(0)
+	f.convs = []*fakeConv{{
+		ID: "D01", Kind: "im", IMUser: "UALICE",
+		Msgs: []fakeMsg{{
+			TS: rootTS, User: "UALICE", Text: "root",
+			Replies: []fakeMsg{{TS: ts(1), ThreadTS: rootTS, User: "UME", Text: "reply"}},
+		}},
+	}}
+	imp, opts := testImporter(t, f)
+	limited := opts
+	limited.Limit = 1
+	_, err := imp.Import(context.Background(), limited)
+	requirements.NoError(err)
+
+	excluded := opts
+	excluded.ExcludeDMs = true
+	_, err = imp.Import(context.Background(), excluded)
+	requirements.NoError(err)
+
+	sum, err := imp.Import(context.Background(), opts)
+	requirements.NoError(err)
+	assertions.Equal(1, sum.ConversationsProcessed)
+	src, err := imp.store.GetOrCreateSource(sourceTypeSlack, "T01:UME")
+	requirements.NoError(err)
+	state := requireResumeState(t, imp, src.ID)
+	assertions.Empty(state.Conversations["D01"].PendingThreads)
+	var replies int
+	requirements.NoError(imp.store.DB().QueryRow(imp.store.Rebind(
+		`SELECT COUNT(*) FROM messages WHERE source_message_id = ?`), "D01:"+ts(1)).Scan(&replies))
+	assertions.Equal(1, replies)
 }
 
 func TestImportEndToEnd(t *testing.T) {
@@ -464,22 +694,23 @@ func TestImportInterruptResumesWithoutDuplicates(t *testing.T) {
 	imp, opts := testImporter(t, f)
 	st := imp.store
 
-	// Cancel partway through the first run: as soon as the first history
-	// page has been served, mid-conversation-walk.
+	// Cancel partway through the first run when the fake serves the second
+	// history page, mid-conversation-walk.
 	ctx, cancel := context.WithCancel(context.Background())
-	go func() {
-		for {
-			f.mu.Lock()
-			served := f.historyCalls > 0
-			f.mu.Unlock()
-			if served {
-				cancel()
-				return
-			}
-			time.Sleep(time.Millisecond)
+	defer cancel()
+	historyCalls := 0
+	f.mu.Lock()
+	f.onHistory = func(string) {
+		historyCalls++
+		if historyCalls == 2 {
+			cancel()
 		}
-	}()
+	}
+	f.mu.Unlock()
 	_, _ = imp.Import(ctx, opts)
+	f.mu.Lock()
+	f.onHistory = nil
+	f.mu.Unlock()
 
 	// Resume to completion: every message exactly once.
 	_, err := imp.Import(context.Background(), opts)
@@ -1886,9 +2117,17 @@ func TestFullRepairSurvivesInterruption(t *testing.T) {
 	require.NoError(err)
 
 	// An old message is edited at the source; --full is the repair path.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	historyCalls := 0
 	f.mu.Lock()
 	f.conv("C01").Msgs[0].Text = "hello 0 (repaired)"
-	baseline := f.historyCalls
+	f.onHistory = func(string) {
+		historyCalls++
+		if historyCalls == 2 {
+			cancel()
+		}
+	}
 	f.mu.Unlock()
 
 	// The repair run dies mid-walk. Its generation-stamped checkpoint must
@@ -1897,20 +2136,10 @@ func TestFullRepairSurvivesInterruption(t *testing.T) {
 	// abandon the repair half-done.
 	full := opts
 	full.Full = true
-	ctx, cancel := context.WithCancel(context.Background())
-	go func() {
-		for {
-			f.mu.Lock()
-			served := f.historyCalls > baseline
-			f.mu.Unlock()
-			if served {
-				cancel()
-				return
-			}
-			time.Sleep(time.Millisecond)
-		}
-	}()
 	_, _ = imp.Import(ctx, full)
+	f.mu.Lock()
+	f.onHistory = nil
+	f.mu.Unlock()
 
 	// A PLAIN run continues (and completes) the repair session.
 	_, err = imp.Import(context.Background(), opts)
@@ -2799,10 +3028,106 @@ func TestImportChannelFilters(t *testing.T) {
 	require.NoError(st.DB().QueryRow(st.Rebind(`
 		SELECT COUNT(*) FROM conversations WHERE source_conversation_id = ?`), "C01").Scan(&n))
 	assert.Zero(n, "excluded channel must not be archived")
-	// DMs are never filtered.
+	// Name filters never apply to DMs or group DMs.
 	require.NoError(st.DB().QueryRow(st.Rebind(`
 		SELECT COUNT(*) FROM conversations WHERE source_conversation_id = ?`), "D01").Scan(&n))
 	assert.Equal(1, n)
+	require.NoError(st.DB().QueryRow(st.Rebind(`
+		SELECT COUNT(*) FROM conversations WHERE source_conversation_id = ?`), "G01").Scan(&n))
+	assert.Equal(1, n)
+}
+
+func TestSweepRecoversGapForReEnabledDM(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	f := newFakeSlack(t)
+	f.users = []map[string]any{
+		{"id": "UME", "name": "me", "profile": map[string]any{"email": "me@example.com"}},
+		{"id": "UALICE", "name": "alice", "profile": map[string]any{"email": "alice@example.com"}},
+	}
+	rootTS := ts(-14400)
+	f.convs = []*fakeConv{
+		{ID: "D09", Kind: "im", IMUser: "UALICE", Msgs: []fakeMsg{{
+			TS: rootTS, User: "UALICE", Text: "ancient root",
+			Replies: []fakeMsg{{TS: ts(-14390), ThreadTS: rootTS, User: "UME", Text: "ancient reply"}},
+		}, {TS: ts(0), User: "UALICE", Text: "recent chatter"}}},
+		{ID: "C11", Name: "keep", Kind: "public", Members: []string{"UME"},
+			Msgs: []fakeMsg{{TS: ts(1), User: "UME", Text: "keep hi"}}},
+	}
+	imp, opts := testImporter(t, f)
+	sum, err := imp.Import(context.Background(), opts)
+	require.NoError(err)
+
+	gapReply := tsFresh(0)
+	f.mu.Lock()
+	f.conv("D09").findRoot(rootTS).Replies = append(f.conv("D09").findRoot(rootTS).Replies,
+		fakeMsg{TS: gapReply, ThreadTS: rootTS, User: "UME", Text: "reply while excluded"})
+	f.mu.Unlock()
+
+	imp.now = func() time.Time { return time.Now().Add(time.Hour) }
+	excluded := opts
+	excluded.ExcludeDMs = true
+	_, err = imp.Import(context.Background(), excluded)
+	require.NoError(err)
+	state := requireResumeState(t, imp, sum.SourceID)
+	require.True(tsLess(gapReply, state.SweepWatermark),
+		"test setup: the watermark must have certified past the excluded DM reply")
+	var n int
+	require.NoError(imp.store.DB().QueryRow(imp.store.Rebind(
+		`SELECT COUNT(*) FROM messages WHERE source_message_id = ?`), "D09:"+gapReply).Scan(&n))
+	require.Zero(n, "the reply must not be archived while its DM is excluded")
+
+	// The first run's sweep flags the gap; the next run performs the catch-up walk.
+	imp.now = func() time.Time { return time.Now().Add(2 * time.Hour) }
+	_, err = imp.Import(context.Background(), opts)
+	require.NoError(err)
+	imp.now = func() time.Time { return time.Now().Add(3 * time.Hour) }
+	_, err = imp.Import(context.Background(), opts)
+	require.NoError(err)
+	require.NoError(imp.store.DB().QueryRow(imp.store.Rebind(
+		`SELECT COUNT(*) FROM messages WHERE source_message_id = ?`), "D09:"+gapReply).Scan(&n))
+	assert.Equal(1, n, "a reply created while a DM was excluded must be recovered on re-entry")
+}
+
+func TestFullRepairWithExcludedDMsCoversSelectedConversations(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	f := testWorkspace(t)
+	historyCalls := map[string]int{}
+	f.onHistory = func(channelID string) { historyCalls[channelID]++ }
+	imp, opts := testImporter(t, f)
+	_, err := imp.Import(context.Background(), opts)
+	require.NoError(err)
+	var beforeMessages int
+	require.NoError(imp.store.DB().QueryRow(`SELECT COUNT(*) FROM messages`).Scan(&beforeMessages))
+
+	full := opts
+	full.Full = true
+	full.ExcludeDMs = true
+	historyCalls["D01"] = 0
+
+	sum, err := imp.Import(context.Background(), full)
+	require.NoError(err)
+	assert.Equal(3, sum.ConversationsProcessed)
+	assert.Zero(historyCalls["D01"])
+	var afterExcludedMessages int
+	require.NoError(imp.store.DB().QueryRow(`SELECT COUNT(*) FROM messages`).Scan(&afterExcludedMessages))
+	assert.Equal(beforeMessages, afterExcludedMessages, "full repair must retain archived messages for an excluded DM")
+
+	state := requireResumeState(t, imp, sum.SourceID)
+	assert.False(state.RepairPending)
+	assert.NotContains(state.Conversations, "D01")
+	for _, id := range []string{"C01", "C02", "G01"} {
+		assert.True(state.Conversations[id].Done, id)
+	}
+
+	_, err = imp.Import(context.Background(), opts)
+	require.NoError(err)
+	state = requireResumeState(t, imp, sum.SourceID)
+	assert.Contains(state.Conversations, "D01")
+	var afterReentryMessages int
+	require.NoError(imp.store.DB().QueryRow(`SELECT COUNT(*) FROM messages`).Scan(&afterReentryMessages))
+	assert.Equal(beforeMessages, afterReentryMessages, "re-entry must not duplicate archived messages")
 }
 
 // tsAgo renders a Slack ts for a moment shortly in the past — close enough

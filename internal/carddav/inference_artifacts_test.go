@@ -88,7 +88,7 @@ func TestPendingPreviewApprovesImmutableBytesLeavingNewInference(t *testing.T) {
 				require.NoError(err)
 				t.Cleanup(func() { _ = reopened.Close() })
 				require.NoError(reopened.InitSchema())
-				service = NewService(reopened, service.client)
+				service = NewService(reopened, service.dav().client)
 			}
 			require.NoError(service.PublishPerson(t.Context(), personID))
 			assert.Equal(string(pending.OutgoingBody), string(fixture.body))
@@ -226,8 +226,8 @@ func TestPendingRecoveryAndCancellationShareHTTPBarrierAcrossServices(t *testing
 		t.Cleanup(server.Close)
 		transport, ok := server.Client().Transport.(*http.Transport)
 		require.True(ok)
-		service.client.dialContext = transport.DialContext
-		second := NewService(st, service.client)
+		service.dav().client.dialContext = transport.DialContext
+		second := NewService(st, service.dav().client)
 		require.Error(service.PublishPerson(t.Context(), personID))
 		block.Store(true)
 		recoveryDone := make(chan error, 1)
@@ -281,7 +281,7 @@ func TestConflictReviewSupportsTwoSubscribedNonWriteBooks(t *testing.T) {
 	for _, book := range books {
 		require.NoError(st.SetCardDAVBookRolesContext(t.Context(), book.ID, store.CardDAVBookRoles{IsSubscribed: true}))
 	}
-	books, err = st.ListCardDAVAddressBooksContext(t.Context())
+	books, err = st.ListCardDAVAddressBooksContext(t.Context(), store.AllCardDAVAccounts)
 	require.NoError(err)
 	for _, book := range books {
 		body := []byte("BEGIN:VCARD\r\nVERSION:3.0\r\nUID:person\r\nFN:Shared Person\r\nEND:VCARD\r\n")
@@ -294,7 +294,7 @@ func TestConflictReviewSupportsTwoSubscribedNonWriteBooks(t *testing.T) {
 		require.Equal(&personID, mapping.PersonID)
 	}
 	appendInferenceReviewNote(t, st, personID, "Shared inferred detail")
-	books, err = st.ListCardDAVAddressBooksContext(t.Context())
+	books, err = st.ListCardDAVAddressBooksContext(t.Context(), store.AllCardDAVAccounts)
 	require.NoError(err)
 	var previews []*PublicationPreview
 	for _, book := range books {
@@ -417,7 +417,7 @@ func TestCancelAbsentPendingCreateAfterPullMaterializedMapping(t *testing.T) {
 	remote, absent, err := service.fetchCanonical(t.Context(), pending.Href)
 	require.NoError(err)
 	require.False(absent)
-	account, err := st.GetCardDAVAccountContext(t.Context())
+	account, err := st.GetCardDAVAccountByIDContext(t.Context(), store.DefaultCardDAVAccountID)
 	require.NoError(err)
 	_, err = st.ApplyCardDAVSyncPlanContext(t.Context(), store.CardDAVSyncPlan{AddressBookID: book.ID, ConnectionGeneration: account.ConnectionGeneration, SyncRevision: book.SyncRevision, Upserts: []store.CardDAVRemoteResource{remote}})
 	require.NoError(err)
