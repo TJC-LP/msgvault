@@ -137,9 +137,9 @@ func Import(ctx context.Context, st *store.Store, c *Client, opts Options, log *
 		restarted := false
 		switch {
 		case link == "":
-			link, seen = DeltaStartURL(f.ID), map[string]bool{}
+			link, seen = c.DeltaStartURL(f.ID), map[string]bool{}
 		case strings.HasPrefix(link, walkPrefix):
-			link, seen = DeltaStartURL(f.ID), map[string]bool{}
+			link, seen = c.DeltaStartURL(f.ID), map[string]bool{}
 		}
 		for {
 			page, perr := c.DeltaPage(ctx, link)
@@ -147,7 +147,7 @@ func Import(ctx context.Context, st *store.Store, c *Client, opts Options, log *
 				// The token expired. Walk the folder again; messages already
 				// in the vault are not downloaded again.
 				log.Info("delta token expired, walking folder again", "folder", f.Path)
-				link, seen, restarted = DeltaStartURL(f.ID), map[string]bool{}, true
+				link, seen, restarted = c.DeltaStartURL(f.ID), map[string]bool{}, true
 				continue
 			}
 			if perr != nil {

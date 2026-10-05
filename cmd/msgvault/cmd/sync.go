@@ -208,7 +208,7 @@ func runSyncIncrementalLocal(cmd *cobra.Command, args []string) error {
 			break
 		}
 		fmt.Printf("Syncing Microsoft Graph mail for %s\n", src.Identifier)
-		sum, err := runMSMailSync(ctx, s, src.Identifier, func(line string) { fmt.Println(line) }, state)
+		sum, err := runMSMailSync(ctx, s, src, func(line string) { fmt.Println(line) }, state)
 		if err != nil {
 			syncErrors = append(syncErrors, fmt.Sprintf("%s: %v", src.Identifier, err))
 			continue

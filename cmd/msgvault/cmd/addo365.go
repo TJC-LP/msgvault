@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"strings"
@@ -16,6 +17,7 @@ var (
 	o365TenantID             string
 	noDefaultIdentityAddO365 bool
 	o365Graph                bool
+	o365As                   string
 )
 
 func newAddO365Cmd() *cobra.Command {
@@ -48,6 +50,9 @@ func preflightAddO365Authorize(cmd *cobra.Command, email string) error {
 	if err := requireMicrosoftOAuthConfig(cfg); err != nil {
 		return err
 	}
+	if err := validateO365As(); err != nil {
+		return err
+	}
 	if err := authorizeO365(cmd, email); err != nil {
 		return err
 	}
@@ -77,11 +82,18 @@ asks for Mail.ReadWrite, which the app registration must also list. A Graph
 account is a separate account: if the mailbox is also synced over IMAP, the
 vault holds two copies, and 'msgvault dedup --collection' hides the extra ones.
 
+With --graph and --as, the account is a shared or delegated mailbox that the
+user named by --as can open. msgvault signs in as that user, never as the
+mailbox, and reads the mailbox through Microsoft Graph. It needs the
+Mail.Read.Shared permission on the app registration. Microsoft Graph checks the
+user's access to the mailbox on every request.
+
 Examples:
   msgvault add-o365 user@outlook.com
   msgvault add-o365 user@outlook.com --headless
   msgvault add-o365 user@company.com --tenant my-tenant-id
-  msgvault add-o365 user@company.com --graph`,
+  msgvault add-o365 user@company.com --graph
+  msgvault add-o365 team@company.com --graph --as user@company.com`,
 		Args: cobra.ExactArgs(1),
 		RunE: runAddO365Local,
 	}
@@ -91,6 +103,8 @@ Examples:
 	cmd.Flags().BoolVar(&o365Headless, "headless", false,
 		"Sign in with a device code instead of a local browser")
 	cmd.Flags().BoolVar(&o365Graph, "graph", false, "sync through the Microsoft Graph mail API instead of IMAP")
+	cmd.Flags().StringVar(&o365As, "as", "",
+		"with --graph: sign in as this user and sync <email> as a shared or delegated mailbox")
 	registerOAuthPreflightedFlag(cmd)
 	return cmd
 }
@@ -105,6 +119,9 @@ func runAddO365Local(cmd *cobra.Command, args []string) error {
 	email := args[0]
 
 	if err := requireMicrosoftOAuthConfig(cfg); err != nil {
+		return err
+	}
+	if err := validateO365As(); err != nil {
 		return err
 	}
 	if o365Graph {
@@ -228,7 +245,14 @@ func authorizeO365(cmd *cobra.Command, email string) error {
 	redirect := cfg.Microsoft.EffectiveRedirectURI()
 	fmt.Printf("Authorizing %s with Microsoft...\n", email)
 	var err error
-	if o365Graph {
+	if o365Graph && o365SharedMailbox(email) {
+		fmt.Printf("Signing in as %s to read %s...\n", strings.TrimSpace(o365As), email)
+		mgr := microsoft.NewGraphMailSharedManager(cfg.Microsoft.ClientID, tenant, redirect, cfg.TokensDir(), logger)
+		if o365Headless {
+			mgr.UseDeviceCode()
+		}
+		err = mgr.AuthorizeAs(cmd.Context(), strings.TrimSpace(o365As), email)
+	} else if o365Graph {
 		mgr := microsoft.NewGraphMailManager(cfg.Microsoft.ClientID, tenant, redirect, cfg.TokensDir(), logger)
 		if o365Headless {
 			mgr.UseDeviceCode()
@@ -277,6 +301,19 @@ func runAddO365GraphLocal(cmd *cobra.Command, email string) error {
 	if err := s.UpdateSourceDisplayName(source.ID, email); err != nil {
 		return fmt.Errorf("set display name: %w", err)
 	}
+	// Re-adding without --as turns a shared mailbox source back into the
+	// signed-in user's own, so the config is always written.
+	mcfg := msmailSourceConfig{}
+	if o365SharedMailbox(email) {
+		mcfg.SignedInAs = strings.TrimSpace(o365As)
+	}
+	cfgJSON, err := json.Marshal(mcfg)
+	if err != nil {
+		return fmt.Errorf("serialize config: %w", err)
+	}
+	if err := s.UpdateSourceSyncConfig(source.ID, string(cfgJSON)); err != nil {
+		return fmt.Errorf("store config: %w", err)
+	}
 	if err := setDefaultIdentityOptOut(cmd, s, source, noDefaultIdentityAddO365); err != nil {
 		return err
 	}
@@ -289,10 +326,29 @@ func runAddO365GraphLocal(cmd *cobra.Command, email string) error {
 
 	fmt.Printf("\nMicrosoft 365 account added for Graph mail sync!\n")
 	fmt.Printf("  Email: %s\n", email)
+	if mcfg.shared() {
+		fmt.Printf("  Read as: %s (shared or delegated mailbox)\n", mcfg.SignedInAs)
+	}
 	fmt.Println()
 	fmt.Println("You can now run:")
 	fmt.Printf("  msgvault sync %s\n", email)
 	return nil
+}
+
+// validateO365As rejects --as without --graph: only Graph mail can read a
+// shared or delegated mailbox.
+func validateO365As() error {
+	if strings.TrimSpace(o365As) != "" && !o365Graph {
+		return errors.New("--as requires --graph: IMAP sync reads only the signed-in user's mailbox")
+	}
+	return nil
+}
+
+// o365SharedMailbox reports whether --as names a user other than the
+// mailbox, so the account is a shared or delegated mailbox.
+func o365SharedMailbox(email string) bool {
+	as := strings.TrimSpace(o365As)
+	return as != "" && !strings.EqualFold(as, strings.TrimSpace(email))
 }
 
 // isMicrosoftIMAPSource returns true only if src is an IMAP source already

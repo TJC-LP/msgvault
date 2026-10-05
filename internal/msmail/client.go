@@ -19,6 +19,10 @@ const GraphBaseURL = "https://graph.microsoft.com/v1.0"
 // Client adds the mail endpoints to the shared Graph transport.
 type Client struct {
 	*msgraph.Client
+
+	// root is the mailbox every request reads: "/me" for the signed-in
+	// user, or "/users/<address>" for a shared or delegated mailbox.
+	root string
 }
 
 // NewClient creates a mail Client. Every request asks for immutable IDs, so a
@@ -26,7 +30,18 @@ type Client struct {
 func NewClient(baseURL string, token msgraph.TokenFunc, qps float64) *Client {
 	c := msgraph.NewClient(baseURL, token, qps)
 	c.Headers = map[string]string{"Prefer": `IdType="ImmutableId", odata.maxpagesize=1000`}
-	return &Client{c}
+	return &Client{Client: c, root: "/me"}
+}
+
+// ForMailbox points the client at another user's mailbox, one the signed-in
+// user can open: a shared mailbox or a delegated one. Graph checks the access
+// on every request, and the token needs Mail.Read.Shared. An empty address
+// keeps the signed-in user's own mailbox.
+func (c *Client) ForMailbox(address string) *Client {
+	if address != "" {
+		c.root = "/users/" + url.PathEscape(address)
+	}
+	return c
 }
 
 // Folder is a mail folder. Path joins the display names from the top of the
@@ -68,28 +83,28 @@ func (c *Client) ListFolders(ctx context.Context) ([]Folder, error) {
 			}
 			out = append(out, f)
 			if f.ChildFolderCount > 0 {
-				if err := walk("/me/mailFolders/"+url.PathEscape(f.ID)+"/childFolders"+folderSelect, f.Path); err != nil {
+				if err := walk(c.root+"/mailFolders/"+url.PathEscape(f.ID)+"/childFolders"+folderSelect, f.Path); err != nil {
 					return err
 				}
 			}
 		}
 		return nil
 	}
-	return out, walk("/me/mailFolders"+folderSelect, "")
+	return out, walk(c.root+"/mailFolders"+folderSelect, "")
 }
 
 // WellKnownFolderID returns the ID of a well-known folder such as "sentitems".
 // It returns msgraph.ErrNotFound when the mailbox does not have that folder.
 func (c *Client) WellKnownFolderID(ctx context.Context, name string) (string, error) {
 	var f Folder
-	err := c.GetJSON(ctx, "/me/mailFolders/"+name+"?$select=id", &f)
+	err := c.GetJSON(ctx, c.root+"/mailFolders/"+name+"?$select=id", &f)
 	return f.ID, err
 }
 
 // DeltaStartURL is the first delta request for a folder with no saved cursor.
 // It returns every message in the folder and ends with a deltaLink.
-func DeltaStartURL(folderID string) string {
-	return "/me/mailFolders/" + url.PathEscape(folderID) + "/messages/delta?$select=receivedDateTime"
+func (c *Client) DeltaStartURL(folderID string) string {
+	return c.root + "/mailFolders/" + url.PathEscape(folderID) + "/messages/delta?$select=receivedDateTime"
 }
 
 // DeltaPage fetches one page of a delta walk. The page carries a NextLink
@@ -104,7 +119,7 @@ func (c *Client) DeltaPage(ctx context.Context, pageURL string) (*msgraph.ListRe
 
 // GetMIME returns the full RFC 5322 source of a message.
 func (c *Client) GetMIME(ctx context.Context, id string) ([]byte, error) {
-	return c.GetRawWithTimeout(ctx, "/me/messages/"+url.PathEscape(id)+"/$value", 10*time.Minute)
+	return c.GetRawWithTimeout(ctx, c.root+"/messages/"+url.PathEscape(id)+"/$value", 10*time.Minute)
 }
 
 // MessageInfo is where a message is now and when it arrived.
@@ -117,7 +132,7 @@ type MessageInfo struct {
 // msgraph.ErrNotFound when the message no longer exists.
 func (c *Client) LookupMessage(ctx context.Context, id string) (MessageInfo, error) {
 	var m MessageInfo
-	err := c.GetJSON(ctx, "/me/messages/"+url.PathEscape(id)+"?$select=parentFolderId,receivedDateTime", &m)
+	err := c.GetJSON(ctx, c.root+"/messages/"+url.PathEscape(id)+"?$select=parentFolderId,receivedDateTime", &m)
 	return m, err
 }
 
@@ -141,7 +156,7 @@ func (c *Client) BatchDeleteMessages(context.Context, []string) error {
 }
 
 func (c *Client) post(ctx context.Context, id, action string, body any) error {
-	path := "/me/messages/" + url.PathEscape(id) + "/" + action
+	path := c.root + "/messages/" + url.PathEscape(id) + "/" + action
 	err := c.Post(ctx, path, body)
 	if errors.Is(err, msgraph.ErrNotFound) {
 		return &gmail.NotFoundError{Path: path}

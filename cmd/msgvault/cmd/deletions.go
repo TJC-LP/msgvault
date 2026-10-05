@@ -1051,6 +1051,18 @@ Examples:
 		}
 		account := target.Account
 		src := target.Source
+		if src.SourceType == sourceTypeMSMail {
+			// A shared or delegated mailbox needs Mail.ReadWrite.Shared and
+			// /users/<mailbox> paths for deletion; neither is wired up yet,
+			// and the own-mailbox client would act on the wrong mailbox.
+			mcfg, err := msmailConfigOf(src)
+			if err != nil {
+				return err
+			}
+			if mcfg.shared() {
+				return fmt.Errorf("delete-staged does not support the shared mailbox %s yet; it was added with --as %s", account, mcfg.SignedInAs)
+			}
+		}
 
 		// Set up context with cancellation
 		ctx, cancel := context.WithCancel(cmd.Context())

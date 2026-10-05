@@ -324,3 +324,64 @@ func TestRefreshingAccessTokenPersistsToEachManagerFileAndNamesProduct(t *testin
 		})
 	}
 }
+
+// A shared mailbox is read through the signed-in user's token: AuthorizeAs
+// signs in and verifies that user, requests Mail.Read.Shared, and saves the
+// token under the shared mailbox's address.
+func TestGraphMailSharedManager_AuthorizeAs(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	dir := t.TempDir()
+	m := NewGraphMailSharedManager("test-client", "common", "", dir, slog.Default())
+	m.verifyIDTokenFn = testVerifyFn
+
+	var hint string
+	var gotScopes []string
+	m.browserFlowFn = func(_ context.Context, email string, scopes []string) (*oauth2.Token, string, error) {
+		hint, gotScopes = email, scopes
+		idToken := makeIDToken(t, map[string]any{"email": email, "tid": "org-tid"})
+		tok := (&oauth2.Token{AccessToken: "graph-access", RefreshToken: "graph-refresh", TokenType: "Bearer"}).
+			WithExtra(map[string]any{"id_token": idToken})
+		return tok, "test-nonce", nil
+	}
+
+	require.NoError(m.AuthorizeAs(t.Context(), "user@company.com", "team@company.com"))
+	assert.Equal("user@company.com", hint, "the sign-in is the user, never the shared mailbox")
+	assert.Contains(gotScopes, "https://graph.microsoft.com/Mail.Read.Shared")
+	assert.True(m.HasToken("team@company.com"))
+	assert.False(m.HasToken("user@company.com"), "the user's own mail token is untouched")
+
+	ok, err := m.HasScopes("team@company.com")
+	require.NoError(err)
+	assert.True(ok)
+	_, err = NewGraphMailManager("test-client", "common", "", dir, slog.Default()).TokenSource(t.Context(), "team@company.com")
+	require.NoError(err, "the shared grant keeps Mail.Read")
+}
+
+func TestGraphMailSharedManager_AuthorizeAsMismatch(t *testing.T) {
+	dir := t.TempDir()
+	m := NewGraphMailSharedManager("test-client", "common", "", dir, slog.Default())
+	m.verifyIDTokenFn = testVerifyFn
+	m.browserFlowFn = func(_ context.Context, _ string, _ []string) (*oauth2.Token, string, error) {
+		idToken := makeIDToken(t, map[string]any{"email": "team@company.com"})
+		tok := (&oauth2.Token{AccessToken: "x", TokenType: "Bearer"}).
+			WithExtra(map[string]any{"id_token": idToken})
+		return tok, "nonce", nil
+	}
+	err := m.AuthorizeAs(t.Context(), "user@company.com", "team@company.com")
+	mismatch := &TokenMismatchError{}
+	require.ErrorAs(t, err, &mismatch, "signing in as the mailbox instead of the user is refused")
+	assert.False(t, m.HasToken("team@company.com"))
+}
+
+// A token saved before Mail.Read.Shared was requested does not satisfy the
+// shared manager, and the error says how to re-authorize.
+func TestGraphMailSharedManager_RequiresSharedScope(t *testing.T) {
+	dir := t.TempDir()
+	m := NewGraphMailSharedManager("test-client", "common", "", dir, slog.Default())
+	token := &oauth2.Token{AccessToken: "graph-access", RefreshToken: "graph-refresh", TokenType: "Bearer"}
+	require.NoError(t, m.saveToken("team@company.com", token, GraphMailScopes(), "org-tid"))
+	_, err := m.TokenSource(t.Context(), "team@company.com")
+	require.ErrorContains(t, err, "Mail.Read.Shared")
+	require.ErrorContains(t, err, "--as")
+}

@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"encoding/json/v2"
 	"fmt"
 	"io"
 	"time"
@@ -26,6 +27,42 @@ func newGraphMailManager(state *invocation) *microsoft.GraphManager {
 	)
 }
 
+// msmailSourceConfig is the sync_config of a Graph mail source. It is empty
+// for the signed-in user's own mailbox. For a shared or delegated mailbox,
+// SignedInAs is the user whose token reads it; the source identifier is the
+// mailbox itself.
+type msmailSourceConfig struct {
+	SignedInAs string `json:"signed_in_as,omitempty"`
+}
+
+// shared reports whether the source reads a mailbox other than the signed-in
+// user's own.
+func (c msmailSourceConfig) shared() bool { return c.SignedInAs != "" }
+
+func msmailConfigOf(src *store.Source) (msmailSourceConfig, error) {
+	var c msmailSourceConfig
+	if src == nil || !src.SyncConfig.Valid || src.SyncConfig.String == "" {
+		return c, nil
+	}
+	if err := json.Unmarshal([]byte(src.SyncConfig.String), &c); err != nil {
+		return c, fmt.Errorf("read Graph mail config for %s: %w", src.Identifier, err)
+	}
+	return c, nil
+}
+
+// newGraphMailSharedManager requests Mail.Read.Shared on top of the sync
+// scopes. Shared and delegated mailbox sources use it.
+func newGraphMailSharedManager(state *invocation) *microsoft.GraphManager {
+	cfg := state.cfg
+	return microsoft.NewGraphMailSharedManager(
+		cfg.Microsoft.ClientID,
+		cfg.Microsoft.EffectiveTenantID(),
+		cfg.Microsoft.EffectiveRedirectURI(),
+		cfg.TokensDir(),
+		state.logger,
+	)
+}
+
 // newGraphMailWriteManager requests Mail.ReadWrite on top of the sync scopes.
 // delete-staged uses it.
 func newGraphMailWriteManager(state *invocation) *microsoft.GraphManager {
@@ -40,14 +77,27 @@ func newGraphMailWriteManager(state *invocation) *microsoft.GraphManager {
 }
 
 // runMSMailSync syncs one Graph mail account. The first run downloads every
-// folder; later runs fetch only the changes.
-func runMSMailSync(ctx context.Context, s *store.Store, email string, progress func(string), state *invocation) (*msmail.Summary, error) {
+// folder; later runs fetch only the changes. A shared or delegated mailbox is
+// read through the token of the user who added it.
+func runMSMailSync(ctx context.Context, s *store.Store, src *store.Source, progress func(string), state *invocation) (*msmail.Summary, error) {
 	cfg := state.cfg
-	tokenFn, err := newGraphMailManager(state).TokenSource(ctx, email)
+	email := src.Identifier
+	mcfg, err := msmailConfigOf(src)
+	if err != nil {
+		return nil, err
+	}
+	mgr := newGraphMailManager(state)
+	if mcfg.shared() {
+		mgr = newGraphMailSharedManager(state)
+	}
+	tokenFn, err := mgr.TokenSource(ctx, email)
 	if err != nil {
 		return nil, err
 	}
 	client := msmail.NewClient(msmail.GraphBaseURL, tokenFn, msmailQPS)
+	if mcfg.shared() {
+		client.ForMailbox(email)
+	}
 	return msmail.Import(ctx, s, client, msmail.Options{
 		Email:          email,
 		AttachmentsDir: cfg.AttachmentsDir(),
@@ -62,7 +112,7 @@ func runScheduledMSMailSync(ctx context.Context, src *store.Source, s *store.Sto
 	if err := runPostSourceCreateMigrationsForInvocation(s, state); err != nil {
 		return fmt.Errorf("post-source-create migrations: %w", err)
 	}
-	_, err := runMSMailSync(ctx, s, src.Identifier, nil, state)
+	_, err := runMSMailSync(ctx, s, src, nil, state)
 	return err
 }
 
