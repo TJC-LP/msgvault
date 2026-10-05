@@ -50,7 +50,8 @@ type fakeGraph struct {
 	throttle       bool              // answer the next $value with 429 once
 	denied         bool              // answer move and permanentDelete with 403
 	pageSize       int
-	stopAt         int // fail the delta page at this skip offset, when non-zero
+	stopAt         int    // fail the delta page at this skip offset, when non-zero
+	root           string // mailbox path the server answers for; "/me" when empty
 
 	mimeCalls     atomic.Int32
 	walkStarts    atomic.Int32 // delta requests with no token and no nextLink
@@ -116,10 +117,25 @@ func (f *fakeGraph) writeJSON(w http.ResponseWriter, v any) {
 	assert.NoError(f.t, json.MarshalWrite(w, v))
 }
 
+// mailboxRoot is the path prefix of the mailbox the server holds, as Graph
+// writes it into delta links.
+func (f *fakeGraph) mailboxRoot() string {
+	if f.root == "" {
+		return "/me"
+	}
+	return f.root
+}
+
 func (f *fakeGraph) serve(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	p := r.URL.Path
+	// Serve one mailbox: a request for any other one is a test failure.
+	if !strings.HasPrefix(p, f.mailboxRoot()+"/") {
+		http.Error(w, "unexpected mailbox "+p, http.StatusBadRequest)
+		return
+	}
+	p = "/me" + strings.TrimPrefix(p, f.mailboxRoot())
 	q := r.URL.Query()
 	switch {
 	case p == "/me/mailFolders":
@@ -232,7 +248,7 @@ func (f *fakeGraph) delta(w http.ResponseWriter, folder string, q map[string][]s
 		return ""
 	}
 	link := func(kind string, vals ...string) string {
-		return f.srv.URL + "/me/mailFolders/" + folder + "/messages/delta?" + kind + "&" + strings.Join(vals, "&")
+		return f.srv.URL + f.mailboxRoot() + "/mailFolders/" + folder + "/messages/delta?" + kind + "&" + strings.Join(vals, "&")
 	}
 	if f.gone[folder] {
 		http.Error(w, `{"error":{"code":"syncStateNotFound"}}`, http.StatusGone)
@@ -300,6 +316,9 @@ func (f *fakeGraph) delta(w http.ResponseWriter, folder string, q map[string][]s
 func (f *fakeGraph) sync(t *testing.T, st *store.Store) (*Summary, error) {
 	t.Helper()
 	c := NewClient(f.srv.URL, func(context.Context) (string, error) { return "tok", nil }, 1000)
+	if f.root != "" {
+		c.ForMailbox(strings.TrimPrefix(f.root, "/users/"))
+	}
 	dir := f.attachDir
 	if dir == "" {
 		dir = f.t.TempDir()
@@ -363,6 +382,33 @@ func TestImportFirstSyncThenNoChange(t *testing.T) {
 	require.NoError(err)
 	assert.Equal(0, sum.Added)
 	assert.EqualValues(0, f.mimeCalls.Load())
+}
+
+// A shared or delegated mailbox is read at /users/<address>: every request,
+// including the delta links Graph hands back, stays on that mailbox, and the
+// signed-in user's own mailbox at /me is never touched.
+func TestImportSharedMailbox(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	st := testutil.NewTestStore(t)
+	f := newFakeGraph(t)
+	f.root = "/users/team@example.com"
+	f.put("m1", "inbox")
+	f.put("m2", "inbox")
+	f.put("m3", "archive")
+
+	sum, err := f.sync(t, st)
+	require.NoError(err)
+	assert.Equal(3, sum.Added)
+	assert.Equal(map[string]string{"m1": "Inbox", "m2": "Inbox", "m3": "Archive"}, state(t, st))
+
+	f.put("m4", "inbox")
+	f.put("m1", "archive")
+	sum, err = f.sync(t, st)
+	require.NoError(err)
+	assert.Equal(1, sum.Added)
+	assert.Equal(1, sum.Moved)
+	assert.Equal(map[string]string{"m1": "Archive", "m2": "Inbox", "m3": "Archive", "m4": "Inbox"}, state(t, st))
 }
 
 func TestImportMoveAndDelete(t *testing.T) {

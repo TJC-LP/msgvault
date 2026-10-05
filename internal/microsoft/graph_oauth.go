@@ -27,6 +27,7 @@ const (
 	scopeGraphChannelMemberRead = "https://graph.microsoft.com/ChannelMember.Read.All"
 	scopeGraphMailRead          = "https://graph.microsoft.com/Mail.Read"
 	scopeGraphMailReadWrite     = "https://graph.microsoft.com/Mail.ReadWrite"
+	scopeGraphMailReadShared    = "https://graph.microsoft.com/Mail.Read.Shared"
 )
 
 // GraphScopes returns the OAuth scopes requested for Microsoft Teams ingestion
@@ -45,6 +46,13 @@ func GraphScopes() []string {
 // the Graph API.
 func GraphMailScopes() []string {
 	return []string{scopeGraphMailRead, scopeGraphUserRead, scopeOfflineAccess, "openid", scopeEmail}
+}
+
+// GraphMailSharedScopes returns the mail scopes plus Mail.Read.Shared, which
+// reading a shared or delegated mailbox needs. It keeps Mail.Read, so the
+// token also satisfies the sync manager for the user's own mailbox.
+func GraphMailSharedScopes() []string {
+	return append(GraphMailScopes(), scopeGraphMailReadShared)
 }
 
 // GraphMailWriteScopes returns the mail scopes plus Mail.ReadWrite, which
@@ -107,6 +115,17 @@ func NewGraphMailWriteManager(clientID, tenantID, redirectURI, tokensDir string,
 	return m
 }
 
+// NewGraphMailSharedManager is NewGraphMailManager for a shared or delegated
+// mailbox: it requests GraphMailSharedScopes. The token belongs to the user
+// who signs in, and is saved under the shared mailbox's address. See
+// AuthorizeAs.
+func NewGraphMailSharedManager(clientID, tenantID, redirectURI, tokensDir string, logger *slog.Logger) *GraphManager {
+	m := NewGraphMailManager(clientID, tenantID, redirectURI, tokensDir, logger)
+	m.scopes = GraphMailSharedScopes()
+	m.reauthCmd = "msgvault add-o365 %s --graph --as <your address>"
+	return m
+}
+
 func newGraphManager(clientID, tenantID, redirectURI, tokensDir string, logger *slog.Logger) *GraphManager {
 	if tenantID == "" {
 		tenantID = DefaultTenant
@@ -158,13 +177,22 @@ func (m *GraphManager) TokenPath(email string) string {
 // persists the token. Unlike Manager.Authorize there is no IMAP scope
 // correction step — Graph scopes are identical across account types.
 func (m *GraphManager) Authorize(ctx context.Context, email string) error {
+	return m.AuthorizeAs(ctx, email, email)
+}
+
+// AuthorizeAs signs in as signIn, verifies the ID token matches signIn, and
+// saves the token under account. For the user's own mailbox the two are the
+// same address. For a shared or delegated mailbox, account is that mailbox:
+// msgvault never signs in as it, and Microsoft Graph decides on each request
+// whether signIn may read it.
+func (m *GraphManager) AuthorizeAs(ctx context.Context, signIn, account string) error {
 	scopes := m.scopes
 	d := m.delegate()
-	token, nonce, err := d.doBrowserFlow(ctx, email, scopes)
+	token, nonce, err := d.doBrowserFlow(ctx, signIn, scopes)
 	if err != nil {
 		return err
 	}
-	_, claims, err := d.resolveTokenEmail(ctx, email, token, nonce)
+	_, claims, err := d.resolveTokenEmail(ctx, signIn, token, nonce)
 	if err != nil {
 		return err
 	}
@@ -172,7 +200,7 @@ func (m *GraphManager) Authorize(ctx context.Context, email string) error {
 	if claims != nil {
 		tenantID = claims.TenantID
 	}
-	return m.saveToken(email, token, scopes, tenantID)
+	return m.saveToken(account, token, scopes, tenantID)
 }
 
 // TokenSource loads the persisted Graph token and returns a function yielding a

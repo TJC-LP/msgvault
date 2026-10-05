@@ -1,5 +1,5 @@
 ---
-last_edited: "2026-10-03"
+last_edited: "2026-10-05"
 title: Changelog
 description: Release history for msgvault
 ---
@@ -7,6 +7,11 @@ description: Release history for msgvault
 All notable changes to msgvault, grouped by release.
 
 ## Unreleased
+
+- `add-o365 --graph --as <you>` syncs a shared or delegated Microsoft 365
+  mailbox through Microsoft Graph, signed in as you. It needs the
+  `Mail.Read.Shared` permission. See
+  [shared and delegated mailboxes](guides/oauth-setup.md#shared-and-delegated-mailboxes).
 
 - Rerunning `import-whatsapp` on an Apple `ChatStorage.sqlite` writes only new
   and changed messages instead of rewriting the whole archive, and picks up

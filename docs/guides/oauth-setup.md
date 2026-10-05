@@ -442,6 +442,30 @@ permission `Mail.ReadWrite`. Sync does not use it. The first `delete-staged`
 for the account asks to upgrade the token. See
 [Deleting Email](/docs/usage/deletion/).
 
+#### Shared and delegated mailboxes
+
+A shared mailbox, or another user's mailbox you have been granted access to,
+syncs as its own account. You sign in as yourself; msgvault never signs in as
+the shared mailbox. Add the **Microsoft Graph** delegated permission
+`Mail.Read.Shared` to the app registration, then name yourself with `--as`:
+
+```bash
+msgvault add-o365 team@example.com --graph --as you@example.com
+msgvault sync team@example.com
+```
+
+- The account is `team@example.com`, and its token is saved under
+  `tokens/msmail_team@example.com.json`. The token is yours: it is separate from
+  your own mailbox's token, and removing the account deletes only this copy.
+- Microsoft Graph checks your access to the mailbox on every request. If the
+  access is removed, sync fails with a permission error.
+- Sync works as for your own mailbox: every folder on the first run, then
+  only the changes.
+- `delete-staged` does not support shared or delegated mailboxes yet.
+
+Running `add-o365 team@example.com --graph` again without `--as` turns the
+account back into a mailbox you sign in to directly.
+
 A Graph account is a new account. If the same mailbox is also synced over
 IMAP, the vault holds two copies. Run `msgvault dedup --collection` to hide the
 extra copies, and `--undo` to reverse it.
