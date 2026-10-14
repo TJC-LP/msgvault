@@ -2722,25 +2722,29 @@ func TestStoreAPIAdapterSyncNeverWaitsForOrStreamsBackgroundPackFailures(t *test
 	assert.True(maintenance.packPending.Load(), "the sync leaves its pack request pending")
 	assert.NotContains(logs.String(), "automatic attachment maintenance", "no pack pass ran inside the request")
 }
-func TestStoreAPIAdapterMaintenanceWarningStreamFailurePreservesSuccess(t *testing.T) {
+func TestStoreAPIAdapterImportNeverStreamsBackgroundPackFailures(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
 	maintenance, logs := newFailingAttachmentMaintenance(t)
 	adapter := &storeAPIAdapter{store: maintenance.store, attachmentMaintenance: maintenance}
-	warningErr := errors.New("client disconnected")
+	emitted := 0
 
 	err := adapter.runCLICommandWithRunner(
 		context.Background(),
 		api.CLIRunRequest{Args: []string{importMboxCommand, "archive.mbox"}},
-		func(api.CLIRunEvent) error { return warningErr },
+		func(api.CLIRunEvent) error {
+			emitted++
+			return errors.New("client disconnected")
+		},
 		func(context.Context, []string, map[string]string, string, func(string, string) error) error {
 			return nil
 		},
 	)
 
-	require.NoError(err, "warning stream failure must preserve command success")
-	assert.Contains(logs.String(), "failed to emit automatic attachment maintenance warning")
-	assert.Contains(logs.String(), warningErr.Error())
+	require.NoError(err, "a maintenance fault cannot fail the import request")
+	assert.Zero(emitted, "the request streams only the import's own output")
+	assert.True(maintenance.packPending.Load(), "the import leaves its pack request pending")
+	assert.NotContains(logs.String(), "automatic attachment maintenance", "no pack pass ran inside the request")
 }
 
 func TestStoreAPIAdapterServesCLIInitDB(t *testing.T) {
