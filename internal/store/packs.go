@@ -694,34 +694,47 @@ func (s *Store) ListUnpackedBlobsContext(ctx context.Context) ([]UnpackedBlob, e
 		return nil
 	}
 
-	if err := collect(`
-		SELECT content_hash, storage_path, COALESCE(MAX(size), -1)
-		FROM attachments
-		WHERE content_hash IS NOT NULL AND content_hash != ''
-		  AND storage_path IS NOT NULL AND storage_path != ''
-		  AND LOWER(storage_path) NOT LIKE 'http://%'
-		  AND LOWER(storage_path) NOT LIKE 'https://%'
-		  AND NOT EXISTS (SELECT 1 FROM attachment_pack_index p
-		                  WHERE p.blob_hash = LOWER(attachments.content_hash))
-		GROUP BY content_hash, storage_path
-		ORDER BY MIN(id), storage_path`, true); err != nil {
+	if err := collect(listUnpackedContentBlobsSQL, true); err != nil {
 		return nil, err
 	}
-	if err := collect(`
-		SELECT thumbnail_hash, thumbnail_path
-		FROM attachments
-		WHERE thumbnail_hash IS NOT NULL AND thumbnail_hash != ''
-		  AND thumbnail_path IS NOT NULL AND thumbnail_path != ''
-		  AND LOWER(thumbnail_path) NOT LIKE 'http://%'
-		  AND LOWER(thumbnail_path) NOT LIKE 'https://%'
-		  AND NOT EXISTS (SELECT 1 FROM attachment_pack_index p
-		                  WHERE p.blob_hash = LOWER(attachments.thumbnail_hash))
-		GROUP BY thumbnail_hash, thumbnail_path
-		ORDER BY MIN(id), thumbnail_path`, false); err != nil {
+	if err := collect(listUnpackedThumbnailBlobsSQL, false); err != nil {
 		return nil, err
 	}
 	return blobs, nil
 }
+
+// The unpacked-blob queries find their few candidate hashes from the hash
+// indexes alone, then read attachment rows only for those hashes. Testing
+// every row against the pack index directly would read every attachment row
+// of a large archive to find a handful of new blobs.
+const (
+	listUnpackedContentBlobsSQL = `
+		SELECT content_hash, storage_path, COALESCE(MAX(size), -1)
+		FROM attachments
+		WHERE content_hash IN (
+		      SELECT candidate.content_hash FROM attachments AS candidate
+		      WHERE candidate.content_hash IS NOT NULL AND candidate.content_hash != ''
+		        AND NOT EXISTS (SELECT 1 FROM attachment_pack_index p
+		                        WHERE p.blob_hash = LOWER(candidate.content_hash)))
+		  AND storage_path IS NOT NULL AND storage_path != ''
+		  AND LOWER(storage_path) NOT LIKE 'http://%'
+		  AND LOWER(storage_path) NOT LIKE 'https://%'
+		GROUP BY content_hash, storage_path
+		ORDER BY MIN(id), storage_path`
+	listUnpackedThumbnailBlobsSQL = `
+		SELECT thumbnail_hash, thumbnail_path
+		FROM attachments
+		WHERE thumbnail_hash IN (
+		      SELECT candidate.thumbnail_hash FROM attachments AS candidate
+		      WHERE candidate.thumbnail_hash IS NOT NULL AND candidate.thumbnail_hash != ''
+		        AND NOT EXISTS (SELECT 1 FROM attachment_pack_index p
+		                        WHERE p.blob_hash = LOWER(candidate.thumbnail_hash)))
+		  AND thumbnail_path IS NOT NULL AND thumbnail_path != ''
+		  AND LOWER(thumbnail_path) NOT LIKE 'http://%'
+		  AND LOWER(thumbnail_path) NOT LIKE 'https://%'
+		GROUP BY thumbnail_hash, thumbnail_path
+		ORDER BY MIN(id), thumbnail_path`
+)
 
 // ListIndexedBlobHashes returns the set of all packed blob hashes.
 func (s *Store) ListIndexedBlobHashes() (map[string]struct{}, error) {

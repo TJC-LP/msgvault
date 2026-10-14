@@ -1,5 +1,5 @@
 ---
-last_edited: "2026-10-05"
+last_edited: "2026-10-14"
 title: CLI Reference
 description: Complete command reference for all msgvault commands.
 ---
@@ -1783,22 +1783,35 @@ msgvault pack-attachments
 
 The daemon serializes packing against sync and backup operations. Reads remain
 available from loose, packed, or mixed storage, and the command is safe to
-rerun as new loose content arrives. Bounded packing also runs after successful
-attachment-producing commands sent to the daemon. Scheduled syncs never pack
-inline: when one writes new loose blobs, the daemon's `attachment-pack` job
-(every 6 hours) packs them, and the daily `attachment-maintenance` job packs
-and repacks. Each automatic pack pass has a 256 MiB soft raw-byte budget and
-finishes its current blob before stopping for that byte limit. Scheduled packing
-and daily attachment maintenance also stop after one minute, which lets queued
-scheduled work run. Each scheduled pack pass verifies at most 128
-existing packed blobs or 32 MiB of their raw content, allowing one oversized
-blob. Its durable hash cursor resumes verification after a restart, while new
-loose blobs can be packed during each pass. Manual unpacking reads the full
-catalog. Cancellation preserves committed packs. A pass with committed
-progress resumes behind waiting work; runtime expiry without a checkpoint
-records an error and waits for the next trigger. The first pack tick after a
-restart also checks for blobs left by the previous daemon.
-This command processes the complete eligible backlog immediately.
+rerun as new loose content arrives. This command processes the complete
+eligible backlog immediately.
+
+The daemon also packs automatically:
+
+- After a successful attachment-producing command sent to the daemon, such as
+  `sync` or an import, the command returns as soon as its own work finishes.
+  The daemon then starts its `attachment-pack` job in the background. A daemon
+  started on demand stays running while that job waits and runs, and still
+  stops after its idle timeout once the job finishes.
+- The `attachment-pack` job also runs every 6 hours, which packs loose blobs
+  written by scheduled syncs. Scheduled syncs never pack inline.
+- The daily `attachment-maintenance` job packs, finishes a verification
+  cycle, and repacks.
+
+Each automatic pack pass has a 256 MiB soft raw-byte budget and finishes its
+current blob before stopping for that byte limit. Passes stop after one minute,
+which lets queued work run, and yield to waiting requests. Each pass also
+verifies the next window of at most 128 existing packed blobs or 32 MiB of
+their raw content, allowing one oversized blob, so its cost follows the new
+content rather than the archive's size. A durable hash cursor resumes
+verification after a restart. The `attachment-pack` job verifies one window
+per pass and queues follow-ups only while loose blobs remain; the daily job
+continues until the whole cycle is verified. Manual unpacking reads the full
+catalog. Cancellation, including daemon shutdown, preserves committed packs. A
+pass with committed progress resumes behind waiting work; runtime expiry
+without a checkpoint records an error and waits for the next trigger, such as
+the next sync. The first pack pass after a restart also checks for blobs left
+by the previous daemon.
 
 With `[data].loose_attachments = true`, automatic packing is disabled and this
 command refuses to run.

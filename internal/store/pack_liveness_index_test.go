@@ -47,3 +47,33 @@ func TestAttachmentPackLivenessQueriesUseExpressionIndexes(t *testing.T) {
 		})
 	}
 }
+
+func TestUnpackedBlobQueriesReadOnlyCandidateRows(t *testing.T) {
+	require := require.New(t)
+	dir := t.TempDir()
+	st, err := OpenForTest(filepath.Join(dir, "unpacked.db"))
+	require.NoError(err)
+	defer func() { require.NoError(st.Close()) }()
+	require.NoError(st.InitSchema())
+
+	tests := map[string]struct {
+		sql   string
+		index string
+		key   string
+	}{
+		"content":   {sql: listUnpackedContentBlobsSQL, index: "idx_attachments_hash", key: "content_hash"},
+		"thumbnail": {sql: listUnpackedThumbnailBlobsSQL, index: "idx_attachments_thumbnail_hash", key: "thumbnail_hash"},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			assert := assert.New(t)
+			plan := explainPlan(t, st, tc.sql)
+			t.Logf("query plan:\n%s", plan)
+			assert.Contains(plan, "candidate USING COVERING INDEX "+tc.index,
+				"candidates must come from the hash index without reading attachment rows:\n%s", plan)
+			assert.Contains(plan, "SEARCH attachments USING INDEX "+tc.index+" ("+tc.key+"=?)",
+				"attachment rows must be read only for candidate hashes:\n%s", plan)
+			assert.NotContains(plan, "SCAN attachments", "no attachment table scan:\n%s", plan)
+		})
+	}
+}

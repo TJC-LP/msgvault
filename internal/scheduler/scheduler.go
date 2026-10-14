@@ -830,6 +830,26 @@ func (s *Scheduler) StartJob(name string) error {
 	return nil
 }
 
+// RequestJob asks for one run of the named generic job without waiting for
+// it. Like StartJob, it returns once the run is reserved, so a caller that
+// holds the daemon's operation gate releases it before the job acquires it.
+// Like a cron tick, a request that finds the job executing queues one
+// follow-up run instead of being dropped, and a request that finds a run
+// still waiting to start is absorbed by that run.
+func (s *Scheduler) RequestJob(name string) error {
+	run, ok, err := s.reserveGenericJob(name, true)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return nil
+	}
+	go func() {
+		_ = s.runJob(name, run)
+	}()
+	return nil
+}
+
 // onJobTick handles one cron firing for a generic job, coalescing a tick
 // that arrives while the job is active like onAccountTick does.
 func (s *Scheduler) onJobTick(name string) {

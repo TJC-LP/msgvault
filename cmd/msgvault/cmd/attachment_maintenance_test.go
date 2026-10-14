@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
@@ -22,6 +23,7 @@ import (
 	"go.kenn.io/kit/pack"
 	"go.kenn.io/kit/packstore"
 
+	"go.kenn.io/msgvault/internal/api"
 	"go.kenn.io/msgvault/internal/attachmentstore"
 	"go.kenn.io/msgvault/internal/export"
 	"go.kenn.io/msgvault/internal/jobctx"
@@ -155,19 +157,14 @@ func TestAutomaticAttachmentMaintenancePacksBoundedAndLogsCompleteStats(t *testi
 	f := newAttachmentMaintenanceFixture(t)
 	content := []byte("automatic attachment maintenance payload")
 	hash := f.addLoose(content)
-	warnings := 0
 
-	err := f.maintenance.runAutomaticPack(context.Background(), func(string) error {
-		warnings++
-		return nil
-	})
+	err := f.maintenance.runAutomaticPack(context.Background())
 
 	require.NoError(err, "runAutomaticPack")
 	gotAutomaticAttachmentBytes := automaticAttachmentBytes
 	assert.Equal(wantAutomaticAttachmentBytes, gotAutomaticAttachmentBytes)
 	assert.Equal("attachment-maintenance", attachmentMaintenanceJob)
 	assert.Equal("17 3 * * *", attachmentMaintenanceCron)
-	assert.Zero(warnings, "successful automatic packing must not emit CLI output")
 	require.NotNil(f.packedEntry(hash), "loose attachment must be packed")
 	assert.Equal(content, f.readBlob(hash), "packed attachment stays readable")
 
@@ -205,7 +202,7 @@ func TestLooseAttachmentModeSkipsAutomaticPackingAndRejectsPackCreation(t *testi
 	f.maintenance.packCreationEnabled = false
 	hash := f.addLoose([]byte("remain loose when attachment packing is disabled"))
 
-	err := f.maintenance.runAutomaticPack(context.Background(), nil)
+	err := f.maintenance.runAutomaticPack(context.Background())
 	require.NoError(err)
 	assert.Nil(f.packedEntry(hash))
 	assert.Contains(f.logs.String(), "automatic attachment packing disabled")
@@ -225,38 +222,26 @@ func TestAutomaticAttachmentMaintenanceCancellationIsInformational(t *testing.T)
 	f := newAttachmentMaintenanceFixture(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	warnings := 0
 
-	err := f.maintenance.runAutomaticPack(ctx, func(string) error {
-		warnings++
-		return nil
-	})
+	err := f.maintenance.runAutomaticPack(ctx)
 
 	require.ErrorIs(err, context.Canceled)
-	assert.Zero(warnings)
 	assert.Contains(f.logs.String(), "level=INFO msg=\"automatic attachment maintenance canceled\"")
 	assert.NotContains(f.logs.String(), "level=WARN")
 }
 
-func TestAutomaticAttachmentMaintenanceFailureWarnsWithoutReplacingIngestSuccess(t *testing.T) {
+func TestBackgroundPackFailureLogsProgressAndStaysPending(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
 	maintenance, logs := newFailingAttachmentMaintenance(t)
-	var warning string
 
-	err := runAfterSuccessfulAttachmentIngest(
-		context.Background(),
-		maintenance,
-		func(context.Context) error { return nil },
-		func(message string) error {
-			warning = message
-			return nil
-		},
-	)
+	require.NoError(runAfterSuccessfulAttachmentIngest(
+		context.Background(), maintenance, func(context.Context) error { return nil },
+	), "a later maintenance failure cannot reach the ingest result")
+	require.Error(maintenance.runPendingPack(context.Background()), "the job records the failure")
+	assert.True(maintenance.packPending.Load(), "a failed pass leaves its work pending")
 
-	require.NoError(err, "maintenance failure must preserve successful ingest")
-	assert.Contains(warning, "pack-attachments")
-	assert.Contains(warning, "retry")
+	require.Error(maintenance.runAutomaticPack(context.Background()))
 	logOutput := logs.String()
 	progressAt := strings.Index(logOutput, "level=INFO msg=\"automatic attachment maintenance progress\"")
 	warnAt := strings.Index(logOutput, "level=WARN msg=\"automatic attachment maintenance failed\"")
@@ -266,24 +251,6 @@ func TestAutomaticAttachmentMaintenanceFailureWarnsWithoutReplacingIngestSuccess
 	assert.Contains(logOutput, "blobs_deferred_oversized=0")
 	assert.Contains(logOutput, "packs_deferred_oversized=0")
 	assert.Contains(logOutput, "pack-attachments", "log names the explicit retry command")
-}
-
-func TestAutomaticAttachmentMaintenanceWarningFailurePreservesIngestSuccess(t *testing.T) {
-	require := require.New(t)
-	assert := assert.New(t)
-	maintenance, logs := newFailingAttachmentMaintenance(t)
-	warningErr := errors.New("warning stream closed")
-
-	err := runAfterSuccessfulAttachmentIngest(
-		context.Background(),
-		maintenance,
-		func(context.Context) error { return nil },
-		func(string) error { return warningErr },
-	)
-
-	require.NoError(err, "warning failure must preserve successful ingest")
-	assert.Contains(logs.String(), "failed to emit automatic attachment maintenance warning")
-	assert.Contains(logs.String(), warningErr.Error())
 }
 
 func (f *attachmentMaintenanceFixture) ingestLoose(content []byte) string {
@@ -657,7 +624,7 @@ func TestAttachmentIngestMutationLeaseWaitsForMaintenance(t *testing.T) {
 			func(context.Context) error {
 				close(ingestStarted)
 				return nil
-			}, nil,
+			},
 		)
 	}()
 
@@ -686,14 +653,17 @@ func TestPendingPackCheckpointsVerificationAndStillPacksNewBlobs(t *testing.T) {
 	require.NoError(err)
 	fresh := f.addLoose([]byte("new attachment while verification is pending"))
 	f.maintenance.markPackPending()
-	require.ErrorIs(f.maintenance.runPendingPack(t.Context()), scheduler.ErrReschedule)
+	require.NoError(f.maintenance.runPendingPack(t.Context()),
+		"one window of verification does not chain the whole cycle")
 	require.NotNil(f.packedEntry(fresh), "new blobs must not wait for the whole verification cycle")
 	// A reconstructed daemon resumes the durable verification cursor.
 	resumed, err := newAttachmentMaintenance(f.store, f.dir, nil, true)
 	require.NoError(err)
 	defer func() { require.NoError(resumed.close()) }()
-	resumed.markPackPending()
-	require.NoError(resumed.runPendingPack(t.Context()))
+	ctx := jobctx.WithProgress(t.Context())
+	verifyMore, err := resumed.runScheduledPack(ctx)
+	require.NoError(err)
+	assert.False(t, verifyMore, "the second window finishes the cycle the first pass started")
 	stats, err := resumed.unpack(t.Context())
 	require.NoError(err)
 	assert.Equal(t, existing+1, stats.BlobsRestored, "manual unpack must see the full catalog")
@@ -702,7 +672,9 @@ func TestPendingPackCheckpointsVerificationAndStillPacksNewBlobs(t *testing.T) {
 func TestCompletedPackVerificationRecordsNoProgress(t *testing.T) {
 	f := newAttachmentMaintenanceFixture(t)
 	ctx := jobctx.WithProgress(t.Context())
-	require.NoError(t, f.maintenance.runScheduledPack(ctx))
+	verifyMore, err := f.maintenance.runScheduledPack(ctx)
+	require.NoError(t, err)
+	assert.False(t, verifyMore)
 	assert.False(t, jobctx.HasProgress(ctx), "an empty completed scan provides no resume point for a cancelled repack")
 }
 
@@ -749,7 +721,129 @@ func TestRemovingRedundantOrphanPackCountsAsProgress(t *testing.T) {
 	require.NoError(os.MkdirAll(filepath.Dir(orphan), 0o700))
 	require.NoError(os.WriteFile(orphan, data, 0o600))
 	ctx := jobctx.WithProgress(t.Context())
-	require.NoError(f.maintenance.runAutomaticPack(ctx, nil))
+	require.NoError(f.maintenance.runAutomaticPack(ctx))
 	assert.NoFileExists(t, orphan)
 	assert.True(t, jobctx.HasProgress(ctx), "a removed pack is committed progress a timed-out pass can resume after")
+}
+
+// holdPackPass stands in for a pass that cannot finish quickly: an
+// attachment mutation in progress keeps Pack waiting for its exclusive lease,
+// exactly where a pass waits behind a running ingest.
+func (f *attachmentMaintenanceFixture) holdPackPass() func() {
+	f.t.Helper()
+	lease, err := f.maintenance.coordinator.AcquireMutation(f.t.Context())
+	require.NoError(f.t, err)
+	return func() { require.NoError(f.t, lease.Release()) }
+}
+
+func TestBackgroundPackKeepsIdleDaemonAliveUntilItFinishes(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		require := require.New(t)
+		assert := assert.New(t)
+		f := newAttachmentMaintenanceFixture(t)
+		hash := f.addLoose([]byte("blob packed while the daemon would otherwise idle out"))
+		const idleTimeout = 20 * time.Second
+		idleShutdown := make(chan struct{})
+		idle := api.NewIdleTracker(idleTimeout, func() { close(idleShutdown) })
+		sched, media := newServeSchedulers(nil, f.maintenance.logger, idle, api.NewSerialOperationGate())
+		defer func() { <-serveSchedulers{sched, media}.Stop().Done() }()
+		require.NoError(registerAttachmentPackJob(sched, f.maintenance))
+		go idle.Run(t.Context())
+		release := f.holdPackPass()
+
+		require.NoError(runAfterSuccessfulAttachmentIngest(t.Context(), f.maintenance,
+			func(context.Context) error { return nil }))
+		// Longer than the idle timeout, shorter than the job's runtime limit.
+		synctest.Sleep(2 * idleTimeout)
+		select {
+		case <-idleShutdown:
+			require.FailNow("the daemon idled out while its pack job was running")
+		default:
+		}
+		require.Less(2*idleTimeout, automaticAttachmentMaxRuntime)
+		assert.True(attachmentPackJobStatus(t, sched).Running)
+
+		release()
+		synctest.Wait()
+		assert.NotNil(f.packedEntry(hash), "the pass finishes once it can take the maintenance lease")
+		select {
+		case <-idleShutdown:
+			require.FailNow("idle timeout must count from the end of the pack job")
+		default:
+		}
+		synctest.Sleep(idleTimeout + time.Second)
+		select {
+		case <-idleShutdown:
+		default:
+			assert.Fail("an idle daemon must still shut down after packing")
+		}
+	})
+}
+
+func TestBackgroundPackStopsAtRuntimeLimitAndNextIngestResumesIt(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		require := require.New(t)
+		assert := assert.New(t)
+		f := newAttachmentMaintenanceFixture(t)
+		hash := f.addLoose([]byte("blob whose first pass runs out of time"))
+		sched, _ := newBackgroundPackHarness(t, f)
+		release := f.holdPackPass()
+
+		require.NoError(runAfterSuccessfulAttachmentIngest(t.Context(), f.maintenance,
+			func(context.Context) error { return nil }))
+		synctest.Sleep(automaticAttachmentMaxRuntime + time.Second)
+		synctest.Wait()
+
+		status := attachmentPackJobStatus(t, sched)
+		assert.False(status.Running, "the runtime limit ends the pass and releases the gate")
+		assert.False(status.Pending, "a pass without committed progress waits for the next trigger")
+		assert.Contains(status.LastError, jobctx.ErrRunBudgetExceeded.Error())
+		assert.Nil(f.packedEntry(hash))
+		assert.True(f.maintenance.packPending.Load(), "the unfinished work stays pending")
+
+		release()
+		// The next manual ingest restarts the job, which picks up the pending work.
+		require.NoError(runAfterSuccessfulAttachmentIngest(t.Context(), f.maintenance,
+			func(context.Context) error { return nil }))
+		synctest.Wait()
+		assert.NotNil(f.packedEntry(hash))
+		assert.False(f.maintenance.packPending.Load())
+		assert.Empty(attachmentPackJobStatus(t, sched).LastError)
+	})
+}
+
+func TestBackgroundPackCancelsOnShutdownAndRestartResumesIt(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		require := require.New(t)
+		assert := assert.New(t)
+		f := newAttachmentMaintenanceFixture(t)
+		hash := f.addLoose([]byte("blob whose pass is interrupted by shutdown"))
+		gate := api.NewSerialOperationGate()
+		sched, media := newServeSchedulers(nil, f.maintenance.logger, nil, gate)
+		require.NoError(registerAttachmentPackJob(sched, f.maintenance))
+		release := f.holdPackPass()
+
+		require.NoError(runAfterSuccessfulAttachmentIngest(t.Context(), f.maintenance,
+			func(context.Context) error { return nil }))
+		synctest.Wait()
+		require.True(attachmentPackJobStatus(t, sched).Running)
+		require.NoError(shutdownServeRuntime(t.Context(), io.Discard, nil,
+			serveSchedulers{sched, media}, gate))
+		assert.Nil(f.packedEntry(hash), "a cancelled pass commits nothing")
+		assert.Contains(f.logs.String(), "automatic attachment maintenance canceled")
+		release()
+
+		// A restarted daemon has no in-memory request; its job rechecks the
+		// catalog on the first pass after startup.
+		restarted, err := newAttachmentMaintenance(f.store, f.dir, f.maintenance.logger, true)
+		require.NoError(err)
+		defer func() { require.NoError(restarted.close()) }()
+		restartedSched := scheduler.New(nil).WithLogger(f.maintenance.logger)
+		defer func() { <-restartedSched.Stop().Done() }()
+		require.NoError(registerAttachmentPackJob(restartedSched, restarted))
+		require.NoError(runAfterSuccessfulAttachmentIngest(t.Context(), restarted,
+			func(context.Context) error { return nil }))
+		synctest.Wait()
+		assert.NotNil(f.packedEntry(hash))
+	})
 }

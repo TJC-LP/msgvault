@@ -20,6 +20,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -2037,52 +2038,92 @@ func TestStoreAPIAdapterServesSourceStatus(t *testing.T) {
 	assert.Equal(store.SyncStatusCompleted, got.LastSuccessfulSync.Status, "LastSuccessfulSync.Status")
 }
 
-func TestStoreAPIAdapterRunCLISyncPacksOnlyAfterSubprocessSuccess(t *testing.T) {
+// newBackgroundPackHarness wires the attachment-pack job the way the daemon
+// does: on the daemon scheduler, behind the operation gate. The startup
+// catalog recheck is cleared so a test observes only what a request asks for;
+// TestRegisterAttachmentPackJobFindsBacklogAfterRestart covers that recheck.
+func newBackgroundPackHarness(t *testing.T, f *attachmentMaintenanceFixture) (*scheduler.Scheduler, *api.SerialOperationGate) {
+	t.Helper()
+	gate := api.NewSerialOperationGate()
+	sched, media := newServeSchedulers(nil, f.maintenance.logger, nil, gate)
+	t.Cleanup(func() { <-serveSchedulers{sched, media}.Stop().Done() })
+	require.NoError(t, registerAttachmentPackJob(sched, f.maintenance))
+	f.maintenance.packPending.Store(false)
+	return sched, gate
+}
+
+func attachmentPackJobStatus(t *testing.T, sched *scheduler.Scheduler) scheduler.JobStatus {
+	t.Helper()
+	for _, status := range sched.JobStatus() {
+		if status.Name == attachmentPackJob {
+			return status
+		}
+	}
+	require.FailNow(t, "attachment-pack job is not registered")
+	return scheduler.JobStatus{}
+}
+
+// TestStoreAPIAdapterRunCLISyncReturnsBeforeBackgroundPack proves a manual
+// sync's request finishes without packing: the pack job only queues for the
+// operation gate the request still holds, and packs once it is released.
+func TestStoreAPIAdapterRunCLISyncReturnsBeforeBackgroundPack(t *testing.T) {
 	tests := []struct {
 		name           string
 		predecessorErr error
 		wantPacked     bool
-		wantAttempts   int
 	}{
-		{name: "success", wantPacked: true, wantAttempts: 1},
+		{name: "success", wantPacked: true},
 		{name: "failure", predecessorErr: errors.New("sync subprocess failed")},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			require := require.New(t)
-			assert := assert.New(t)
-			f := newAttachmentMaintenanceFixture(t)
-			hash := f.addLoose([]byte("CLI sync attachment payload"))
-			adapter := &storeAPIAdapter{store: f.store, attachmentMaintenance: f.maintenance}
-			var events []api.CLISyncEvent
-			runnerCalls := 0
+			synctest.Test(t, func(t *testing.T) {
+				require := require.New(t)
+				assert := assert.New(t)
+				f := newAttachmentMaintenanceFixture(t)
+				hash := f.addLoose([]byte("CLI sync attachment payload"))
+				sched, gate := newBackgroundPackHarness(t, f)
+				adapter := &storeAPIAdapter{store: f.store, attachmentMaintenance: f.maintenance}
+				var events []api.CLISyncEvent
+				runnerCalls := 0
 
-			err := adapter.runCLISyncWithRunner(
-				context.Background(),
-				api.CLISyncRequest{Email: "alice@example.com"},
-				func(event api.CLISyncEvent) error {
-					events = append(events, event)
-					return nil
-				},
-				func(_ context.Context, args []string, _ func(string, string) error) error {
-					runnerCalls++
-					assert.Equal([]string{"sync", "alice@example.com"}, args)
-					assert.Nil(f.packedEntry(hash), "packing must follow subprocess success")
-					return tt.predecessorErr
-				},
-			)
+				// The API middleware holds the gate for the whole request.
+				releaseRequest, ok := gate.BeginRequestWorkContext(t.Context(), "msgvault sync")
+				require.True(ok)
+				err := adapter.runCLISyncWithRunner(
+					t.Context(),
+					api.CLISyncRequest{Email: "alice@example.com"},
+					func(event api.CLISyncEvent) error {
+						events = append(events, event)
+						return nil
+					},
+					func(_ context.Context, args []string, _ func(string, string) error) error {
+						runnerCalls++
+						assert.Equal([]string{"sync", "alice@example.com"}, args)
+						return tt.predecessorErr
+					},
+				)
+				if tt.predecessorErr != nil {
+					require.ErrorIs(err, tt.predecessorErr)
+				} else {
+					require.NoError(err)
+				}
+				assert.Equal(1, runnerCalls)
+				assert.Empty(events, "packing writes no CLI output")
+				synctest.Wait()
+				assert.Nil(f.packedEntry(hash), "the request returns before any packing")
+				assert.Equal(tt.wantPacked, attachmentPackJobStatus(t, sched).Queued,
+					"only a successful sync queues the pack job behind its request")
 
-			if tt.predecessorErr != nil {
-				require.ErrorIs(err, tt.predecessorErr)
-			} else {
-				require.NoError(err)
-			}
-			assert.Equal(1, runnerCalls)
-			assert.Equal(tt.wantPacked, f.packedEntry(hash) != nil)
-			assert.Equal(tt.wantAttempts,
-				strings.Count(f.logs.String(), "automatic attachment maintenance complete"))
-			assert.Empty(events, "successful automatic maintenance writes no normal CLI output")
+				releaseRequest()
+				synctest.Wait()
+				assert.Equal(tt.wantPacked, f.packedEntry(hash) != nil)
+				status := attachmentPackJobStatus(t, sched)
+				assert.False(status.Running)
+				assert.Empty(status.LastError)
+				assert.Equal(tt.wantPacked, !status.LastRun.IsZero())
+			})
 		})
 	}
 }
@@ -2293,13 +2334,11 @@ func TestStoreAPIAdapterRunCLICommandPacksOnlyAllowlistedSuccess(t *testing.T) {
 		args           []string
 		predecessorErr error
 		wantPacked     bool
-		wantAttempts   int
 	}{
 		{
-			name:         "allowlisted success",
-			args:         []string{importMboxCommand, "archive.mbox"},
-			wantPacked:   true,
-			wantAttempts: 1,
+			name:       "allowlisted success",
+			args:       []string{importMboxCommand, "archive.mbox"},
+			wantPacked: true,
 		},
 		{
 			name: "unrelated success",
@@ -2314,47 +2353,51 @@ func TestStoreAPIAdapterRunCLICommandPacksOnlyAllowlistedSuccess(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			require := require.New(t)
-			assert := assert.New(t)
-			f := newAttachmentMaintenanceFixture(t)
-			hash := f.addLoose([]byte("generic CLI attachment payload"))
-			adapter := &storeAPIAdapter{store: f.store, attachmentMaintenance: f.maintenance}
-			var events []api.CLIRunEvent
-			runnerCalls := 0
+			synctest.Test(t, func(t *testing.T) {
+				require := require.New(t)
+				assert := assert.New(t)
+				f := newAttachmentMaintenanceFixture(t)
+				hash := f.addLoose([]byte("generic CLI attachment payload"))
+				sched, _ := newBackgroundPackHarness(t, f)
+				adapter := &storeAPIAdapter{store: f.store, attachmentMaintenance: f.maintenance}
+				var events []api.CLIRunEvent
+				runnerCalls := 0
 
-			err := adapter.runCLICommandWithRunner(
-				context.Background(),
-				api.CLIRunRequest{Args: tt.args, Env: map[string]string{"TEST": "value"}, Cwd: "/tmp"},
-				func(event api.CLIRunEvent) error {
-					events = append(events, event)
-					return nil
-				},
-				func(
-					_ context.Context,
-					args []string,
-					env map[string]string,
-					cwd string,
-					_ func(string, string) error,
-				) error {
-					runnerCalls++
-					assert.Equal(tt.args, args)
-					assert.Equal(map[string]string{"TEST": "value"}, env)
-					assert.Equal("/tmp", cwd)
-					assert.Nil(f.packedEntry(hash), "packing must follow subprocess success")
-					return tt.predecessorErr
-				},
-			)
+				err := adapter.runCLICommandWithRunner(
+					t.Context(),
+					api.CLIRunRequest{Args: tt.args, Env: map[string]string{"TEST": "value"}, Cwd: "/tmp"},
+					func(event api.CLIRunEvent) error {
+						events = append(events, event)
+						return nil
+					},
+					func(
+						_ context.Context,
+						args []string,
+						env map[string]string,
+						cwd string,
+						_ func(string, string) error,
+					) error {
+						runnerCalls++
+						assert.Equal(tt.args, args)
+						assert.Equal(map[string]string{"TEST": "value"}, env)
+						assert.Equal("/tmp", cwd)
+						assert.Nil(f.packedEntry(hash), "packing must follow subprocess success")
+						return tt.predecessorErr
+					},
+				)
 
-			if tt.predecessorErr != nil {
-				require.ErrorIs(err, tt.predecessorErr)
-			} else {
-				require.NoError(err)
-			}
-			assert.Equal(1, runnerCalls)
-			assert.Equal(tt.wantPacked, f.packedEntry(hash) != nil)
-			assert.Equal(tt.wantAttempts,
-				strings.Count(f.logs.String(), "automatic attachment maintenance complete"))
-			assert.Empty(events, "successful automatic maintenance writes no normal CLI output")
+				if tt.predecessorErr != nil {
+					require.ErrorIs(err, tt.predecessorErr)
+				} else {
+					require.NoError(err)
+				}
+				assert.Equal(1, runnerCalls)
+				synctest.Wait()
+				assert.Equal(tt.wantPacked, f.packedEntry(hash) != nil)
+				assert.Equal(tt.wantPacked, !attachmentPackJobStatus(t, sched).LastRun.IsZero(),
+					"only successful attachment-producing commands start the pack job")
+				assert.Empty(events, "background packing writes no CLI output")
+			})
 		})
 	}
 }
@@ -2657,7 +2700,7 @@ func TestStoreAPIAdapterExplicitRepackCancellationFailsFast(t *testing.T) {
 	assert.True(has, "fail-fast cancellation leaves physical inventory untouched")
 }
 
-func TestStoreAPIAdapterMaintenanceWarningStreamsWithoutChangingSuccess(t *testing.T) {
+func TestStoreAPIAdapterSyncNeverWaitsForOrStreamsBackgroundPackFailures(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
 	maintenance, logs := newFailingAttachmentMaintenance(t)
@@ -2674,14 +2717,11 @@ func TestStoreAPIAdapterMaintenanceWarningStreamsWithoutChangingSuccess(t *testi
 		func(context.Context, []string, func(string, string) error) error { return nil },
 	)
 
-	require.NoError(err, "automatic maintenance failure must preserve sync success")
-	require.Len(events, 1, "one concise warning event")
-	assert.Equal("stderr", events[0].Type)
-	assert.Contains(events[0].Data, "pack-attachments")
-	assert.Contains(events[0].Data, "retry")
-	assert.Contains(logs.String(), "automatic attachment maintenance failed")
+	require.NoError(err, "a maintenance fault cannot fail the sync request")
+	assert.Empty(events, "the request streams only the sync's own output")
+	assert.True(maintenance.packPending.Load(), "the sync leaves its pack request pending")
+	assert.NotContains(logs.String(), "automatic attachment maintenance", "no pack pass ran inside the request")
 }
-
 func TestStoreAPIAdapterMaintenanceWarningStreamFailurePreservesSuccess(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)

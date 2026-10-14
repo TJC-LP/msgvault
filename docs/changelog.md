@@ -1,5 +1,5 @@
 ---
-last_edited: "2026-10-05"
+last_edited: "2026-10-14"
 title: Changelog
 description: Release history for msgvault
 ---
@@ -7,6 +7,13 @@ description: Release history for msgvault
 All notable changes to msgvault, grouped by release.
 
 ## Unreleased
+
+- A `sync` or import sent to the daemon returns when its own work finishes.
+  Attachment packing now runs afterwards as the daemon's bounded
+  `attachment-pack` job instead of inside the request, and a daemon started on
+  demand stays up until that job finishes. Each pass verifies one bounded
+  window of existing packs instead of every packed blob, and finding new loose
+  blobs no longer reads every attachment row.
 
 - `add-o365 --graph --as <you>` syncs a shared or delegated Microsoft 365
   mailbox through Microsoft Graph, signed in as you. It needs the
