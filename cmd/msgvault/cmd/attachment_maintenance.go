@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -25,9 +26,10 @@ const (
 	automaticAttachmentMaxRuntime = time.Minute
 	attachmentMaintenanceJob      = "attachment-maintenance"
 	attachmentMaintenanceCron     = "17 3 * * *"
-	// attachmentPackJob packs blobs that scheduled syncs left loose. A pass
-	// re-reads the whole pack catalog, so it runs a few times a day rather
-	// than after every sync. Bounded follow-ups drain any remaining backlog.
+	// attachmentPackJob packs loose blobs in bounded background passes. It
+	// runs on its schedule and whenever a manual ingest sent to the daemon
+	// succeeds, after that request has returned. Follow-ups drain a loose
+	// backlog larger than one pass's byte budget.
 	attachmentPackJob  = "attachment-pack"
 	attachmentPackCron = "41 */6 * * *"
 	importMboxCommand  = "import-mbox"
@@ -44,9 +46,16 @@ type attachmentMaintenance struct {
 	logger              *slog.Logger
 	packCreationEnabled bool
 	attachmentsDir      string
-	// packPending records that a scheduled sync wrote loose blobs that no
-	// pack pass has drained yet. Startup requests one scan of existing blobs.
+	// packPending records that an ingest wrote loose blobs that no pack pass
+	// has drained yet. Startup requests one scan of existing blobs.
 	packPending atomic.Bool
+	// requestPackJob asks the daemon scheduler for a background
+	// attachment-pack run, and packJobLastError reports the scheduler's
+	// record of that job's last failure. registerAttachmentPackJob sets both
+	// before the daemon serves requests; without them a pending pass waits
+	// for the job's schedule.
+	requestPackJob   func() error
+	packJobLastError func() string
 }
 
 func newAttachmentMaintenance(
@@ -126,10 +135,10 @@ func (m *attachmentMaintenance) unpack(ctx context.Context) (packstore.UnpackSta
 	return stats, nil
 }
 
-// runAutomaticPack performs one bounded maintenance pass. Errors remain
-// visible to schedulers, while callers following a successful ingest can log
-// or stream the warning and deliberately preserve the ingest result.
-func (m *attachmentMaintenance) runAutomaticPack(ctx context.Context, emitWarning func(string) error) error {
+// runAutomaticPack performs one pack pass with the automatic byte budget.
+// Scheduled callers bound its verification work and runtime; errors remain
+// visible to them.
+func (m *attachmentMaintenance) runAutomaticPack(ctx context.Context) error {
 	if !m.packCreationEnabled {
 		m.log().Debug("automatic attachment packing disabled")
 		return nil
@@ -152,17 +161,9 @@ func (m *attachmentMaintenance) runAutomaticPack(ctx context.Context, emitWarnin
 		}
 
 		m.logAutomaticPackSummary("automatic attachment maintenance progress", stats, duration)
-		const retry = "run `msgvault pack-attachments` to retry"
 		m.log().Warn("automatic attachment maintenance failed",
 			"error", err,
-			"retry", retry)
-		if emitWarning != nil {
-			warning := fmt.Sprintf("Automatic attachment maintenance failed: %v; %s.\n", err, retry)
-			if emitErr := emitWarning(warning); emitErr != nil {
-				m.log().Warn("failed to emit automatic attachment maintenance warning",
-					"error", emitErr)
-			}
-		}
+			"retry", "run `msgvault pack-attachments` to retry")
 		return err
 	}
 
@@ -241,41 +242,47 @@ func (m *attachmentMaintenance) logAutomaticRepackSummary(message string, stats 
 		"budget_exhausted", stats.BudgetExhausted)
 }
 
-// runScheduledPack bounds existing-blob verification as well as new pack bytes.
-func (m *attachmentMaintenance) runScheduledPack(ctx context.Context) error {
+// runScheduledPack performs one pass that packs new loose blobs within the
+// byte budget and verifies only the next window of existing packed blobs.
+// The pass still lists every referenced hash and checks every pack file, so
+// part of its cost grows with the archive. A pass that stops at its byte
+// budget leaves packPending set. verifyMore reports that the durable
+// verification cursor has further windows.
+func (m *attachmentMaintenance) runScheduledPack(ctx context.Context) (verifyMore bool, err error) {
 	if !m.packCreationEnabled {
-		return nil
+		return false, nil
 	}
 	packCtx, pass, err := m.store.BeginPackVerification(ctx, 128, 32<<20)
 	if err != nil {
-		return err
+		return false, err
 	}
-	if err := m.runAutomaticPack(packCtx, nil); err != nil {
-		return err
+	if err := m.runAutomaticPack(packCtx); err != nil {
+		return false, err
 	}
 	more, err := m.store.FinishPackVerification(ctx, pass)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if more {
 		// A completed verification cycle restarts on the next request. Only an
 		// unfinished window provides a resume point for a budgeted follow-up.
 		jobctx.RecordProgress(ctx)
-		m.markPackPending()
 	}
-	return nil
+	return more, nil
 }
 
-// daily runs the two bounded phases in order. A failed pack phase stops the
-// job so the scheduler records the failure instead of obscuring it with a
-// second maintenance result.
+// daily runs the two bounded phases in order. Follow-ups finish the loose
+// backlog and the whole verification cycle before the repack phase. A failed
+// pack phase stops the job so the scheduler records the failure instead of
+// obscuring it with a second maintenance result.
 func (m *attachmentMaintenance) daily(ctx context.Context) error {
 	m.packPending.Store(false)
-	if err := m.runScheduledPack(ctx); err != nil {
+	verifyMore, err := m.runScheduledPack(ctx)
+	if err != nil {
 		m.markPackPending()
 		return err
 	}
-	if m.packPending.Load() {
+	if verifyMore || m.packPending.Load() {
 		return scheduler.ErrReschedule
 	}
 	return m.runAutomaticRepack(ctx, nil)
@@ -288,14 +295,17 @@ func (m *attachmentMaintenance) markPackPending() {
 	}
 }
 
-// runPendingPack runs one automatic pack pass when a scheduled sync left new
-// loose blobs since the last pass. A failed pass leaves the request pending;
-// an exhausted byte budget queues another pass behind waiting work.
+// runPendingPack runs one automatic pack pass when an ingest left new loose
+// blobs since the last pass. A failed pass leaves the request pending; an
+// exhausted byte budget queues another pass behind waiting work. Each pass
+// advances verification by one window but does not chain a whole
+// verification cycle: on a large archive that is hundreds of passes, and the
+// daily attachment-maintenance job completes cycles.
 func (m *attachmentMaintenance) runPendingPack(ctx context.Context) error {
 	if m == nil || !m.packPending.Swap(false) {
 		return nil
 	}
-	if err := m.runScheduledPack(ctx); err != nil {
+	if _, err := m.runScheduledPack(ctx); err != nil {
 		m.packPending.Store(true)
 		return err
 	}
@@ -303,6 +313,25 @@ func (m *attachmentMaintenance) runPendingPack(ctx context.Context) error {
 		return scheduler.ErrReschedule
 	}
 	return nil
+}
+
+// requestPack records that a successful manual ingest may have left loose
+// blobs and asks the attachment-pack job to pack them. It never waits: the
+// job takes the operation gate after the ingest's request releases it, runs
+// under the job's runtime limit, and counts as daemon activity while it
+// waits and runs. Without a registered job the request stays pending.
+func (m *attachmentMaintenance) requestPack() {
+	if m == nil || !m.packCreationEnabled {
+		return
+	}
+	m.markPackPending()
+	if m.requestPackJob == nil {
+		return
+	}
+	if err := m.requestPackJob(); err != nil {
+		m.log().Info("background attachment packing not started; new blobs stay pending",
+			"job", attachmentPackJob, "error", err)
+	}
 }
 
 // looseBlobWrites reports the in-process count of loose blobs created under
@@ -321,21 +350,41 @@ func (m *attachmentMaintenance) log() *slog.Logger {
 	return slog.Default()
 }
 
-// runAfterSuccessfulAttachmentIngest runs bounded maintenance only after a
-// successful ingest. Maintenance and warning-stream failures are best-effort:
-// neither may replace the successful ingest result.
+// reportPackFailure tells the user of a manual ingest that the previous
+// background pack pass failed. A background pass has no request to report
+// to, so the next ingest carries a one-line notice. Notices are
+// best-effort and never change the ingest result.
+func (m *attachmentMaintenance) reportPackFailure(emitNotice func(string) error) {
+	if m == nil || emitNotice == nil || m.packJobLastError == nil {
+		return
+	}
+	lastErr := strings.TrimSpace(m.packJobLastError())
+	if lastErr == "" {
+		return
+	}
+	notice := fmt.Sprintf(
+		"Warning: the last background attachment packing pass failed: %s; run `msgvault pack-attachments` to retry.\n",
+		strings.Join(strings.Fields(lastErr), " "))
+	if err := emitNotice(notice); err != nil {
+		m.log().Warn("failed to emit attachment packing notice", "error", err)
+	}
+}
+
+// runAfterSuccessfulAttachmentIngest requests background packing only after
+// a successful ingest. The caller's request returns as soon as the ingest
+// does; packing can neither delay nor replace the ingest result. A failure
+// of the previous background pass is reported through emitNotice.
 func runAfterSuccessfulAttachmentIngest(
 	ctx context.Context,
 	maintenance *attachmentMaintenance,
 	ingest func(context.Context) error,
-	emitWarning func(string) error,
+	emitNotice func(string) error,
 ) error {
 	if err := runWithAttachmentMutation(ctx, maintenance, ingest); err != nil {
 		return err
 	}
-	if maintenance != nil {
-		_ = maintenance.runAutomaticPack(ctx, emitWarning)
-	}
+	maintenance.reportPackFailure(emitNotice)
+	maintenance.requestPack()
 	return nil
 }
 
@@ -406,15 +455,29 @@ func registerAttachmentMaintenanceJob(sched *scheduler.Scheduler, maintenance *a
 }
 
 func registerAttachmentPackJob(sched *scheduler.Scheduler, maintenance *attachmentMaintenance) error {
-	// Recheck the catalog on the first tick after startup. In-memory write
+	// Recheck the catalog on the first pass after startup. In-memory write
 	// counts cannot tell us what a previous daemon left loose.
 	maintenance.markPackPending()
-	return sched.AddJob(scheduler.Job{
+	if err := sched.AddJob(scheduler.Job{
 		Name:       attachmentPackJob,
 		MaxRuntime: automaticAttachmentMaxRuntime,
 		Schedule:   attachmentPackCron,
 		Run:        maintenance.runPendingPack,
-	})
+	}); err != nil {
+		return err
+	}
+	// A daemon started on demand may idle out long before the next cron
+	// tick, so ingests start the job themselves and report its failures.
+	maintenance.requestPackJob = func() error { return sched.RequestJob(attachmentPackJob) }
+	maintenance.packJobLastError = func() string {
+		for _, status := range sched.JobStatus() {
+			if status.Name == attachmentPackJob {
+				return status.LastError
+			}
+		}
+		return ""
+	}
+	return nil
 }
 
 func registerScheduledBeeperJob(

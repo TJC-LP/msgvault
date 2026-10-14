@@ -267,6 +267,55 @@ func TestStartJobIsAsync(t *testing.T) {
 	})
 }
 
+// TestRequestJobCoalescesLikeATick proves RequestJob returns before the job
+// holds the work gate, that a request made while a run waits for the gate is
+// absorbed by that run, and that a request made while a run executes queues
+// exactly one follow-up instead of being dropped.
+func TestRequestJobCoalescesLikeATick(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		require := require.New(t)
+		assert := assert.New(t)
+		var runs atomic.Int32
+		release := make(chan struct{})
+		tracker := newSerialWorkTracker()
+		s := New(func(context.Context, string) error { return nil }).WithWorkTracker(tracker)
+		defer func() { <-s.Stop().Done() }()
+		require.NoError(s.AddJob(Job{Name: "job", Schedule: "0 0 1 1 *", Run: func(context.Context) error {
+			if runs.Add(1) == 1 {
+				<-release
+			}
+			return nil
+		}}))
+
+		// The caller holds the gate, as an HTTP handler does.
+		holding, ok := tracker.BeginWork()
+		require.True(ok)
+		require.NoError(s.RequestJob("job"), "request while the caller holds the gate")
+		synctest.Wait()
+		assert.True(s.JobStatus()[0].Queued, "the run waits for the caller's gate")
+		require.NoError(s.RequestJob("job"), "request while a run waits to start")
+		assert.False(s.JobStatus()[0].Pending, "a waiting run absorbs the request")
+		assert.Equal(int32(0), runs.Load())
+
+		holding()
+		synctest.Wait()
+		require.Equal(int32(1), runs.Load(), "the run starts once the caller releases the gate")
+		require.NoError(s.RequestJob("job"), "request while the run executes")
+		require.NoError(s.RequestJob("job"), "a second request coalesces into the same follow-up")
+		assert.True(s.JobStatus()[0].Pending, "an executing run queues one follow-up")
+
+		close(release)
+		synctest.Wait()
+		assert.Equal(int32(2), runs.Load(), "exactly one follow-up runs")
+		assert.False(s.JobStatus()[0].Running)
+
+		require.Error(s.RequestJob("missing"), "unknown jobs are rejected")
+		<-s.Stop().Done()
+		require.Error(s.RequestJob("job"), "a stopped scheduler starts nothing")
+		assert.Equal(int32(2), runs.Load())
+	})
+}
+
 func TestStartStop(t *testing.T) {
 	s := New(func(ctx context.Context, email string) error {
 		return nil
