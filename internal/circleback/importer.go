@@ -1136,8 +1136,6 @@ func normalizeEmail(email string) string {
 }
 
 func emailDomain(email string) string {
-	if i := strings.LastIndex(email, "@"); i >= 0 {
-		return email[i+1:]
-	}
-	return ""
+	_, domain, _ := strings.CutLast(email, "@")
+	return domain
 }
