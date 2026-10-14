@@ -2085,9 +2085,12 @@ func (a *storeAPIAdapter) runCLISyncWithRunner(
 		}
 		return emit(api.CLISyncEvent{Type: stream, Data: data})
 	}
+	emitNotice := func(message string) error {
+		return emitSubprocess(cliStreamStderr, message)
+	}
 	return runAfterSuccessfulAttachmentIngest(ctx, a.attachmentMaintenance, func(ctx context.Context) error {
 		return run(ctx, cliSyncSubprocessArgs(req), emitSubprocess)
-	})
+	}, emitNotice)
 }
 
 // emitFolderArgs appends a --folder/--skip-folder flag for each
@@ -2224,7 +2227,10 @@ func (a *storeAPIAdapter) runCLIRepairMessageWithRunner(
 	if req.Audit {
 		return runRepair(ctx)
 	}
-	return runAfterSuccessfulAttachmentIngest(ctx, a.attachmentMaintenance, runRepair)
+	emitNotice := func(message string) error {
+		return emitSubprocess(cliStreamStderr, message)
+	}
+	return runAfterSuccessfulAttachmentIngest(ctx, a.attachmentMaintenance, runRepair, emitNotice)
 }
 
 func cliRepairMessageSubprocessArgs(req api.CLIRepairMessageRequest) []string {
@@ -2337,7 +2343,10 @@ func (a *storeAPIAdapter) runCLICommandWithRunner(
 			ctx, a.attachmentMaintenance, runSubprocess, emitWarning,
 		)
 	}
-	return runAfterSuccessfulAttachmentIngest(ctx, a.attachmentMaintenance, runSubprocess)
+	emitNotice := func(message string) error {
+		return emitSubprocess(cliStreamStderr, message)
+	}
+	return runAfterSuccessfulAttachmentIngest(ctx, a.attachmentMaintenance, runSubprocess, emitNotice)
 }
 
 func attachmentRemovalCommand(args []string) bool {

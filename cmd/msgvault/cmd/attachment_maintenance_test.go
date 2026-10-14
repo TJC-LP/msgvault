@@ -236,7 +236,7 @@ func TestBackgroundPackFailureLogsProgressAndStaysPending(t *testing.T) {
 	maintenance, logs := newFailingAttachmentMaintenance(t)
 
 	require.NoError(runAfterSuccessfulAttachmentIngest(
-		context.Background(), maintenance, func(context.Context) error { return nil },
+		context.Background(), maintenance, func(context.Context) error { return nil }, nil,
 	), "a later maintenance failure cannot reach the ingest result")
 	require.Error(maintenance.runPendingPack(context.Background()), "the job records the failure")
 	assert.True(maintenance.packPending.Load(), "a failed pass leaves its work pending")
@@ -624,7 +624,7 @@ func TestAttachmentIngestMutationLeaseWaitsForMaintenance(t *testing.T) {
 			func(context.Context) error {
 				close(ingestStarted)
 				return nil
-			},
+			}, nil,
 		)
 	}()
 
@@ -752,7 +752,7 @@ func TestBackgroundPackKeepsIdleDaemonAliveUntilItFinishes(t *testing.T) {
 		release := f.holdPackPass()
 
 		require.NoError(runAfterSuccessfulAttachmentIngest(t.Context(), f.maintenance,
-			func(context.Context) error { return nil }))
+			func(context.Context) error { return nil }, nil))
 		// Longer than the idle timeout, shorter than the job's runtime limit.
 		synctest.Sleep(2 * idleTimeout)
 		select {
@@ -790,7 +790,7 @@ func TestBackgroundPackStopsAtRuntimeLimitAndNextIngestResumesIt(t *testing.T) {
 		release := f.holdPackPass()
 
 		require.NoError(runAfterSuccessfulAttachmentIngest(t.Context(), f.maintenance,
-			func(context.Context) error { return nil }))
+			func(context.Context) error { return nil }, nil))
 		synctest.Sleep(automaticAttachmentMaxRuntime + time.Second)
 		synctest.Wait()
 
@@ -802,14 +802,133 @@ func TestBackgroundPackStopsAtRuntimeLimitAndNextIngestResumesIt(t *testing.T) {
 		assert.True(f.maintenance.packPending.Load(), "the unfinished work stays pending")
 
 		release()
-		// The next manual ingest restarts the job, which picks up the pending work.
+		// The next manual ingest reports the failed pass and restarts the job,
+		// which picks up the pending work.
+		var notices []string
+		collect := func(message string) error {
+			notices = append(notices, message)
+			return nil
+		}
 		require.NoError(runAfterSuccessfulAttachmentIngest(t.Context(), f.maintenance,
-			func(context.Context) error { return nil }))
+			func(context.Context) error { return nil }, collect))
+		require.Len(notices, 1, "one notice about the failed pass")
+		assert.Contains(notices[0], "last background attachment packing pass failed")
+		assert.Contains(notices[0], jobctx.ErrRunBudgetExceeded.Error())
+		assert.Contains(notices[0], "msgvault pack-attachments")
+		assert.Equal(1, strings.Count(notices[0], "\n"), "the notice is one line")
 		synctest.Wait()
 		assert.NotNil(f.packedEntry(hash))
 		assert.False(f.maintenance.packPending.Load())
 		assert.Empty(attachmentPackJobStatus(t, sched).LastError)
+
+		require.NoError(runAfterSuccessfulAttachmentIngest(t.Context(), f.maintenance,
+			func(context.Context) error { return nil }, collect))
+		assert.Len(notices, 1, "a clean pass clears the notice")
+		synctest.Wait()
 	})
+}
+
+func TestPackFailureNoticeCannotFailTheIngest(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		require := require.New(t)
+		assert := assert.New(t)
+		f := newAttachmentMaintenanceFixture(t)
+		f.addLoose([]byte("blob whose pass fails before a disconnected client returns"))
+		_, _ = newBackgroundPackHarness(t, f)
+		release := f.holdPackPass()
+		require.NoError(runAfterSuccessfulAttachmentIngest(t.Context(), f.maintenance,
+			func(context.Context) error { return nil }, nil))
+		synctest.Sleep(automaticAttachmentMaxRuntime + time.Second)
+		synctest.Wait()
+		release()
+
+		err := runAfterSuccessfulAttachmentIngest(t.Context(), f.maintenance,
+			func(context.Context) error { return nil },
+			func(string) error { return errors.New("client disconnected") })
+
+		require.NoError(err, "a notice that cannot be delivered never fails the ingest")
+		synctest.Wait() // the requested pass also writes to the log
+		assert.Contains(f.logs.String(), "failed to emit attachment packing notice")
+		assert.Contains(f.logs.String(), "client disconnected")
+	})
+}
+
+// TestQueuedPackJobCountsAsDaemonActivity covers the window before the job
+// holds the operation gate: another holder keeps it queued past the idle
+// timeout, and the daemon must not stop with packing still waiting.
+func TestQueuedPackJobCountsAsDaemonActivity(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		require := require.New(t)
+		assert := assert.New(t)
+		f := newAttachmentMaintenanceFixture(t)
+		hash := f.addLoose([]byte("blob queued behind another gate holder"))
+		const idleTimeout = 20 * time.Second
+		idleShutdown := make(chan struct{})
+		idle := api.NewIdleTracker(idleTimeout, func() { close(idleShutdown) })
+		gate := api.NewSerialOperationGate()
+		sched, media := newServeSchedulers(nil, f.maintenance.logger, idle, gate)
+		defer func() { <-serveSchedulers{sched, media}.Stop().Done() }()
+		require.NoError(registerAttachmentPackJob(sched, f.maintenance))
+		go idle.Run(t.Context())
+		releaseGate, ok := gate.BeginLabeledWorkContext(t.Context(), "other archive work")
+		require.True(ok)
+
+		require.NoError(runAfterSuccessfulAttachmentIngest(t.Context(), f.maintenance,
+			func(context.Context) error { return nil }, nil))
+		synctest.Sleep(2 * idleTimeout)
+		select {
+		case <-idleShutdown:
+			require.FailNow("the daemon idled out while its pack job waited for the gate")
+		default:
+		}
+		status := attachmentPackJobStatus(t, sched)
+		assert.True(status.Queued, "the job is still waiting for the gate")
+		assert.Nil(f.packedEntry(hash))
+
+		releaseGate()
+		synctest.Wait()
+		assert.NotNil(f.packedEntry(hash))
+		synctest.Sleep(idleTimeout + time.Second)
+		select {
+		case <-idleShutdown:
+		default:
+			assert.Fail("an idle daemon must still shut down after packing")
+		}
+	})
+}
+
+// TestDailyMaintenanceChainsTheWholeVerificationCycle runs the daily job the
+// way the scheduler does, one pass per follow-up, and checks that it verifies
+// every window before it repacks.
+func TestDailyMaintenanceChainsTheWholeVerificationCycle(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	f := newAttachmentMaintenanceFixture(t)
+	for i := range 140 { // two verification windows: 128 + 12
+		f.addLoose([]byte(fmt.Sprintf("packed before the daily job %d", i)))
+	}
+	_, err := f.maintenance.pack(t.Context(), 0)
+	require.NoError(err)
+
+	followUps := 0
+	for {
+		err := f.maintenance.daily(t.Context())
+		if !errors.Is(err, scheduler.ErrReschedule) {
+			require.NoError(err)
+			break
+		}
+		followUps++
+		require.Less(followUps, 10, "the daily chain must end")
+	}
+
+	assert.Equal(1, followUps, "the second window needs one follow-up")
+	var cursor string
+	require.NoError(f.store.DB().QueryRow(f.store.Rebind(
+		`SELECT value FROM archive_metadata WHERE key = ?`), "attachment_pack_verification_cursor").Scan(&cursor))
+	assert.Empty(cursor, "a finished cycle resets the verification cursor")
+	assert.Equal(2, strings.Count(f.logs.String(), "automatic attachment maintenance complete"))
+	assert.Equal(1, strings.Count(f.logs.String(), "automatic attachment repack complete"),
+		"repack runs once, after the cycle")
 }
 
 func TestBackgroundPackCancelsOnShutdownAndRestartResumesIt(t *testing.T) {
@@ -824,7 +943,7 @@ func TestBackgroundPackCancelsOnShutdownAndRestartResumesIt(t *testing.T) {
 		release := f.holdPackPass()
 
 		require.NoError(runAfterSuccessfulAttachmentIngest(t.Context(), f.maintenance,
-			func(context.Context) error { return nil }))
+			func(context.Context) error { return nil }, nil))
 		synctest.Wait()
 		require.True(attachmentPackJobStatus(t, sched).Running)
 		require.NoError(shutdownServeRuntime(t.Context(), io.Discard, nil,
@@ -842,7 +961,7 @@ func TestBackgroundPackCancelsOnShutdownAndRestartResumesIt(t *testing.T) {
 		defer func() { <-restartedSched.Stop().Done() }()
 		require.NoError(registerAttachmentPackJob(restartedSched, restarted))
 		require.NoError(runAfterSuccessfulAttachmentIngest(t.Context(), restarted,
-			func(context.Context) error { return nil }))
+			func(context.Context) error { return nil }, nil))
 		synctest.Wait()
 		assert.NotNil(f.packedEntry(hash))
 	})

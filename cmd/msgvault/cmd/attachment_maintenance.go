@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -49,10 +50,12 @@ type attachmentMaintenance struct {
 	// has drained yet. Startup requests one scan of existing blobs.
 	packPending atomic.Bool
 	// requestPackJob asks the daemon scheduler for a background
-	// attachment-pack run. registerAttachmentPackJob sets it before the
-	// daemon serves requests; without it a pending pass waits for the job's
-	// schedule.
-	requestPackJob func() error
+	// attachment-pack run, and packJobLastError reports the scheduler's
+	// record of that job's last failure. registerAttachmentPackJob sets both
+	// before the daemon serves requests; without them a pending pass waits
+	// for the job's schedule.
+	requestPackJob   func() error
+	packJobLastError func() string
 }
 
 func newAttachmentMaintenance(
@@ -240,9 +243,10 @@ func (m *attachmentMaintenance) logAutomaticRepackSummary(message string, stats 
 }
 
 // runScheduledPack performs one pass that packs new loose blobs within the
-// byte budget and verifies the next window of existing packed blobs, so its
-// cost tracks new content rather than archive size. A pass that stops at its
-// byte budget leaves packPending set. verifyMore reports that the durable
+// byte budget and verifies only the next window of existing packed blobs.
+// The pass still lists every referenced hash and checks every pack file, so
+// part of its cost grows with the archive. A pass that stops at its byte
+// budget leaves packPending set. verifyMore reports that the durable
 // verification cursor has further windows.
 func (m *attachmentMaintenance) runScheduledPack(ctx context.Context) (verifyMore bool, err error) {
 	if !m.packCreationEnabled {
@@ -346,17 +350,40 @@ func (m *attachmentMaintenance) log() *slog.Logger {
 	return slog.Default()
 }
 
+// reportPackFailure tells the user of a manual ingest that the previous
+// background pack pass failed. A background pass has no request to report
+// to, so the next ingest carries a one-line notice. Notices are
+// best-effort and never change the ingest result.
+func (m *attachmentMaintenance) reportPackFailure(emitNotice func(string) error) {
+	if m == nil || emitNotice == nil || m.packJobLastError == nil {
+		return
+	}
+	lastErr := strings.TrimSpace(m.packJobLastError())
+	if lastErr == "" {
+		return
+	}
+	notice := fmt.Sprintf(
+		"Warning: the last background attachment packing pass failed: %s; run `msgvault pack-attachments` to retry.\n",
+		strings.Join(strings.Fields(lastErr), " "))
+	if err := emitNotice(notice); err != nil {
+		m.log().Warn("failed to emit attachment packing notice", "error", err)
+	}
+}
+
 // runAfterSuccessfulAttachmentIngest requests background packing only after
 // a successful ingest. The caller's request returns as soon as the ingest
-// does; packing can neither delay nor replace the ingest result.
+// does; packing can neither delay nor replace the ingest result. A failure
+// of the previous background pass is reported through emitNotice.
 func runAfterSuccessfulAttachmentIngest(
 	ctx context.Context,
 	maintenance *attachmentMaintenance,
 	ingest func(context.Context) error,
+	emitNotice func(string) error,
 ) error {
 	if err := runWithAttachmentMutation(ctx, maintenance, ingest); err != nil {
 		return err
 	}
+	maintenance.reportPackFailure(emitNotice)
 	maintenance.requestPack()
 	return nil
 }
@@ -440,8 +467,16 @@ func registerAttachmentPackJob(sched *scheduler.Scheduler, maintenance *attachme
 		return err
 	}
 	// A daemon started on demand may idle out long before the next cron
-	// tick, so ingests start the job themselves.
+	// tick, so ingests start the job themselves and report its failures.
 	maintenance.requestPackJob = func() error { return sched.RequestJob(attachmentPackJob) }
+	maintenance.packJobLastError = func() string {
+		for _, status := range sched.JobStatus() {
+			if status.Name == attachmentPackJob {
+				return status.LastError
+			}
+		}
+		return ""
+	}
 	return nil
 }
 

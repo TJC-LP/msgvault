@@ -10,8 +10,9 @@ All notable changes to msgvault, grouped by release.
 
 - A `sync` or import sent to the daemon returns when its own work finishes.
   Attachment packing now runs afterwards as the daemon's bounded
-  `attachment-pack` job instead of inside the request, and a daemon started on
-  demand stays up until that job finishes. Each pass verifies one bounded
+  `attachment-pack` job instead of inside the request. A daemon started on
+  demand stays up until that job finishes, and the next such command warns
+  when the previous background pass failed. Each pass verifies one bounded
   window of existing packs instead of every packed blob, and finding new loose
   blobs no longer reads every attachment row.
 

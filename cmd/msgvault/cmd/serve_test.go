@@ -2328,6 +2328,77 @@ func TestStoreAPIAdapterFinalizesSyncOperationAfterRunnerReturns(t *testing.T) {
 	assert.Equal("done", op.Status)
 }
 
+// TestStoreAPIAdapterIngestsReportPreviousPackFailure proves each ingest
+// request tells its CLI, on stderr, that the last background pack pass failed.
+func TestStoreAPIAdapterIngestsReportPreviousPackFailure(t *testing.T) {
+	ingests := map[string]func(*storeAPIAdapter, context.Context) ([]string, error){
+		"sync": func(a *storeAPIAdapter, ctx context.Context) ([]string, error) {
+			var stderr []string
+			err := a.runCLISyncWithRunner(ctx, api.CLISyncRequest{Email: "alice@example.com"},
+				func(event api.CLISyncEvent) error {
+					if event.Type == cliStreamStderr {
+						stderr = append(stderr, event.Data)
+					}
+					return nil
+				},
+				func(context.Context, []string, func(string, string) error) error { return nil })
+			return stderr, err
+		},
+		"import": func(a *storeAPIAdapter, ctx context.Context) ([]string, error) {
+			var stderr []string
+			err := a.runCLICommandWithRunner(ctx, api.CLIRunRequest{Args: []string{importMboxCommand, "archive.mbox"}},
+				func(event api.CLIRunEvent) error {
+					if event.Type == cliStreamStderr {
+						stderr = append(stderr, event.Data)
+					}
+					return nil
+				},
+				func(context.Context, []string, map[string]string, string, func(string, string) error) error {
+					return nil
+				})
+			return stderr, err
+		},
+		"repair": func(a *storeAPIAdapter, ctx context.Context) ([]string, error) {
+			var stderr []string
+			err := a.runCLIRepairMessageWithRunner(ctx, api.CLIRepairMessageRequest{Reference: "gmail-42"},
+				func(event api.CLIRepairMessageEvent) error {
+					if event.Type == cliStreamStderr {
+						stderr = append(stderr, event.Data)
+					}
+					return nil
+				},
+				func(context.Context, []string, func(string, string) error) error { return nil })
+			return stderr, err
+		},
+	}
+	for name, ingest := range ingests {
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				require := require.New(t)
+				assert := assert.New(t)
+				f := newAttachmentMaintenanceFixture(t)
+				f.addLoose([]byte("blob whose first background pass fails"))
+				_, _ = newBackgroundPackHarness(t, f)
+				adapter := &storeAPIAdapter{store: f.store, attachmentMaintenance: f.maintenance}
+				release := f.holdPackPass()
+				_, err := ingest(adapter, t.Context())
+				require.NoError(err)
+				synctest.Sleep(automaticAttachmentMaxRuntime + time.Second)
+				synctest.Wait()
+				release()
+
+				stderr, err := ingest(adapter, t.Context())
+
+				require.NoError(err)
+				require.Len(stderr, 1)
+				assert.Contains(stderr[0], "last background attachment packing pass failed")
+				assert.Contains(stderr[0], "msgvault pack-attachments")
+				synctest.Wait()
+			})
+		})
+	}
+}
+
 func TestStoreAPIAdapterRunCLICommandPacksOnlyAllowlistedSuccess(t *testing.T) {
 	tests := []struct {
 		name           string
@@ -2700,7 +2771,7 @@ func TestStoreAPIAdapterExplicitRepackCancellationFailsFast(t *testing.T) {
 	assert.True(has, "fail-fast cancellation leaves physical inventory untouched")
 }
 
-func TestStoreAPIAdapterSyncNeverWaitsForOrStreamsBackgroundPackFailures(t *testing.T) {
+func TestStoreAPIAdapterSyncDoesNotPackInsideTheRequest(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
 	maintenance, logs := newFailingAttachmentMaintenance(t)
@@ -2722,7 +2793,7 @@ func TestStoreAPIAdapterSyncNeverWaitsForOrStreamsBackgroundPackFailures(t *test
 	assert.True(maintenance.packPending.Load(), "the sync leaves its pack request pending")
 	assert.NotContains(logs.String(), "automatic attachment maintenance", "no pack pass ran inside the request")
 }
-func TestStoreAPIAdapterImportNeverStreamsBackgroundPackFailures(t *testing.T) {
+func TestStoreAPIAdapterImportDoesNotPackInsideTheRequest(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
 	maintenance, logs := newFailingAttachmentMaintenance(t)

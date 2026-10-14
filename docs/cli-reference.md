@@ -1792,7 +1792,9 @@ The daemon also packs automatically:
   `sync` or an import, the command returns as soon as its own work finishes.
   The daemon then starts its `attachment-pack` job in the background. A daemon
   started on demand stays running while that job waits and runs, and still
-  stops after its idle timeout once the job finishes.
+  stops after its idle timeout once the job finishes. If the job's previous
+  pass failed, the command prints a one-line warning on stderr; run
+  `msgvault pack-attachments` to retry.
 - The `attachment-pack` job also runs every 6 hours, which packs loose blobs
   written by scheduled syncs. Scheduled syncs never pack inline.
 - The daily `attachment-maintenance` job packs, finishes a verification
@@ -1802,11 +1804,12 @@ Each automatic pack pass has a 256 MiB soft raw-byte budget and finishes its
 current blob before stopping for that byte limit. Passes stop after one minute,
 which lets queued work run, and yield to waiting requests. Each pass also
 verifies the next window of at most 128 existing packed blobs or 32 MiB of
-their raw content, allowing one oversized blob, so its cost follows the new
-content rather than the archive's size. A durable hash cursor resumes
-verification after a restart. The `attachment-pack` job verifies one window
-per pass and queues follow-ups only while loose blobs remain; the daily job
-continues until the whole cycle is verified. Manual unpacking reads the full
+their raw content, allowing one oversized blob, instead of every packed blob.
+A pass still lists every attachment hash and checks every pack file, so it
+takes longer on a larger archive even when little is new. A durable hash
+cursor resumes verification after a restart. The `attachment-pack` job
+verifies one window per pass and queues follow-ups only while loose blobs
+remain; the daily job continues until the whole cycle is verified. Manual unpacking reads the full
 catalog. Cancellation, including daemon shutdown, preserves committed packs. A
 pass with committed progress resumes behind waiting work; runtime expiry
 without a checkpoint records an error and waits for the next trigger, such as
