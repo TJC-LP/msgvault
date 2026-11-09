@@ -133,8 +133,8 @@ func credentialsCommandConfig(cmd *cobra.Command) (*config.Config, error) {
 }
 
 func validateHeadlessCredentialID(id string) error {
-	if id == providercredentials.PeopleSweepID {
-		return errors.New("people.sweep uses named profile credentials; use msgvault person provider add --api-key-stdin or --credential-env")
+	if strings.HasPrefix(id, providercredentials.PeopleProviderID("")) {
+		return errors.New("people provider keys belong to named profiles; use msgvault person provider add --api-key-stdin or --credential-env")
 	}
 	if id == providercredentials.PersonEnrichmentSuppressionID {
 		return nil
@@ -159,6 +159,9 @@ func configuredCredentialEndpoint(cfg *config.Config, id string) (string, error)
 }
 
 func putHeadlessCredential(cfg *config.Config, snapshot providercredentials.Snapshot, id, endpoint, key string) (providercredentials.Snapshot, error) {
+	if id == providercredentials.VectorEmbeddingsID && cfg.Vector.Embeddings.LocalOnly {
+		return providercredentials.Snapshot{}, errors.New("local embeddings do not use provider credentials")
+	}
 	if id == providercredentials.PersonEnrichmentSuppressionID {
 		if _, err := personenrichment.NewSuppressionHasher([]byte(key)); err != nil {
 			return providercredentials.Snapshot{}, fmt.Errorf("validate suppression key: %w", err)
@@ -196,7 +199,7 @@ func importCredentialEnvironment(cmd *cobra.Command, cfg *config.Config) error {
 			kept++
 			continue
 		}
-		if entry.environment == "" {
+		if entry.environment == "" || entry.id == providercredentials.VectorEmbeddingsID && cfg.Vector.Embeddings.LocalOnly {
 			continue
 		}
 		key, ok := os.LookupEnv(entry.environment)

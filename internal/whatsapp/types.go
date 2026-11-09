@@ -111,6 +111,16 @@ type ImportOptions struct {
 
 	// BatchSize is the number of messages to process per batch (default: 1000).
 	BatchSize int
+
+	// Full makes an Apple import compare every message, including chats whose
+	// change markers match the last successful import.
+	Full bool
+
+	// After and Before restrict an Apple import to messages sent at or after
+	// After and before Before (zero = unbounded). Messages outside the window
+	// are neither written nor removed. The Android importer rejects them.
+	After  time.Time
+	Before time.Time
 }
 
 // DefaultOptions returns ImportOptions with sensible defaults.
@@ -128,6 +138,7 @@ type ImportSummary struct {
 	ChatsProcessed    int64
 	MessagesProcessed int64
 	MessagesAdded     int64
+	MessagesUpdated   int64
 	MessagesSkipped   int64
 	ReactionsAdded    int64
 	AttachmentsFound  int64

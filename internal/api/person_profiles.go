@@ -33,6 +33,7 @@ type PersonProfileStore interface {
 		ctx context.Context, participantID int64, displayName *string,
 	) (*store.Person, bool, error)
 	GetPersonContext(ctx context.Context, id int64) (*store.Person, error)
+	GetPersonByUIDContext(ctx context.Context, uid string) (*store.Person, error)
 	ListPersonsContext(ctx context.Context) ([]store.Person, error)
 	DirectoryPeoplePageContext(ctx context.Context, query store.DirectoryPeopleQuery) (*store.DirectoryPeoplePage, error)
 	UpdatePersonDisplayNameContext(
@@ -137,6 +138,17 @@ func (s *Server) registerPersonProfileRoutes(api huma.API) {
 	addErrorResponses(api, get.Responses, http.StatusNotFound, http.StatusServiceUnavailable)
 	registerRawHumaRoute(api, get, s.handleGetPersonProfile)
 
+	getByUID := rawAPIV1Operation("getPersonByUID", http.MethodGet,
+		"/people/by-uid", "Look up a durable person by vCard or CardDAV UID")
+	getByUID.Description = "Resolves the person's current vCard UID, a retired UID that still aliases the person, " +
+		"or the UID of a CardDAV resource mapped to the person. Returns a conflict when one remote UID maps to " +
+		"different people."
+	addPersonUIDParameter(&getByUID)
+	getByUID.Responses = jsonResponsesFor[store.Person](api)
+	addErrorResponses(api, getByUID.Responses, http.StatusBadRequest, http.StatusNotFound,
+		http.StatusConflict, http.StatusServiceUnavailable)
+	registerRawHumaRoute(api, getByUID, s.handleGetPersonByUID)
+
 	patch := rawAPIV1Operation("patchPerson", http.MethodPatch, "/people/{id}", "Update a durable person's display name")
 	addPersonIDParameter(&patch)
 	addPersonIfMatchParameter(&patch)
@@ -195,7 +207,7 @@ func (s *Server) handleSemanticPersonSearch(w http.ResponseWriter, r *http.Reque
 	}
 	results, err := engine.Search(r.Context(), request.Query, request.Limit)
 	if err != nil {
-		s.writePersonSearchError(w, err)
+		s.writePersonSearchError(r.Context(), w, err)
 		return
 	}
 	response := PersonSearchResponse{Results: make([]PersonSearchResult, len(results))}
@@ -205,7 +217,7 @@ func (s *Server) handleSemanticPersonSearch(w http.ResponseWriter, r *http.Reque
 	writeJSON(w, http.StatusOK, response)
 }
 
-func (s *Server) writePersonSearchError(w http.ResponseWriter, err error) {
+func (s *Server) writePersonSearchError(ctx context.Context, w http.ResponseWriter, err error) {
 	if s.writeIfContextError(w, err) {
 		return
 	}
@@ -222,8 +234,10 @@ func (s *Server) writePersonSearchError(w http.ResponseWriter, err error) {
 			"Semantic person search cannot verify the current semantic person embedding policy or exact consent; check the live configuration and consent store")
 	case errors.Is(err, vector.ErrNotEnabled):
 		writeError(w, http.StatusServiceUnavailable, "vector_not_enabled", "Vector search is not configured")
-	case errors.Is(err, vector.ErrIndexStale):
+	case errors.Is(err, vector.ErrSemanticPersonEmbeddingRuntimeStale):
 		writeError(w, http.StatusServiceUnavailable, "index_stale", "The vector index does not match configured embedding settings")
+	case errors.Is(err, vector.ErrIndexStale):
+		s.writeIndexStale(ctx, w, err)
 	case errors.Is(err, personsearch.ErrPersonCoverageIncomplete):
 		var coverageErr *personsearch.CoverageIncompleteError
 		if errors.As(err, &coverageErr) && coverageErr.Rejected > 0 {
@@ -309,6 +323,24 @@ func (s *Server) handleGetPersonProfile(w http.ResponseWriter, r *http.Request) 
 	writePerson(w, http.StatusOK, person)
 }
 
+func (s *Server) handleGetPersonByUID(w http.ResponseWriter, r *http.Request) {
+	profiles, ok := s.personProfileStore(w)
+	if !ok {
+		return
+	}
+	uid := strings.TrimSpace(r.URL.Query().Get("uid"))
+	if uid == "" {
+		writeError(w, http.StatusBadRequest, "invalid_person_uid", "vCard UID must not be empty")
+		return
+	}
+	person, err := profiles.GetPersonByUIDContext(r.Context(), uid)
+	if err != nil {
+		s.writePersonError(w, err)
+		return
+	}
+	writePerson(w, http.StatusOK, person)
+}
+
 func (s *Server) handleListPeople(w http.ResponseWriter, r *http.Request) {
 	profiles, ok := s.personProfileStore(w)
 	if !ok {
@@ -347,6 +379,7 @@ func (s *Server) handleDirectoryPeople(w http.ResponseWriter, r *http.Request) {
 func directoryPeopleQuery(values url.Values) (store.DirectoryPeopleQuery, error) {
 	query := store.DirectoryPeopleQuery{
 		Query:          values.Get("q"),
+		Address:        values.Get("address"),
 		Cursor:         values.Get("cursor"),
 		ContactState:   values.Get("contact_state"),
 		Category:       values.Get("category"),
@@ -455,6 +488,8 @@ func (s *Server) writePersonError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, store.ErrPersonNotFound):
 		writeError(w, http.StatusNotFound, "person_profile_not_found", "Person profile not found")
+	case errors.Is(err, store.ErrPersonUIDAmbiguous):
+		writeError(w, http.StatusConflict, "person_uid_ambiguous", "UID is bound to multiple person profiles")
 	case errors.Is(err, store.ErrPersonRevisionConflict):
 		writeError(w, http.StatusConflict, "person_revision_conflict", "Person profile changed; reload and retry")
 	case errors.Is(err, store.ErrPersonBindingConflict):
@@ -495,6 +530,15 @@ func addPersonIDParameter(operation *huma.Operation) {
 	})
 }
 
+func addPersonUIDParameter(operation *huma.Operation) {
+	minimumLength := 1
+	operation.Parameters = append(operation.Parameters, &huma.Param{
+		Name: "uid", In: queryParamLocation, Required: true,
+		Description: "Exact vCard UID or CardDAV resource UID",
+		Schema:      &huma.Schema{Type: huma.TypeString, MinLength: &minimumLength},
+	})
+}
+
 func addDirectoryPeopleParameters(operation *huma.Operation) {
 	lastContactAfter := queryStringParam("last_contact_after", "Return people contacted at or after this RFC3339 timestamp", false)
 	lastContactAfter.Schema.Format = "date-time"
@@ -508,6 +552,7 @@ func addDirectoryPeopleParameters(operation *huma.Operation) {
 	}
 	operation.Parameters = append(operation.Parameters,
 		queryStringParam("q", "Lexical query over person names, contact points, and organizations", false),
+		queryStringParam("address", "Literal case-insensitive substring of current bound participant identities or curated contact points", false),
 		queryStringParam("cursor", "Opaque cursor returned by the previous Directory page", false),
 		queryIntegerParam("limit", "Maximum rows to return (default 50, max 100)"),
 		queryStringParam("contact_state", "Current contact state: active or inactive", false),

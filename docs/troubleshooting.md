@@ -68,7 +68,7 @@ you@gmail.com already has Gmail write access (https://www.googleapis.com/auth/gm
 To make the account read-only, remove its access and grant it again:
 
 1. Revoke msgvault at [myaccount.google.com/permissions](https://myaccount.google.com/permissions)
-2. `rm ~/.msgvault/tokens/you@gmail.com.json`
+2. Remove the token: with file storage, run `rm ~/.msgvault/tokens/you@gmail.com.json`; with command storage, delete its record from the configured store.
 3. `msgvault add-account you@gmail.com --readonly`
 
 Revoking clears every other Google scope for the account, so re-run whichever commands granted them — `add-calendar` for Calendar, `add-synctech-sms-drive` for Drive. Archived mail is unaffected. Confirm the result by reading the token's `scopes` array rather than the permissions page, which reports what msgvault is authorized to request.
@@ -98,6 +98,8 @@ Declining the prompt leaves both the token and the staged batch untouched. Accep
 
 ### General OAuth Issues
 
+For token-file storage:
+
 1. Remove old tokens: `rm ~/.msgvault/tokens/you@gmail.com.json`
 2. Re-add account: `msgvault add-account you@gmail.com`
 3. Revoke and retry: [myaccount.google.com/permissions](https://myaccount.google.com/permissions)
@@ -106,13 +108,15 @@ Declining the prompt leaves both the token and the staged batch untouched. Accep
 
 ### "No browser available"
 
-The standard OAuth flow requires a browser. For headless servers, use the copy-token workflow:
+The standard OAuth flow requires a browser. With token-file storage, use the copy-token workflow:
 
 1. Authorize on a machine with a browser: `msgvault add-account you@gmail.com`
 2. Copy the token file to your server: `scp ~/.msgvault/tokens/you@gmail.com.json user@server:~/.msgvault/tokens/`
 3. Register on the server: `msgvault add-account you@gmail.com`
 
 Run `msgvault add-account you@gmail.com --headless` to see detailed instructions with the exact paths for your configuration.
+
+For command storage, follow [credential configuration](https://github.com/kenn-io/msgvault/blob/main/docs/configuration.md#command-backed-google-credentials-and-tokens) and [export-token](https://github.com/kenn-io/msgvault/blob/main/docs/cli-reference.md#export-token). Use `--upload-only` for Calendar-only tokens, then register with `add-calendar` on the server.
 
 ### Token copied but "account not found"
 
@@ -305,9 +309,7 @@ You set `bind_addr` to a non-loopback address (e.g., `0.0.0.0`) without configur
 
 ### The UI reports a missing, stale, or unavailable analytical cache
 
-Run `msgvault build-cache`, then restart a daemon that was already running. The
-Web UI preserves the reported cache state instead of silently switching some
-modalities to a different query engine. See [Web UI: Cache states](/docs/web-ui/#cache-states)
+Run `msgvault build-cache --full-rebuild`, then restart a daemon that was already running. In auto mode, Messages serves live archive rows during a full rebuild. If no usable cache is produced, those rows stay available with recovery steps. Its notice names operations that still need the cache. Other cache-dependent views show their cache state and recovery steps. See [Web UI: Cache states](/docs/web-ui/#cache-states)
 and [Configuration: analytics](/docs/configuration/#analytics).
 
 ### The UI warns that the session cookie is not secure
@@ -329,9 +331,10 @@ api_port = 9090
 ### HTTP 429 Too Many Requests
 
 The general API limit allows 10 requests per second per client IP with a burst
-of 20. Trusted, authenticated loopback requests are exempt, except session
-login. Some expensive endpoints have tighter limits. If you receive 429, space
-out requests and follow the `Retry-After` header.
+of 20. Trusted loopback requests and local daemon discovery are exempt; see
+[Web UI & API Server: Rate Limiting](/docs/api-server/#rate-limiting). Some
+expensive endpoints have tighter limits. If you receive 429, space out requests
+and follow the `Retry-After` header.
 
 ## Using Logs for Troubleshooting
 

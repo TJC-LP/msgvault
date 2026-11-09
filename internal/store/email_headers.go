@@ -9,6 +9,7 @@ import (
 	"fmt"
 
 	"go.kenn.io/msgvault/internal/mime"
+	"go.kenn.io/msgvault/internal/sqliteutil"
 )
 
 const emailReplyMetadataKey = "email_in_reply_to"
@@ -77,7 +78,7 @@ func (s *Store) recordEmailHeadersContext(
 		if _, err := tx.ExecContext(ctx, `UPDATE messages SET rfc822_message_id = ? WHERE id = ?`, rfcID, messageID); err != nil {
 			return err
 		}
-		return s.bumpDerivedDataRevision(tx)
+		return s.bumpDerivedDataRevisionContext(ctx, tx)
 	})
 }
 
@@ -128,6 +129,12 @@ func mergeEmailHeaderMetadata(metadata sql.NullString, inReplyTo, threadKey stri
 }
 
 func (s *Store) lockEmailHeaderRow(ctx context.Context, tx *loggedTx, messageID int64) error {
+	// A completed generation fence already reserves SQLite's writer slot for
+	// this transaction. Avoid rewriting the content_changed_at index merely
+	// to acquire that same reservation again.
+	if s.dialect.DriverName() == sqliteutil.DriverName() && tx.syncGenerationFenced {
+		return nil
+	}
 	// Acquire the SQLite writer slot before reading. This column is outside the
 	// last-modified trigger, so an idempotent repair does not change message facts.
 	if query := s.dialect.RowWriterLockSQL("messages", "content_changed_at"); query != "" {

@@ -1,28 +1,33 @@
 package cmd
 
 import (
+	"bufio"
 	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"errors"
 	"fmt"
-	"os"
+	"io"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
+	"go.kenn.io/msgvault/internal/daemonclient"
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/textutil"
 )
 
 var (
-	showMessageJSON bool
+	showMessageJSON        bool
+	showMessageBodyOnly    bool
+	showMessageStripQuoted bool
 )
 
 var showMessageCmd = &cobra.Command{
-	Use:   "show-message <id>",
-	Short: "Show full message details",
+	Use:     "show-message <id>",
+	Aliases: []string{"show"},
+	Short:   "Show full message details",
 	Long: `Show the complete details of a message by its internal ID or Gmail ID.
 
 Uses configured remote server or the local daemon by default.
@@ -31,6 +36,14 @@ Use --local to use the local daemon even when a remote is configured.
 This command displays the full message including headers, body, labels,
 and attachment information. Use --json for programmatic output, including
 a web_url that opens the message in the selected daemon browser UI.
+
+Use --body-only to print just body text. Add --strip-quoted to remove quoted
+lines, complete single-line dated reply headers above them, and "-- " signatures.
+Inline replies, uncertain wrapped headers, and complete URLs are preserved.
+Only ">" quoting and English "On ... wrote:" headers are recognized; Outlook
+"Original Message" blocks and other languages stay as written.
+--strip-quoted also cleans body_text in JSON; the archived body and body_html
+are unchanged. --body-only and --json cannot be combined.
 
 Examples:
   msgvault show-message 12345
@@ -64,12 +77,13 @@ func resolveMessageIDArg(raw string) (string, error) {
 	return trimmed, nil
 }
 
-func showHTTPMessage(cmd *cobra.Command, idStr string) error {
-	s, _, err := OpenHTTPStore(cmd.Context())
+func showHTTPMessage(cmd *cobra.Command, idStr string) (result error) {
+	s, _, err := OpenHTTPStore(cmd.Context(), daemonclient.AgentReadMinAPISchemaVersion)
 	if err != nil {
 		return fmt.Errorf("open store: %w", err)
 	}
 	defer func() { _ = s.Close() }()
+	defer reportSuccessfulCLIAction(cmd, s, "message_opened", "", "", &result)
 
 	msg, err := s.GetCLIMessage(cmd.Context(), idStr)
 	if errors.Is(err, store.ErrMessageNotFound) {
@@ -83,83 +97,102 @@ func showHTTPMessage(cmd *cobra.Command, idStr string) error {
 	}
 
 	if showMessageJSON {
-		return outputMessageJSON(msg)
+		return outputMessageJSON(cmd.OutOrStdout(), msg)
 	}
-	return outputMessageText(msg)
+	if msg.HiddenTextPresent {
+		_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "Warning: this message's HTML may hide text.")
+	}
+	return outputMessageText(cmd.OutOrStdout(), msg)
 }
 
-// nil error return mirrors outputMessageJSON so callers can return either
-// uniformly; text printing never fails.
-func outputMessageText(msg *query.MessageDetail) error {
+func outputMessageText(w io.Writer, msg *query.MessageDetail) error {
+	output := bufio.NewWriter(w)
+	body, hasBody := messageTextBody(msg, showMessageStripQuoted)
+	if showMessageBodyOnly {
+		_, _ = fmt.Fprintln(output, textutil.SanitizeTerminalMultiline(body))
+		if err := output.Flush(); err != nil {
+			return fmt.Errorf("write message: %w", err)
+		}
+		return nil
+	}
 	// Header section
-	fmt.Println("═══════════════════════════════════════════════════════════════════════════════")
-	fmt.Printf("Message ID: %d (Gmail: %s)\n", msg.ID, msg.SourceMessageID)
-	fmt.Println("───────────────────────────────────────────────────────────────────────────────")
+	_, _ = fmt.Fprintln(output, "═══════════════════════════════════════════════════════════════════════════════")
+	_, _ = fmt.Fprintf(output, "Message ID: %d (Gmail: %s)\n", msg.ID, msg.SourceMessageID)
+	if msg.RelatedMessageID != nil {
+		_, _ = fmt.Fprintf(output, "Related message: %d (show-message %d)\n", *msg.RelatedMessageID, *msg.RelatedMessageID)
+	}
+	_, _ = fmt.Fprintln(output, "───────────────────────────────────────────────────────────────────────────────")
 
 	// From
 	if len(msg.From) > 0 {
-		fmt.Printf("From:    %s\n", formatAddresses(msg.From))
+		_, _ = fmt.Fprintf(output, "From:    %s\n", formatAddresses(msg.From))
 	}
 
 	// To
 	if len(msg.To) > 0 {
-		fmt.Printf("To:      %s\n", formatAddresses(msg.To))
+		_, _ = fmt.Fprintf(output, "To:      %s\n", formatAddresses(msg.To))
 	}
 
 	// CC
 	if len(msg.Cc) > 0 {
-		fmt.Printf("Cc:      %s\n", formatAddresses(msg.Cc))
+		_, _ = fmt.Fprintf(output, "Cc:      %s\n", formatAddresses(msg.Cc))
 	}
 
 	// BCC
 	if len(msg.Bcc) > 0 {
-		fmt.Printf("Bcc:     %s\n", formatAddresses(msg.Bcc))
+		_, _ = fmt.Fprintf(output, "Bcc:     %s\n", formatAddresses(msg.Bcc))
 	}
 
 	// Subject
-	fmt.Printf("Subject: %s\n", msg.Subject)
+	_, _ = fmt.Fprintf(output, "Subject: %s\n", msg.Subject)
 
 	// Date
-	fmt.Printf("Date:    %s\n", msg.SentAt.Format(time.RFC1123))
+	_, _ = fmt.Fprintf(output, "Date:    %s\n", msg.SentAt.Format(time.RFC1123))
 
 	// Size
-	fmt.Printf("Size:    %s\n", formatSize(msg.SizeEstimate))
+	_, _ = fmt.Fprintf(output, "Size:    %s\n", formatSize(msg.SizeEstimate))
 
 	// Labels
 	if len(msg.Labels) > 0 {
-		fmt.Printf("Labels:  %s\n", textutil.SanitizeTerminal(strings.Join(msg.Labels, ", ")))
+		_, _ = fmt.Fprintf(output, "Labels:  %s\n", textutil.SanitizeTerminal(strings.Join(msg.Labels, ", ")))
 	}
 	if msg.DeletedAt != nil {
-		fmt.Printf("Deleted from source: %s\n", msg.DeletedAt.UTC().Format(time.RFC3339))
+		_, _ = fmt.Fprintf(output, "Deleted from source: %s\n", msg.DeletedAt.UTC().Format(time.RFC3339))
 	}
 
 	// Attachments
 	if len(msg.Attachments) > 0 {
-		fmt.Println("\nAttachments:")
+		_, _ = fmt.Fprintln(output, "\nAttachments:")
 		for _, att := range msg.Attachments {
 			if att.URL != "" {
-				fmt.Printf("  • %s (%s, link) %s\n", att.Filename, att.MimeType, att.URL)
+				_, _ = fmt.Fprintf(output, "  • %s (%s, link) %s\n", att.Filename, att.MimeType, att.URL)
 			} else {
-				fmt.Printf("  • %s (%s, %s)\n", att.Filename, att.MimeType, formatSize(att.Size))
+				_, _ = fmt.Fprintf(output, "  • %s (%s, %s)\n", att.Filename, att.MimeType, formatSize(att.Size))
+			}
+			for _, ref := range att.Docbank {
+				_, _ = fmt.Fprintf(output, "    Docbank node %d (%s)\n", ref.NodeID, textutil.SanitizeTerminal(ref.Endpoint+ref.Folder))
 			}
 		}
 	}
 
 	// Body
-	fmt.Println("\n═══════════════════════════════════════════════════════════════════════════════")
-	if msg.BodyText != "" {
-		fmt.Println(textutil.SanitizeTerminalMultiline(msg.BodyText))
+	_, _ = fmt.Fprintln(output, "\n═══════════════════════════════════════════════════════════════════════════════")
+	if hasBody {
+		_, _ = fmt.Fprintln(output, textutil.SanitizeTerminalMultiline(body))
 	} else if msg.Snippet != "" {
-		fmt.Printf("[No body text available. Snippet: %s]\n", textutil.SanitizeTerminal(msg.Snippet))
+		_, _ = fmt.Fprintf(output, "[No body text available. Snippet: %s]\n", textutil.SanitizeTerminal(body))
 	} else {
-		fmt.Println("[No body content available]")
+		_, _ = fmt.Fprintln(output, "[No body content available]")
 	}
-	fmt.Println("═══════════════════════════════════════════════════════════════════════════════")
+	_, _ = fmt.Fprintln(output, "═══════════════════════════════════════════════════════════════════════════════")
 
+	if err := output.Flush(); err != nil {
+		return fmt.Errorf("write message: %w", err)
+	}
 	return nil
 }
 
-func outputMessageJSON(msg *query.MessageDetail) error {
+func messageJSONValue(msg *query.MessageDetail) map[string]any {
 	// Build address arrays
 	fromAddrs := make([]map[string]string, len(msg.From))
 	for i, addr := range msg.From {
@@ -188,6 +221,9 @@ func outputMessageJSON(msg *query.MessageDetail) error {
 			"size":         att.Size,
 			"content_hash": att.ContentHash,
 		}
+		if len(att.Docbank) > 0 {
+			attachments[i]["docbank"] = att.Docbank
+		}
 		if att.URL != "" {
 			attachments[i]["url"] = att.URL
 		}
@@ -212,8 +248,15 @@ func outputMessageJSON(msg *query.MessageDetail) error {
 		"attachments":            attachments,
 		"body_text":              msg.BodyText,
 		"body_html":              msg.BodyHTML,
+		"hidden_text_present":    msg.HiddenTextPresent,
 	}
 
+	if msg.SenderAuth != nil {
+		output["sender_auth"] = msg.SenderAuth
+	}
+	if msg.RelatedMessageID != nil {
+		output["related_message_id"] = *msg.RelatedMessageID
+	}
 	if msg.WebURL != "" {
 		output["web_url"] = msg.WebURL
 	}
@@ -224,9 +267,15 @@ func outputMessageJSON(msg *query.MessageDetail) error {
 		output["deleted_from_source_at"] = msg.DeletedAt.UTC().Format(time.RFC3339)
 	}
 
-	enc := jsontext.NewEncoder(os.Stdout, jsontext.WithIndentPrefix(""), jsontext.WithIndent("  "))
+	return output
+}
 
-	return json.MarshalEncode(enc, output, json.Deterministic(true))
+func outputMessageJSON(w io.Writer, msg *query.MessageDetail) error {
+	if showMessageStripQuoted {
+		msg = readableMessageDetail(msg)
+	}
+	enc := jsontext.NewEncoder(w, jsontext.WithIndent("  "))
+	return json.MarshalEncode(enc, messageJSONValue(msg), json.Deterministic(true))
 }
 
 func formatAddresses(addrs []query.Address) string {
@@ -244,4 +293,7 @@ func formatAddresses(addrs []query.Address) string {
 func init() {
 	rootCmd.AddCommand(showMessageCmd)
 	showMessageCmd.Flags().BoolVar(&showMessageJSON, flagJSON, false, "Output as JSON")
+	showMessageCmd.Flags().BoolVar(&showMessageBodyOnly, "body-only", false, "Print only the text body")
+	showMessageCmd.Flags().BoolVar(&showMessageStripQuoted, "strip-quoted", false, "Remove quoted history and conventional signatures")
+	showMessageCmd.MarkFlagsMutuallyExclusive("body-only", flagJSON)
 }

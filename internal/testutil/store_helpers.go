@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/testutil/dbtest"
 )
 
 // NewTestStore creates a temporary database for testing.
@@ -22,7 +24,7 @@ import (
 //   - unset or empty: SQLite (default)
 //   - starts with "postgres://" or "postgresql://": PostgreSQL
 //
-// For PostgreSQL, each test gets its own schema (created and dropped for isolation).
+// PostgreSQL tests get a template clone or, when cloning is unavailable, a private schema.
 func NewTestStore(t *testing.T) *store.Store {
 	t.Helper()
 
@@ -45,18 +47,30 @@ func NewTestStore(t *testing.T) *store.Store {
 // because MSGVAULT_TEST_DB is set.
 func NewSQLiteTestStore(t *testing.T) *store.Store {
 	t.Helper()
+	return NewSQLiteTestStoreAt(t, filepath.Join(t.TempDir(), "test.db"))
+}
 
-	template, err := sqliteTemplateBytes()
+// NewSQLiteTestStoreAt clones an empty SQLite store at dbPath and closes it on cleanup.
+func NewSQLiteTestStoreAt(t *testing.T, dbPath string) *store.Store {
+	t.Helper()
+
+	template, err := sqliteTemplateBytes(t.Context())
 	require.NoError(t, err, "build sqlite template")
 
-	dbPath := filepath.Join(t.TempDir(), "test.db")
+	require.NotContains(t, dbPath, "://", "NewSQLiteTestStoreAt takes a file path, not a database URL")
+	require.NoFileExists(t, dbPath, "NewSQLiteTestStoreAt clones onto a new path; reopen an existing archive with store.Open")
+	require.NoError(t, os.MkdirAll(filepath.Dir(dbPath), 0o700), "create sqlite fixture directory")
 	require.NoError(t, os.WriteFile(dbPath, template, 0o600), "clone sqlite template")
 
-	st, err := store.OpenForTest(dbPath)
+	st, err := store.OpenForTest(t.Context(), dbPath)
 	require.NoError(t, err, "open store")
 
+	// Cleanup runs after t.Context() is canceled.
 	t.Cleanup(func() {
-		_ = st.Close()
+		// A test may close the store early to run a command against the file.
+		if st.DB().PingContext(context.WithoutCancel(t.Context())) == nil {
+			_ = st.Close()
+		}
 	})
 	assignFreshArchiveUID(t, st)
 
@@ -70,18 +84,12 @@ func NewSQLiteTestStore(t *testing.T) *store.Store {
 // by the Dialect interface.
 func SkipIfPostgres(t *testing.T, reason string) {
 	t.Helper()
-	testDB := os.Getenv("MSGVAULT_TEST_DB")
-	if strings.HasPrefix(testDB, "postgres://") || strings.HasPrefix(testDB, "postgresql://") {
-		t.Skipf("skipping on PostgreSQL: %s", reason)
-	}
+	dbtest.SkipIfPostgres(t, reason)
 }
 
-// newPostgresTestStore creates a test-isolated PostgreSQL store: a clone of
-// the binary's template database, or — when the server cannot build one, or
-// cloning is switched off — a private schema in the configured database,
-// created and migrated here exactly as before templates existed. Either way
-// the database is private to this test, never previously used, and dropped on
-// cleanup.
+// newPostgresTestStore creates an isolated PostgreSQL store for the given URL.
+// It clones the test binary's template database or, if cloning is unavailable
+// or disabled, initializes a private schema. Cleanup drops the clone or schema.
 func newPostgresTestStore(t *testing.T, dbURL string) *store.Store {
 	t.Helper()
 
@@ -98,18 +106,19 @@ func newPostgresTestStore(t *testing.T, dbURL string) *store.Store {
 func cloneTestDatabase(t *testing.T, tmpl *pgTemplate) *store.Store {
 	t.Helper()
 
-	name, err := tmpl.clone(context.Background())
+	name, err := tmpl.clone(t.Context())
 	require.NoError(t, err, "clone template database")
 
 	// Register removal before opening, so a failure below does not leak the
 	// clone.
 	var st *store.Store
+	// Cleanup runs after t.Context() is canceled.
 	t.Cleanup(func() {
 		if st != nil {
 			_ = st.Close()
 		}
 		if admin, err := pgAdminDB(tmpl.dbURL); err == nil {
-			dropOwnedDatabase(admin, name)
+			dropOwnedDatabase(context.WithoutCancel(t.Context()), admin, name)
 		}
 	})
 
@@ -130,6 +139,7 @@ func newSchemaTestStore(t *testing.T, dbURL string) *store.Store {
 	// Register schema cleanup immediately so that any failure below this
 	// point (store.Open, InitSchema) doesn't leak the schema.
 	var st *store.Store
+	// Cleanup runs after t.Context() is canceled.
 	t.Cleanup(func() {
 		if st != nil {
 			_ = st.Close()
@@ -138,7 +148,7 @@ func newSchemaTestStore(t *testing.T, dbURL string) *store.Store {
 		if err != nil {
 			return
 		}
-		dropOwnedSchema(cleanupDB, schemaName)
+		dropOwnedSchema(context.WithoutCancel(t.Context()), cleanupDB, schemaName)
 	})
 
 	st, err := store.Open(schemaURL(dbURL, schemaName))
@@ -162,7 +172,7 @@ func createTestSchema(t *testing.T, dbURL string) string {
 
 	setupDB, err := pgAdminDB(dbURL)
 	require.NoError(t, err, "open setup connection")
-	_, schemaErr := setupDB.Exec("CREATE SCHEMA " + schemaName)
+	_, schemaErr := setupDB.ExecContext(t.Context(), "CREATE SCHEMA "+schemaName)
 	require.NoErrorf(t, schemaErr, "create schema %s", schemaName)
 
 	return schemaName
@@ -175,13 +185,13 @@ var fixtureSchemaNamePattern = regexp.MustCompile("^msgvault_test_([0-9a-f]{16})
 // dropOwnedSchema removes a schema this package created, and does nothing at
 // all for any other name. Failure is ignored: the schema is a leak, not a
 // wrong verdict.
-func dropOwnedSchema(db *sql.DB, name string) {
+func dropOwnedSchema(ctx context.Context, db *sql.DB, name string) {
 	match := fixtureSchemaNamePattern.FindStringSubmatch(name)
 	if match == nil {
 		return
 	}
 
-	_, _ = db.Exec("DROP SCHEMA IF EXISTS msgvault_test_" + match[1] + " CASCADE")
+	_, _ = db.ExecContext(ctx, "DROP SCHEMA IF EXISTS msgvault_test_"+match[1]+" CASCADE")
 }
 
 // schemaURL returns dbURL with its search_path pointed at a schema.
@@ -210,9 +220,34 @@ func assignFreshArchiveUID(t *testing.T, st *store.Store) {
 	if st.IsPostgreSQL() {
 		statement = "UPDATE archive_metadata SET value = $1 WHERE key = 'archive_uid'"
 	}
-	result, err := st.DB().Exec(statement, hex.EncodeToString(random))
+	result, err := st.DB().ExecContext(t.Context(), statement, hex.EncodeToString(random))
 	require.NoError(t, err, "assign archive UID")
 	updated, err := result.RowsAffected()
 	require.NoError(t, err, "assigned archive UID rows")
 	require.Equal(t, int64(1), updated, "the template carried exactly one archive UID to replace")
+}
+
+// CreateIndexedSourceMessage inserts a synthetic email and its search index for shared read fixtures.
+func CreateIndexedSourceMessage(ctx context.Context, st *store.Store, identifier, providerID, subject, body string) (*store.Source, int64, error) {
+	source, err := st.GetOrCreateSource("test", identifier)
+	if err != nil {
+		return nil, 0, fmt.Errorf("create fixture source: %w", err)
+	}
+	conv, err := st.EnsureConversation(ctx, source.ID, "thread", "Synthetic")
+	if err != nil {
+		return nil, 0, fmt.Errorf("create fixture conversation: %w", err)
+	}
+	id, err := st.UpsertMessageContext(ctx, &store.Message{SourceID: source.ID, ConversationID: conv, SourceMessageID: providerID, MessageType: "email", Subject: sql.NullString{String: subject, Valid: true}})
+	if err != nil {
+		return nil, 0, fmt.Errorf("create fixture message: %w", err)
+	}
+	if body != "" {
+		if err := st.UpsertMessageBodyContext(ctx, id, sql.NullString{String: body, Valid: true}, sql.NullString{}); err != nil {
+			return nil, 0, fmt.Errorf("create fixture body: %w", err)
+		}
+	}
+	if err := st.UpsertFTSContext(ctx, id, subject, body, identifier, "", ""); err != nil {
+		return nil, 0, fmt.Errorf("index fixture message: %w", err)
+	}
+	return source, id, nil
 }

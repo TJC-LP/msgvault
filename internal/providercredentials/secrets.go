@@ -83,11 +83,14 @@ func ReadSecret(reader io.Reader) (string, error) {
 // EnsureServerKey creates a persisted daemon credential once.
 func EnsureServerKey(tokenDir string) (string, error) {
 	permissions := nativePermissions{}
-	if err := permissions.secureDirectory(tokenDir); err != nil {
-		return "", fmt.Errorf("secure server credential directory: %w", err)
+	if err := permissions.prepareDirectory(tokenDir); err != nil {
+		return "", fmt.Errorf("create server credential directory: %w", err)
 	}
 	var key string
 	err := withStoreLock(tokenDir, func() error {
+		if err := permissions.secureDirectory(tokenDir); err != nil {
+			return fmt.Errorf("secure server credential directory: %w", err)
+		}
 		path := filepath.Join(tokenDir, ServerKeyFilename)
 		var err error
 		key, err = ReadSecretFile(path)
@@ -119,7 +122,7 @@ func EnsureServerKey(tokenDir string) (string, error) {
 		if err := candidate.Close(); err != nil {
 			return fmt.Errorf("close server credential: %w", err)
 		}
-		if err := replaceStoreFile(candidate.Name(), path); err != nil {
+		if err := atomicfile.Replace(candidate.Name(), path); err != nil {
 			return fmt.Errorf("publish server credential: %w", err)
 		}
 		return atomicfile.SyncDir(tokenDir)

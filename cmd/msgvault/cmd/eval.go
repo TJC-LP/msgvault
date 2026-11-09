@@ -41,7 +41,7 @@ var (
 
 var evalCmd = &cobra.Command{
 	Use:   "eval",
-	Short: "Evaluate retrieval quality against relevance judgments (qrels)",
+	Short: "Score search quality against relevance judgments (qrels)",
 	Long: `Measure retrieval quality over a set of labeled queries.
 
 Runs each topic through one or more search modes (fts, vector, hybrid) against
@@ -1048,9 +1048,13 @@ func (e *evaluator) attachVector(ctx context.Context, mainStore *store.Store) (f
 	// paths do. The fingerprint folds in the scope, so an unresolved config
 	// would compute a different one and every query would fail as "index
 	// stale" on any archive that scopes embedding by account.
-	vecCfg, err := resolvedVectorConfig(mainStore, cfg.Vector)
+	vecCfg, err := resolvedVectorConfig(ctx, mainStore, cfg.Vector)
 	if err != nil {
 		return nil, fmt.Errorf("vector embed scope: %w", err)
+	}
+	vecCfg, err = resolveLocalVectorConfig(ctx, vecCfg)
+	if err != nil {
+		return nil, err
 	}
 	// Validate the resolved config with the same check serve runs before it
 	// opens anything. It names the offending key and value — including an
@@ -1072,10 +1076,7 @@ func (e *evaluator) attachVector(ctx context.Context, mainStore *store.Store) (f
 	if err != nil {
 		return nil, fmt.Errorf("load provider credentials: %w", err)
 	}
-	embeddingAPIKey, err := resolveProviderCredentialFromSnapshot(
-		credentialSnapshot, providercredentials.VectorEmbeddingsID,
-		vecCfg.Embeddings.Endpoint, vecCfg.Embeddings.APIKeyEnv,
-	)
+	embeddingAPIKey, err := resolveTextEmbeddingCredential(credentialSnapshot, vecCfg)
 	if err != nil {
 		return nil, fmt.Errorf("resolve text embedding credential: %w", err)
 	}

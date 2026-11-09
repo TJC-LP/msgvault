@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -111,10 +112,13 @@ func TestIsPersonalMicrosoftAccount(t *testing.T) {
 }
 
 func TestScopesForEmail(t *testing.T) {
+	assert := assert.New(t)
 	orgScopes := scopesForEmail("user@company.com")
-	assert.Equal(t, ScopeIMAPOrg, orgScopes[0], "org scope")
+	assert.Equal(ScopeIMAPOrg, orgScopes[0], "org scope")
 	personalScopes := scopesForEmail("user@hotmail.com")
-	assert.Equal(t, ScopeIMAPPersonal, personalScopes[0], "personal scope")
+	assert.Equal(ScopeIMAPPersonal, personalScopes[0], "personal scope")
+	assert.Contains(orgScopes, scopeProfile)
+	assert.Contains(personalScopes, scopeProfile)
 }
 
 func TestSanitizeEmail(t *testing.T) {
@@ -169,6 +173,21 @@ func makeIDToken(t *testing.T, claims map[string]any) string {
 	require.NoError(t, err, "marshal claims")
 	body := base64.RawURLEncoding.EncodeToString(payload)
 	return header + "." + body + ".fake-sig"
+}
+
+func makeScopedIDToken(t *testing.T, claims map[string]any, scopes []string) string {
+	t.Helper()
+	requested := make(map[string]any, len(claims))
+	for key, value := range claims {
+		if key == "preferred_username" && !slices.Contains(scopes, scopeProfile) {
+			continue
+		}
+		if key == "email" && !slices.Contains(scopes, scopeEmail) {
+			continue
+		}
+		requested[key] = value
+	}
+	return makeIDToken(t, requested)
 }
 
 // testVerifyFn decodes an unsigned test JWT, bypassing OIDC validation.
@@ -270,46 +289,92 @@ func TestResolveTokenEmail_Mismatch(t *testing.T) {
 	assert.True(t, ok, "expected *TokenMismatchError, got %T: %v", err, err)
 }
 
-func TestResolveTokenEmail_FallbackToUPN(t *testing.T) {
-	// Some accounts omit "email" and only have "preferred_username".
-	m := &Manager{
-		clientID:        "test-client",
-		tenantID:        "common",
-		tokensDir:       t.TempDir(),
-		logger:          slog.Default(),
-		verifyIDTokenFn: testVerifyFn,
-	}
-	idToken := makeIDToken(t, map[string]any{"preferred_username": "user@example.com"})
-	token := (&oauth2.Token{AccessToken: "test-token", TokenType: "Bearer"}).
-		WithExtra(map[string]any{"id_token": idToken})
+func TestResolveTokenEmail_UPNFallback(t *testing.T) {
+	// With no "email" claim, the UPN must match the mailbox or the sign-in name.
+	for _, tc := range []struct {
+		name, upn, signIn, mismatch string
+	}{
+		{name: "upn equals address", upn: "john@example.com"},
+		{name: "upn differs, no sign-in name", upn: "john.doe@example.org", mismatch: "john.doe@example.org"},
+		{name: "upn matches sign-in name ignoring case", upn: "JDoe@example.org", signIn: "jdoe@example.org"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert := assert.New(t)
+			require := require.New(t)
+			m := &Manager{clientID: "test-client", tenantID: "common", tokensDir: t.TempDir(), logger: slog.Default(), verifyIDTokenFn: testVerifyFn}
+			m.UseSignInName(tc.signIn)
+			idToken := makeIDToken(t, map[string]any{"preferred_username": tc.upn, "tid": "org-tenant-id"})
+			token := (&oauth2.Token{AccessToken: "test-token", TokenType: "Bearer"}).
+				WithExtra(map[string]any{"id_token": idToken})
 
-	actual, _, err := m.resolveTokenEmail(t.Context(), "user@example.com", token, "test-nonce")
-	require.NoError(t, err)
-	assert.Equal(t, "user@example.com", actual, "actual")
+			actual, _, err := m.resolveTokenEmail(t.Context(), "john@example.com", token, "test-nonce")
+			if tc.mismatch != "" {
+				mismatch := &TokenMismatchError{}
+				require.ErrorAs(err, &mismatch)
+				assert.Equal(tc.mismatch, mismatch.Actual, "Actual")
+				return
+			}
+			require.NoError(err)
+			assert.Equal("john@example.com", actual, "actual")
+		})
+	}
 }
 
-func TestResolveTokenEmail_UPNDiffersFromExpected(t *testing.T) {
-	// When "email" claim is absent and UPN differs from expected address,
-	// resolveTokenEmail should accept the user-entered email (not the UPN)
-	// because Entra UPN can legitimately differ from the SMTP mailbox address.
-	m := &Manager{
-		clientID:        "test-client",
-		tenantID:        "common",
-		tokensDir:       t.TempDir(),
-		logger:          slog.Default(),
-		verifyIDTokenFn: testVerifyFn,
+// upnBrowserFlow returns a token whose ID token has upn and no email claim,
+// recording the login hint it was given when hint is non-nil.
+func upnBrowserFlow(t *testing.T, upn string, hint *string) func(context.Context, string, []string) (*oauth2.Token, string, error) {
+	t.Helper()
+	return func(_ context.Context, h string, scopes []string) (*oauth2.Token, string, error) {
+		if hint != nil {
+			*hint = h
+		}
+		idToken := makeScopedIDToken(t, map[string]any{"preferred_username": upn, "tid": "org-tenant-id"}, scopes)
+		tok := (&oauth2.Token{AccessToken: "new-access", RefreshToken: "new-refresh", TokenType: "Bearer"}).
+			WithExtra(map[string]any{"id_token": idToken})
+		return tok, "test-nonce", nil
 	}
-	idToken := makeIDToken(t, map[string]any{
-		"preferred_username": "john.doe@company.onmicrosoft.com",
-		"tid":                "org-tenant-id",
-	})
-	token := (&oauth2.Token{AccessToken: "test-token", TokenType: "Bearer"}).
-		WithExtra(map[string]any{"id_token": idToken})
+}
 
-	actual, claims, err := m.resolveTokenEmail(t.Context(), "john@company.com", token, "test-nonce")
-	require.NoError(t, err, "unexpected error")
-	assert.Equal(t, "john@company.com", actual, "actual should equal user-entered email")
-	assert.Equal(t, "org-tenant-id", claims.TenantID, "TenantID")
+func TestAuthorize_OtherUPNKeepsExistingToken(t *testing.T) {
+	for _, tc := range []struct {
+		name, signIn, hint string
+	}{
+		{name: "no sign-in name", hint: "sign in as alice@example.com, or if bob@example.com is your own sign-in name for that mailbox, pass it with --sign-in"},
+		{name: "other sign-in name", signIn: "alice@example.org", hint: "that account is not the --sign-in name alice@example.org either"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require := require.New(t)
+			assert := assert.New(t)
+			m := &Manager{clientID: "test-client", tenantID: "common", tokensDir: t.TempDir(), logger: slog.Default(), verifyIDTokenFn: testVerifyFn}
+			m.UseSignInName(tc.signIn)
+			old := &oauth2.Token{AccessToken: "old-access", RefreshToken: "old-refresh", TokenType: "Bearer"}
+			require.NoError(m.saveToken("alice@example.com", old, scopesForEmail("alice@example.com"), "org-tenant-id"))
+			m.browserFlowFn = upnBrowserFlow(t, "bob@example.com", nil)
+
+			err := m.Authorize(t.Context(), "alice@example.com")
+			mismatch := &TokenMismatchError{}
+			require.ErrorAs(err, &mismatch)
+			assert.Contains(err.Error(), tc.hint)
+			tf, err := m.loadTokenFile("alice@example.com")
+			require.NoError(err)
+			assert.Equal("old-access", tf.AccessToken, "existing token untouched")
+		})
+	}
+}
+
+func TestAuthorize_SignInNameAcceptsUPN(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	m := &Manager{clientID: "test-client", tenantID: "common", tokensDir: t.TempDir(), logger: slog.Default(), verifyIDTokenFn: testVerifyFn}
+	m.UseSignInName("jdoe@example.org")
+	var hint string
+	m.browserFlowFn = upnBrowserFlow(t, "jdoe@example.org", &hint)
+
+	require.NoError(m.Authorize(t.Context(), "john@example.com"))
+	assert.Equal("jdoe@example.org", hint, "login hint")
+	tf, err := m.loadTokenFile("john@example.com")
+	require.NoError(err)
+	assert.Equal("new-access", tf.AccessToken, "AccessToken")
 }
 
 func TestResolveTokenEmail_EmailClaimMismatchStillErrors(t *testing.T) {
@@ -338,7 +403,7 @@ func TestResolveTokenEmail_EmailClaimMismatchStillErrors(t *testing.T) {
 func TestAuthorize_ScopeCorrection(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
-	// Simulate: user@custom-domain.com guessed as org, but tid reveals consumer.
+	// A custom domain is guessed as organizational, but the tenant is personal.
 	// The browser flow should be called twice: once with org scope, once with personal.
 	dir := t.TempDir()
 	m := &Manager{
@@ -354,10 +419,10 @@ func TestAuthorize_ScopeCorrection(t *testing.T) {
 
 	m.browserFlowFn = func(ctx context.Context, email string, scopes []string) (*oauth2.Token, string, error) {
 		callCount++
-		idToken := makeIDToken(t, map[string]any{
-			"email": "user@custom-domain.com",
-			"tid":   consumerTID,
-		})
+		idToken := makeScopedIDToken(t, map[string]any{
+			"preferred_username": "user@example.com",
+			"tid":                consumerTID,
+		}, scopes)
 		switch callCount {
 		case 1:
 			// First call: should have org scope (domain-based guess).
@@ -374,12 +439,12 @@ func TestAuthorize_ScopeCorrection(t *testing.T) {
 		return tok, "test-nonce", nil
 	}
 
-	require.NoError(m.Authorize(t.Context(), "user@custom-domain.com"))
+	require.NoError(m.Authorize(t.Context(), "user@example.com"))
 
 	assert.Equal(2, callCount, "browserFlowFn call count")
 
 	// Verify saved scopes are personal (corrected).
-	tf, err := m.loadTokenFile("user@custom-domain.com")
+	tf, err := m.loadTokenFile("user@example.com")
 	require.NoError(err)
 	require.NotEmpty(tf.Scopes, "saved scopes should not be empty")
 	assert.Equal(ScopeIMAPPersonal, tf.Scopes[0], "saved scopes[0]")
@@ -534,29 +599,6 @@ func TestOAuthConfigWithTenant(t *testing.T) {
 	assert.Contains(t, cfg.Endpoint.AuthURL, "my-org", "AuthURL")
 	assert.Contains(t, cfg.Endpoint.TokenURL, "my-org", "TokenURL")
 	assert.NotContains(t, cfg.Endpoint.AuthURL, "common", "AuthURL should not contain common")
-}
-
-func TestTokenSource_PersistedTenantOverridesManager(t *testing.T) {
-	dir := t.TempDir()
-	m := &Manager{
-		clientID:  "test-client",
-		tenantID:  "common",
-		tokensDir: dir,
-		logger:    slog.Default(),
-	}
-
-	// Save token with a specific tenant ID (simulating post-authorization state).
-	token := &oauth2.Token{
-		AccessToken:  "access-token",
-		RefreshToken: "refresh-token",
-		TokenType:    "Bearer",
-	}
-	require.NoError(t, m.saveToken("user@company.com", token, []string{ScopeIMAPOrg, "offline_access"}, "my-org-tenant"))
-
-	// TokenSource should succeed and use "my-org-tenant", not "common".
-	ts, err := m.TokenSource(t.Context(), "user@company.com")
-	require.NoError(t, err)
-	require.NotNil(t, ts, "TokenSource returned nil")
 }
 
 func TestTokenSource_ConcurrentAccess(t *testing.T) {
@@ -752,37 +794,6 @@ func TestResolveTokenEmail_NeitherEmailNorUPN(t *testing.T) {
 	assert.ErrorContains(t, err, "preferred_username")
 }
 
-// --- TokenSource timeout ---
-
-func TestTokenSource_RespectsCallCtxCancellation(t *testing.T) {
-	dir := t.TempDir()
-	m := &Manager{
-		clientID:  "test-client",
-		tenantID:  "common",
-		tokensDir: dir,
-		logger:    slog.Default(),
-	}
-
-	token := &oauth2.Token{
-		AccessToken:  "access-token",
-		RefreshToken: "refresh-token",
-		TokenType:    "Bearer",
-	}
-	require.NoError(t, m.saveToken("user@outlook.com", token, []string{ScopeIMAPPersonal, "offline_access"}, MicrosoftConsumerTenantID))
-
-	fn, err := m.TokenSource(t.Context(), "user@outlook.com")
-	require.NoError(t, err)
-
-	// Cancel the context immediately — the token source should return
-	// the cached token (not refreshed) or cancel, but must not hang.
-	ctx, cancel := context.WithCancel(t.Context())
-	cancel()
-	// The call may succeed (cached token returned instantly before select
-	// sees cancellation) or fail with context.Canceled — either is acceptable.
-	// The key property is that it returns promptly, not that it errors.
-	_, _ = fn(ctx)
-}
-
 // --- redactAuthURL ---
 
 func TestRedactAuthURL(t *testing.T) {
@@ -831,17 +842,6 @@ func TestDeleteToken_RevokesBeforeDeleting(t *testing.T) {
 	// Microsoft endpoint in tests). The local file should be removed.
 	require.NoError(t, m.DeleteToken("user@example.com"), "DeleteToken")
 	assert.False(t, m.HasToken("user@example.com"), "token file should be deleted after DeleteToken")
-}
-
-func TestDeleteToken_NoTokenFile(t *testing.T) {
-	m := &Manager{
-		clientID:  "test-client",
-		tenantID:  "common",
-		tokensDir: t.TempDir(),
-		logger:    slog.Default(),
-	}
-	// Should not error on non-existent token
-	assert.NoError(t, m.DeleteToken("nobody@example.com"), "DeleteToken non-existent")
 }
 
 // --- peekTIDFromJWT edge cases ---

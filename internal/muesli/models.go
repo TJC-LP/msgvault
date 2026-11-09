@@ -23,38 +23,44 @@ type Participant struct {
 	// or "carried_forward" when they are set.
 	ContactEmails []string
 	ContactPhones []string
+	// ContactReviewPhones suggest existing identities for owner review only.
+	ContactReviewPhones []string
 	// LinkExcludedAddresses remain meeting evidence but cannot assert ownership.
 	LinkExcludedAddresses []string
 	Anchor                string
 	Resolution            string
 	// SkippedPhones counts Contacts phones that could not become E.164.
 	SkippedPhones int
+	// ref is the already-hashed participant identifier received from a client.
+	ref string
 }
 
 // Meeting is one row of Muesli's meetings table. Text columns hold Muesli's
 // values verbatim; columns an older database lacks are left empty.
 type Meeting struct {
-	ID               int64
-	Title            string
-	StartTime        string
-	EndTime          string
-	CreatedAt        string
-	DurationSeconds  float64
-	Status           string
-	Source           string
-	RawTranscript    string
-	FormattedNotes   string
-	ManualNotes      string
-	WordCount        int64
-	TemplateName     string
-	TemplateKind     string
-	CalendarEventID  string
-	CalendarSource   string
-	CalendarSeriesID string
-	Folder           string // folder path such as "Clients/Acme"
-	FollowUpToID     int64
-	Deleted          bool
-	Participants     []Participant // not suppressed, in Muesli's display order
+	// SavedRecordingPath stays recorder-local; it is never archived or sent.
+	SavedRecordingPath string
+	ID                 int64
+	Title              string
+	StartTime          string
+	EndTime            string
+	CreatedAt          string
+	DurationSeconds    float64
+	Status             string
+	Source             string
+	RawTranscript      string
+	FormattedNotes     string
+	ManualNotes        string
+	WordCount          int64
+	TemplateName       string
+	TemplateKind       string
+	CalendarEventID    string
+	CalendarSource     string
+	CalendarSeriesID   string
+	Folder             string // folder path such as "Clients/Acme"
+	FollowUpToID       int64
+	Deleted            bool
+	Participants       []Participant // not suppressed, in Muesli's display order
 	// ContactsState is how much of Contacts the sync could read.
 	ContactsState ContactsState
 }

@@ -34,11 +34,21 @@ type pgEngine struct {
 }
 
 var _ MessageBodySearcher = (*pgEngine)(nil)
+var _ SenderNameMatcher = (*pgEngine)(nil)
 var _ DeletionTargetSearchResolver = (*pgEngine)(nil)
+var _ BoundedDeletionTargetSearchResolver = (*pgEngine)(nil)
 var _ DeletionTargetAggregateSearchResolver = (*pgEngine)(nil)
 
 type deletionTargetsByMessageIDsResolver interface {
 	GetDeletionTargetsByMessageIDs(ctx context.Context, ids []int64) ([]DeletionTarget, error)
+}
+
+func (e *pgEngine) MatchSenderName(ctx context.Context, q *search.Query) []SearchHint {
+	matcher, ok := e.Engine.(SenderNameMatcher)
+	if !ok {
+		return nil
+	}
+	return matcher.MatchSenderName(ctx, q)
 }
 
 func (e *pgEngine) GetDeletionTargetsByMessageIDs(ctx context.Context, ids []int64) ([]DeletionTarget, error) {
@@ -62,6 +72,20 @@ func (e *pgEngine) GetDeletionTargetsBySearch(
 	return resolver.GetDeletionTargetsBySearch(ctx, searchQuery, filter, mode)
 }
 
+func (e *pgEngine) GetDeletionTargetsBySearchBounded(
+	ctx context.Context,
+	searchQuery *search.Query,
+	filter MessageFilter,
+	mode DeletionSearchMode,
+	maxResults int,
+) ([]DeletionTarget, int, error) {
+	resolver, ok := e.Engine.(BoundedDeletionTargetSearchResolver)
+	if !ok {
+		return nil, 0, ErrNotImplemented
+	}
+	return resolver.GetDeletionTargetsBySearchBounded(ctx, searchQuery, filter, mode, maxResults)
+}
+
 func (e *pgEngine) GetDeletionTargetsByAggregateSearch(
 	ctx context.Context,
 	searchQuery string,
@@ -82,7 +106,7 @@ func (e *pgEngine) GetDeletionTargetsByAggregateSearch(
 // explicitly.
 func (e *pgEngine) SearchMessageBodies(
 	ctx context.Context, q *search.Query, limit, offset int,
-) ([]MessageSummary, error) {
+) (*SearchFastResult, error) {
 	bodySearcher, ok := e.Engine.(MessageBodySearcher)
 	if !ok {
 		return nil, ErrMessageBodySearchUnavailable
@@ -125,6 +149,15 @@ func (e *pgEngine) ReadOriginalMessage(ctx context.Context, ref MessageRef, maxB
 		return nil, ErrOriginalExportUnsupported
 	}
 	return reader.ReadOriginalMessage(ctx, ref, maxBytes)
+}
+
+// ResolveMessageID forwards to the dialect-parameterized engine.
+func (e *pgEngine) ResolveMessageID(ctx context.Context, ref string) (int64, string, error) {
+	resolver, ok := e.Engine.(MessageIDResolver)
+	if !ok {
+		return 0, "", ErrOriginalExportUnsupported
+	}
+	return resolver.ResolveMessageID(ctx, ref)
 }
 
 // ListThread forwards to the dialect-parameterized engine.

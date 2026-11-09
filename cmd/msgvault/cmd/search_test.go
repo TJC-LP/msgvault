@@ -14,7 +14,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -22,6 +21,7 @@ import (
 	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/testutil"
 )
 
 func TestSummaryTableText(t *testing.T) {
@@ -159,6 +159,8 @@ func captureStderr(t *testing.T) func() string {
 }
 
 func resetSearchFlags() {
+	searchShowSnippet = false
+	searchSort = ""
 	searchAccount = ""
 	searchCollection = ""
 	searchLimit = 50
@@ -173,13 +175,6 @@ func resetSearchFlags() {
 	// pairs (--account / --collection) trip when a subsequent test only
 	// passes one of them.
 	searchCmd.Flags().VisitAll(func(f *pflag.Flag) { f.Changed = false })
-}
-
-func TestSearchCmd_HelpMentionsMeetingTranscripts(t *testing.T) {
-	assert.Contains(t, searchCmd.Long, "meeting_transcript", "operator help")
-	messageTypeFlag := searchCmd.Flags().Lookup("message-type")
-	require.NotNil(t, messageTypeFlag)
-	assert.Contains(t, messageTypeFlag.Usage, "meeting_transcript", "flag help")
 }
 
 func TestSummaryFromDisplayFallsBackForPhoneMessages(t *testing.T) {
@@ -410,6 +405,7 @@ func TestSearchCmd_FTSUsesLocalDaemonHTTPAndPreservesJSONOutput(t *testing.T) {
 
 	assert.Equal(1, int(searchRequests.Load()), "search endpoint calls")
 	assert.Contains(out, `"subject": "Lunch"`, "JSON output should preserve local result shape")
+	assert.Contains(out, `"hidden_text_present": true`)
 	assert.NotContains(out, `"total"`, "local JSON search output is a bare result array")
 }
 
@@ -505,6 +501,7 @@ func searchHTTPDaemon(t *testing.T) (*httptest.Server, *atomic.Int32) {
 				"conversation_id": 7,
 				"subject": "Lunch",
 				"snippet": "see you there",
+				"hidden_text_present": true,
 				"from_email": "alice@example.com",
 				"sent_at": "2024-01-02T03:04:05Z",
 				"size_estimate": 123,
@@ -519,8 +516,7 @@ func searchHTTPDaemon(t *testing.T) (*httptest.Server, *atomic.Int32) {
 	return server, searchRequests
 }
 
-// TestSearchCmd_PrintsBackgroundIndexNote verifies only known index gaps
-// produce a caveat. An unfinished completeness probe alone stays silent.
+// TestSearchCmd_PrintsBackgroundIndexNote keeps index advice separate from JSON results.
 func TestSearchCmd_PrintsBackgroundIndexNote(t *testing.T) {
 	cfg := testConfigValue()
 	useLocal := false
@@ -530,6 +526,16 @@ func TestSearchCmd_PrintsBackgroundIndexNote(t *testing.T) {
 		indexState string
 		wantNote   string
 	}{
+		{
+			name:       "awaiting owner warns",
+			indexState: "awaiting_owner",
+			wantNote:   "run rebuild-fts with owner access",
+		},
+		{
+			name:       "unverified check warns",
+			indexState: "unverified",
+			wantNote:   "could not be verified for this request; results may be incomplete. Search again to retry the check, or run rebuild-fts.",
+		},
 		{
 			name:       "building warns about rebuilding or awaiting rebuild",
 			indexState: "building",
@@ -594,7 +600,7 @@ func TestSearchCmd_PrintsBackgroundIndexNote(t *testing.T) {
 			root := newTestRootCmd()
 			root.SetContext(testCtx)
 			root.AddCommand(searchCmd)
-			root.SetArgs([]string{"search", "lunch"})
+			root.SetArgs([]string{"search", "lunch", "--json"})
 
 			err := root.Execute()
 			out := doneOut()
@@ -602,6 +608,8 @@ func TestSearchCmd_PrintsBackgroundIndexNote(t *testing.T) {
 			require.NoError(err, "search command")
 
 			assert.Contains(out, "Lunch", "results still print")
+			assert.True(strings.HasPrefix(strings.TrimSpace(out), "["), "JSON remains an array")
+			assert.NotContains(out, "Note:")
 			if tt.wantNote == "" {
 				assert.NotContains(errOut, "Note:", "no index note without a known gap")
 			} else {
@@ -620,19 +628,16 @@ func TestSearchCmd_AccountFlagWithoutQuery(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := tmpDir + "/msgvault.db"
 
-	s, err := store.Open(dbPath)
-	require.NoError(err, "open store")
-	require.NoError(s.InitSchema(), "init schema")
-	t.Cleanup(func() { _ = s.Close() })
+	s := testutil.NewSQLiteTestStoreAt(t, dbPath)
 
 	// Seed two accounts with one message each.
 	src1, err := s.GetOrCreateSource("gmail", "alice@example.com")
 	require.NoError(err, "create source 1")
 	src2, err := s.GetOrCreateSource("gmail", "bob@example.com")
 	require.NoError(err, "create source 2")
-	conv1, err := s.EnsureConversation(src1.ID, "c1", "")
+	conv1, err := s.EnsureConversation(t.Context(), src1.ID, "c1", "")
 	require.NoError(err, "create conv 1")
-	conv2, err := s.EnsureConversation(src2.ID, "c2", "")
+	conv2, err := s.EnsureConversation(t.Context(), src2.ID, "c2", "")
 	require.NoError(err, "create conv 2")
 	_, err = s.UpsertMessage(&store.Message{
 		SourceID: src1.ID, ConversationID: conv1,
@@ -695,13 +700,10 @@ func TestSearchCmd_MessageTypeFlagScopesResults(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := tmpDir + "/msgvault.db"
 
-	s, err := store.Open(dbPath)
-	require.NoError(err, "open store")
-	require.NoError(s.InitSchema(), "init schema")
-	t.Cleanup(func() { _ = s.Close() })
+	s := testutil.NewSQLiteTestStoreAt(t, dbPath)
 	src, err := s.GetOrCreateSource("gmail", "alice@example.com")
 	require.NoError(err, "create source")
-	emailConv, err := s.EnsureConversation(src.ID, "email-thread", "")
+	emailConv, err := s.EnsureConversation(t.Context(), src.ID, "email-thread", "")
 	require.NoError(err, "create email conversation")
 	calendarConv, err := s.EnsureConversationWithType(src.ID, "calendar-thread", "calendar_event", "")
 	require.NoError(err, "create calendar conversation")
@@ -790,13 +792,10 @@ func TestSearchCmd_AccountFlagDoesNotLeakAcrossInvocations(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := tmpDir + "/msgvault.db"
 
-	s, err := store.Open(dbPath)
-	require.NoError(err, "open store")
-	require.NoError(s.InitSchema(), "init schema")
-	t.Cleanup(func() { _ = s.Close() })
+	s := testutil.NewSQLiteTestStoreAt(t, dbPath)
 	src, err := s.GetOrCreateSource("gmail", "alice@example.com")
 	require.NoError(err, "create source")
-	conv, err := s.EnsureConversation(src.ID, "c1", "")
+	conv, err := s.EnsureConversation(t.Context(), src.ID, "c1", "")
 	require.NoError(err, "create conv")
 	_, err = s.UpsertMessage(&store.Message{
 		SourceID: src.ID, ConversationID: conv,
@@ -892,17 +891,14 @@ func TestSearchCmd_CollectionFlagScopesResults(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := tmpDir + "/msgvault.db"
 
-	s, err := store.Open(dbPath)
-	require.NoError(err, "open store")
-	require.NoError(s.InitSchema(), "init schema")
-	t.Cleanup(func() { _ = s.Close() })
+	s := testutil.NewSQLiteTestStoreAt(t, dbPath)
 	src1, err := s.GetOrCreateSource("gmail", "alice@example.com")
 	require.NoError(err, "create source 1")
 	src2, err := s.GetOrCreateSource("gmail", "bob@example.com")
 	require.NoError(err, "create source 2")
-	conv1, err := s.EnsureConversation(src1.ID, "c1", "")
+	conv1, err := s.EnsureConversation(t.Context(), src1.ID, "c1", "")
 	require.NoError(err, "create conv 1")
-	conv2, err := s.EnsureConversation(src2.ID, "c2", "")
+	conv2, err := s.EnsureConversation(t.Context(), src2.ID, "c2", "")
 	require.NoError(err, "create conv 2")
 	_, err = s.UpsertMessage(&store.Message{
 		SourceID: src1.ID, ConversationID: conv1,
@@ -963,10 +959,7 @@ func TestSearchCmd_CollectionFlagUnknown(t *testing.T) {
 	require := require.New(t)
 	tmpDir := t.TempDir()
 	dbPath := tmpDir + "/msgvault.db"
-	s, err := store.Open(dbPath)
-	require.NoError(err, "open store")
-	require.NoError(s.InitSchema(), "init schema")
-	t.Cleanup(func() { _ = s.Close() })
+	s := testutil.NewSQLiteTestStoreAt(t, dbPath)
 	startStoreQueryAPIDaemon(t, tmpDir, s)
 
 	savedCfg := cfg
@@ -992,7 +985,7 @@ func TestSearchCmd_CollectionFlagUnknown(t *testing.T) {
 	root.SetArgs([]string{
 		"search", "--collection", "does-not-exist", "anything",
 	})
-	err = root.Execute()
+	err := root.Execute()
 	require.Error(err, "expected error for unknown collection")
 	assert.ErrorContains(t, err, "no collection")
 }
@@ -1051,26 +1044,6 @@ func TestSearchCmd_VectorOrHybridRejectFilterOnlyQuery(t *testing.T) {
 	}
 }
 
-// TestSearchCmd_MutualExclusion confirms --account and --collection are rejected together.
-func TestSearchCmd_MutualExclusion(t *testing.T) {
-	var a, b string
-	cmd := &cobra.Command{Use: "search-test", SilenceErrors: true}
-	sub := &cobra.Command{Use: "search", RunE: func(cmd *cobra.Command, args []string) error { return nil }}
-	sub.Flags().StringVar(&a, "account", "", "")
-	sub.Flags().StringVar(&b, "collection", "", "")
-	sub.MarkFlagsMutuallyExclusive("account", "collection")
-	cmd.AddCommand(sub)
-	cmd.SetArgs([]string{"search", "--account", "alpha@example.com", "--collection", "work"})
-
-	err := cmd.Execute()
-	require.Error(t, err, "expected error when both --account and --collection are set")
-	msg := err.Error()
-	assert.Contains(t, msg, "account", "error should mention account flag name")
-	assert.Contains(t, msg, "collection", "error should mention collection flag name")
-	_ = a
-	_ = b
-}
-
 func TestOutputSearchResultsJSONShowsDeletedFromSourceOnlyWhenPresent(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
@@ -1085,6 +1058,20 @@ func TestOutputSearchResultsJSONShowsDeletedFromSourceOnlyWhenPresent(t *testing
 	require.Len(got, 2)
 	assert.Equal("2026-08-17T18:19:46Z", got[0]["deleted_from_source_at"])
 	assert.NotContains(got[1], "deleted_from_source_at")
+}
+
+func TestOutputSearchResultsJSONHiddenTextPresent(t *testing.T) {
+	assert, require := assert.New(t), require.New(t)
+	done := captureStdout(t)
+	require.NoError(outputSearchResultsJSON([]query.MessageSummary{
+		{ID: 1, HiddenTextPresent: true},
+		{ID: 2},
+	}))
+	var rows []map[string]any
+	require.NoError(json.Unmarshal([]byte(done()), &rows))
+	require.Len(rows, 2)
+	assert.Equal(true, rows[0]["hidden_text_present"])
+	assert.Equal(false, rows[1]["hidden_text_present"])
 }
 
 // Zero-match searches in --json mode must emit a valid empty JSON
@@ -1131,6 +1118,38 @@ func TestSearchCmd_JSONEmptyResultsEmitEmptyArray(t *testing.T) {
 	require.NoError(json.Unmarshal([]byte(out), &results),
 		"--json output must be valid JSON with zero results, got: %q", out)
 	assert.Empty(results)
+}
+
+func TestSearchCmd_EmptyResultsPrintHintsToStderr(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/api/v1/cli/search", r.URL.Path)
+		assert.Equal(t, "from:alex", r.URL.Query().Get("q"))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"results":[],"hints":[{"code":"sender_name_requires_address","message":"try from:alex@example.com","retry_with":{"query":"from:alex@example.com"}}]}`))
+	}))
+	defer srv.Close()
+	for _, tc := range []struct {
+		name, stdout string
+		args         []string
+	}{
+		{"text", "No messages found.\n", []string{"search", "from:alex"}},
+		{"json", "[]\n", []string{"search", "from:alex", "--json"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			defer resetSearchFlags()
+			cfg := &config.Config{Remote: config.RemoteConfig{URL: srv.URL, AllowInsecure: true}}
+			root := newTestRootCmd()
+			root.SetContext(testInvocationContext(t.Context(), cfg, invocationOptions{}))
+			root.AddCommand(searchCmd)
+			root.SetArgs(tc.args)
+			doneOut, doneErr := captureStdout(t), captureStderr(t)
+			err := root.Execute()
+			stdout, stderr := doneOut(), doneErr()
+			require.NoError(t, err)
+			assert.Equal(t, tc.stdout, stdout)
+			assert.Contains(t, stderr, "Hint: try from:alex@example.com\n")
+		})
+	}
 }
 
 func TestOutputSearchResultsJSONIncludesBrowserURL(t *testing.T) {

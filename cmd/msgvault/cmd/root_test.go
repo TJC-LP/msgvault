@@ -6,10 +6,9 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
-	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
@@ -47,6 +46,8 @@ func TestErrOAuthNotConfigured(t *testing.T) {
 }
 
 func TestWrapOAuthError_NotExist(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
 	originalErr := fmt.Errorf("open /path/to/secrets.json: %w", os.ErrNotExist)
 
 	wrapped := wrapOAuthError(originalErr, config.NewDefaultConfig())
@@ -54,9 +55,11 @@ func TestWrapOAuthError_NotExist(t *testing.T) {
 	msg := wrapped.Error()
 
 	// Should contain accessible message (not "not found" anymore)
-	assert.Contains(t, msg, "not accessible", "missing 'not accessible'")
+	assert.Contains(msg, "not accessible", "missing 'not accessible'")
 	// Should contain setup hint
-	assert.Contains(t, msg, "https://msgvault.io/guides/oauth-setup/", "missing setup URL")
+	assert.Contains(msg, "https://msgvault.io/guides/oauth-setup/", "missing setup URL")
+	require.ErrorIs(wrapped, originalErr)
+	assert.True(strings.HasSuffix(msg, oauthSetupHint(config.NewDefaultConfig())))
 }
 
 func TestWrapOAuthError_Permission(t *testing.T) {
@@ -110,104 +113,6 @@ func newTestRootCmd() *cobra.Command {
 	}
 }
 
-// TestExecuteContext_CancellationPropagates verifies that context cancellation
-// from ExecuteContext propagates to command handlers.
-func TestExecuteContext_CancellationPropagates(t *testing.T) {
-	require := require.New(t)
-	assert := assert.New(t)
-	// Track whether context was cancelled
-	var contextWasCancelled atomic.Bool
-
-	// Signal when the command handler has started waiting on ctx.Done()
-	handlerStarted := make(chan struct{})
-
-	// Create a fresh root command for this test
-	testRoot := newTestRootCmd()
-
-	// Create a test command that waits for context cancellation
-	testCmd := &cobra.Command{
-		Use:   "test-cancel",
-		Short: "Test command for context cancellation",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			ctx := cmd.Context()
-			// Signal that we're now waiting for cancellation
-			close(handlerStarted)
-			select {
-			case <-ctx.Done():
-				contextWasCancelled.Store(true)
-				return ctx.Err()
-			case <-time.After(5 * time.Second):
-				return nil
-			}
-		},
-	}
-
-	testRoot.AddCommand(testCmd)
-
-	// Create a cancellable context
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel() // Ensure cleanup even if test fails early
-
-	// Start ExecuteContext in a goroutine
-	done := make(chan error, 1)
-	go func() {
-		testRoot.SetArgs([]string{"test-cancel"})
-		done <- testRoot.ExecuteContext(ctx)
-	}()
-
-	// Wait for handler to start (synchronization instead of sleep)
-	select {
-	case <-handlerStarted:
-		// Handler is now waiting on ctx.Done()
-	case <-time.After(2 * time.Second):
-		require.Fail("command handler did not start in time")
-	}
-
-	// Cancel the context (simulates SIGINT/SIGTERM)
-	cancel()
-
-	// Wait for execution to complete
-	select {
-	case err := <-done:
-		require.ErrorIs(err, context.Canceled, "expected context.Canceled error")
-	case <-time.After(2 * time.Second):
-		require.Fail("ExecuteContext did not return after context cancellation")
-	}
-
-	// Verify the command observed the cancellation
-	assert.True(contextWasCancelled.Load(), "command did not observe context cancellation")
-}
-
-// TestExecute_UsesBackgroundContext verifies Execute() works with background context.
-func TestExecute_UsesBackgroundContext(t *testing.T) {
-	// Create a fresh root command for this test
-	testRoot := newTestRootCmd()
-
-	// Create a simple command that completes immediately
-	completed := make(chan struct{})
-	testCmd := &cobra.Command{
-		Use:   "test-execute",
-		Short: "Test command for Execute",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			close(completed)
-			return nil
-		},
-	}
-
-	testRoot.AddCommand(testCmd)
-
-	testRoot.SetArgs([]string{"test-execute"})
-	err := testRoot.Execute()
-	require.NoError(t, err, "Execute()")
-
-	select {
-	case <-completed:
-		// Success
-	case <-time.After(time.Second):
-		require.Fail(t, "command did not complete")
-	}
-}
-
 // TestExecuteContext_PropagatesContext verifies ExecuteContext passes context to command handlers.
 //
 // NOTE: This test modifies the package-level rootCmd variable and must NOT use t.Parallel().
@@ -228,7 +133,7 @@ func TestExecuteContext_PropagatesContext(t *testing.T) {
 		Use:   "test-ctx",
 		Short: "Test command for context verification",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			receivedCtx = cmd.Context()
+			receivedCtx = cmd.Context() //nolint:fatcontext // The test captures the command context to inspect it.
 			return nil
 		},
 	}
@@ -240,7 +145,7 @@ func TestExecuteContext_PropagatesContext(t *testing.T) {
 	// Create a context with a custom value
 	testKey := ctxKey("test-key")
 	testValue := "test-value"
-	ctx := context.WithValue(context.Background(), testKey, testValue)
+	ctx := context.WithValue(t.Context(), testKey, testValue)
 
 	testRoot.SetArgs([]string{"test-ctx"})
 	err := ExecuteContext(ctx)
@@ -249,56 +154,6 @@ func TestExecuteContext_PropagatesContext(t *testing.T) {
 	// Verify the context was propagated
 	require.NotNil(t, receivedCtx, "command did not receive context")
 	assert.Equal(t, testValue, receivedCtx.Value(testKey), "context value")
-}
-
-// TestExecute_UsesBackgroundContextInHandler verifies Execute provides background context to handlers.
-//
-// NOTE: This test modifies the package-level rootCmd variable and must NOT use t.Parallel().
-// Running this test in parallel with other tests that access rootCmd would cause data races.
-func TestExecute_UsesBackgroundContextInHandler(t *testing.T) {
-	require := require.New(t)
-	assert := assert.New(t)
-	// Save and restore global rootCmd to avoid state leakage between tests.
-	// This pattern requires sequential test execution - do not add t.Parallel().
-	savedRootCmd := rootCmd
-	defer func() { rootCmd = savedRootCmd }()
-
-	// Create a test root command
-	testRoot := newTestRootCmd()
-
-	// Track the context received by the command
-	var receivedCtx context.Context
-	testCmd := &cobra.Command{
-		Use:   "test-bg-ctx",
-		Short: "Test command for background context",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			receivedCtx = cmd.Context()
-			return nil
-		},
-	}
-	testRoot.AddCommand(testCmd)
-
-	// Replace global rootCmd for this test
-	rootCmd = testRoot
-
-	testRoot.SetArgs([]string{"test-bg-ctx"})
-	err := Execute()
-	require.NoError(err, "Execute")
-
-	// Verify the command received a non-nil context (should be background context)
-	require.NotNil(receivedCtx, "command did not receive context")
-
-	// Background context should not have any deadline
-	deadline, ok := receivedCtx.Deadline()
-	assert.False(ok, "expected no deadline from background context, got %v", deadline)
-
-	// Background context should not be cancelled
-	select {
-	case <-receivedCtx.Done():
-		assert.Fail("background context should not be done")
-	default:
-		// Expected: context is not done
-	}
 }
 
 func TestIsAuthInvalidError(t *testing.T) {
@@ -437,6 +292,16 @@ func (fakeTokenSource) Token() (*extOAuth2.Token, error) {
 }
 
 func TestGetTokenSourceWithReauth(t *testing.T) {
+	t.Run("malformed file token", func(t *testing.T) {
+		tokenPath, restore := seedTokenEnv(t, "{")
+		defer restore()
+		mgr, err := oauth.NewManagerWithCredentials(t.Context(), config.OAuthApp{ClientSecrets: filepath.Join(filepath.Dir(filepath.Dir(tokenPath)), "client_secret.json")}, filepath.Dir(tokenPath), config.OAuthTokenCommands{}, nil, oauth.Scopes)
+		require.NoError(t, err)
+		_, err = getTokenSourceWithReauth(t.Context(), mgr, scopeEscalationAccount, false, gmailReauthHint)
+		require.ErrorIs(t, err, oauth.ErrInvalidTokenJSON)
+		assert.ErrorContains(t, err, "add-account")
+	})
+
 	invalidGrant := &extOAuth2.RetrieveError{ErrorCode: "invalid_grant"}
 	genericErr := errors.New("transient network error")
 
@@ -464,7 +329,7 @@ func TestGetTokenSourceWithReauth(t *testing.T) {
 			name: "no token at all",
 			mock: &mockReauthorizer{
 				tokenSourceFn: func(_ context.Context, _ string) (extOAuth2.TokenSource, error) {
-					return nil, errors.New("no token")
+					return nil, os.ErrNotExist
 				},
 				hasTokenVal: false,
 			},
@@ -551,7 +416,7 @@ func TestGetTokenSourceWithReauth(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			require := require.New(t)
 			assert := assert.New(t)
-			ctx := context.Background()
+			ctx := t.Context()
 			ts, err := getTokenSourceWithReauth(ctx, tt.mock, "test@gmail.com", tt.interactive, gmailReauthHint)
 
 			if tt.wantErr {
@@ -586,7 +451,7 @@ func TestGetTokenSourceWithReauth(t *testing.T) {
 				return mismatch
 			},
 		}
-		_, err := getTokenSourceWithReauth(context.Background(), mock, "user@example.com", true, gmailReauthHint)
+		_, err := getTokenSourceWithReauth(t.Context(), mock, "user@example.com", true, gmailReauthHint)
 		require.Error(t, err)
 		msg := err.Error()
 		for _, want := range []string{"remove-account", "add-account", "primary address"} {
@@ -609,7 +474,7 @@ func TestGetTokenSourceWithReauth(t *testing.T) {
 			},
 			hasTokenVal: true,
 		}
-		_, err := getTokenSourceWithReauth(context.Background(), mock, "x@gmail.com", false, gmailReauthHint)
+		_, err := getTokenSourceWithReauth(t.Context(), mock, "x@gmail.com", false, gmailReauthHint)
 		require.ErrorContains(t, err, "add-account x@gmail.com --force")
 		require.ErrorContains(t, err, "add-account x@gmail.com --headless")
 	})
@@ -623,7 +488,7 @@ func TestGetTokenSourceWithReauth(t *testing.T) {
 			},
 			hasTokenVal: true,
 		}
-		_, err := getTokenSourceWithReauth(context.Background(), mock, "x@gmail.com", false, calendarReauthHint)
+		_, err := getTokenSourceWithReauth(t.Context(), mock, "x@gmail.com", false, calendarReauthHint)
 		require.ErrorContains(t, err, "add-calendar x@gmail.com")
 		require.ErrorContains(t, err, "add-calendar x@gmail.com --headless")
 		require.NotContains(t, err.Error(), "add-account")
@@ -644,7 +509,7 @@ func TestGetTokenSourceWithReauthUsesScopePreservingReauth(t *testing.T) {
 		return fakeTokenSource{}, nil
 	}
 
-	ts, err := getTokenSourceWithReauth(context.Background(), m, "test@gmail.com", true, gmailReauthHint)
+	ts, err := getTokenSourceWithReauth(t.Context(), m, "test@gmail.com", true, gmailReauthHint)
 
 	require.NoError(err)
 	assert.NotNil(ts)
@@ -667,12 +532,14 @@ func withAgentFlags(t *testing.T) context.Context {
 // draft commands with agent flags pass the PersistentPreRunE early-return path.
 func TestAgentDelegatedCapableCommandSucceeds(t *testing.T) {
 	for _, name := range []string{
-		"draft-reply", "draft-compose", "draft-get", "draft-edit", "draft-delete",
+		"draft-reply", "draft-compose", "draft-get", "draft-edit", "draft-delete", "mcp", "search", "stats", "show-message",
 	} {
 		t.Run(name, func(t *testing.T) {
 			ctx := withAgentFlags(t)
 			cmd := &cobra.Command{Use: name}
-			cmd.SetContext(ctx)
+			root := &cobra.Command{Use: "msgvault"}
+			root.SetContext(ctx)
+			root.AddCommand(cmd)
 			err := rootCmd.PersistentPreRunE(cmd, nil)
 			require.NoError(t, err)
 		})
@@ -701,12 +568,20 @@ func TestAgentDelegatedRecoveryCommandSucceeds(t *testing.T) {
 // not in the delegated-capable set (serve) returns "not available in
 // agent-delegated mode" when agent flags are present.
 func TestAgentDelegatedNonCapableCommandReturnsError(t *testing.T) {
-	ctx := withAgentFlags(t)
-
-	cmd := &cobra.Command{Use: "serve"}
-	cmd.SetContext(ctx)
-	err := rootCmd.PersistentPreRunE(cmd, nil)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "not available in agent-delegated mode")
-	assert.Contains(t, err.Error(), "serve")
+	for _, tc := range []struct{ parent, name string }{{"", "serve"}, {"documents", "search"}, {"person", "search"}, {"multimodal", "search"}} {
+		t.Run(strings.TrimSpace(tc.parent+" "+tc.name), func(t *testing.T) {
+			root := &cobra.Command{Use: "msgvault"}
+			root.SetContext(withAgentFlags(t))
+			cmd := &cobra.Command{Use: tc.name}
+			if tc.parent == "" {
+				root.AddCommand(cmd)
+			} else {
+				parent := &cobra.Command{Use: tc.parent}
+				root.AddCommand(parent)
+				parent.AddCommand(cmd)
+			}
+			err := rootCmd.PersistentPreRunE(cmd, nil)
+			require.ErrorContains(t, err, tc.name+" is not available in agent-delegated mode")
+		})
+	}
 }

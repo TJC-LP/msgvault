@@ -1,8 +1,16 @@
 <script lang="ts">
-  import { Button, SegmentedControl } from '@kenn-io/kit-ui';
-  import { onDestroy, untrack } from 'svelte';
+  import { tasksSettingsDestination } from './navigation';
+  import { Button, MEDIA, PageHeader, SearchByMeaningHint } from '@kenn-io/kit-ui';
+  import { onDestroy, tick, untrack } from 'svelte';
+  import { MediaQuery } from 'svelte/reactivity';
 
+  import { getLocalEmbeddings } from '../../api/generated/api/api';
+  import type { LocalEmbeddingsStatus } from '../../api/generated/models';
   import type { APIClient } from '../../api/client';
+  import { mediaReadiness } from '../../search/media-ready.svelte';
+  import { reportError } from '../../telemetry/actions';
+  import { ArchiveMessageLoader } from '../../archive/message-loader.svelte';
+  import { parseRecordingSelection } from '../../archive/recording-selection';
   import type {
     MeetingRef,
     ExplorePreflightResponse as GeneratedExplorePreflightResponse,
@@ -25,18 +33,19 @@
   import { groupingByDimension } from '../../grouping/catalog';
   import { canonicalFingerprint, createAllMatchingSelection, predicateFingerprint } from '../../explore/selection';
   import type { ExploreSelectionState, ExploreState } from '../../explore/state.svelte';
-  import ColumnsMenu from '../explore/ColumnsMenu.svelte';
+  import { readerPosition } from '../../explore/reader-position.svelte';
   import ContextBar from '../explore/ContextBar.svelte';
   import EverythingTable from '../explore/EverythingTable.svelte';
   import GroupTable from '../explore/GroupTable.svelte';
   import SelectionBar from '../explore/SelectionBar.svelte';
   import SplitPane from '../layout/SplitPane.svelte';
+  import { splitHandleSize } from '../layout/split-handle';
   import PersonTimeline from '../people/PersonTimeline.svelte';
   import SearchCoverage from '../search/SearchCoverage.svelte';
+  import TranscriptHits from '../search/TranscriptHits.svelte';
   import ReadingPane, { type ReadingPaneSelection, type ReadingPaneStatus } from '../reader/ReadingPane.svelte';
   import type { SearchCoverageAction } from '../../search/modes';
-  import MeetingPanel from '../meetings/MeetingPanel.svelte';
-  import PageHeader from './PageHeader.svelte';
+  import MessageMeetingSummary from '../meetings/MessageMeetingSummary.svelte';
   import {
     exploreMeetingScope,
     filtersToMeetingTranscripts,
@@ -46,8 +55,14 @@
   import type { EverythingSessionState } from './EverythingSessionState.svelte';
 
   type ExplorePreflight = GeneratedExplorePreflightResponse;
+  const stackedListMin = 120, stackedReaderMin = 160;
 
   interface Props {
+    meetingContext?: { scope?: import('../../meetings/controller.svelte').MeetingPanelScope; error?: string };
+    scope?: import('../../explore/models').ExploreFilter;
+    conversationStart?: string;
+    conversationEnd?: string;
+    resultsWidth?: number;
     client: APIClient;
     exploreState: ExploreState;
     loader: ExploreLoader;
@@ -61,7 +76,8 @@
     selectionPreflight: ExplorePreflight | undefined;
     meetingSelection: GeneratedExploreSelection | undefined;
     exportSelection: () => void;
-    onReviewDeletion: (mode: 'explicit' | 'all_matching') => void;
+    onAddSource?: () => void;
+    onReviewDeletion?: (mode: 'explicit' | 'all_matching') => void;
     commitNavigation: (patch: Partial<ExploreURLState>) => void;
     commitSearch: (query: string, mode: ExploreSearchMode) => void;
     commitWorkspace: (workspace: ExploreWorkspace) => void;
@@ -69,15 +85,22 @@
     fixedSortNotice: () => void;
     focusGrid: () => void;
     openRow: (row: EntryRow) => void;
+    onOpenRecording: (messageID: number) => void;
     drillGroup: (row: ExploreGroupRow) => void;
     closeReadingPane: () => void;
     openRelationship: (participantID: number) => void;
     changeConversationAnchor: (anchorId: number) => void;
     onOpenMeeting?: (meeting: MeetingRef) => void;
     onSaveView: () => void;
+    onStatusChange?: () => void;
   }
 
   let {
+    meetingContext = undefined,
+    scope = undefined,
+    conversationStart = undefined,
+    conversationEnd = undefined,
+    resultsWidth = $bindable(0),
     client,
     exploreState,
     loader,
@@ -91,6 +114,7 @@
     selectionPreflight,
     meetingSelection,
     exportSelection,
+    onAddSource,
     onReviewDeletion,
     commitNavigation,
     commitSearch,
@@ -99,15 +123,58 @@
     fixedSortNotice,
     focusGrid,
     openRow,
+    onOpenRecording,
     drillGroup,
     closeReadingPane,
     openRelationship,
     changeConversationAnchor,
     onOpenMeeting = undefined,
     onSaveView,
+    onStatusChange = () => undefined,
   }: Props = $props();
 
+  const compact = new MediaQuery(MEDIA.compact);
+  const solo = $derived(compact.current && Boolean(readingTargetKey) && !loader.error && !loader.unavailable);
+  let resultsSplit: HTMLDivElement | undefined = $state();
+  let previousSolo: boolean | undefined;
+  $effect(() => {
+    const currentSolo = solo;
+    const changed = previousSolo !== undefined && previousSolo !== currentSolo;
+    previousSolo = currentSolo;
+    if (!changed || !untrack(() => readingTargetKey)) return;
+    void tick().then(() => {
+      const focused = document.activeElement;
+      if (focused instanceof HTMLElement && focused !== document.body &&
+        (focused.checkVisibility?.({ visibilityProperty: true }) ?? !resultsSplit?.querySelector('[data-pane="primary"]')?.contains(focused))) return;
+      resultsSplit?.querySelector<HTMLButtonElement>('[data-reader-dismiss]')?.focus();
+    });
+  });
+
   const api = createExploreAPI(untrack(() => client));
+  const recording = new ArchiveMessageLoader();
+  $effect(() => { if (recording.error) return reportError(() => client, () => 'message'); });
+  const readiness = mediaReadiness();
+  const recordingSelection = $derived(parseRecordingSelection(readingTargetKey));
+  const mediaParticipantID = $derived.by(() => {
+    const filters = exploreState.current.filters;
+    if (filters.length !== 1 || filters[0].dimension !== 'participant' || filters[0].values.length !== 1) return undefined;
+    const value = filters[0].values[0];
+    const id = Number(value);
+    return /^[1-9]\d*$/.test(value) && Number.isSafeInteger(id) ? id : undefined;
+  });
+  const mediaSearchSupported = $derived(exploreState.current.searchMode === 'full_text'
+    && (exploreState.current.filters.length === 0 || mediaParticipantID !== undefined)
+    && exploreState.current.groupingChain.length === 0);
+  const mediaSearchVisible = $derived.by(() => {
+    const query = exploreState.current.query.trim();
+    return Boolean(enabled && readiness?.ready && query && exploreState.current.presentation === 'table');
+  });
+
+  $effect(() => {
+    void readingDetailRetryRevision;
+    void recording.load(client, recordingSelection);
+    return () => recording.cancel();
+  });
 
   const countLabel = $derived.by(() => {
     const result = loader.result;
@@ -123,27 +190,8 @@
     return `${count.toLocaleString()} ${count === 1 ? one : many}`;
   });
 
-  function storedPreviewPosition(): 'below' | 'right' {
-    try {
-      return localStorage.getItem('msgvault.reading-pane.position') === 'right' ? 'right' : 'below';
-    } catch {
-      return 'below';
-    }
-  }
-
-  let previewPosition = $state(storedPreviewPosition());
-  let resultsWidth = $state(0);
   const canPreviewRight = $derived(resultsWidth >= 960);
-  const previewRight = $derived(canPreviewRight && previewPosition === 'right');
-
-  function setPreviewPosition(value: string): void {
-    previewPosition = value === 'right' ? 'right' : 'below';
-    try {
-      localStorage.setItem('msgvault.reading-pane.position', previewPosition);
-    } catch {
-      // Keep the control usable when browser storage is unavailable.
-    }
-  }
+  const previewRight = $derived(canPreviewRight && readerPosition.value === 'right');
 
   // coverage, coveragePollAttempts/coveragePollKey, visibleLexicalRowKeys,
   // lexicalCountCache/canonicalQueryHashes, and readingGroupDetail/
@@ -182,6 +230,7 @@
   const readingSelection = $derived.by((): ReadingPaneSelection | undefined => {
     const selected = readingTargetKey;
     if (!selected) return undefined;
+    if (recordingSelection) return recording.detail ? { kind: 'archive', message: recording.detail } : undefined;
     const entry = loader.rows.find((row) => row.key === selected);
     if (entry) return { kind: 'entry', row: entry };
     const group = parseGroupSelection(selected);
@@ -201,6 +250,7 @@
     } => {
       const selected = readingTargetKey;
       if (!selected || readingSelection) return { status: 'ready', message: '' };
+      if (recordingSelection) return { status: !recording.error ? 'loading' : recording.missing ? 'missing' : 'error', message: recording.missing ? 'This message is no longer available.' : 'Could not load this message.' };
       if (parseGroupSelection(selected)) {
         if (readingDetailUnavailable) {
           return {
@@ -369,7 +419,7 @@
     const loading = loader.loading;
     const generation = loader.resultGeneration;
     const resultFingerprint = loader.resultFingerprint;
-    const isMeetingView = exploreState.current.workspace === 'everything' && filtersToMeetingTranscripts(predicate);
+    const isMeetingView = !meetingContext && exploreState.current.workspace === 'everything' && filtersToMeetingTranscripts(predicate);
     untrack(() => {
       if (!isMeetingView || session.meetingOverview?.fingerprint !== fingerprint) session.meetingOverview = undefined;
       if (!isMeetingView || !result || loading || resultFingerprint !== fingerprint) return;
@@ -390,6 +440,25 @@
   function reloadGroupMeetings(): void {
     session.readingDetailFingerprint = '';
     readingDetailRetryRevision += 1;
+  }
+
+  let localSetup = $state<LocalEmbeddingsStatus>();
+  const localSearchOff = $derived(localSetup && localSetup.provider !== 'configured' && !localSetup.enabled && !localSetup.running && localSetup.phase === 'idle' && !loader.loading && Boolean(loader.result) && Boolean(exploreState.current.query.trim()));
+  $effect(() => {
+    localSetup = undefined;
+    if (!enabled || exploreState.current.workspace !== 'everything' || exploreState.current.searchMode !== 'full_text') return;
+    const controller = new AbortController();
+    const load = () => void getLocalEmbeddings({ ...client, signal: controller.signal }).then(({ data, response }) => {
+      if (!controller.signal.aborted && response.ok) localSetup = data;
+    }).catch(() => undefined);
+    load();
+    // Another tab may have turned search on while this one was in the background.
+    window.addEventListener('focus', load);
+    return () => { controller.abort(); window.removeEventListener('focus', load); };
+  });
+  // Settings runs and follows the setup; the hint only opens it.
+  function openSearchSettings(): void {
+    commitNavigation({ workspace: 'settings', settingsCategory: 'overview', settingsAuthority: '', selectedRow: null, conversationAnchor: null });
   }
 
   const coverageFiltersFingerprint = $derived(canonicalFingerprint(exploreState.current.filters));
@@ -578,6 +647,8 @@
         detail: cause instanceof Error ? cause.message : 'The semantic index action failed.',
         actions: ['retry'],
       };
+    } finally {
+      onStatusChange();
     }
   }
 
@@ -600,18 +671,20 @@
   });
 </script>
 
-<main class="everything-workspace" aria-label="Everything">
-  <PageHeader title="Everything">
+<svelte:element this={scope ? 'div' : 'main'} class="everything-workspace" aria-label={scope ? undefined : 'Messages'}>
+  {#if !scope}<PageHeader title="Messages">
     {#snippet actions()}<Button surface="outline" label="Save view…" onclick={onSaveView} />{/snippet}
-  </PageHeader>
+  </PageHeader>{/if}
 
   <ContextBar
+    messages
+    lockedFilter={scope}
     {client}
     query={exploreState.current.query}
     searchMode={exploreState.current.searchMode}
     filters={exploreState.current.filters}
     groupingChain={exploreState.current.groupingChain}
-    {countLabel}
+    countLabel={mediaSearchVisible ? '' : countLabel}
     sort={exploreState.current.groupingChain.length > 0 ? undefined : {
       options: [{ value: 'newest', label: 'Newest first' }],
       value: 'newest',
@@ -651,24 +724,12 @@
         scrollAnchor: null,
       })}
   >
-    {#snippet extra()}
-      {#if exploreState.current.presentation === 'table' && exploreState.current.groupingChain.length === 0}
-        <ColumnsMenu
-          columns={exploreState.current.columns}
-          onchange={(columns) => exploreState.replaceTransient({ columns })}
-        />
-      {/if}
-      {#if canPreviewRight}
-        <SegmentedControl
-          ariaLabel="Preview position"
-          options={[{ value: 'below', label: 'Below' }, { value: 'right', label: 'Right' }]}
-          value={previewPosition}
-          onchange={setPreviewPosition}
-        />
-      {/if}
-    {/snippet}
   </ContextBar>
   <span class="kit-sr-only" role="status" aria-label="Sort status" aria-live="polite">{sortNotice}</span>
+
+  {#each loader.result?.warnings ?? [] as warning}
+    <p class="scope-note" role="status">{warning}</p>
+  {/each}
 
   {#if loader.result?.candidatePoolSaturated}
     <div class="search-limit" role="status">
@@ -692,9 +753,10 @@
     <p class="scope-note" role="status">Semantic search covers active messages only.</p>
   {/if}
 
-  {#if meetingScope}
-    <div class="meeting-overview" data-scroll>
-      <MeetingPanel {client} scope={meetingScope} refreshKey={String(session.meetingOverview?.refreshKey ?? 0)}
+  {#if meetingContext?.error}<p role="status">{meetingContext.error}</p>{/if}
+  {#if meetingContext?.scope || meetingScope}
+    <div class="meeting-overview">
+      <MessageMeetingSummary {client} scope={(meetingContext?.scope ?? meetingScope)!} refreshKey={String(session.meetingOverview?.refreshKey ?? 0)}
         onReloadScope={reloadOverviewMeetings} {onOpenMeeting} />
     </div>
   {/if}
@@ -703,6 +765,9 @@
     class="results-split"
     class:results-split--open={Boolean(readingTargetKey)}
     class:results-split--right={previewRight}
+    class:results-split--solo={solo}
+    style:min-height={scope && readingTargetKey && !previewRight && !solo ? `${stackedListMin + stackedReaderMin + splitHandleSize}px` : undefined}
+    bind:this={resultsSplit}
     bind:clientWidth={resultsWidth}
   >
     <SplitPane
@@ -710,12 +775,24 @@
       storageKey={previewRight ? 'msgvault.reading-pane.right-size' : 'msgvault.reading-pane.size'}
       orientation={previewRight ? 'horizontal' : 'vertical'}
       initialFraction={previewRight ? 0.45 : 0.55}
-      minPrimary={previewRight ? 360 : 120}
-      minSecondary={previewRight ? 400 : 160}
+      minPrimary={previewRight ? 360 : stackedListMin}
+      minSecondary={previewRight ? 400 : stackedReaderMin}
       collapsed={!readingTargetKey}
     >
       {#snippet primary()}
-        <div class="results-primary">
+        <div class="results-primary" class:results-primary--recordings={mediaSearchVisible}>
+          {#if mediaSearchVisible}
+            <TranscriptHits
+              {client}
+              participantID={mediaParticipantID}
+              missingMessageID={recording.missing ? recordingSelection : undefined}
+              query={exploreState.current.query}
+              supported={mediaSearchSupported}
+              selectedMessageID={recordingSelection}
+              onOpen={(hit) => onOpenRecording(hit.message_id)}
+            />
+            <h2 class="results-heading">Results <span class="count" aria-live="polite">{countLabel}</span></h2>
+          {/if}
           {#if exploreState.current.groupingChain.length > 0}
             <GroupTable
               rows={loader.groupRows}
@@ -770,8 +847,9 @@
               />
             {:else}
               <EverythingTable
+                {onAddSource}
                 rows={loader.rows}
-                {selection}
+                selection={scope ? undefined : selection}
                 columns={exploreState.current.columns}
                 columnWidths={exploreState.current.columnWidths}
                 focusedKey={exploreState.current.activeRow}
@@ -797,7 +875,7 @@
                 onRetry={loader.retry}
               />
             {/if}
-            <SelectionBar
+            {#if !scope}<SelectionBar
               {selection}
               totalCount={loader.result?.totalCount}
               allMatching={allMatchingSelection}
@@ -809,6 +887,7 @@
               {onReviewDeletion}
               onClear={focusGrid}
             />
+            {/if}
           {/if}
         </div>
       {/snippet}
@@ -820,13 +899,17 @@
             targetKey={readingTargetKey}
             status={readingState.status}
             statusMessage={readingState.message}
+            onRetry={recordingSelection && !recording.missing ? () => readingDetailRetryRevision += 1 : undefined}
             unavailable={readingState.unavailable}
             predicate={exploreState.predicate()}
             onClose={closeReadingPane}
+            back={solo}
             {onOpenMeeting}
             onReloadMeetings={reloadGroupMeetings}
-            onOpenSettings={() => commitWorkspace('settings')}
-            onOpenRelationship={openRelationship}
+            onOpenSettings={() => commitNavigation(tasksSettingsDestination())}
+            onOpenPerson={openRelationship}
+            {conversationStart}
+            {conversationEnd}
             {conversationAnchorId}
             onConversationAnchorChange={changeConversationAnchor}
           />
@@ -835,20 +918,31 @@
     </SplitPane>
   </div>
 
-</main>
+  {#if localSearchOff && localSetup}
+    <div class="local-search-hint">
+      <SearchByMeaningHint onturnon={openSearchSettings} />
+    </div>
+  {/if}
+
+</svelte:element>
 
 <style>
+  .local-search-hint { margin: 0; line-height: 1.45; }
+  .local-search-hint :global(.kit-search-by-meaning-hint) { font-size: var(--font-size-xs); text-wrap: balance; }
+  .local-search-hint :global(button) { text-decoration: underline; }
   .everything-workspace {
     display: flex;
     width: 100%;
+    min-width: 0;
     min-height: 0;
     flex: 1;
     flex-direction: column;
     gap: var(--space-4);
     padding: var(--space-5) var(--page-gutter) var(--space-4);
+    overflow: hidden;
   }
 
-  .meeting-overview { max-height: 42vh; overflow: auto; flex: none; border: 1px solid var(--border-muted); }
+  .meeting-overview { width: 100%; max-width: 100%; min-width: 0; max-height: 42vh; overflow-x: hidden; overflow-y: auto; flex: none; }
 
   .scope-note {
     margin: 0;
@@ -884,11 +978,29 @@
   }
 
   .results-split {
+    contain: size;
     display: flex;
     min-width: 0;
     min-height: 200px;
     flex: 1;
     overflow: hidden;
+  }
+
+  .results-split--solo :global([data-split-pane]) { position: relative; }
+  .results-split--solo :global([data-pane='primary']) {
+    position: absolute;
+    inset: 0;
+    visibility: hidden;
+  }
+  .results-split--solo :global(.handle-reset) { display: none; }
+  .results-split.results-split--solo :global([data-pane='secondary']) {
+    flex-grow: 1;
+    flex-shrink: 1;
+    border: 0;
+  }
+  .results-split--solo :global(.reading-pane) {
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-md);
   }
 
   .results-primary {
@@ -897,6 +1009,9 @@
     height: 100%;
     flex-direction: column;
   }
+  .results-primary--recordings { container: results / size; min-height: 0; gap: var(--space-3); }
+  .results-heading { margin: 0; font-size: var(--font-size-sm); font-weight: var(--font-weight-semibold); }
+  .results-heading .count { color: var(--text-secondary); font-size: var(--font-size-xs); font-weight: var(--font-weight-normal); font-variant-numeric: tabular-nums; }
 
   /* The reading pane provides its own surface; the split's secondary pane
    * frames it on every edge except the one beside the drag handle. The

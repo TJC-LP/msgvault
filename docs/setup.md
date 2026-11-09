@@ -1,4 +1,5 @@
 ---
+last_edited: "2026-10-23"
 title: Setup Guide
 description: Install msgvault, choose a source, and explore your first archived messages.
 ---
@@ -8,9 +9,6 @@ Install msgvault, bring in a small first batch, then open it in the browser or
 terminal. The Gmail walkthrough below includes Google OAuth setup. For other
 mail providers, chats, meetings, contacts, or local exports, use
 [Choose a Source](guides/sources.md) after installation.
-
-Already have an archive? Read [the upgrade notes](changelog.md#before-upgrading) before
-opening an existing archive with a newer build.
 
 ## Install Release
 
@@ -26,6 +24,8 @@ powershell -ExecutionPolicy ByPass -c "irm https://msgvault.io/install.ps1 | iex
 
 The installer detects your OS and architecture, downloads the latest release from [GitHub Releases](https://github.com/kenn-io/msgvault/releases), verifies the SHA-256 checksum, and installs the binary.
 
+The Unix installer adds msgvault to your Bash, Zsh, or Fish profile; `MSGVAULT_NO_MODIFY_PATH=1` skips the profile edit.
+
 Windows releases include native AMD64 and ARM64 packages. On Windows ARM64,
 the PowerShell installer selects the native package when the release provides
 one and falls back to the AMD64 package under emulation for older releases.
@@ -38,6 +38,57 @@ Verify the installation:
 ```bash
 msgvault --help
 ```
+
+## Vendor a pinned binary
+
+Applications can download a release archive directly from
+[GitHub Releases](https://github.com/kenn-io/msgvault/releases). Pin the tag,
+pick the archive for your platform from that release's asset list, and check it
+against the release's `SHA256SUMS` before extracting it. Fail the download if
+the archive or its checksum entry is missing.
+
+Archives use `msgvault_<version>_<os>_<arch>`, with the version's leading `v`
+removed. Use `darwin` for macOS, `linux` for Linux, and `windows` for Windows;
+architectures are `amd64` and `arm64`. macOS and Linux archives end in `.tar.gz`;
+Windows archives end in `.zip`, such as `msgvault_0.23.0_windows_arm64.zip`.
+
+### Migrate before replacing the executable
+
+These commands are available in 0.22.0 and later; run them from the candidate
+binary. Run maintenance on the archive host; for a configured
+remote server, use `--local` only when intentionally selecting this host's archive.
+
+1. Download, verify, and extract the candidate into a separate directory.
+2. Stop the daemon and all other processes using the archive. For PostgreSQL,
+   stop users on other hosts too. Back up the archive before migrating.
+3. Compare the candidate's expected archive version with the stored version:
+
+   ```bash
+   ./candidate/msgvault schema-version
+   ./candidate/msgvault --home /path/to/archive-home schema-version --database
+   ```
+
+4. Run the candidate's migrations. Require exit status zero before continuing:
+
+   ```bash
+   ./candidate/msgvault --home /path/to/archive-home migrate
+   ./candidate/msgvault --home /path/to/archive-home schema-version --database
+   ```
+
+5. Require the stored version to equal the candidate's expected version, then
+   replace the installed executable and restart the daemon.
+
+A stored version of `0` means the archive predates this contract or has not
+completed schema initialization. A greater stored version requires a newer
+compatible binary. There is no schema downgrade command.
+
+Migrations can commit progress before failing or being interrupted. A retained
+old version does not make those partial changes safe for an old executable.
+Retry with the candidate, or restore the backup before restarting the old
+binary. Older releases do not have the future-version guard.
+
+See [schema-version](cli-reference.md#schema-version) for the exact probe
+contract and [migrate](cli-reference.md#migrate) for its scope and failure behavior.
 
 ## Conda-Forge
 
@@ -165,6 +216,13 @@ msgvault add-account you@gmail.com
 This opens your browser for OAuth consent. For headless servers, see the [copy-token workflow](/docs/guides/oauth-setup/#headless-server-setup).
 
 If you plan to deploy to a remote host (NAS, cloud VM, etc.), run `msgvault setup` after this step to generate a ready-to-run deployment bundle with Docker Compose and remote configuration. See the [Remote Deployment](/docs/guides/remote-deployment/) guide.
+
+During setup, choose the detected host IANA timezone for activity day
+boundaries, or enter another IANA zone. Setup writes the effective zone to
+`[activity].timezone` in the local config and to any NAS bundle it creates. If
+the daemon is running, restart it to load the new zone; later projection passes
+then re-date existing activity rows automatically. `Local` is not accepted
+because it depends on the host at runtime.
 
 ## Add an IMAP Account
 
@@ -382,18 +440,21 @@ full workflow, scheduled sync, and headless-server setup.
 
 ## Open the Web UI
 
-Start the daemon:
+Start the daemon, or find the one already running:
 
 ```bash
-msgvault serve
+msgvault daemon start
 ```
 
-The daemon builds a missing or stale analytical cache during startup. Open the
-`API server` URL it prints. With the default loopback bind,
+Open the URL it prints in your browser. The daemon builds a missing or stale
+analytical cache during startup. With the default loopback bind,
 the browser is trusted locally. A daemon bound to another interface must use an
 API key; the browser presents a login screen and stores only an in-memory
 daemon session. The release binary contains the complete UI, so no frontend
 runtime or separately installed web files are required.
+
+To run in the foreground, stop the daemon with `msgvault daemon stop`, then run
+`msgvault serve`.
 
 For a server or NAS, prefer HTTPS at a reverse proxy and configure only that
 proxy in `server.trusted_proxies`. Plain HTTP is an explicit private-network

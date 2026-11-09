@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	"go.kenn.io/msgvault/internal/search"
 	"go.kenn.io/msgvault/internal/store"
 )
 
@@ -188,6 +189,9 @@ func (e *DuckDBEngine) ListConversationsSnapshot(
 ) ([]ConversationRow, string, error) {
 	release, err := e.acquireQuerySlot(ctx)
 	if err != nil {
+		if e.useLiveSQL(err) {
+			return e.sqliteEngine.ListConversationsSnapshot(ctx, filter)
+		}
 		return nil, "", err
 	}
 	defer release()
@@ -346,6 +350,9 @@ func (e *DuckDBEngine) TextAggregate(
 	// SubAggregate already hold a slot when they reach it.
 	release, err := e.acquireQuerySlot(ctx)
 	if err != nil {
+		if e.useLiveSQL(err) {
+			return e.sqliteEngine.TextAggregate(ctx, viewType, opts)
+		}
 		return nil, err
 	}
 	defer release()
@@ -379,7 +386,7 @@ func (e *DuckDBEngine) TextAggregate(
 	// Search filter on key columns.
 	if opts.SearchQuery != "" {
 		searchConds, searchArgs := e.buildAggregateSearchConditions(
-			opts.SearchQuery, def.keyColumns...)
+			search.Parse(opts.SearchQuery), def.keyColumns...)
 		conditions = append(conditions, searchConds...)
 		args = append(args, searchArgs...)
 	}
@@ -512,6 +519,7 @@ func (e *DuckDBEngine) listConversationMessages(
 			msg.sent_at,
 			COALESCE(msg.size_estimate, 0) AS size_estimate,
 			COALESCE(msg.has_attachments, false) AS has_attachments,
+			msg.hidden_text_present,
 			COALESCE(msg.attachment_count, 0) AS attachment_count,
 			msg.deleted_from_source_at,
 			COALESCE(msg.message_type, '') AS message_type,
@@ -560,6 +568,9 @@ func (e *DuckDBEngine) GetTextStats(
 ) (*TotalStats, error) {
 	release, err := e.acquireQuerySlot(ctx)
 	if err != nil {
+		if e.useLiveSQL(err) {
+			return e.sqliteEngine.GetTextStats(ctx, opts)
+		}
 		return nil, err
 	}
 	defer release()
@@ -654,6 +665,7 @@ func scanMessageSummaries(rows *sql.Rows) ([]MessageSummary, error) {
 			&sentAt,
 			&msg.SizeEstimate,
 			&msg.HasAttachments,
+			&msg.HiddenTextPresent,
 			&msg.AttachmentCount,
 			&deletedAt,
 			&msg.MessageType,

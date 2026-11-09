@@ -4,11 +4,14 @@ import (
 	"context"
 	"log/slog"
 	"os"
+	"sync"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
+	"go.kenn.io/kit/telemetry/posthog"
 	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/logging"
+	"go.kenn.io/msgvault/internal/telemetry"
 )
 
 // invocationOptions is the set of root-owned options that belong to one
@@ -47,13 +50,19 @@ type invocation struct {
 	cfg       *config.Config
 	logger    *slog.Logger
 	logResult *logging.Result
+	sends     *posthog.SendGroup
+
+	syncFailures       *telemetry.SyncFailures
+	imapFolderAccounts *sync.Once
 }
 
 type invocationContextKey struct{}
 
 func newInvocation() *invocation {
 	return &invocation{
-		logger: slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})),
+		logger:             slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})),
+		sends:              &posthog.SendGroup{},
+		imapFolderAccounts: new(sync.Once),
 	}
 }
 
@@ -76,6 +85,13 @@ func invocationFromContext(ctx context.Context) *invocation {
 	}
 	inv, _ := ctx.Value(invocationContextKey{}).(*invocation)
 	return inv
+}
+
+func recordSyncAttempt(ctx context.Context, sourceType, identifier string, err error) error {
+	if state := invocationFromContext(ctx); state != nil {
+		state.syncFailures.Record(ctx, sourceType, identifier, err)
+	}
+	return err
 }
 
 func invocationFromCommand(cmd *cobra.Command) *invocation {

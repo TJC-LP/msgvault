@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -84,6 +85,11 @@ func validateSyncFullFlags(cmd *cobra.Command) error {
 	return nil
 }
 
+// isFullSyncSource reports whether 'msgvault sync-full' downloads src.
+func isFullSyncSource(src *store.Source) bool {
+	return src.SourceType == sourceTypeGmail || src.SourceType == sourceTypeIMAP
+}
+
 func runSyncFullLocal(cmd *cobra.Command, args []string) error {
 	state := invocationFromCommand(cmd)
 	if state == nil || state.cfg == nil || state.logger == nil {
@@ -95,7 +101,7 @@ func runSyncFullLocal(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return usageErr(cmd, err)
 	}
-	s, cleanup, err := openWritableStoreAndInitForInvocation(state)
+	s, cleanup, err := openWritableStoreAndInitForInvocation(cmd.Context(), state)
 	if err != nil {
 		return err
 	}
@@ -116,7 +122,10 @@ func runSyncFullLocal(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return err
 		}
-		for _, src := range allMatches {
+		if err := rejectExplicitlyRetiredSyncSources(allMatches, selector, isFullSyncableSource); err != nil {
+			return err
+		}
+		for _, src := range activeSyncSources(allMatches) {
 			if src.SourceType == sourceTypeGmail || src.SourceType == sourceTypeIMAP || src.SourceType == "" {
 				sources = append(sources, src)
 			}
@@ -142,9 +151,10 @@ func runSyncFullLocal(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return fmt.Errorf("list sources: %w", err)
 		}
-		if len(allSources) == 0 {
-			return errors.New("no accounts configured - run 'add-account' or 'add-imap' first")
+		if !slices.ContainsFunc(allSources, isFullSyncSource) {
+			return errors.New("no Gmail or IMAP accounts to sync; add one with 'msgvault add-account <gmail>' or 'msgvault add-imap'; Microsoft Graph mail uses 'msgvault sync' (file imports are not synced)")
 		}
+		allSources = activeSyncSources(allSources)
 		for _, src := range allSources {
 			switch src.SourceType {
 			case sourceTypeGmail:
@@ -155,12 +165,17 @@ func runSyncFullLocal(cmd *cobra.Command, args []string) error {
 				appName := sourceOAuthApp(src)
 				// Service accounts are always ready — no per-user token needed
 				if cfg.OAuth.ServiceAccountKeyFor(appName) == "" {
-					mgr, err := getOAuthMgr(appName)
+					mgr, err := getOAuthMgr(cmd.Context(), appName)
 					if err != nil {
 						syncErrors = append(syncErrors, fmt.Sprintf("%s: %v", src.Identifier, err))
 						continue
 					}
-					if !mgr.HasToken(src.Identifier) {
+					info, readErr := mgr.InspectToken(cmd.Context(), src.Identifier)
+					if readErr != nil && mgr.CommandTokens() {
+						syncErrors = append(syncErrors, fmt.Sprintf("%s: %v", src.Identifier, readErr))
+						continue
+					}
+					if !info.Exists {
 						fmt.Printf("Skipping %s (no OAuth token - run 'add-account' first)\n", src.Identifier)
 						continue
 					}
@@ -216,7 +231,7 @@ func runSyncFullLocal(cmd *cobra.Command, args []string) error {
 		if src.SourceType == sourceTypeGmail || src.SourceType == "" {
 			appName := sourceOAuthApp(src)
 			if cfg.OAuth.ServiceAccountKeyFor(appName) == "" {
-				if _, err := getOAuthMgr(appName); err != nil {
+				if _, err := getOAuthMgr(ctx, appName); err != nil {
 					syncErrors = append(syncErrors, fmt.Sprintf("%s: %v", src.Identifier, err))
 					continue
 				}
@@ -253,7 +268,7 @@ func runSyncFullLocal(cmd *cobra.Command, args []string) error {
 // caller-provided getOAuthMgr factory. Pass nil to use oauth.Scopes; pass
 // oauth.ScopesDeletion (or another set) for workflows that need elevated
 // access.
-func buildAPIClient(ctx context.Context, src *store.Source, getOAuthMgr func(string) (*oauth.Manager, error), saScopes []string, imapOpts ...imaplib.Option) (gmail.API, error) {
+func buildAPIClient(ctx context.Context, src *store.Source, getOAuthMgr func(ctx context.Context, _ string) (*oauth.Manager, error), saScopes []string, imapOpts ...imaplib.Option) (gmail.API, error) {
 	state := invocationFromContext(ctx)
 	if state == nil || state.cfg == nil || state.logger == nil {
 		return nil, errors.New("configuration is unavailable")
@@ -280,7 +295,7 @@ func buildAPIClient(ctx context.Context, src *store.Source, getOAuthMgr func(str
 				return nil, err
 			}
 		} else {
-			oauthMgr, err := getOAuthMgr(appName)
+			oauthMgr, err := getOAuthMgr(ctx, appName)
 			if err != nil {
 				return nil, err
 			}
@@ -307,7 +322,10 @@ func buildAPIClient(ctx context.Context, src *store.Source, getOAuthMgr func(str
 		}
 
 		var opts []imaplib.Option
-		opts = append(opts, imaplib.WithLogger(logger))
+		opts = append(opts,
+			imaplib.WithLogger(logger),
+			imaplib.WithMaxCommandsPerMinute(cfg.Sync.IMAPMaxCommandsPerMinute),
+		)
 		opts = append(opts, imapOpts...)
 
 		var since, before time.Time
@@ -566,7 +584,7 @@ func saveIMAPFolderStates(
 	return nil
 }
 
-func runFullSync(ctx context.Context, s *store.Store, getOAuthMgr func(string) (*oauth.Manager, error), src *store.Source, state *invocation) error {
+func runFullSync(ctx context.Context, s *store.Store, getOAuthMgr func(ctx context.Context, _ string) (*oauth.Manager, error), src *store.Source, state *invocation) error {
 	if state == nil {
 		state = invocationFromContext(ctx)
 	}
@@ -582,21 +600,9 @@ func runFullSync(ctx context.Context, s *store.Store, getOAuthMgr func(string) (
 	// completed run still saves fresh high water marks afterwards.
 	imapOpts := imapFolderStateOptions(s, src, syncNoResume, cfg, logger)
 
-	// Pass CLI folder filter strings to the IMAP client. The IMAP
-	// client selects the effective include list (CLI --folder when
-	// set, otherwise config Folders) and applies CLI --skip-folder
-	// as an exclusion on top. Both CLI filters are applied in a
-	// single call to filterMailboxes so --folder can fully
-	// override configuration and --skip-folder works together with
-	// --folder.
-	imapOpts = append(imapOpts,
-		imaplib.WithFolderFilter(
-			parseFolderFilter(syncFolders),
-			parseFolderFilter(syncSkipFolders),
-		))
-
 	if src.SourceType == sourceTypeIMAP {
 		imapOpts = append(imapOpts,
+			imapSyncFolderFilter(ctx, s, src.Identifier, state, syncFolders, syncSkipFolders),
 			imaplib.WithListProgress(progress.OnIMAPListProgress),
 		)
 	}
@@ -724,7 +730,33 @@ func runFullSync(ctx context.Context, s *store.Store, getOAuthMgr func(string) (
 	return nil
 }
 
-// trimFolderFilter trims whitespace from folder names and removes empty
+// imapSyncFolderFilter uses saved exclusions unless command folder flags
+// replace the saved filter for this run.
+func imapSyncFolderFilter(ctx context.Context, s *store.Store, identifier string, state *invocation, folders, skipFolders []string) imaplib.Option {
+	folders = parseFolderFilter(folders)
+	skipFolders = parseFolderFilter(skipFolders)
+	cfg := state.cfg
+	if len(folders) == 0 && len(skipFolders) == 0 {
+		if len(cfg.Sync.IMAPSkipFolders) > 0 {
+			state.imapFolderAccounts.Do(func() {
+				sources, err := s.ListSourcesContext(ctx, sourceTypeIMAP)
+				if err != nil {
+					state.logger.Warn("could not check IMAP folder exclusion accounts", "error", err)
+					return
+				}
+				for account := range cfg.Sync.IMAPSkipFolders {
+					if !slices.ContainsFunc(sources, func(src *store.Source) bool { return src.Identifier == account }) {
+						state.logger.Warn("IMAP folder exclusions match no stored account; copy the ACCOUNT identifier from msgvault list-accounts", "account", account)
+					}
+				}
+			})
+		}
+		skipFolders = parseFolderFilter(cfg.Sync.IMAPSkipFolders[identifier])
+	}
+	return imaplib.WithFolderFilter(folders, skipFolders)
+}
+
+// parseFolderFilter trims whitespace from folder names and removes empty
 // entries. Returns nil when the input slice is empty.
 func parseFolderFilter(folders []string) []string {
 	if len(folders) == 0 {
@@ -940,12 +972,12 @@ func (p *CLIProgress) printProgress() {
 
 	if p.outputMode() == progressModePlain {
 		_, _ = fmt.Fprintf(p.writer(),
-			"  Scanned: %d | Added: %d | Skipped: %d | Rate: %.1f/s | Elapsed: %s%s\n",
+			"  Scanned: %07d | Added: %07d | Skipped: %07d | Rate: %.1f/s | Elapsed: %s%s\n",
 			p.processed, p.added, p.skipped, rate, elapsedStr, dateStr)
 		return
 	}
 	_, _ = fmt.Fprintf(p.writer(),
-		"\r  Scanned: %d | Added: %d | Skipped: %d | Rate: %.1f/s | Elapsed: %s%s    ",
+		"\r  Scanned: %07d | Added: %07d | Skipped: %07d | Rate: %.1f/s | Elapsed: %s%s    ",
 		p.processed, p.added, p.skipped, rate, elapsedStr, dateStr)
 }
 
@@ -1011,7 +1043,7 @@ func init() {
 	syncFullCmd.Flags().StringVar(&syncBefore, "before", "", "Only messages before this date (YYYY-MM-DD)")
 	syncFullCmd.Flags().StringVar(&syncAfter, "after", "", "Only messages after this date (YYYY-MM-DD)")
 	syncFullCmd.Flags().IntVar(&syncLimit, "limit", 0, "Limit number of messages (for testing)")
-	syncFullCmd.Flags().StringArrayVar(&syncFolders, "folder", []string{}, "IMAP folder to scan (repeatable)")
-	syncFullCmd.Flags().StringArrayVar(&syncSkipFolders, "skip-folder", []string{}, "IMAP folder to skip (repeatable)")
+	syncFullCmd.Flags().StringArrayVar(&syncFolders, "folder", []string{}, "IMAP folder to scan; either folder flag replaces saved exclusions for this run (repeatable)")
+	syncFullCmd.Flags().StringArrayVar(&syncSkipFolders, "skip-folder", []string{}, "IMAP folder to skip; either folder flag replaces saved exclusions for this run (repeatable)")
 	rootCmd.AddCommand(addManualSyncCacheFlags(syncFullCmd))
 }

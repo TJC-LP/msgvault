@@ -8,6 +8,10 @@ export type GetSubAggregatesParams = {
    */
   view_type: string;
   /**
+   * JSON list of account scopes that intersect, for structured clients
+   */
+  account_scopes?: string;
+  /**
    * Sort field: count, size, attachment_size, or name
    */
   sort?: string;
@@ -40,7 +44,7 @@ export type GetSubAggregatesParams = {
    */
   hide_deleted?: boolean;
   /**
-   * Search query
+   * Search query; full text accepts standalone pipe-separated OR alternatives
    */
   search_query?: string;
   /**

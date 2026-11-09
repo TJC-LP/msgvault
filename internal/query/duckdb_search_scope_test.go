@@ -1,7 +1,6 @@
 package query
 
 import (
-	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -9,7 +8,28 @@ import (
 	"go.kenn.io/msgvault/internal/search"
 )
 
+func TestDuckDBSearchFastPipeOR(t *testing.T) {
+	t.Parallel()
+	b := NewTestDataBuilder(t)
+	b.AddSource("test@example.com")
+	first := b.AddMessage(MessageOpt{Subject: "alpha beta"})
+	second := b.AddMessage(MessageOpt{Subject: "gamma"})
+	b.AddMessage(MessageOpt{Subject: "alpha only"})
+	other := b.AddSource("other@example.com")
+	b.AddMessage(MessageOpt{Subject: "gamma", SourceID: other})
+	engine := b.BuildEngine()
+	q := search.ParseOR("alpha beta | gamma")
+	filter := MessageFilter{SourceIDs: []int64{1}, HideDeletedFromSource: true}
+	rows, err := engine.SearchFast(t.Context(), q, filter, 50, 0)
+	require.NoError(t, err)
+	assertMessageIDs(t, rows, []int64{first, second})
+	count, err := engine.SearchFastCount(t.Context(), q, filter)
+	require.NoError(t, err)
+	assert.Equal(t, int64(2), count)
+}
+
 func TestDuckDBSearchFast_RecipientMetadata(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	b := NewTestDataBuilder(t)
@@ -22,17 +42,18 @@ func TestDuckDBSearchFast_RecipientMetadata(t *testing.T) {
 	engine := b.BuildEngine()
 
 	q := &search.Query{TextTerms: []string{"recipientneedle"}}
-	messages, err := engine.SearchFast(context.Background(), q, MessageFilter{}, 50, 0)
+	messages, err := engine.SearchFast(t.Context(), q, MessageFilter{}, 50, 0)
 	require.NoError(err, "SearchFast")
 	require.Len(messages, 1, "recipient metadata hit")
 	assert.Equal(messageID, messages[0].ID, "recipient metadata hit ID")
 
-	count, err := engine.SearchFastCount(context.Background(), q, MessageFilter{})
+	count, err := engine.SearchFastCount(t.Context(), q, MessageFilter{})
 	require.NoError(err, "SearchFastCount")
 	assert.Equal(int64(len(messages)), count, "result/count agreement")
 }
 
 func TestDuckDBSearchFast_AllFromParticipantsMetadata(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	b := NewTestDataBuilder(t)
@@ -45,17 +66,18 @@ func TestDuckDBSearchFast_AllFromParticipantsMetadata(t *testing.T) {
 	engine := b.BuildEngine()
 
 	q := &search.Query{TextTerms: []string{"secondaryneedle"}}
-	messages, err := engine.SearchFast(context.Background(), q, MessageFilter{}, 50, 0)
+	messages, err := engine.SearchFast(t.Context(), q, MessageFilter{}, 50, 0)
 	require.NoError(err, "SearchFast")
 	require.Len(messages, 1, "secondary from participant metadata hit")
 	assert.Equal(messageID, messages[0].ID, "secondary from participant hit ID")
 
-	count, err := engine.SearchFastCount(context.Background(), q, MessageFilter{})
+	count, err := engine.SearchFastCount(t.Context(), q, MessageFilter{})
 	require.NoError(err, "SearchFastCount")
 	assert.Equal(int64(len(messages)), count, "result/count agreement")
 }
 
 func TestDuckDBSearchFast_DomainFilterTreatsWildcardsLiterally(t *testing.T) {
+	t.Parallel()
 	b := NewTestDataBuilder(t)
 	b.AddSource("test@example.com")
 	wantedSenderID := b.AddParticipant("sender@team_ops.example", "team_ops.example", "Wanted Sender")
@@ -69,7 +91,7 @@ func TestDuckDBSearchFast_DomainFilterTreatsWildcardsLiterally(t *testing.T) {
 	b.AddFrom(secondaryMatchMessageID, wantedSenderID, "Wanted Sender")
 	engine := b.BuildEngine()
 
-	messages, err := engine.SearchFast(context.Background(), search.Parse("domain filter needle"), MessageFilter{
+	messages, err := engine.SearchFast(t.Context(), search.Parse("domain filter needle"), MessageFilter{
 		Domain: "team_ops.example",
 	}, 50, 0)
 	require.NoError(t, err)
@@ -81,9 +103,10 @@ func TestDuckDBSearchFast_DomainFilterTreatsWildcardsLiterally(t *testing.T) {
 }
 
 func TestDuckDBSearchFast_AppliesCompleteViewFilter(t *testing.T) {
+	t.Parallel()
 	t.Run("sender name", func(t *testing.T) {
 		engine := newParquetEngine(t)
-		messages, err := engine.SearchFast(context.Background(), search.Parse("Preview"), MessageFilter{
+		messages, err := engine.SearchFast(t.Context(), search.Parse("Preview"), MessageFilter{
 			SenderName: "Alice",
 		}, 50, 0)
 		require.NoError(t, err)
@@ -92,7 +115,7 @@ func TestDuckDBSearchFast_AppliesCompleteViewFilter(t *testing.T) {
 
 	t.Run("recipient name", func(t *testing.T) {
 		engine := newParquetEngine(t)
-		messages, err := engine.SearchFast(context.Background(), search.Parse("Preview"), MessageFilter{
+		messages, err := engine.SearchFast(t.Context(), search.Parse("Preview"), MessageFilter{
 			RecipientName: "Bob",
 		}, 50, 0)
 		require.NoError(t, err)
@@ -101,7 +124,7 @@ func TestDuckDBSearchFast_AppliesCompleteViewFilter(t *testing.T) {
 
 	t.Run("empty sender", func(t *testing.T) {
 		engine := newEmptyBucketsEngine(t)
-		messages, err := engine.SearchFast(context.Background(), search.Parse("No"), MessageFilter{
+		messages, err := engine.SearchFast(t.Context(), search.Parse("No"), MessageFilter{
 			EmptyValueTargets: map[ViewType]bool{ViewSenders: true},
 		}, 50, 0)
 		require.NoError(t, err)
@@ -110,6 +133,7 @@ func TestDuckDBSearchFast_AppliesCompleteViewFilter(t *testing.T) {
 }
 
 func TestDuckDBSearchFast_UnscopedIncludesCachedMessageTypes(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	b := NewTestDataBuilder(t)
@@ -141,7 +165,7 @@ func TestDuckDBSearchFast_UnscopedIncludesCachedMessageTypes(t *testing.T) {
 	})
 	b.SetEmptyAttachments()
 	engine := b.BuildEngine()
-	ctx := context.Background()
+	ctx := t.Context()
 
 	q := search.Parse("cachewide needle")
 	messages, err := engine.SearchFast(ctx, q, MessageFilter{}, 50, 0)
@@ -223,23 +247,26 @@ func TestDuckDBSearchFast_UnscopedIncludesCachedMessageTypes(t *testing.T) {
 }
 
 func TestDuckDBSearchMessageBodies_DelegatesToDirectSQLite(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	env := newTestEnv(t)
 	env.EnableFTS()
 	engine := &DuckDBEngine{sqliteEngine: env.Engine}
 
-	messages, err := engine.SearchMessageBodies(context.Background(),
+	messages, err := engine.SearchMessageBodies(
+		t.Context(),
 		&search.Query{TextTerms: []string{"body 1"}}, 50, 0)
 	require.NoError(err, "SearchMessageBodies")
-	require.Len(messages, 1, "body-only hit")
-	assert.Equal(int64(1), messages[0].ID, "body-only hit ID")
-	require.NotEmpty(messages[0].BodyContextSnippets, "body-only hit context")
-	assert.Contains(messages[0].BodyContextSnippets[0], "body 1")
+	require.Len(messages.Messages, 1, "body-only hit")
+	assert.Equal(int64(1), messages.Messages[0].ID, "body-only hit ID")
+	require.NotEmpty(messages.Messages[0].BodyContextSnippets, "body-only hit context")
+	assert.Contains(messages.Messages[0].BodyContextSnippets[0], "body 1")
 }
 
 func TestDuckDBSearchMessageBodies_RequiresDirectSQLite(t *testing.T) {
-	_, err := (&DuckDBEngine{}).SearchMessageBodies(context.Background(),
+	t.Parallel()
+	_, err := (&DuckDBEngine{}).SearchMessageBodies(t.Context(),
 		&search.Query{TextTerms: []string{"needle"}}, 50, 0)
 	require.Error(t, err, "missing direct SQLite engine")
 	require.ErrorIs(t, err, ErrMessageBodySearchUnavailable)

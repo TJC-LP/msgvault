@@ -1,5 +1,5 @@
 ---
-last_edited: "2026-09-25"
+last_edited: "2026-10-29"
 title: Recommended Configuration
 description: Set up optional search and people features from your available provider keys, then check what still needs attention.
 ---
@@ -49,9 +49,9 @@ conversation briefs.
 | Key present                             | Lanes                                                                           | Model                                                                               | Notes                                                                                                                                                                                  |
 | --------------------------------------- | ------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `VOYAGE_API_KEY`                        | text search, semantic people search, visual attachments (after the probe)       | `voyage-context-4` (1024), `voyage-multimodal-3.5` (1024)                           | Beeper chats use conversation windows; meetings use speaker turns. Other messages share the generation as individual documents.                                                        |
-| `MISTRAL_API_KEY`                       | document extraction and lexical search; document vectors when a text lane is on | `mistral-ocr-4-0`, EU region                                                        | Uploads are manual-only and need the probe manifest plus `documents consent-mistral --yes`.                                                                                            |
+| `MISTRAL_API_KEY`                       | document extraction and lexical search; document vectors when a text lane is on | `mistral-ocr-4-1`, EU region                                                        | Uploads are manual-only and need the probe manifest plus `documents consent-mistral --yes`.                                                                                            |
 | `OPENAI_API_KEY`                        | text search only when no Voyage key      | `text-embedding-3-small` (1536)               | The OpenAI text path gives per-message vectors: no conversation-window context and no visual lane, both are Voyage-only endpoints.                                                     |
-| no key for the feature being configured | loopback Ollama at `[chat].server` when reachable                               | `nomic-embed-text` (768); the `[chat].model` for the sweep with `--allow-sensitive` | Text uses Ollama only without Voyage or OpenAI keys. Inference uses it without an OpenAI key, even when Voyage or Mistral is configured. The required model must already be installed. |
+| no key for the feature being configured | text: Ollama with `nomic-embed-text`, then the shared local server; sweep: loopback Ollama at `[chat].server`                               | `nomic-embed-text` (768); the `[chat].model` for the sweep with `--allow-sensitive` | Text uses Ollama only without Voyage or OpenAI keys. Inference uses it without an OpenAI key, even when Voyage or Mistral is configured. The Ollama model must already be installed. Setup asks before downloading missing files for the shared local server. |
 
 These are setup choices, not runtime failover. Adding a Voyage key does not
 replace an existing OpenAI text index, and an unavailable inference provider
@@ -126,6 +126,8 @@ source_since = "2025-01-01"      # January 1 of last year
 allow_sensitive = true
 request_timeout = "1m0s"
 ```
+
+Use `msgvault setup providers --local-embeddings` to switch text search to the shared local server. The same Nomic message recipe keeps its index. Another model requires a full rebuild. See [local embedding setup](vector-search.md) for separate document-vector and person-consent behavior.
 
 ### `[vector]` and `[vector.embeddings]`
 
@@ -247,7 +249,7 @@ configure; see [Configuration](/docs/configuration/#activity).
 Chat sources cap collection by conversation size: media from rooms above 20
 participants is skipped with a typed `participant_threshold` marker, direct and
 small-group media is kept. Set `media_max_participants = 0` on a source to lift
-the cap. The per-file default is 250 MiB for Beeper, Slack, and Teams, and 50
+the cap. The per-file default is 250 MiB for Beeper, Slack, Teams, and iMessage, and 50
 MiB for Discord. These limits also apply to existing configurations that omit
 the keys; setup does not need to write them. Explicit values and per-account
 overrides keep their configured policy. See
@@ -329,15 +331,15 @@ attributes. The plan describes this policy in both human and JSON output.
 `setup status` reads local configuration, the process environment, stored
 credentials, and archive consent records. It does not contact a provider. An
 `on` state means those setup checks passed; use the index's status command or
-[Web Operations](/docs/web-ui/#operations) to inspect build progress and
+[Settings Overview](/docs/web-ui/#settings-and-restart-behavior) to inspect build progress and
 coverage.
 
 ```text
-LANE                                      STATE    PROVIDER  MODEL             CONSENT  SCHEDULE
-Text search (messages, chats, meetings)   on       voyage    voyage-context-4  -        cron */15 * * * *, after each scheduled sync
-Semantic people search                    pending  voyage    voyage-context-4  missing  -
-Visual attachment search                  pending  -         -                 -        -
-Document attachments (...)                pending  mistral   mistral-ocr-4-0   missing  -
+LANE                                           STATE    PROVIDER  MODEL             CONSENT  SCHEDULE
+Search by meaning (messages, chats, meetings)  on       voyage    voyage-context-4  -        cron */15 * * * *, after each scheduled sync
+Semantic people search                         pending  voyage    voyage-context-4  missing  -
+Visual attachment search                       pending  -         -                 -        -
+Document attachments (...)                     pending  mistral   mistral-ocr-4-1   missing  -
 ```
 
 `pending` means the lane is configured or the key is present but an operator

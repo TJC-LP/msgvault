@@ -16,7 +16,13 @@ import (
 	"golang.org/x/oauth2"
 
 	"go.kenn.io/msgvault/internal/gmail"
+
+	"go.kenn.io/msgvault/internal/gcal/gcalmodel"
 )
+
+var ErrRateLimited = errors.New("calendar rate limited")
+
+var ErrUnauthorized = errors.New("unauthorized (401): token may be invalid")
 
 const (
 	defaultBaseURL = "https://www.googleapis.com/calendar/v3"
@@ -186,13 +192,13 @@ func (c *Client) request(ctx context.Context, op gmail.Operation, path string) (
 		case http.StatusTooManyRequests:
 			c.logger.Debug("calendar rate limited, backing off 30s", "path", path, "attempt", attempt)
 			c.rateLimiter.Throttle(30 * time.Second)
-			return nil, errors.New("rate limited (429)")
+			return nil, fmt.Errorf("rate limited (429): %w", ErrRateLimited)
 
 		case http.StatusForbidden:
 			if isRateLimitError(respBody) {
 				c.logger.Debug("calendar quota exceeded, backing off 60s", "path", path, "attempt", attempt)
 				c.rateLimiter.Throttle(60 * time.Second)
-				return nil, errors.New("quota exceeded (403)")
+				return nil, fmt.Errorf("quota exceeded (403): %w", ErrRateLimited)
 			}
 			return nil, backoff.Permanent(fmt.Errorf("forbidden (403): %s", string(respBody)))
 
@@ -201,7 +207,7 @@ func (c *Client) request(ctx context.Context, op gmail.Operation, path string) (
 			return nil, fmt.Errorf("server error (%d)", resp.StatusCode)
 
 		case http.StatusUnauthorized:
-			return nil, backoff.Permanent(errors.New("unauthorized (401): token may be invalid"))
+			return nil, backoff.Permanent(ErrUnauthorized)
 
 		case http.StatusGone:
 			return nil, backoff.Permanent(&GoneError{Path: path})
@@ -346,7 +352,7 @@ func decodeEventsPage(body []byte) (*EventsPage, error) {
 		TimeZone:      wire.TimeZone,
 	}
 	for _, raw := range wire.Items {
-		ev, err := decodeEvent(raw)
+		ev, err := gcalmodel.DecodeEvent(raw)
 		if err != nil {
 			return nil, fmt.Errorf("decode event: %w", err)
 		}
@@ -362,7 +368,7 @@ func (c *Client) GetEvent(ctx context.Context, calendarID, eventID string) (*Eve
 	if err != nil {
 		return nil, fmt.Errorf("events.get: %w", err)
 	}
-	ev, err := decodeEvent(body)
+	ev, err := gcalmodel.DecodeEvent(body)
 	if err != nil {
 		return nil, fmt.Errorf("decode event: %w", err)
 	}

@@ -532,7 +532,7 @@ func addSemanticSearchAttachment(
 		SourcePartKey: sourcePartKey,
 	}))
 	var attachmentID int64
-	require.NoError(t, fixture.Store.DB().QueryRow(fixture.Store.Rebind(
+	require.NoError(t, fixture.Store.DB().QueryRowContext(t.Context(), fixture.Store.Rebind(
 		`SELECT id FROM attachments WHERE message_id = ?`), messageID).Scan(&attachmentID))
 	return attachmentID
 }
@@ -559,6 +559,10 @@ type searchBackend struct {
 	hits     []Hit
 	err      error
 	searches []searchBackendCall
+}
+
+func (*searchBackend) UnpublishedTokens(context.Context, GenerationID, int, []string) (map[string]bool, error) {
+	return map[string]bool{}, nil
 }
 
 func (*searchBackend) PutUnpublished(context.Context, GenerationID, int, []Embedding) error {

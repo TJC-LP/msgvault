@@ -4,6 +4,10 @@
 
 export type GetGmailIDsByFilterParams = {
   /**
+   * JSON list of account scopes that intersect, for structured clients
+   */
+  account_scopes?: string;
+  /**
    * Sender email/address filter
    */
   sender?: string;
@@ -99,6 +103,10 @@ export type GetGmailIDsByFilterParams = {
    * Search mode: fast, deep, or aggregate; required with q
    */
   search_mode?: string;
+  /**
+   * Maximum results for bounded search-aware deletion resolution (max 100001)
+   */
+  max_results?: number;
   /**
    * Aggregate view type; required for aggregate search
    */

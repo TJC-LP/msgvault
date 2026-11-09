@@ -174,7 +174,11 @@ var KnownMessageTypes = []string{
 	"google_voice_call",
 	"google_voice_voicemail",
 	"beeper",
+	"chatwoot",
 	"slack",
+	"inline",
+	"matrix",
+	"telegram",
 }
 
 // IsKnownMessageType reports whether mt is a message_type value that msgvault

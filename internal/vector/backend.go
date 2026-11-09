@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"time"
+
+	"go.kenn.io/msgvault/internal/jobctx"
+	"go.kenn.io/msgvault/internal/search"
 )
 
 // GenerationID identifies one index generation.
@@ -13,6 +16,50 @@ type GenerationID int64
 // inputs. Providers may partially complete only a leading document prefix.
 type DocumentInput struct {
 	Chunks []string
+}
+
+// DocumentEmbedder embeds documents in one or more provider requests and
+// returns the completed leading document prefix with any error.
+type DocumentEmbedder interface {
+	EmbedDocuments(ctx context.Context, documents []DocumentInput) ([][][]float32, error)
+}
+
+// DocumentRequestEmbedder reports each packed request before dispatch and after completion.
+type DocumentRequestEmbedder interface {
+	DocumentEmbedder
+	EmbedDocumentRequests(ctx context.Context, documents []DocumentInput, started func(first, count int), completed DocumentRequestFunc) error
+}
+
+// DocumentRequestFunc receives one completed provider request: the index of
+// its first document and its documents' vectors. An error stops the requests
+// that remain.
+type DocumentRequestFunc func(first int, vectors [][][]float32) error
+
+// EmbedDocumentRequests calls started before dispatch, then passes each response to completed
+// before the next request is sent, so the caller can save it first. A
+// provider that does not expose its requests reports its completed prefix once.
+func EmbedDocumentRequests(
+	ctx context.Context, embedder DocumentEmbedder, documents []DocumentInput, started func(first, count int), completed DocumentRequestFunc,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if jobctx.PreemptionRequested(ctx) {
+		return jobctx.ErrYieldedToWaiter
+	}
+	if requests, ok := embedder.(DocumentRequestEmbedder); ok {
+		return requests.EmbedDocumentRequests(ctx, documents, started, completed)
+	}
+	if started != nil {
+		started(0, len(documents))
+	}
+	vectors, err := embedder.EmbedDocuments(ctx, documents)
+	if len(vectors) > 0 {
+		if completedErr := completed(0, vectors); completedErr != nil {
+			return errors.Join(completedErr, err)
+		}
+	}
+	return err
 }
 
 // SourceBasis identifies the source text used for chunk offsets.
@@ -201,6 +248,9 @@ type Chunk struct {
 //     `>= After` and `< Before`.
 //   - LargerThan/SmallerThan compare against m.size_estimate.
 type Filter struct {
+	// AccountScopes intersect; each matches its addresses or unattributed rows.
+	AccountScopes []search.AccountScope
+
 	MessageIDs         []int64   // exact bounded candidate population; empty = unrestricted
 	SourceIDs          []int64   // from [server/sources].identifier; empty = no source filter
 	ConversationIDs    []int64   // exact messages.conversation_id values; empty = unrestricted
@@ -216,6 +266,7 @@ type Filter struct {
 	LargerThan         *int64   // `larger:` — strictly greater than
 	SmallerThan        *int64   // `smaller:` — strictly less than
 	SubjectSubstrings  []string // one per `subject:` term (ANDed)
+	FilenameSubstrings []string // ANDed literal attachment-name substrings
 	ListIDSubstrings   []string // one per `list:` term (ANDed, literal substring)
 	ListID             string   // exact structured List-Id; empty = unrestricted
 	MessageTypes       []string // exact m.message_type values; empty = unrestricted
@@ -226,7 +277,7 @@ type Filter struct {
 // IsEmpty reports whether the filter has no restrictions. A zero-value
 // Filter is empty and backends should skip filter resolution entirely.
 func (f Filter) IsEmpty() bool {
-	return len(f.MessageIDs) == 0 &&
+	return len(f.AccountScopes) == 0 && len(f.MessageIDs) == 0 &&
 		len(f.SourceIDs) == 0 &&
 		len(f.ConversationIDs) == 0 &&
 		len(f.SenderGroups) == 0 &&
@@ -242,6 +293,7 @@ func (f Filter) IsEmpty() bool {
 		f.LargerThan == nil &&
 		f.SmallerThan == nil &&
 		len(f.SubjectSubstrings) == 0 &&
+		len(f.FilenameSubstrings) == 0 &&
 		len(f.ListIDSubstrings) == 0 &&
 		len(f.ListIDExactGroups) == 0 &&
 		f.ListID == "" &&
@@ -253,6 +305,9 @@ const MaxFilterMessageIDs = 2_000
 var ErrFilterTooLarge = errors.New("vector message ID filter exceeds 2000 IDs")
 
 func ValidateFilter(filter Filter) error {
+	if err := search.ValidateAccountScopes(filter.AccountScopes); err != nil {
+		return err
+	}
 	if len(filter.MessageIDs) > MaxFilterMessageIDs {
 		return ErrFilterTooLarge
 	}
@@ -312,8 +367,17 @@ type Stats struct {
 	StorageBytes int64
 }
 
+// BuildScopeBackend can pin coverage gates to a new scope over shared storage.
+// The original backend retains ownership of the shared storage handle.
+type BuildScopeBackend interface {
+	Backend
+	WithBuildScope(scope BuildScope) Backend
+}
+
 // Backend is the minimum contract a vector store must implement.
 type Backend interface {
+	EmbeddingCheckpoints() EmbeddingCheckpoints
+
 	// CreateGeneration starts (or resumes) a building generation.
 	// fingerprint is stored verbatim on the row; pass
 	// Config.GenerationFingerprint() so a later config change (model,
@@ -398,7 +462,10 @@ type Backend interface {
 // SearchMetadata reports bounded-search behavior that cannot be inferred from
 // result length. Exact backends may omit this optional capability.
 type SearchMetadata struct {
-	PoolSaturated bool
+	// CandidatePoolOmitted reports an eligible identity outside the retained
+	// union after a retrieval method actually exceeded KPerSignal.
+	CandidatePoolOmitted bool
+	PoolSaturated        bool
 	// Accelerator identifies the SQLite retrieval path: vec1_ivf_opq,
 	// exact-filter, exact, or exact-fallback. Other backends leave it empty.
 	Accelerator string
@@ -417,10 +484,34 @@ type MetadataSearchingBackend interface {
 }
 
 // FilteredCoverageBackend is the optional exact-coverage capability used by
-// analytical search. The caller resolves the canonical filtered population in
-// DuckDB; the vector backend intersects that population with one generation.
+// callers that resolve a canonical message-ID population in another database.
+// The vector backend intersects that population with one generation.
 type FilteredCoverageBackend interface {
 	EmbeddedMessageCountForIDs(ctx context.Context, gen GenerationID, messageIDs []int64) (int64, error)
+}
+
+// CoverageSnapshotBackend intersects a generation with live, stamped message
+// IDs captured from one main-database read snapshot. Implementations count only
+// the supplied population and do not re-read mutable message lifecycle state.
+// Callers page at FilteredCoverageBatchSize.
+type CoverageSnapshotBackend interface {
+	EmbeddedMessageCountForSnapshot(ctx context.Context, gen GenerationID, stampedMessageIDs []int64) (int64, error)
+}
+
+// EmbeddingCoverage partitions the in-scope live messages for one generation:
+// Stamped messages carry the generation's embed_gen, and Embedded counts the
+// stamped messages that also have at least one vector.
+type EmbeddingCoverage struct {
+	Live     int64
+	Stamped  int64
+	Embedded int64
+}
+
+// CoverageCountingBackend is implemented by backends whose vectors share the
+// main database. It reads every coverage count from one statement, so the
+// counts describe one snapshot without moving message IDs to the client.
+type CoverageCountingBackend interface {
+	EmbeddingCoverage(ctx context.Context, gen GenerationID, scope BuildScope) (EmbeddingCoverage, error)
 }
 
 // OrphanEmbeddingPruner removes message embeddings whose authoritative

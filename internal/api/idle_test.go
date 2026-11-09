@@ -53,7 +53,7 @@ func serveTrackedNoContent(t *testing.T, tracker *IdleTracker) *httptest.Respons
 	rec := httptest.NewRecorder()
 	tracker.Wrap(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
-	})).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	})).ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/", nil))
 	return rec
 }
 
@@ -65,8 +65,8 @@ func TestIdleTrackerExternalRequestResetsIdle(t *testing.T) {
 		synctest.Sleep(50 * time.Millisecond)
 		rec := serveTrackedNoContent(t, f.tracker)
 		require.Equal(t, http.StatusNoContent, rec.Code)
-		f.requireNotFiredWithin(t, 100*time.Millisecond, "idle fired before reset timeout elapsed")
-		f.requireFiredWithin(t, 300*time.Millisecond, "idle did not fire after external activity")
+		f.requireNotFiredWithin(t, 175*time.Millisecond, "idle fired before reset timeout elapsed")
+		f.requireFiredWithin(t, 50*time.Millisecond, "idle did not fire after external activity")
 	})
 }
 
@@ -87,15 +87,17 @@ func TestIdleTrackerInternalWorkBlocksIdle(t *testing.T) {
 
 func TestIdleTrackerRejectsRequestsAfterDrainStarts(t *testing.T) {
 	t.Parallel()
-	f := newIdleTrackerFixture(t, 1*time.Millisecond)
-	f.run(t)
+	synctest.Test(t, func(t *testing.T) {
+		f := newIdleTrackerFixture(t, 1*time.Millisecond)
+		f.run(t)
 
-	f.requireFiredWithin(t, time.Second, "idle did not fire")
+		f.requireFiredWithin(t, time.Second, "idle did not fire")
 
-	rec := serveTrackedNoContent(t, f.tracker)
-	assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
+		rec := serveTrackedNoContent(t, f.tracker)
+		assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
 
-	done, ok := f.tracker.BeginWork()
-	assert.False(t, ok, "BeginWork after draining")
-	done()
+		done, ok := f.tracker.BeginWork()
+		assert.False(t, ok, "BeginWork after draining")
+		done()
+	})
 }

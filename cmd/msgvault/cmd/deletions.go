@@ -694,14 +694,16 @@ func isDeleteStagedUsageError(err error) bool {
 }
 
 func resolveDeleteStagedTarget(
+	ctx context.Context,
 	st *store.Store,
 	manifests []*deletion.Manifest,
 	requestedAccount string,
 ) (deleteStagedTarget, error) {
-	return resolveDeleteStagedTargetWithSourceID(st, manifests, requestedAccount, 0, false)
+	return resolveDeleteStagedTargetWithSourceID(ctx, st, manifests, requestedAccount, 0, false)
 }
 
 func resolveDeleteStagedTargetWithSourceID(
+	ctx context.Context,
 	st *store.Store,
 	manifests []*deletion.Manifest,
 	requestedAccount string,
@@ -728,7 +730,7 @@ func resolveDeleteStagedTargetWithSourceID(
 	}
 
 	if durable != nil {
-		source, err := st.GetSourceByTypeAndIdentifier(durable.Type, durable.Identifier)
+		source, err := st.GetSourceByTypeAndIdentifier(ctx, durable.Type, durable.Identifier)
 		if err != nil {
 			return deleteStagedTarget{}, err
 		}
@@ -736,7 +738,7 @@ func resolveDeleteStagedTargetWithSourceID(
 			return deleteStagedTarget{}, fmt.Errorf("source %d is not a gmail, imap or msmail source", source.ID)
 		}
 		if requestedSourceIDSet {
-			selected, selectErr := sourceops.ResolveExactOne(st, sourceops.Selector{
+			selected, selectErr := sourceops.ResolveExactOneContext(ctx, st, sourceops.Selector{
 				SourceID: requestedSourceID, SourceIDSet: true,
 			})
 			if selectErr != nil {
@@ -749,7 +751,7 @@ func resolveDeleteStagedTargetWithSourceID(
 			}
 		}
 		if strings.TrimSpace(requestedAccount) != "" {
-			selected, selectErr := sourceops.ResolveExactOne(st, sourceops.Selector{Account: requestedAccount})
+			selected, selectErr := sourceops.ResolveExactOneContext(ctx, st, sourceops.Selector{Account: requestedAccount})
 			if selectErr != nil {
 				return deleteStagedTarget{}, selectErr
 			}
@@ -784,7 +786,7 @@ func resolveDeleteStagedTargetWithSourceID(
 			selector.Account = account
 		}
 	}
-	source, err := sourceops.ResolveExactOne(st, selector)
+	source, err := sourceops.ResolveExactOneContext(ctx, st, selector)
 	if err != nil {
 		return deleteStagedTarget{}, err
 	}
@@ -802,24 +804,24 @@ func resolveDeleteStagedTargetWithSourceID(
 
 // canDeleteAtSource reports whether delete-staged has a client for a source type.
 func canDeleteAtSource(sourceType string) bool {
-	return sourceType == sourceTypeGmail || sourceType == sourceTypeIMAP || sourceType == sourceTypeMSMail
+	return slices.Contains(sourceops.ExecutableDeletionSourceTypes(), sourceType)
 }
 
 type deleteStagedScopeEscalation struct {
 	Needed            bool
 	Account           string
 	BatchDelete       bool
-	ClientSecretsPath string
+	ClientSecretsPath config.OAuthApp
 	Headline          string
 	BodyLines         []string
 	CancelHint        string
 }
 
-func deleteStagedScopeEscalationForSource(
+func deleteStagedScopeEscalationForSource(ctx context.Context,
 	account string,
 	src *store.Source,
 	permanent bool,
-	clientSecretsPath string,
+	clientSecretsPath config.OAuthApp,
 	state *invocation,
 ) (deleteStagedScopeEscalation, error) {
 	if src == nil || src.SourceType != sourceTypeGmail {
@@ -829,21 +831,25 @@ func deleteStagedScopeEscalationForSource(
 	if permanent {
 		requiredScopes = oauth.ScopesDeletion
 	}
-	state = invocationState(context.Background(), state)
+	state = invocationState(ctx, state)
 	if state == nil || state.cfg == nil || state.logger == nil {
 		return deleteStagedScopeEscalation{}, errors.New("configuration is unavailable")
 	}
-	oauthMgr, err := oauth.NewManagerWithScopes(clientSecretsPath, state.cfg.TokensDir(), state.logger, requiredScopes)
+	oauthMgr, err := oauth.NewManagerWithCredentials(ctx, clientSecretsPath, state.cfg.TokensDir(), state.cfg.OAuth.Tokens, state.logger, requiredScopes)
 	if err != nil {
 		return deleteStagedScopeEscalation{}, wrapOAuthError(fmt.Errorf("create oauth manager: %w", err), state.cfg)
 	}
-	if !oauthMgr.HasScopeMetadata(account) {
-		if permanent && oauthMgr.HasToken(account) {
+	info, err := oauthMgr.InspectToken(ctx, account)
+	if err != nil && oauthMgr.CommandTokens() {
+		return deleteStagedScopeEscalation{}, err
+	}
+	if len(info.Scopes) == 0 {
+		if permanent && info.Exists {
 			return newDeleteStagedScopeEscalation(account, permanent, clientSecretsPath), nil
 		}
 		return deleteStagedScopeEscalation{}, nil
 	}
-	if grantCoversDeletion(oauthMgr.GrantedScopes(account), permanent) {
+	if grantCoversDeletion(info.Scopes, permanent) {
 		return deleteStagedScopeEscalation{}, nil
 	}
 	return newDeleteStagedScopeEscalation(account, permanent, clientSecretsPath), nil
@@ -902,7 +908,7 @@ func grantCoversDeletion(grantedScopes []string, permanent bool) bool {
 func newDeleteStagedScopeEscalation(
 	account string,
 	permanent bool,
-	clientSecretsPath string,
+	clientSecretsPath config.OAuthApp,
 ) deleteStagedScopeEscalation {
 	bodyLines, cancelHint := deletionScopeEscalationPrompt(permanent)
 	return deleteStagedScopeEscalation{
@@ -946,7 +952,7 @@ Examples:
   msgvault delete-staged                 # With durable config consent
   msgvault delete-staged batch-123       # With durable config consent
   msgvault delete-staged --permanent     # With durable config consent
-	MSGVAULT_ENABLE_REMOTE_DELETE=1 msgvault delete-staged --yes  # One command`,
+  MSGVAULT_ENABLE_REMOTE_DELETE=1 msgvault delete-staged --yes  # One command`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		state := invocationFromCommand(cmd)
 		if state == nil || state.cfg == nil {
@@ -1016,7 +1022,7 @@ Examples:
 		manager := plan.Manager
 		manifests := plan.Manifests
 
-		release, err := acquireDirectSQLiteWriteLock(cfg, state)
+		release, err := acquireDirectSQLiteWriteLock(cmd.Context(), cfg, state)
 		if err != nil {
 			return err
 		}
@@ -1041,6 +1047,7 @@ Examples:
 		// remote call, while the direct write lock keeps the source catalog
 		// stable for the duration of the command.
 		target, err := resolveDeleteStagedTargetWithSourceID(
+			cmd.Context(),
 			s, manifests, deleteAccount, deleteSourceID, cmd.Flags().Changed("source-id"),
 		)
 		if err != nil {
@@ -1081,7 +1088,7 @@ Examples:
 		// buildAPIClient uses standard scopes; deletion may need elevated ones.
 		// Service-account flows get scopes via the JWT assertion (no stored
 		// token), so the scope-escalation prompt only applies to browser OAuth.
-		var clientSecretsPath string
+		var clientSecretsPath config.OAuthApp
 		if src.SourceType == sourceTypeGmail {
 			if !cfg.OAuth.HasAnyConfig() {
 				return errOAuthNotConfigured(cfg)
@@ -1090,12 +1097,12 @@ Examples:
 			isServiceAccount := cfg.OAuth.ServiceAccountKeyFor(appName) != ""
 
 			if !isServiceAccount {
-				clientSecretsPath, err = cfg.OAuth.ClientSecretsFor(appName)
+				clientSecretsPath, err = cfg.OAuth.CredentialsFor(appName)
 				if err != nil {
 					return err
 				}
 
-				escalation, err := deleteStagedScopeEscalationForSource(account, src, deletePermanent, clientSecretsPath, state)
+				escalation, err := deleteStagedScopeEscalationForSource(ctx, account, src, deletePermanent, clientSecretsPath, state)
 				if err != nil {
 					return err
 				}
@@ -1136,11 +1143,11 @@ Examples:
 		}
 
 		// Build API client — reuses the same factory as sync.
-		getOAuthMgr := func(appName string) (*oauth.Manager, error) {
+		getOAuthMgr := func(ctx context.Context, appName string) (*oauth.Manager, error) {
 			secretsPath := clientSecretsPath
-			if secretsPath == "" {
+			if secretsPath.ClientSecrets == "" && secretsPath.ClientSecretsCommand == nil {
 				var err error
-				secretsPath, err = cfg.OAuth.ClientSecretsFor(appName)
+				secretsPath, err = cfg.OAuth.CredentialsFor(appName)
 				if err != nil {
 					return nil, err
 				}
@@ -1149,7 +1156,7 @@ Examples:
 			if deletePermanent {
 				scopes = oauth.ScopesDeletion
 			}
-			return oauth.NewManagerWithScopes(secretsPath, cfg.TokensDir(), logger, scopes)
+			return oauth.NewManagerWithCredentials(ctx, secretsPath, cfg.TokensDir(), cfg.OAuth.Tokens, logger, scopes)
 		}
 		// For permanent deletion (not trash), service-account flows need the
 		// elevated mail.google.com scope; trash-only uses the standard set.
@@ -1270,7 +1277,7 @@ Examples:
 			fmt.Println("\nDeletion complete!")
 			return nil
 		}, func() error {
-			return rebuildCacheAfterWrite(dbPath, state)
+			return rebuildCacheAfterWrite(ctx, dbPath, state)
 		})
 	},
 }
@@ -1404,7 +1411,7 @@ func preflightDeleteStagedScopeEscalation(ctx context.Context, plan *daemonclien
 	if plan.ScopeEscalationSourceType == sourceTypeMSMail {
 		return authorizeGraphMailWrite(ctx, plan.ScopeEscalationAccount, state)
 	}
-	clientSecretsPath, err := state.cfg.OAuth.ClientSecretsFor(plan.ScopeEscalationOAuthApp)
+	clientSecretsPath, err := state.cfg.OAuth.CredentialsFor(plan.ScopeEscalationOAuthApp)
 	if err != nil {
 		return err
 	}
@@ -1488,7 +1495,7 @@ func planCLIDeleteStaged(
 	cfg := state.cfg
 	var resolvedSource *store.Source
 	if req.SourceID != nil {
-		resolved, err := sourceops.ResolveExactOne(st, sourceops.Selector{
+		resolved, err := sourceops.ResolveExactOneContext(ctx, st, sourceops.Selector{
 			Account: req.Account, SourceID: *req.SourceID, SourceIDSet: true,
 		})
 		if err != nil {
@@ -1496,7 +1503,7 @@ func planCLIDeleteStaged(
 		}
 		resolvedSource = resolved
 	} else if strings.TrimSpace(req.Account) != "" {
-		resolved, err := sourceops.ResolveExactOne(st, sourceops.Selector{Account: req.Account})
+		resolved, err := sourceops.ResolveExactOneContext(ctx, st, sourceops.Selector{Account: req.Account})
 		if err != nil {
 			return api.CLIDeleteStagedPlanResponse{}, err
 		}
@@ -1528,6 +1535,7 @@ func planCLIDeleteStaged(
 	}
 	if plan.NeedsExecution && req.RemoteDeleteEnabled {
 		target, err := resolveDeleteStagedTargetWithSourceID(
+			ctx,
 			st, plan.Manifests, "", resolvedSourceID, resolvedSource != nil,
 		)
 		if err != nil {
@@ -1553,11 +1561,11 @@ func planCLIDeleteStaged(
 			}
 			appName := sourceOAuthApp(target.Source)
 			if cfg.OAuth.ServiceAccountKeyFor(appName) == "" {
-				clientSecretsPath, err := cfg.OAuth.ClientSecretsFor(appName)
+				clientSecretsPath, err := cfg.OAuth.CredentialsFor(appName)
 				if err != nil {
 					return api.CLIDeleteStagedPlanResponse{}, err
 				}
-				escalation, err := deleteStagedScopeEscalationForSource(target.Account, target.Source, req.Permanent, clientSecretsPath, state)
+				escalation, err := deleteStagedScopeEscalationForSource(ctx, target.Account, target.Source, req.Permanent, clientSecretsPath, state)
 				if err != nil {
 					return api.CLIDeleteStagedPlanResponse{}, err
 				}
@@ -1777,7 +1785,7 @@ func promptScopeEscalation(
 	headline string,
 	bodyLines []string,
 	cancelHint string,
-	clientSecretsPath string,
+	mgr *oauth.Manager,
 ) error {
 	ok, err := promptScopeEscalationConfirmation(os.Stdin, os.Stdout, headline, bodyLines, cancelHint)
 	if err != nil {
@@ -1787,19 +1795,15 @@ func promptScopeEscalation(
 		return errUserCanceled
 	}
 
-	return authorizeScopeEscalation(ctx, account, requiredScopes, clientSecretsPath)
+	return authorizeScopeEscalation(ctx, account, requiredScopes, mgr)
 }
 
 func authorizeScopeEscalation(
 	ctx context.Context,
 	account string,
 	requiredScopes []string,
-	clientSecretsPath string,
+	mgr *oauth.Manager,
 ) error {
-	state := invocationFromContext(ctx)
-	if state == nil || state.cfg == nil || state.logger == nil {
-		return errors.New("configuration is unavailable")
-	}
 	// Re-authorize with the upgraded scope set. We deliberately do NOT delete
 	// the existing token first: Authorize overwrites it atomically only after a
 	// successful, validated grant, so the old token survives a cancelled or
@@ -1807,12 +1811,7 @@ func authorizeScopeEscalation(
 	fmt.Println("\nStarting OAuth flow...")
 	fmt.Println()
 
-	newMgr, err := oauth.NewManagerWithScopes(clientSecretsPath, state.cfg.TokensDir(), state.logger, requiredScopes)
-	if err != nil {
-		return fmt.Errorf("create oauth manager: %w", err)
-	}
-
-	if err := newMgr.Authorize(ctx, account); err != nil {
+	if err := mgr.WithScopes(requiredScopes).Authorize(ctx, account); err != nil {
 		return fmt.Errorf("authorize: %w", err)
 	}
 
@@ -1822,22 +1821,22 @@ func authorizeScopeEscalation(
 
 // promptDeletionScopeEscalation is the deletion-specific wrapper that maps the
 // batchDelete bool to the right scopes/copy and delegates to the generic helper.
-func promptDeletionScopeEscalation(ctx context.Context, account string, batchDelete bool, clientSecretsPath string) error {
-	requiredScopes, err := deletionEscalationScopesForAccountWithState(ctx, account, batchDelete, clientSecretsPath)
+func promptDeletionScopeEscalation(ctx context.Context, account string, batchDelete bool, clientSecretsPath config.OAuthApp) error {
+	requiredScopes, mgr, err := deletionEscalationSelection(ctx, account, batchDelete, clientSecretsPath)
 	if err != nil {
 		return err
 	}
 	bodyLines, cancelHint := deletionScopeEscalationPrompt(batchDelete)
 	return promptScopeEscalation(ctx, account, requiredScopes,
-		deleteStagedScopeEscalationHeadline, bodyLines, cancelHint, clientSecretsPath)
+		deleteStagedScopeEscalationHeadline, bodyLines, cancelHint, mgr)
 }
 
-func authorizeDeletionScopeEscalation(ctx context.Context, account string, batchDelete bool, clientSecretsPath string) error {
-	requiredScopes, err := deletionEscalationScopesForAccountWithState(ctx, account, batchDelete, clientSecretsPath)
+func authorizeDeletionScopeEscalation(ctx context.Context, account string, batchDelete bool, clientSecretsPath config.OAuthApp) error {
+	requiredScopes, mgr, err := deletionEscalationSelection(ctx, account, batchDelete, clientSecretsPath)
 	if err != nil {
 		return err
 	}
-	return authorizeScopeEscalation(ctx, account, requiredScopes, clientSecretsPath)
+	return authorizeScopeEscalation(ctx, account, requiredScopes, mgr)
 }
 
 func deletionScopeEscalationPrompt(batchDelete bool) ([]string, string) {
@@ -1863,24 +1862,25 @@ func deletionScopeEscalationPrompt(batchDelete bool) ([]string, string) {
 	}, "Cancelled. Drop --permanent to use trash deletion without elevated permissions."
 }
 
-func deletionEscalationScopesForAccount(account string, batchDelete bool, clientSecretsPath string, state *invocation) ([]string, error) {
-	ctx := context.Background()
-	if state != nil {
-		ctx = withInvocation(ctx, state)
-	}
-	return deletionEscalationScopesForAccountWithState(ctx, account, batchDelete, clientSecretsPath)
+func deletionEscalationScopesForAccountWithState(ctx context.Context, account string, batchDelete bool, credentials config.OAuthApp) ([]string, error) {
+	scopes, _, err := deletionEscalationSelection(ctx, account, batchDelete, credentials)
+	return scopes, err
 }
 
-func deletionEscalationScopesForAccountWithState(ctx context.Context, account string, batchDelete bool, clientSecretsPath string) ([]string, error) {
+func deletionEscalationSelection(ctx context.Context, account string, batchDelete bool, credentials config.OAuthApp) ([]string, *oauth.Manager, error) {
 	state := invocationFromContext(ctx)
 	if state == nil || state.cfg == nil || state.logger == nil {
-		return nil, errors.New("configuration is unavailable")
+		return nil, nil, errors.New("configuration is unavailable")
 	}
-	mgr, err := oauth.NewManagerWithScopes(clientSecretsPath, state.cfg.TokensDir(), state.logger, oauth.ScopesGmailCalendar)
+	mgr, err := oauth.NewManagerWithCredentials(ctx, credentials, state.cfg.TokensDir(), state.cfg.OAuth.Tokens, state.logger, oauth.ScopesGmailCalendar)
 	if err != nil {
-		return nil, fmt.Errorf("create oauth manager: %w", err)
+		return nil, nil, fmt.Errorf("create oauth manager: %w", err)
 	}
-	return deletionEscalationScopes(batchDelete, mgr.GrantedScopes(account)), nil
+	info, err := mgr.InspectToken(ctx, account)
+	if err != nil && mgr.CommandTokens() {
+		return nil, nil, err
+	}
+	return deletionEscalationScopes(batchDelete, info.Scopes), mgr.WithTokenInfo(account, info), nil
 }
 
 func deletionEscalationScopes(batchDelete bool, existingScopes []string) []string {

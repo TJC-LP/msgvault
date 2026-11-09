@@ -35,7 +35,7 @@ A same-service, same-scope username match can become a review candidate instead
 of an automatic link. Conflicting existing bindings remain conflicts. This is
 why two entries for the same person may stay separate after a sync.
 
-Open the Web [Directory review queues](/docs/web-ui/#directory-and-reviews) to inspect
+Open the Web [People: Possible duplicates](/docs/web-ui/#saved-profiles-and-possible-duplicates) to inspect
 identity candidates and accept or reject the proposed match. Check the source
 and identifier evidence before linking. See [people and source identities](/docs/usage/people/)
 for the difference between an observed participant and a curated profile.
@@ -101,6 +101,27 @@ are only picked up by `--full` runs.
 | `--full` | `false` | Ignore stored cursors and re-fetch every message (repairs rows in place) |
 | `--no-media` | `false` | Skip attachment downloads for this run |
 
+### Failed chats
+
+A chat page or attachment that fails to download does not stop the sync. The
+account's summary reports an error count, followed by the chats behind it:
+
+```text
+  signal done in 2m14s: 812 chats, 5310 messages (402 added), 54 errors
+  Failed chats (49 errors in 2 chats):
+    Book Club (!abc:beeper.local): 36 attachment, 2 fetch errors; last: asset download timed out
+    !def:beeper.local: 11 fetch errors; last: connect to Beeper Desktop refused
+  5 other errors aren't listed by chat; re-run to retry.
+  Retry with the same global options (such as --local):
+    fetch errors: msgvault sync-beeper --account signal
+    attachment errors: msgvault backfill-beeper-media --account signal
+```
+
+Each chat line shows its title or Beeper chat ID, error count, failed steps,
+and newest error. Counts cover the whole run; up to 20 chats are shown.
+A separate line counts errors with no chat. Keep the same global options, such
+as `--local`, when retrying that account's failures.
+
 ## What is archived
 
 - Message text, sender, timestamps, and per-network conversation threads
@@ -137,9 +158,34 @@ excluded markers, which become eligible when the policy allows them.
 Some networks delete old media from their servers. WhatsApp, for example,
 reports `Media is no longer available`. msgvault requests such a file once,
 records it as `unavailable` with reason `source_unavailable`, and never retries
-it. Sync and backfill summaries report these as "media no longer available at
-source". Other failed downloads get at most three attempts per run and stay
-pending for the next backfill.
+it.
+
+Beeper can also report `Media not found`, `M_NOT_FOUND`, or
+`failed to download file: HTTP 404`, sometimes wrapped in an HTTP 502 response.
+A plain HTTP 404 that names none of these is an ordinary failed download.
+msgvault stops retrying a not-found download for the current run, but the
+marker stays pending: a not-found alone never ends retries for good. It only becomes
+terminal once the message is at least 30 days old and a separate, later sync
+or backfill run gets not-found again for the same attachment. Anything else
+in between resets this: a successful download clears the history, and a
+different kind of error means the next not-found starts the count over, not
+continues it. Recent media stays pending no matter how many times it
+repeats. Missing or future message timestamps also leave the download
+retryable.
+
+The age and repeat-on-a-separate-run requirement limit how many requests an
+old missing file ever gets. Neither proves the file is permanently gone: an
+old file that later returns stays skipped, including during
+`sync-beeper --full`, and two runs close enough together to both land
+inside one brief bridge outage can retire a file the bridge would otherwise
+have recovered. Sync and backfill summaries report newly terminal files as
+"media no longer available at source".
+
+A not-found costs one request per attachment per run. If a server error or
+throttling response comes before the not-found in the same run, msgvault
+records an ordinary failed download instead, and that starts the repeat count
+over. Other failed downloads get at most three attempts per attachment per run
+and stay pending for the next backfill.
 
 Because Beeper's API serves what Beeper Desktop has synced locally, archive
 depth equals your local Beeper history: a freshly added Beeper account may only
@@ -191,6 +237,10 @@ JOIN messages m ON m.id = a.message_id
 WHERE m.message_type = 'beeper'
 GROUP BY is_share;
 ```
+
+## Mirror all attachments to Docbank
+
+Mirror stored attachments from all sources with [attachment upload consent](../configuration.md#mirror-stored-attachments-to-docbank).
 
 ## Send audio to Docbank
 
@@ -307,6 +357,24 @@ FROM beeper_media_deliveries
 GROUP BY phase, coverage_state;
 ```
 
+### Read transcripts in the Web reader
+
+Open a conversation in the Web reader and expand a message with audio. Each
+recording shows its filename, size and transcript state. A ready transcript
+says whether it came from the provider or was generated, and marks partial
+text. Supplied text requires Docbank to identify the exact input sent for this
+recording, using its [supplied-input attribution](https://github.com/kenn-io/docbank/pull/825).
+Older servers that omit the identity show it as unavailable. The same happens
+when Docbank serves another input for the same audio, including after an edit is reverted.
+Lines show their start time and speaker when Docbank recorded them.
+The Web reader is the only client for now. Person-scoped Media and Files,
+search, CLI, TUI and MCP readers are later work. msgvault reads the text from
+Docbank while the message stays open and does not store it. The view refreshes
+every 2 to 30 seconds while visible and immediately when you return to the tab.
+Turning Docbank off keeps archived audio visible with transcript unavailable.
+Unmapped captured audio stays unavailable until discovery records processing work.
+Audio whose bytes are missing still says so; capture policy exclusions read unavailable.
+
 ## Scheduled sync
 
 Let the daemon run incremental syncs on a schedule:
@@ -370,6 +438,8 @@ separable (different sources and different `message_type` values), and
 participants still unify across archives via phone-number and email matching
 (the Beeper user ID is also persisted as an identifier, so later runs keep
 resolving to the same person).
+
+Telegram users also link to [Telegram Desktop imports](text-messages.md#import-telegram) by numeric user ID when a sync revisits their chat; `sync-beeper --full` covers quiet chats.
 
 ## Caveats
 

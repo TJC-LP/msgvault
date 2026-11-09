@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json/v2"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -44,6 +45,7 @@ type ActivityCandidate struct {
 	LastModified     time.Time
 	DateOnly         bool
 	Eligible         bool
+	Unsent           bool
 	// SourceIsFromMe is the message's source-native ownership flag. It is
 	// authoritative for outbound classification: a source that knows the
 	// archive owner sent a message outranks counterpart resolution, which can
@@ -110,15 +112,114 @@ const activityCandidateStateCTE = `
 		)
 	)`
 
-const activityCandidateColumns = `
+// activityUnsentSQL keeps sent copies eligible even when dedup retained draft
+// evidence. Saved IMAP Sent origin survives moves out of Sent.
+func (s *Store) activityUnsentSQL() string {
+	return activityUnsentInSchemaSQL(s.dialect, "")
+}
+
+func activityUnsentInSchemaSQL(dialect Dialect, schema string) string {
+	return `(NOT COALESCE(m.is_sent, TRUE) OR (` + draftEvidenceInSchemaSQL(schema, "m", "src") + `
+		AND NOT ` + sentConfirmedSQL(dialect, schema, "m", "src") + `))`
+}
+
+// sentConfirmedSQL is true when message m has saved IMAP Sent origin or a Sent
+// label of its own source, which stay after dedup retains draft evidence.
+func sentConfirmedSQL(dialect Dialect, schema, m, src string) string {
+	origin := m + `.metadata ->> 'imap_content_origin'`
+	if dialect.DriverName() != postgresDriverName {
+		origin = `CASE WHEN json_valid(` + m + `.metadata) THEN ` + m + `.metadata ->> 'imap_content_origin' END`
+	}
+	return `(COALESCE(` + origin + `, '') = 'sent'
+		OR EXISTS (SELECT 1 FROM ` + schema + `message_labels ml JOIN ` + schema + `labels l ON l.id = ml.label_id
+		WHERE ml.message_id = ` + m + `.id AND l.source_id = ` + m + `.source_id
+		  AND (` + sentFolderLabelSQL("l") + ` OR ` + sentGmailLabelSQL("l", src) + `)))`
+}
+
+func (s *Store) activityCandidateColumns() string {
+	return `
 	m.id, m.source_id, m.conversation_id,
 	COALESCE(c.conversation_type, ''), COALESCE(m.message_type, ''),
 	m.sent_at, m.received_at, m.internal_date, m.last_modified,
 	m.deleted_at, m.deleted_from_source_at, m.metadata,
-	COALESCE(m.source_is_from_me, FALSE),
+	COALESCE(m.source_is_from_me, FALSE), ` + s.activityUnsentSQL() + `,
 	r.identity_revision, r.account_identity_revision,
 	r.timezone_active, r.timezone_target, r.timezone_generation,
 	r.direct_limit_active, r.direct_limit_target, r.direct_limit_generation`
+}
+
+const activityConversationExpandMessages = 1000
+
+// ExpandActivityConversationQueueContext expands one bounded chunk of a dirty
+// conversation. Identity coordination precedes marker and message queue locks
+// so expansion serializes with source removal before either touches the queues.
+// The return value reports whether a marker was claimed.
+func (s *Store) ExpandActivityConversationQueueContext(ctx context.Context, checkpoint func() error) (bool, error) {
+	var pending bool
+	if err := s.db.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM activity_projection_conversation_queue)`).Scan(&pending); err != nil {
+		return false, fmt.Errorf("check activity conversation queue: %w", err)
+	}
+	if !pending {
+		return false, nil
+	}
+	if err := checkpoint(); err != nil {
+		return false, err
+	}
+	claimed := false
+	err := retryBusyWriteErr(ctx, s, "expand activity conversation queue", func() error {
+		claimed = false
+		return s.withAttributionTxContext(ctx, attributionLock{}, func(tx *loggedTx) error {
+			skipLocked := ""
+			if s.IsPostgreSQL() {
+				skipLocked = " FOR UPDATE SKIP LOCKED"
+			}
+			var conversationID, afterID int64
+			err := tx.QueryRowContext(ctx, s.dialect.Rebind(`
+				SELECT conversation_id, after_message_id FROM activity_projection_conversation_queue
+				ORDER BY conversation_id LIMIT ?`+skipLocked), 1).Scan(&conversationID, &afterID)
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil
+			}
+			if err != nil {
+				return fmt.Errorf("claim activity conversation: %w", err)
+			}
+			claimed = true
+			rows, err := tx.QueryContext(ctx, s.dialect.Rebind(requeueActivityProjectionSQL(`
+				SELECT id, 1, CURRENT_TIMESTAMP FROM messages
+				WHERE conversation_id = ? AND id > ? ORDER BY id LIMIT ?
+			`)+` RETURNING message_id`), conversationID, afterID, activityConversationExpandMessages)
+			if err != nil {
+				return fmt.Errorf("expand activity conversation: %w", err)
+			}
+			count := 0
+			for rows.Next() {
+				var id int64
+				if err := rows.Scan(&id); err != nil {
+					_ = rows.Close()
+					return fmt.Errorf("scan expanded activity message: %w", err)
+				}
+				afterID = max(afterID, id)
+				count++
+			}
+			if err := rows.Close(); err != nil {
+				return fmt.Errorf("close expanded activity messages: %w", err)
+			}
+			if err := rows.Err(); err != nil {
+				return fmt.Errorf("read expanded activity messages: %w", err)
+			}
+			if count < activityConversationExpandMessages {
+				_, err = tx.ExecContext(ctx, s.dialect.Rebind(`DELETE FROM activity_projection_conversation_queue WHERE conversation_id = ?`), conversationID)
+			} else {
+				_, err = tx.ExecContext(ctx, s.dialect.Rebind(`UPDATE activity_projection_conversation_queue SET after_message_id = ? WHERE conversation_id = ?`), afterID, conversationID)
+			}
+			if err != nil {
+				return fmt.Errorf("checkpoint activity conversation: %w", err)
+			}
+			return nil
+		})
+	})
+	return claimed, err
+}
 
 // LoadQueuedActivityCandidatesContext loads the next pending queue batch in
 // stable message order. Ineligible rows stay in the result as retractions.
@@ -131,10 +232,11 @@ func (s *Store) LoadQueuedActivityCandidatesContext(
 	}
 	rows, err := s.db.QueryContext(ctx, s.dialect.Rebind(
 		activityCandidateStateCTE+`
-		SELECT `+activityCandidateColumns+`,
+		SELECT `+s.activityCandidateColumns()+`,
 		       1 AS queue_exists, q.revision, q.processed_revision
 		FROM activity_projection_queue q
 		JOIN messages m ON m.id = q.message_id
+		LEFT JOIN sources src ON src.id = m.source_id
 		LEFT JOIN conversations c ON c.id = m.conversation_id
 		CROSS JOIN activity_current_state r
 		WHERE q.revision > q.processed_revision
@@ -165,10 +267,11 @@ func (s *Store) ScanForActivityProjectionContext(
 	}
 	rows, err := s.db.QueryContext(ctx, s.dialect.Rebind(
 		activityCandidateStateCTE+`
-		SELECT `+activityCandidateColumns+`,
+		SELECT `+s.activityCandidateColumns()+`,
 		       CASE WHEN q.message_id IS NULL THEN 0 ELSE 1 END AS queue_exists,
 		       COALESCE(q.revision, 0), COALESCE(q.processed_revision, 0)
 		FROM messages m
+		LEFT JOIN sources src ON src.id = m.source_id
 		LEFT JOIN conversations c ON c.id = m.conversation_id
 		LEFT JOIN activity_events ae ON ae.message_id = m.id
 		LEFT JOIN activity_projection_queue q ON q.message_id = m.id
@@ -211,10 +314,11 @@ func (s *Store) ScanAllActivityCandidatesContext(
 	}
 	rows, err := s.db.QueryContext(ctx, s.dialect.Rebind(
 		activityCandidateStateCTE+`
-		SELECT `+activityCandidateColumns+`,
+		SELECT `+s.activityCandidateColumns()+`,
 		       CASE WHEN q.message_id IS NULL THEN 0 ELSE 1 END AS queue_exists,
 		       COALESCE(q.revision, 0), COALESCE(q.processed_revision, 0)
 		FROM messages m
+		LEFT JOIN sources src ON src.id = m.source_id
 		LEFT JOIN conversations c ON c.id = m.conversation_id
 		LEFT JOIN activity_projection_queue q ON q.message_id = m.id
 		CROSS JOIN activity_current_state r
@@ -243,6 +347,18 @@ func (s *Store) LoadActivityCandidatesByIDContext(
 }
 
 func (s *Store) loadActivityCandidatesByIDQueryerContext(
+	ctx context.Context,
+	queryer contextRowsQuerier,
+	messageIDs []int64,
+) ([]ActivityCandidate, error) {
+	candidates, err := s.loadActivityCandidateRowsByIDQueryerContext(ctx, queryer, messageIDs)
+	if err != nil {
+		return nil, err
+	}
+	return s.attachActivityCounterpartsQueryerContext(ctx, queryer, candidates)
+}
+
+func (s *Store) loadActivityCandidateRowsByIDQueryerContext(
 	ctx context.Context,
 	queryer contextRowsQuerier,
 	messageIDs []int64,
@@ -276,10 +392,11 @@ func (s *Store) loadActivityCandidatesByIDQueryerContext(
 		}
 		rows, err := queryer.QueryContext(ctx, s.dialect.Rebind(
 			activityCandidateStateCTE+`
-		SELECT `+activityCandidateColumns+`,
+		SELECT `+s.activityCandidateColumns()+`,
 		       CASE WHEN q.message_id IS NULL THEN 0 ELSE 1 END AS queue_exists,
 		       COALESCE(q.revision, 0), COALESCE(q.processed_revision, 0)
 		FROM messages m
+		LEFT JOIN sources src ON src.id = m.source_id
 		LEFT JOIN conversations c ON c.id = m.conversation_id
 		LEFT JOIN activity_projection_queue q ON q.message_id = m.id
 		CROSS JOIN activity_current_state r
@@ -295,7 +412,7 @@ func (s *Store) loadActivityCandidatesByIDQueryerContext(
 		}
 		candidates = append(candidates, loaded...)
 	}
-	return s.attachActivityCounterpartsQueryerContext(ctx, queryer, candidates)
+	return candidates, nil
 }
 
 func scanActivityCandidateRows(rows rowsScanner) ([]ActivityCandidate, error) {
@@ -319,6 +436,7 @@ func scanActivityCandidateRows(rows rowsScanner) ([]ActivityCandidate, error) {
 			&row.deletedFromSourceAt,
 			&row.metadata,
 			&row.candidate.SourceIsFromMe,
+			&row.candidate.Unsent,
 			&row.candidate.IdentityRevision,
 			&row.candidate.AccountIdentityRevision,
 			&timezoneActive,
@@ -373,7 +491,7 @@ func applyActivityEligibility(row *activityCandidateRow) {
 	row.candidate.Eligible = row.deletedAt == nil &&
 		row.deletedFromSourceAt == nil &&
 		hasTimestamp &&
-		!cancelled
+		!cancelled && !row.candidate.Unsent
 }
 
 func activityUsableTime(value *time.Time) bool {

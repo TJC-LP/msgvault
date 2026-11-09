@@ -29,6 +29,7 @@ type Client struct {
 	username           string
 	password           string
 	bearerToken        func(context.Context) (string, error)
+	bearerRejected     func()
 	digest             *digestState
 	requestTimeout     time.Duration
 	operationTimeout   time.Duration
@@ -85,6 +86,7 @@ func NewClient(options ClientOptions) (*Client, error) {
 	}
 	return &Client{
 		origin: originURL(&origin), username: options.Username, password: options.Password, bearerToken: options.BearerToken,
+		bearerRejected: options.BearerTokenRejected,
 		digest:         new(digestState),
 		requestTimeout: options.RequestTimeout, operationTimeout: options.OperationTimeout,
 		responseBytes: options.ResponseBytes, operationBytes: options.OperationBytes,
@@ -233,7 +235,7 @@ func (c *Client) validateTarget(ctx context.Context, target *url.URL) ([]netip.A
 	if !validHTTPURL(target) || !sameOrigin(c.origin, target) {
 		return nil, fmt.Errorf("DAV URL: %w", ErrUnsafeTarget)
 	}
-	port, err := targetPort(target)
+	port, err := netguard.TargetPort(target)
 	if err != nil {
 		return nil, fmt.Errorf("DAV URL port: %w", ErrUnsafeTarget)
 	}
@@ -345,6 +347,10 @@ func (c *Client) doPinned(ctx context.Context, target *url.URL, pinned []netip.A
 		return nil, 0, fmt.Errorf("DAV request: %w", err)
 	}
 	defer func() { _ = httpResponse.Body.Close() }()
+	if authorization == "" && c.bearerToken != nil && c.bearerRejected != nil &&
+		httpResponse.StatusCode == http.StatusUnauthorized {
+		c.bearerRejected()
+	}
 	body, err := c.readResponseBody(httpResponse.Body, operationBytes)
 	response := &Response{StatusCode: httpResponse.StatusCode, Header: httpResponse.Header.Clone(), Body: body}
 	if err != nil {
@@ -425,31 +431,7 @@ func sameOrigin(left, right *url.URL) bool {
 	}
 	return strings.EqualFold(left.Scheme, right.Scheme) &&
 		strings.EqualFold(left.Hostname(), right.Hostname()) &&
-		originPort(left) == originPort(right)
-}
-
-func originPort(target *url.URL) string {
-	if port := target.Port(); port != "" {
-		return port
-	}
-	if strings.EqualFold(target.Scheme, "https") {
-		return "443"
-	}
-	return "80"
-}
-
-func targetPort(target *url.URL) (uint16, error) {
-	if rawPort := target.Port(); rawPort != "" {
-		port, err := strconv.ParseUint(rawPort, 10, 16)
-		if err != nil || port == 0 {
-			return 0, errors.New("invalid port")
-		}
-		return uint16(port), nil
-	}
-	if target.Scheme == "https" {
-		return 443, nil
-	}
-	return 80, nil
+		netguard.EffectivePort(left) == netguard.EffectivePort(right)
 }
 
 func isRedirect(status int) bool {

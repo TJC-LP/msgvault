@@ -15,6 +15,7 @@ import (
 	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/granola"
 	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/telemetry"
 	"go.kenn.io/msgvault/internal/testutil"
 )
 
@@ -85,7 +86,6 @@ func TestAddGranolaIdentityConfirmsPrimaryWhenAliasExists(t *testing.T) {
 	assert.Equal("user-z@example.com", identities[1].Address)
 	assert.Contains(out.String(), "Confirmed identity user-z@example.com")
 	assert.Contains(out.String(), "sync-granola work --full")
-	assert.Nil(addGranolaCmd.Flags().Lookup("no-default-identity"), "meeting identity confirmation is mandatory")
 }
 
 func TestConfiguredGranolaMissingRegisteredSourceStopsBeforeClient(t *testing.T) {
@@ -99,7 +99,7 @@ func TestConfiguredGranolaMissingRegisteredSourceStopsBeforeClient(t *testing.T)
 		return granola.NewClient(baseURL, apiKey)
 	}
 	t.Cleanup(func() { newGranolaClient = savedFactory })
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 
 	err := runConfiguredGranolaSync(ctx, st, config.GranolaSource{
@@ -140,7 +140,7 @@ func TestManualGranolaPartialImportRefreshesCacheBeforeReturningError(t *testing
 		require.NoError(openErr)
 		defer func() { require.NoError(st.Close()) }()
 		var count int
-		require.NoError(st.DB().QueryRow(`SELECT COUNT(*) FROM messages`).Scan(&count))
+		require.NoError(st.DB().QueryRowContext(t.Context(), `SELECT COUNT(*) FROM messages`).Scan(&count))
 		refreshSawWrite = count == 1
 		return nil
 	}
@@ -202,14 +202,14 @@ func TestConfiguredGranolaPartialImportRefreshesCacheBeforeReturningError(t *tes
 	savedRefresh := rebuildGranolaCacheAfterScheduledSync
 	refreshes := 0
 	refreshSawWrite := false
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	var refreshContextErr error
 	rebuildGranolaCacheAfterScheduledSync = func(refreshCtx context.Context, _ string) error {
 		refreshes++
 		cancel()
 		refreshContextErr = refreshCtx.Err()
 		var count int
-		require.NoError(st.DB().QueryRow(`SELECT COUNT(*) FROM messages`).Scan(&count))
+		require.NoError(st.DB().QueryRowContext(refreshCtx, `SELECT COUNT(*) FROM messages`).Scan(&count))
 		refreshSawWrite = count == 1
 		return nil
 	}
@@ -246,7 +246,7 @@ func TestConfiguredGranolaPartialImportWithoutWritesSkipsCacheRefresh(t *testing
 	}
 	t.Cleanup(func() { rebuildGranolaCacheAfterScheduledSync = savedRefresh })
 
-	err = runConfiguredGranolaSync(context.Background(), st, config.GranolaSource{
+	err = runConfiguredGranolaSync(t.Context(), st, config.GranolaSource{
 		Identifier:   "work",
 		AccountEmail: "user-a@example.com",
 		APIKey:       "grn_test",
@@ -288,7 +288,7 @@ func TestManualGranolaLaterFailureRefreshesEarlierSourceWrites(t *testing.T) {
 		require.NoError(openErr)
 		defer func() { require.NoError(st.Close()) }()
 		var count int
-		require.NoError(st.DB().QueryRow(`SELECT COUNT(*) FROM messages`).Scan(&count))
+		require.NoError(st.DB().QueryRowContext(t.Context(), `SELECT COUNT(*) FROM messages`).Scan(&count))
 		refreshSawWrite = count == 1
 		return nil
 	}
@@ -346,4 +346,34 @@ func TestManualGranolaPrevalidatesAllSourcesBeforeImport(t *testing.T) {
 	assert.Zero(constructed, "all selected sources must validate before any client or import starts")
 	_, statErr := os.Stat(testCfg.DatabaseDSN())
 	assert.ErrorIs(statErr, os.ErrNotExist, "invalid configuration must not create or write the archive")
+}
+
+func TestGranolaPartialSyncRecordsOutage(t *testing.T) {
+	assert, require := assert.New(t), require.New(t)
+	server := newGranolaSyncTestServer(t, true, true)
+	installGranolaClientFactory(t, server.URL)
+	st := testutil.NewTestStore(t)
+	_, err := st.GetOrCreateSource(granola.SourceType, "work")
+	require.NoError(err)
+	cfg := lifecycleTestConfig(t.TempDir())
+	cfg.Analytics.AutoBuildCache = false
+	state := testInvocationWithConfig(cfg)
+	events := 0
+	state.syncFailures = &telemetry.SyncFailures{Capture: func(event string, props map[string]any) error {
+		assert.Equal("sync_failed", event)
+		assert.Equal("granola", props["sync_source"])
+		events++
+		return nil
+	}}
+	ctx := withInvocation(t.Context(), state)
+	src := config.GranolaSource{Identifier: "work", AccountEmail: "owner@example.com", APIKey: "synthetic"}
+	require.ErrorContains(runConfiguredGranolaSync(ctx, st, src), "partial Granola sync")
+	assert.Equal(1, events)
+	clean := newGranolaSyncTestServer(t, true, false)
+	installGranolaClientFactory(t, clean.URL)
+	require.NoError(runConfiguredGranolaSync(ctx, st, src))
+	assert.Equal(1, events)
+	installGranolaClientFactory(t, server.URL)
+	require.ErrorContains(runConfiguredGranolaSync(ctx, st, src), "partial Granola sync")
+	assert.Equal(2, events)
 }

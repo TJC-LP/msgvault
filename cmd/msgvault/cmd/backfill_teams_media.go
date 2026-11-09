@@ -14,7 +14,7 @@ var backfillTeamsMediaOnlyIncomplete bool
 
 var backfillTeamsMediaCmd = &cobra.Command{
 	Use:   "backfill-teams-media <email>",
-	Short: "Re-fetch Teams inline media (hostedContents) for already-imported messages",
+	Short: "Re-fetch missing Teams inline images for imported messages",
 	Long: `Re-fetch Microsoft Teams inline media (hostedContents) for messages that
 were already imported but whose inline images were never downloaded.
 
@@ -42,7 +42,7 @@ Examples:
 
 		email := args[0]
 
-		s, cleanup, err := openWritableStoreAndInitForIngestInvocation(state)
+		s, cleanup, err := openWritableStoreAndInitForIngestInvocation(cmd.Context(), state)
 		if err != nil {
 			return err
 		}
@@ -73,7 +73,7 @@ Examples:
 		})
 		if ctx.Err() != nil {
 			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "\nInterrupted — re-run backfill-teams-media to resume (idempotent).")
-			return rebuildCacheAfterWrite(dbPath, state)
+			return rebuildCacheAfterWrite(ctx, dbPath, state)
 		}
 		if err != nil {
 			return fmt.Errorf("teams inline-media backfill failed: %w", err)
@@ -81,7 +81,7 @@ Examples:
 
 		writeTeamsMediaBackfillSummary(cmd.OutOrStdout(), sum)
 
-		return rebuildCacheAfterWrite(dbPath, state)
+		return rebuildCacheAfterWrite(ctx, dbPath, state)
 	},
 }
 

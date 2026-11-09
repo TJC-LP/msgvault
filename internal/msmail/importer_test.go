@@ -30,14 +30,15 @@ type fakeGraph struct {
 	t   *testing.T
 	srv *httptest.Server
 
-	mu      sync.Mutex
-	folders []string          // folder IDs, in list order
-	names   map[string]string // folder ID -> display name, when not derived from the ID
-	folder  map[string]string // message ID -> folder ID; absent when deleted
-	log     []change          // one entry per change
-	expired map[string]bool   // folder IDs whose next delta reports an expired token
-	gone    map[string]bool   // folder IDs whose every delta answers 410
-	version map[string]int    // message ID -> content version
+	mu         sync.Mutex
+	folders    []string            // folder IDs, in list order
+	names      map[string]string   // folder ID -> display name, when not derived from the ID
+	folder     map[string]string   // message ID -> folder ID; absent when deleted
+	log        []change            // one entry per change
+	expired    map[string]bool     // folder IDs whose next delta reports an expired token
+	gone       map[string]bool     // folder IDs whose every delta answers 410
+	version    map[string]int      // message ID -> content version
+	categories map[string][]string // present entries are authoritative category snapshots
 
 	withAttachment map[string]bool   // message IDs whose MIME carries a file
 	shifted        map[string]bool   // message IDs whose file moves to another part
@@ -51,6 +52,9 @@ type fakeGraph struct {
 	denied         bool              // answer move and permanentDelete with 403
 	pageSize       int
 	stopAt         int    // fail the delta page at this skip offset, when non-zero
+	stopStatus     int    // HTTP status returned by stopAt
+	stopInDelta    bool   // stopAt applies to incremental pages instead of a walk
+	changeOnWalk   string // change this message's MIME when the next walk starts
 	root           string // mailbox path the server answers for; "/me" when empty
 
 	mimeCalls     atomic.Int32
@@ -63,7 +67,7 @@ type change struct{ id, from string }
 
 func newFakeGraph(t *testing.T) *fakeGraph {
 	t.Helper()
-	f := &fakeGraph{t: t, folder: map[string]string{}, expired: map[string]bool{}, gone: map[string]bool{}, version: map[string]int{}, withAttachment: map[string]bool{}, shifted: map[string]bool{}, attachmentBody: map[string]string{}, broken: map[string]bool{}, goneOnValue: map[string]bool{}, badValue: map[string]bool{}, pageSize: 2}
+	f := &fakeGraph{t: t, folder: map[string]string{}, expired: map[string]bool{}, gone: map[string]bool{}, version: map[string]int{}, withAttachment: map[string]bool{}, shifted: map[string]bool{}, attachmentBody: map[string]string{}, broken: map[string]bool{}, goneOnValue: map[string]bool{}, badValue: map[string]bool{}, pageSize: 2, stopStatus: http.StatusBadRequest}
 	f.folders = []string{"inbox", "archive"}
 	f.expiredStatus = http.StatusGone
 	f.srv = httptest.NewServer(http.HandlerFunc(f.serve))
@@ -203,7 +207,14 @@ func (f *fakeGraph) serve(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"error":{"code":"ErrorItemNotFound"}}`, http.StatusNotFound)
 			return
 		}
-		f.writeJSON(w, map[string]any{"parentFolderId": folder, "receivedDateTime": "2024-01-01T10:00:00Z"})
+		item := map[string]any{"parentFolderId": folder, "receivedDateTime": "2024-01-01T10:00:00Z"}
+		if f.categories != nil {
+			assert.Contains(f.t, strings.Split(q.Get("$select"), ","), "categories")
+		}
+		if categories, ok := f.categories[id]; ok {
+			item["categories"] = categories
+		}
+		f.writeJSON(w, item)
 	default:
 		http.Error(w, "unexpected "+p, http.StatusBadRequest)
 	}
@@ -247,8 +258,26 @@ func (f *fakeGraph) delta(w http.ResponseWriter, folder string, q map[string][]s
 		}
 		return ""
 	}
+	if f.categories != nil && get("token") == "" && get("skip") == "" {
+		assert.Contains(f.t, strings.Split(get("$select"), ","), "categories")
+	}
+	if id := f.changeOnWalk; id != "" && get("token") == "" && get("skip") == "" {
+		f.changeOnWalk = ""
+		f.version[id]++
+		f.log = append(f.log, change{id, f.folder[id]})
+	}
 	link := func(kind string, vals ...string) string {
 		return f.srv.URL + f.mailboxRoot() + "/mailFolders/" + folder + "/messages/delta?" + kind + "&" + strings.Join(vals, "&")
+	}
+	pos := get("pos")
+	if pos == "" {
+		pos = strconv.Itoa(len(f.log))
+	}
+	skip, _ := strconv.Atoi(get("skip"))
+	if f.stopAt != 0 && skip == f.stopAt && (get("token") != "") == f.stopInDelta {
+		f.stopAt = 0
+		http.Error(w, "boom", f.stopStatus)
+		return
 	}
 	if f.gone[folder] {
 		http.Error(w, `{"error":{"code":"syncStateNotFound"}}`, http.StatusGone)
@@ -260,38 +289,40 @@ func (f *fakeGraph) delta(w http.ResponseWriter, folder string, q map[string][]s
 			http.Error(w, `{"error":{"code":"syncStateNotFound"}}`, f.expiredStatus)
 			return
 		}
-		pos, _ := strconv.Atoi(tok)
+		start, _ := strconv.Atoi(tok)
+		stop, _ := strconv.Atoi(pos)
 		seen := map[string]bool{}
 		var out []map[string]any
-		for _, c := range f.log[pos:] {
+		for _, c := range f.log[start:stop] {
 			id := c.id
 			if seen[id] || (c.from != folder && f.folder[id] != folder) {
 				continue
 			}
 			seen[id] = true
 			if f.folder[id] == folder {
-				out = append(out, map[string]any{"id": id})
+				item := map[string]any{"id": id}
+				if categories, ok := f.categories[id]; ok {
+					item["categories"] = categories
+				}
+				out = append(out, item)
 			} else {
 				out = append(out, map[string]any{"id": id, "@removed": map[string]any{"reason": "deleted"}})
 			}
 		}
-		f.writeJSON(w, map[string]any{"value": out, "@odata.deltaLink": link("t", "token="+strconv.Itoa(len(f.log)))})
+		end := min(skip+f.pageSize, len(out))
+		resp := map[string]any{"value": out[skip:end]}
+		if end < len(out) {
+			resp["@odata.nextLink"] = link("t", "token="+tok, "skip="+strconv.Itoa(end), "pos="+pos)
+		} else {
+			resp["@odata.deltaLink"] = link("t", "token="+pos)
+		}
+		f.writeJSON(w, resp)
 		return
 	}
 	// A walk lists the folder in log order. pos pins the log position that
 	// the final deltaLink carries, taken when the walk started.
-	pos := get("pos")
-	if pos == "" {
-		pos = strconv.Itoa(len(f.log))
-	}
-	skip, _ := strconv.Atoi(get("skip"))
 	if get("skip") == "" {
 		f.walkStarts.Add(1)
-	}
-	if f.stopAt != 0 && skip == f.stopAt {
-		f.stopAt = 0
-		http.Error(w, "boom", http.StatusBadRequest)
-		return
 	}
 	var ids []string
 	for _, c := range f.log {
@@ -302,7 +333,11 @@ func (f *fakeGraph) delta(w http.ResponseWriter, folder string, q map[string][]s
 	end := min(skip+f.pageSize, len(ids))
 	var out []map[string]any
 	for _, id := range ids[skip:end] {
-		out = append(out, map[string]any{"id": id, "receivedDateTime": "2024-01-01T10:00:00Z"})
+		item := map[string]any{"id": id, "receivedDateTime": "2024-01-01T10:00:00Z"}
+		if categories, ok := f.categories[id]; ok {
+			item["categories"] = categories
+		}
+		out = append(out, item)
 	}
 	resp := map[string]any{"value": out}
 	if end < len(ids) {
@@ -323,13 +358,13 @@ func (f *fakeGraph) sync(t *testing.T, st *store.Store) (*Summary, error) {
 	if dir == "" {
 		dir = f.t.TempDir()
 	}
-	return Import(context.Background(), st, c, Options{Email: "me@example.com", AttachmentsDir: dir}, slog.Default())
+	return Import(t.Context(), st, c, Options{Email: "me@example.com", AttachmentsDir: dir}, slog.Default())
 }
 
 // state returns message ID -> "folder label name" or "deleted".
 func state(t *testing.T, st *store.Store) map[string]string {
 	t.Helper()
-	rows, err := st.DB().Query(`
+	rows, err := st.DB().QueryContext(t.Context(), `
 		SELECT m.source_message_id, COALESCE(l.name, ''), m.deleted_from_source_at IS NOT NULL
 		FROM messages m
 		LEFT JOIN message_labels ml ON ml.message_id = m.id
@@ -370,11 +405,11 @@ func TestImportFirstSyncThenNoChange(t *testing.T) {
 	assert.EqualValues(5, f.mimeCalls.Load(), "four downloads plus one 429")
 
 	var labelType string
-	require.NoError(st.DB().QueryRow(`SELECT label_type FROM labels WHERE source_label_id = 'inbox'`).Scan(&labelType))
+	require.NoError(st.DB().QueryRowContext(t.Context(), `SELECT label_type FROM labels WHERE source_label_id = 'inbox'`).Scan(&labelType))
 	assert.Equal("system", labelType)
 
 	var synced bool
-	require.NoError(st.DB().QueryRow(`SELECT last_sync_at IS NOT NULL FROM sources`).Scan(&synced))
+	require.NoError(st.DB().QueryRowContext(t.Context(), `SELECT last_sync_at IS NOT NULL FROM sources`).Scan(&synced))
 	assert.True(synced, "a completed sync sets last_sync_at")
 
 	f.mimeCalls.Store(0)
@@ -485,7 +520,7 @@ func TestImportExpiredTokenWalksAgain(t *testing.T) {
 // snippets returns message ID -> snippet, the stored body start.
 func snippets(t *testing.T, st *store.Store) map[string]string {
 	t.Helper()
-	rows, err := st.DB().Query(`SELECT source_message_id, COALESCE(snippet, '') FROM messages`)
+	rows, err := st.DB().QueryContext(t.Context(), `SELECT source_message_id, COALESCE(snippet, '') FROM messages`)
 	require.NoError(t, err)
 	defer func() { _ = rows.Close() }()
 	out := map[string]string{}
@@ -520,7 +555,7 @@ func TestImportRefreshesChangedMessages(t *testing.T) {
 	require.NoError(err)
 	assert.Equal(2, sum.Updated)
 	var runUpdated int64
-	require.NoError(st.DB().QueryRow(`SELECT messages_updated FROM sync_runs ORDER BY id DESC LIMIT 1`).Scan(&runUpdated))
+	require.NoError(st.DB().QueryRowContext(t.Context(), `SELECT messages_updated FROM sync_runs ORDER BY id DESC LIMIT 1`).Scan(&runUpdated))
 	assert.EqualValues(2, runUpdated)
 	assert.EqualValues(2, f.mimeCalls.Load())
 	assert.Equal(map[string]string{"d1": "body d1 v1", "m1": "body m1 v1"}, snippets(t, st))
@@ -557,7 +592,7 @@ func TestImportRefreshReplacesAttachments(t *testing.T) {
 func attachments(t *testing.T, st *store.Store) [2]int {
 	t.Helper()
 	var rows, count int
-	require.NoError(t, st.DB().QueryRow(st.Rebind(`
+	require.NoError(t, st.DB().QueryRowContext(t.Context(), st.Rebind(`
 		SELECT (SELECT COUNT(*) FROM attachments a WHERE a.message_id = m.id), m.attachment_count
 		FROM messages m WHERE m.source_message_id = 'm1'`)).Scan(&rows, &count))
 	return [2]int{rows, count}
@@ -632,14 +667,14 @@ func TestImportStoreFailureDoesNotAdvanceCursor(t *testing.T) {
 	f := newFakeGraph(t)
 	f.put("m1", "inbox")
 	f.put("m2", "inbox")
-	_, err := st.DB().Exec(`CREATE TRIGGER fail_m2 BEFORE INSERT ON messages
+	_, err := st.DB().ExecContext(t.Context(), `CREATE TRIGGER fail_m2 BEFORE INSERT ON messages
 		WHEN NEW.source_message_id = 'm2' BEGIN SELECT RAISE(ABORT, 'boom'); END`)
 	require.NoError(err)
 
 	_, err = f.sync(t, st)
 	require.Error(err)
 
-	_, err = st.DB().Exec(`DROP TRIGGER fail_m2`)
+	_, err = st.DB().ExecContext(t.Context(), `DROP TRIGGER fail_m2`)
 	require.NoError(err)
 	_, err = f.sync(t, st)
 	require.NoError(err)
@@ -733,7 +768,7 @@ func TestImportRefreshRetriesChangedPartNotWritten(t *testing.T) {
 func attachmentKey(t *testing.T, st *store.Store) string {
 	t.Helper()
 	var key string
-	require.NoError(t, st.DB().QueryRow(st.Rebind(`
+	require.NoError(t, st.DB().QueryRowContext(t.Context(), st.Rebind(`
 		SELECT a.source_part_key FROM attachments a JOIN messages m ON m.id = a.message_id
 		WHERE m.source_message_id = 'm1'`)).Scan(&key))
 	return key
@@ -742,7 +777,7 @@ func attachmentKey(t *testing.T, st *store.Store) string {
 func attachmentHash(t *testing.T, st *store.Store) string {
 	t.Helper()
 	var hash string
-	require.NoError(t, st.DB().QueryRow(st.Rebind(`
+	require.NoError(t, st.DB().QueryRowContext(t.Context(), st.Rebind(`
 		SELECT a.content_hash FROM attachments a JOIN messages m ON m.id = a.message_id
 		WHERE m.source_message_id = 'm1'`)).Scan(&hash))
 	return hash
@@ -771,7 +806,7 @@ func TestImportNewMessageAttachmentWriteFails(t *testing.T) {
 	require.NoError(err)
 	assert.Equal([2]int{1, 1}, attachments(t, st))
 	var hasDate bool
-	require.NoError(st.DB().QueryRow(`SELECT internal_date IS NOT NULL FROM messages WHERE source_message_id = 'm1'`).Scan(&hasDate))
+	require.NoError(st.DB().QueryRowContext(t.Context(), `SELECT internal_date IS NOT NULL FROM messages WHERE source_message_id = 'm1'`).Scan(&hasDate))
 	assert.True(hasDate, "the retry keeps the receipt time")
 }
 
@@ -856,7 +891,7 @@ func TestImportRecreatedFolderReconcilesOldMessages(t *testing.T) {
 	require.NoError(err)
 	assert.Equal(map[string]string{"m1": "deleted", "m2": "Inbox", "m3": "Projects"}, state(t, st))
 	var sourceLabelID string
-	require.NoError(st.DB().QueryRow(`SELECT source_label_id FROM labels WHERE name = 'Projects'`).Scan(&sourceLabelID))
+	require.NoError(st.DB().QueryRowContext(t.Context(), `SELECT source_label_id FROM labels WHERE name = 'Projects'`).Scan(&sourceLabelID))
 	assert.Equal("new", sourceLabelID, "the new folder took over the old label")
 }
 
@@ -979,7 +1014,7 @@ func TestImportDownloadFailureDoesNotBlockAccount(t *testing.T) {
 			}
 			assert.Equal(want, snippets(t, st)["bad"])
 			var hasDate bool
-			require.NoError(st.DB().QueryRow(`SELECT internal_date IS NOT NULL FROM messages WHERE source_message_id = 'bad'`).Scan(&hasDate))
+			require.NoError(st.DB().QueryRowContext(t.Context(), `SELECT internal_date IS NOT NULL FROM messages WHERE source_message_id = 'bad'`).Scan(&hasDate))
 			assert.True(hasDate)
 
 			f.mimeCalls.Store(0)
@@ -1033,7 +1068,7 @@ func TestImportRetryDeletionErrorKeepsMarker(t *testing.T) {
 	require.Error(err)
 
 	f.goneOnValue["m1"] = true
-	_, err = st.DB().Exec(`CREATE TRIGGER reject_delete BEFORE UPDATE OF deleted_from_source_at ON messages
+	_, err = st.DB().ExecContext(t.Context(), `CREATE TRIGGER reject_delete BEFORE UPDATE OF deleted_from_source_at ON messages
  WHEN NEW.source_message_id = 'm1' BEGIN SELECT RAISE(ABORT, 'deletion failed'); END`)
 	require.NoError(err)
 	sum, err := f.sync(t, st)

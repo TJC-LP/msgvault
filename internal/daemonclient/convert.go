@@ -10,6 +10,7 @@ import (
 	"go.kenn.io/msgvault/internal/deletion"
 	"go.kenn.io/msgvault/internal/identityops"
 	"go.kenn.io/msgvault/internal/query"
+	"go.kenn.io/msgvault/internal/senderauth"
 	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/pkg/client/generated"
 )
@@ -53,7 +54,7 @@ func storeStatsFromGenerated(stats generated.StatsResponse) *store.Stats {
 		SourceCount:        stats.TotalAccounts,
 		LabelCount:         stats.TotalLabels,
 		AttachmentCount:    stats.TotalAttachments,
-		DatabaseSize:       stats.DatabaseSizeBytes,
+		DatabaseSize:       int64Value(stats.DatabaseSizeBytes),
 	}
 }
 
@@ -241,12 +242,24 @@ func cliSearchFromGenerated(resp *generated.SearchCLIResponse) *CLISearch {
 	}
 	return &CLISearch{
 		Results:          results,
+		HybridAvailable:  boolValue(resp.HybridAvailable),
+		HasMore:          boolValue(resp.HasMore),
+		Hints:            searchHintsFromGenerated(resp.Hints),
 		ScopeLabel:       stringValue(resp.ScopeLabel),
 		ScopeSourceCount: intValue(resp.ScopeSourceCount),
 		IndexBuilt:       boolValue(resp.IndexBuilt),
 		IndexedMessages:  int64Value(resp.IndexedMessages),
 		IndexState:       stringValue(resp.IndexState),
 	}
+}
+
+func searchHintsFromGenerated(hints []generated.SearchHint) []query.SearchHint {
+	result := make([]query.SearchHint, len(hints))
+	for i, hint := range hints {
+		result[i] = query.SearchHint{Code: hint.Code, Message: hint.Message}
+		result[i].RetryWith.Query = hint.RetryWith.Query
+	}
+	return result
 }
 
 func cliHybridSearchFromGenerated(resp generated.HybridSearchResponse) (*CLIHybridSearch, error) {
@@ -273,12 +286,14 @@ func cliHybridSearchFromGenerated(resp generated.HybridSearchResponse) (*CLIHybr
 			RetrievalMS:      resp.Timings.RetrievalMs,
 			HydrationMS:      resp.Timings.HydrationMs,
 		},
-		PoolSaturated:    resp.PoolSaturated,
-		Accelerator:      stringValue(resp.Accelerator),
-		ReturnedCount:    int(resp.Returned),
-		ScopeLabel:       stringValue(resp.ScopeLabel),
-		ScopeSourceCount: intValue(resp.ScopeSourceCount),
-		HasMore:          resp.HasMore,
+		PoolSaturated:         resp.PoolSaturated,
+		Accelerator:           stringValue(resp.Accelerator),
+		ReturnedCount:         int(resp.Returned),
+		ScopeLabel:            stringValue(resp.ScopeLabel),
+		ScopeSourceCount:      intValue(resp.ScopeSourceCount),
+		HasMore:               resp.HasMore,
+		RankingLimitReached:   intValue(resp.RankingLimitReached),
+		CandidateLimitReached: intValue(resp.CandidateLimitReached),
 	}, nil
 }
 
@@ -301,25 +316,29 @@ func cliHybridSearchResultFromGenerated(item generated.HybridSearchItem) (CLIHyb
 	}
 	out := CLIHybridSearchResult{
 		Message: query.MessageSummary{
-			ID:              item.ID,
-			SourceID:        int64Value(item.SourceID),
-			SourceMessageID: stringValue(item.SourceMessageID),
-			ConversationID:  int64Value(item.ConversationID),
-			Subject:         item.Subject,
-			Snippet:         item.Snippet,
-			FromEmail:       stringValue(item.FromEmail),
-			FromName:        stringValue(item.FromName),
-			FromPhone:       stringValue(item.FromPhone),
-			To:              queryAddressesFromStrings(item.To),
-			Cc:              queryAddressesFromStrings(item.Cc),
-			Bcc:             queryAddressesFromStrings(item.Bcc),
-			SentAt:          sentAt,
-			SizeEstimate:    item.SizeBytes,
-			HasAttachments:  item.HasAttachments,
-			Labels:          item.Labels,
-			DeletedAt:       deletedAt,
-			MessageType:     stringValue(item.MessageType),
+			ID:                item.ID,
+			SourceID:          int64Value(item.SourceID),
+			SourceMessageID:   stringValue(item.SourceMessageID),
+			ConversationID:    int64Value(item.ConversationID),
+			Subject:           item.Subject,
+			Snippet:           item.Snippet,
+			AttachmentCount:   intValue(item.AttachmentCount),
+			AttachmentNames:   item.AttachmentNames,
+			FromEmail:         stringValue(item.FromEmail),
+			FromName:          stringValue(item.FromName),
+			FromPhone:         stringValue(item.FromPhone),
+			To:                queryAddressesFromStrings(item.To),
+			Cc:                queryAddressesFromStrings(item.Cc),
+			Bcc:               queryAddressesFromStrings(item.Bcc),
+			SentAt:            sentAt,
+			SizeEstimate:      item.SizeBytes,
+			HasAttachments:    item.HasAttachments,
+			HiddenTextPresent: item.HiddenTextPresent,
+			Labels:            item.Labels,
+			DeletedAt:         deletedAt,
+			MessageType:       stringValue(item.MessageType),
 		},
+		AttachmentCount:  item.AttachmentCount,
 		ID:               item.ID,
 		Subject:          item.Subject,
 		FromEmail:        stringValue(item.FromEmail),
@@ -372,6 +391,9 @@ func queryMessageSummaryFromGenerated(msg generated.CLIQueryMessageSummary) quer
 		SourceConversationID: msg.SourceConversationID,
 		Subject:              msg.Subject,
 		Snippet:              msg.Snippet,
+		MatchSnippet:         stringValue(msg.MatchSnippet),
+		HiddenTextPresent:    msg.HiddenTextPresent,
+		AttachmentNames:      msg.AttachmentNames,
 		FromEmail:            msg.FromEmail,
 		FromName:             msg.FromName,
 		FromPhone:            stringValue(msg.FromPhone),
@@ -409,7 +431,10 @@ func cliMessageDetailFromGenerated(resp *generated.GetCLIMessageResponse) *query
 		return &query.MessageDetail{}
 	}
 	return &query.MessageDetail{
+		RelatedMessageID:     resp.RelatedMessageID,
 		ID:                   resp.ID,
+		SenderAuth:           senderAuthFromGenerated(resp.SenderAuth),
+		Calendar:             calendarProjectionFromGenerated(resp.Calendar),
 		SourceMessageID:      resp.SourceMessageID,
 		RFC822MessageID:      stringValue(resp.Rfc822MessageID),
 		ConversationID:       resp.ConversationID,
@@ -430,6 +455,7 @@ func cliMessageDetailFromGenerated(resp *generated.GetCLIMessageResponse) *query
 		Attachments:          cliMessageAttachmentsFromGenerated(resp.Attachments),
 		BodyText:             resp.BodyText,
 		BodyHTML:             resp.BodyHTML,
+		HiddenTextPresent:    resp.HiddenTextPresent,
 	}
 }
 
@@ -461,6 +487,7 @@ func cliMessageAttachmentsFromGenerated(
 			MimeType:    attachment.MimeType,
 			Size:        attachment.Size,
 			ContentHash: attachment.ContentHash,
+			Docbank:     docbankRefsFromGenerated(attachment.Docbank),
 			URL:         stringValue(attachment.URL),
 		}
 	}
@@ -474,14 +501,37 @@ func cliAccountsFromGenerated(resp *generated.ListCLIAccountsResponse) []CLIAcco
 	out := make([]CLIAccount, len(resp.Accounts))
 	for i, account := range resp.Accounts {
 		out[i] = CLIAccount{
-			ID:                 account.ID,
+			ID:         account.ID,
+			Identifier: account.Identifier, Alias: stringValue(account.Alias), HistoryOnly: account.HistoryOnly, ReanchorRequired: account.ReanchorRequired, MergedIntoSourceID: account.MergedIntoSourceID,
 			Email:              account.Email,
 			Type:               account.Type,
 			DisplayName:        account.DisplayName,
 			OAuthApp:           stringValue(account.OauthApp),
 			MessageCount:       account.MessageCount,
 			SourceDeletedCount: account.SourceDeletedCount,
+			Stale:              boolValue(resp.Stale),
+			AsOf:               copyTime(resp.AsOf),
 			LastSync:           account.LastSync,
+			VirtualAccounts:    virtualAccountsFromGenerated(account.VirtualAccounts),
+		}
+	}
+	return out
+}
+
+func virtualAccountsFromGenerated(accounts []generated.VirtualAccount) []store.VirtualAccount {
+	if len(accounts) == 0 {
+		return nil
+	}
+	out := make([]store.VirtualAccount, len(accounts))
+	for i, account := range accounts {
+		out[i] = store.VirtualAccount{
+			Key:                account.Key,
+			SourceID:           account.SourceID,
+			AccountAddress:     stringValue(account.AccountAddress),
+			Unattributed:       account.Unattributed != nil && *account.Unattributed,
+			MessageCount:       account.MessageCount,
+			SourceDeletedCount: account.SourceDeletedCount,
+			PendingCount:       int64Value(account.PendingCount),
 		}
 	}
 	return out
@@ -893,4 +943,37 @@ func intValue(value *int64) int {
 		return 0
 	}
 	return int(*value)
+}
+
+func docbankRefsFromGenerated(refs []generated.DocbankAttachmentRef) []store.DocbankAttachmentRef {
+	if refs == nil {
+		return nil
+	}
+	result := make([]store.DocbankAttachmentRef, len(refs))
+	for i, ref := range refs {
+		result[i] = store.DocbankAttachmentRef{Endpoint: ref.Endpoint, Folder: ref.Folder, NodeID: ref.NodeID, VersionID: ref.VersionID, BlobHash: ref.BlobHash}
+	}
+	return result
+}
+
+func calendarProjectionFromGenerated(calendar *generated.CalendarProjection) *store.CalendarProjection {
+	if calendar == nil {
+		return nil
+	}
+	return &store.CalendarProjection{
+		Status:   calendar.Status,
+		Sequence: calendar.Sequence,
+		Start:    calendar.Start,
+		End:      calendar.End,
+		AllDay:   calendar.AllDay,
+		TimeZone: calendar.TimeZone,
+		ICalUID:  calendar.IcalUID,
+	}
+}
+
+func senderAuthFromGenerated(v *generated.SenderAuthVerdict) *senderauth.Verdict {
+	if v == nil {
+		return nil
+	}
+	return &senderauth.Verdict{Verified: v.Verified, Domain: stringValue(v.Domain), AuthservID: stringValue(v.AuthservID), SPF: stringValue(v.Spf), DKIM: stringValue(v.Dkim), DMARC: stringValue(v.Dmarc)}
 }

@@ -238,7 +238,7 @@ func (s *Store) ApplySenderRepairContext(
 		}
 	}
 
-	return s.withTxContext(ctx, func(tx *loggedTx) error {
+	return s.withMessageAttributionTxContext(ctx, messageID, func(tx *loggedTx) error {
 		q := boundQuerier{ctx: ctx, q: tx}
 		if err := s.lockMessageForRecipientWrite(q, messageID); err != nil {
 			return err
@@ -336,6 +336,9 @@ func (s *Store) ApplySenderRepairContext(
 		if err := refreshMessageAttributionWith(q, messageID); err != nil {
 			return fmt.Errorf("refresh message %d attribution: %w", messageID, err)
 		}
+		if _, err := s.refreshAccountAttributionTx(ctx, tx, messageID, deliveryInput{}); err != nil {
+			return err
+		}
 		if s.fts5Available {
 			if _, err := q.Exec(
 				s.dialect.FTSBackfillBatchSQL(), messageID, messageID+1,
@@ -343,7 +346,7 @@ func (s *Store) ApplySenderRepairContext(
 				return fmt.Errorf("refresh message %d FTS after sender repair: %w", messageID, err)
 			}
 		}
-		if err := s.bumpDerivedDataRevision(tx); err != nil {
+		if err := s.bumpDerivedDataRevisionContext(ctx, tx); err != nil {
 			return fmt.Errorf("invalidate derived data after repairing message %d sender: %w", messageID, err)
 		}
 		return nil

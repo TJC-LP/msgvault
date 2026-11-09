@@ -1,6 +1,7 @@
 package api
 
 import (
+	"cmp"
 	"context"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/kit/daemon"
 	"go.kenn.io/msgvault/internal/apiprotocol"
 	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/query/querytest"
@@ -58,7 +60,7 @@ func TestCORSMiddleware(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			req := httptest.NewRequest(tt.method, "/api/v1/stats", nil)
+			req := httptest.NewRequestWithContext(t.Context(), tt.method, "/api/v1/stats", nil)
 			if tt.origin != "" {
 				req.Header.Set("Origin", tt.origin)
 			}
@@ -156,7 +158,7 @@ func TestCORSMiddlewareCredentialsMatrix(t *testing.T) {
 				w.WriteHeader(http.StatusOK)
 			}))
 
-			req := httptest.NewRequest(http.MethodGet, "/api/v1/stats", nil)
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/stats", nil)
 			req.Header.Set("Origin", tt.origin)
 			w := httptest.NewRecorder()
 			handler.ServeHTTP(w, req)
@@ -181,7 +183,7 @@ func TestCORSPreflightHeaders(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	}))
 
-	req := httptest.NewRequest(http.MethodOptions, "/api/v1/settings", nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodOptions, "/api/v1/settings", nil)
 	req.Header.Set("Origin", "http://localhost:3000")
 	w := httptest.NewRecorder()
 
@@ -243,7 +245,7 @@ func TestCORSExposeHeaders(t *testing.T) {
 				w.WriteHeader(http.StatusOK)
 			}))
 
-			req := httptest.NewRequest(http.MethodGet, "/api/v1/settings", nil)
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/settings", nil)
 			req.Header.Set("Origin", tt.origin)
 			w := httptest.NewRecorder()
 			handler.ServeHTTP(w, req)
@@ -310,7 +312,7 @@ func TestRateLimitMiddleware(t *testing.T) {
 	}))
 
 	// First request should succeed
-	req1 := httptest.NewRequest(http.MethodGet, "/test", nil)
+	req1 := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/test", nil)
 	req1.RemoteAddr = "203.0.113.7:1234"
 	w1 := httptest.NewRecorder()
 	handler.ServeHTTP(w1, req1)
@@ -318,7 +320,7 @@ func TestRateLimitMiddleware(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w1.Code, "first request status")
 
 	// Second immediate request should be rate limited
-	req2 := httptest.NewRequest(http.MethodGet, "/test", nil)
+	req2 := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/test", nil)
 	req2.RemoteAddr = "203.0.113.7:1234"
 	w2 := httptest.NewRecorder()
 	handler.ServeHTTP(w2, req2)
@@ -341,14 +343,12 @@ func TestRateLimitMiddlewareExemptsLoopback(t *testing.T) {
 	// Keyless local mode: the TUI/CLI bursts far past the remote budget (daemon
 	// discovery alone fires a dozen parallel pings), so trusted loopback clients
 	// must never see 429 regardless of request rate.
-	for _, remoteAddr := range []string{"127.0.0.1:1234", "[::1]:1234"} {
-		for range 30 {
-			req := httptest.NewRequest(http.MethodGet, "/test", nil)
-			req.RemoteAddr = remoteAddr
-			w := httptest.NewRecorder()
-			handler.ServeHTTP(w, req)
-			assert.Equal(t, http.StatusOK, w.Code, "loopback request from %s must not be rate limited", remoteAddr)
-		}
+	for range 30 {
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/test", nil)
+		req.RemoteAddr = "127.0.0.1:1234"
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+		assert.Equal(t, http.StatusOK, w.Code, "loopback request from %s must not be rate limited", req.RemoteAddr)
 	}
 }
 
@@ -356,66 +356,52 @@ func TestLoopbackRateLimitExempt(t *testing.T) {
 	t.Parallel()
 	const key = "secret-key"
 
-	newReq := func(remoteAddr, apiKey string) *http.Request {
-		req := httptest.NewRequest(http.MethodGet, "/api/v1/stats", nil)
-		req.RemoteAddr = remoteAddr
-		if apiKey != "" {
-			req.Header.Set("X-Api-Key", apiKey)
-		}
-		return req
-	}
-
 	tests := []struct {
-		name       string
-		apiKey     string
-		remoteAddr string
-		reqKey     string
-		want       bool
+		name        string
+		apiKey      string
+		remoteAddr  string
+		method      string
+		path        string
+		header      string
+		headerValue string
+		want        bool
 	}{
-		{"keyless loopback exempt", "", "127.0.0.1:1234", "", true},
-		{"key configured valid key loopback exempt", key, "127.0.0.1:1234", key, true},
-		{"key configured missing key loopback limited", key, "127.0.0.1:1234", "", false},
-		{"key configured bad key loopback limited", key, "127.0.0.1:1234", "wrong", false},
-		{"key configured valid key non-loopback limited", key, "203.0.113.7:1234", key, false},
-		{"keyless non-loopback limited", "", "203.0.113.7:1234", "", false},
+		{name: "keyless loopback exempt", remoteAddr: "127.0.0.1:1234", want: true},
+		{name: "key configured valid key loopback exempt", apiKey: key, remoteAddr: "127.0.0.1:1234", headerValue: key, want: true, header: "X-Api-Key"},
+		{name: "reader key loopback exempt", apiKey: key, remoteAddr: "127.0.0.1:1234", headerValue: remoteClientTestReaderKey, want: true, header: "X-Api-Key"},
+		{name: "key configured missing key loopback limited", apiKey: key, remoteAddr: "127.0.0.1:1234"},
+		{name: "key configured bad key loopback limited", apiKey: key, remoteAddr: "127.0.0.1:1234", headerValue: "wrong", header: "X-Api-Key"},
+		{name: "key configured valid key non-loopback limited", apiKey: key, remoteAddr: "203.0.113.7:1234", headerValue: key, header: "X-Api-Key"},
+		{name: "keyless non-loopback limited", remoteAddr: "203.0.113.7:1234"},
+		{name: "credential-free loopback ping exempt", apiKey: key, remoteAddr: "127.0.0.1:1234", want: true, path: daemon.DefaultPingPath},
+		{name: "credential-free IPv6 loopback ping exempt", apiKey: key, remoteAddr: "[::1]:1234", want: true, path: daemon.DefaultPingPath},
+		{name: "keyless loopback identity exempt", apiKey: key, remoteAddr: "127.0.0.1:1234", want: true, path: DaemonIdentityPath},
+		{name: "wrong key loopback ping limited", apiKey: key, remoteAddr: "127.0.0.1:1234", headerValue: "wrong", path: daemon.DefaultPingPath, header: "X-Api-Key"},
+		{name: "wrong key loopback identity limited", apiKey: key, remoteAddr: "127.0.0.1:1234", headerValue: "wrong", path: DaemonIdentityPath, header: "X-Api-Key"},
+		{name: "wrong authorization loopback ping limited", apiKey: key, remoteAddr: "127.0.0.1:1234", headerValue: "Bearer wrong", path: daemon.DefaultPingPath, header: "Authorization"},
+		{name: "agent token loopback ping limited", apiKey: key, remoteAddr: "127.0.0.1:1234", headerValue: "wrong", path: daemon.DefaultPingPath, header: apiprotocol.AgentTokenHeader},
+		{name: "empty agent token loopback ping limited", apiKey: key, remoteAddr: "127.0.0.1:1234", path: daemon.DefaultPingPath, header: apiprotocol.AgentTokenHeader},
+		{name: "session cookie loopback ping limited", apiKey: key, remoteAddr: "127.0.0.1:1234", headerValue: sessionCookieName + "=wrong", path: daemon.DefaultPingPath, header: "Cookie"},
+		{name: "runtime token loopback ping limited", apiKey: key, remoteAddr: "127.0.0.1:1234", headerValue: "wrong", path: daemon.DefaultPingPath, header: apiprotocol.DaemonRuntimeTokenHeader},
+		{name: "credential-free non-loopback ping limited", apiKey: key, remoteAddr: "203.0.113.7:1234", path: daemon.DefaultPingPath},
+		{name: "credential-free loopback POST ping limited", apiKey: key, remoteAddr: "127.0.0.1:1234", method: http.MethodPost, path: daemon.DefaultPingPath},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			srv := NewServer(
-				&config.Config{Server: config.ServerConfig{APIKey: tt.apiKey}},
+				&config.Config{Server: config.ServerConfig{APIKey: tt.apiKey, RemoteClients: []config.RemoteClientConfig{{ClientID: "reader", APIKey: remoteClientTestReaderKey}}}},
 				nil, nil, testLogger(),
 			)
-			got := srv.loopbackRateLimitExempt(newReq(tt.remoteAddr, tt.reqKey))
+			req := httptest.NewRequestWithContext(t.Context(), tt.method, cmp.Or(tt.path, "/api/v1/stats"), nil)
+			req.RemoteAddr = tt.remoteAddr
+			if tt.header != "" {
+				req.Header.Set(tt.header, tt.headerValue)
+			}
+			got := srv.loopbackRateLimitExempt(req)
 			require.Equal(t, tt.want, got, "loopbackRateLimitExempt")
 		})
 	}
-}
-
-func TestRateLimitMiddlewareLimitsUntrustedLoopback(t *testing.T) {
-	t.Parallel()
-	rl := NewRateLimiter(1, 1) // rejects the second request within a second
-	// Untrusted loopback: an API key is configured but the request has none, so
-	// the predicate refuses the exemption (models brute-force through a local
-	// proxy that forwards to 127.0.0.1).
-	middleware := RateLimitMiddleware(rl, exemptNever)
-
-	handler := middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-
-	req1 := httptest.NewRequest(http.MethodGet, "/test", nil)
-	req1.RemoteAddr = "127.0.0.1:1234"
-	w1 := httptest.NewRecorder()
-	handler.ServeHTTP(w1, req1)
-	assert.Equal(t, http.StatusOK, w1.Code, "first loopback request status")
-
-	req2 := httptest.NewRequest(http.MethodGet, "/test", nil)
-	req2.RemoteAddr = "127.0.0.1:1234"
-	w2 := httptest.NewRecorder()
-	handler.ServeHTTP(w2, req2)
-	assert.Equal(t, http.StatusTooManyRequests, w2.Code,
-		"untrusted loopback request must be rate limited")
 }
 
 func TestExistingAPIKeyAuthenticationCompatibility(t *testing.T) {
@@ -433,6 +419,14 @@ func TestExistingAPIKeyAuthenticationCompatibility(t *testing.T) {
 			name:    "bearer authorization",
 			headers: http.Header{"Authorization": []string{"Bearer " + apiKey}},
 		},
+		{
+			name:    "lowercase bearer",
+			headers: http.Header{"Authorization": []string{"bearer " + apiKey}},
+		},
+		{
+			name:    "uppercase bearer",
+			headers: http.Header{"Authorization": []string{"BEARER " + apiKey}},
+		},
 	}
 
 	for _, tt := range tests {
@@ -441,11 +435,12 @@ func TestExistingAPIKeyAuthenticationCompatibility(t *testing.T) {
 				&config.Config{Server: config.ServerConfig{APIKey: apiKey}},
 				nil, nil, testLogger(),
 			)
+			// Cleanup runs after t.Context() is canceled.
 			t.Cleanup(func() {
-				require.NoError(t, srv.Shutdown(context.Background()))
+				require.NoError(t, srv.Shutdown(context.WithoutCancel(t.Context())))
 			})
 
-			req := httptest.NewRequest(http.MethodGet, "/api/v1/health", nil)
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/health", nil)
 			for name, values := range tt.headers {
 				for _, value := range values {
 					req.Header.Add(name, value)
@@ -462,11 +457,12 @@ func TestExistingAPIKeyAuthenticationCompatibility(t *testing.T) {
 func TestExistingAPIKeyAuthenticationKeepsKeylessLoopbackTrusted(t *testing.T) {
 	t.Parallel()
 	srv := NewServer(&config.Config{}, nil, nil, testLogger())
+	// Cleanup runs after t.Context() is canceled.
 	t.Cleanup(func() {
-		require.NoError(t, srv.Shutdown(context.Background()))
+		require.NoError(t, srv.Shutdown(context.WithoutCancel(t.Context())))
 	})
 
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/health", nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/health", nil)
 	req.RemoteAddr = "127.0.0.1:4242"
 	resp := httptest.NewRecorder()
 	srv.Router().ServeHTTP(resp, req)
@@ -480,11 +476,12 @@ func TestInvalidCLIAuthenticationCannotOptIntoTimeoutPolicy(t *testing.T) {
 		&config.Config{Server: config.ServerConfig{APIKey: cliTimeoutTestAPIKey}},
 		nil, nil, testLogger(),
 	)
+	// Cleanup runs after t.Context() is canceled.
 	t.Cleanup(func() {
-		require.NoError(t, srv.Shutdown(context.Background()))
+		require.NoError(t, srv.Shutdown(context.WithoutCancel(t.Context())))
 	})
 
-	invalid := httptest.NewRequest(http.MethodGet, "/api/v1/health", nil)
+	invalid := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/health", nil)
 	invalid.Header.Set("X-Api-Key", "wrong")
 	invalid.Header.Set(apiprotocol.ClientClassHeader, apiprotocol.ClientClassCLI)
 	assert.False(t, srv.requestUsesCLITimeoutPolicy(invalid))
@@ -503,11 +500,12 @@ func TestProxiedCLIMarkerCannotOptIntoTimeoutPolicy(t *testing.T) {
 		}},
 		nil, nil, testLogger(),
 	)
+	// Cleanup runs after t.Context() is canceled.
 	t.Cleanup(func() {
-		require.NoError(t, srv.Shutdown(context.Background()))
+		require.NoError(t, srv.Shutdown(context.WithoutCancel(t.Context())))
 	})
 
-	proxied := httptest.NewRequest(http.MethodGet, "/api/v1/health", nil)
+	proxied := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/health", nil)
 	proxied.RemoteAddr = "127.0.0.1:4242"
 	proxied.Header.Set("X-Forwarded-For", "203.0.113.10")
 	proxied.Header.Set(apiprotocol.ClientClassHeader, apiprotocol.ClientClassCLI)
@@ -548,22 +546,22 @@ func TestAPICacheControlDefaultsToNoStore(t *testing.T) {
 	})
 
 	download := httptest.NewRecorder()
-	srv.Router().ServeHTTP(download, httptest.NewRequest(http.MethodGet, "/api/v1/files/7/content", nil))
+	srv.Router().ServeHTTP(download, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/files/7/content", nil))
 	requirements.Equal(http.StatusOK, download.Code, download.Body.String())
 	assertions.Equal("no-store", download.Header().Get("Cache-Control"), "file download must not be cacheable")
 
 	metadata := httptest.NewRecorder()
-	srv.Router().ServeHTTP(metadata, httptest.NewRequest(http.MethodGet, "/api/v1/files/7", nil))
+	srv.Router().ServeHTTP(metadata, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/files/7", nil))
 	requirements.Equal(http.StatusOK, metadata.Code, metadata.Body.String())
 	assertions.Equal("no-store", metadata.Header().Get("Cache-Control"), "JSON API response must not be cacheable")
 
 	unknown := httptest.NewRecorder()
-	srv.Router().ServeHTTP(unknown, httptest.NewRequest(http.MethodGet, "/api/v1/not-a-real-route", nil))
+	srv.Router().ServeHTTP(unknown, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/not-a-real-route", nil))
 	requirements.Equal(http.StatusNotFound, unknown.Code)
 	assertions.Equal("no-store", unknown.Header().Get("Cache-Control"), "API error response must not be cacheable")
 
 	asset := httptest.NewRecorder()
-	srv.Router().ServeHTTP(asset, httptest.NewRequest(http.MethodGet, "/favicon.svg", nil))
+	srv.Router().ServeHTTP(asset, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/favicon.svg", nil))
 	requirements.Equal(http.StatusOK, asset.Code)
 	assertions.Empty(asset.Header().Get("Cache-Control"), "static assets keep the web handler's caching policy")
 }

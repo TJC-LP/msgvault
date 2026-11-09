@@ -1,6 +1,7 @@
 package accountops
 
 import (
+	"context"
 	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"errors"
@@ -19,11 +20,14 @@ type Store interface {
 
 // UpdateRequest updates CLI-facing account settings.
 type UpdateRequest struct {
-	Account     string `json:"account,omitempty"`
-	Email       string `json:"email,omitempty"`
-	SourceID    int64  `json:"source_id,omitzero"`
-	SourceIDSet bool   `json:"-"`
-	DisplayName string `json:"display_name"`
+	Account        string  `json:"account,omitempty"`
+	Email          string  `json:"email,omitempty"`
+	SourceID       int64   `json:"source_id,omitzero"`
+	SourceIDSet    bool    `json:"-"`
+	DisplayName    string  `json:"display_name,omitempty"`
+	Alias          *string `json:"alias,omitempty"`
+	HistoryOnly    *bool   `json:"history_only,omitempty"`
+	AcceptReanchor bool    `json:"accept_reanchor,omitempty"`
 }
 
 func (r *UpdateRequest) UnmarshalJSON(data []byte) error {
@@ -43,12 +47,16 @@ func (r *UpdateRequest) UnmarshalJSON(data []byte) error {
 
 // UpdateResult is returned after updating CLI-facing account settings.
 type UpdateResult struct {
-	Email       string `json:"email"`
-	DisplayName string `json:"display_name"`
+	Email            string `json:"email"`
+	DisplayName      string `json:"display_name"`
+	Identifier       string `json:"identifier"`
+	Alias            string `json:"alias"`
+	HistoryOnly      bool   `json:"history_only"`
+	ReanchorRequired bool   `json:"reanchor_required"`
 }
 
 // UpdateDisplayName updates one account's display name.
-func UpdateDisplayName(st Store, req UpdateRequest) (UpdateResult, error) {
+func UpdateDisplayName(ctx context.Context, st Store, req UpdateRequest) (UpdateResult, error) {
 	account := strings.TrimSpace(req.Account)
 	email := strings.TrimSpace(req.Email)
 	if account != "" && email != "" && account != email {
@@ -61,7 +69,7 @@ func UpdateDisplayName(st Store, req UpdateRequest) (UpdateResult, error) {
 		return UpdateResult{}, opserr.Invalid(errors.New("display name is required"))
 	}
 
-	source, err := sourceops.ResolveExactOne(st, sourceops.Selector{
+	source, err := sourceops.ResolveExactOneContext(ctx, st, sourceops.Selector{
 		Account:     account,
 		SourceID:    req.SourceID,
 		SourceIDSet: req.SourceIDSet,

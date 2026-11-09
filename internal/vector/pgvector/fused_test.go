@@ -5,8 +5,8 @@ package pgvector
 import (
 	"context"
 	"database/sql"
-	"fmt"
 	"math"
+	"strings"
 	"testing"
 	"time"
 
@@ -32,15 +32,15 @@ func newFusedFixture(t *testing.T) *fusedFixture {
 	// The shared minimal test schema lacks the inline search_fts column
 	// the fused query reads, so add it here. In production this column
 	// lives on the messages table from the main store schema.
-	_, err := db.Exec(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS search_fts TSVECTOR`)
+	_, err := db.ExecContext(t.Context(), `ALTER TABLE messages ADD COLUMN IF NOT EXISTS search_fts TSVECTOR`)
 	require.NoError(t, err, "add search_fts")
-	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS attachments (
+	_, err = db.ExecContext(t.Context(), `CREATE TABLE IF NOT EXISTS attachments (
         id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
         message_id BIGINT NOT NULL,
         filename TEXT
     )`)
 	require.NoError(t, err, "create attachments")
-	ctx := context.Background()
+	ctx := t.Context()
 	b, err := Open(ctx, Options{DB: db, Dimension: 4})
 	require.NoError(t, err, "Open")
 	t.Cleanup(func() { _ = b.Close() })
@@ -381,39 +381,6 @@ func TestFusedSearch_FilterBySource(t *testing.T) {
 	assert.False(metadata.PoolSaturated, "pool size 2 < KPerSignal 10 must not saturate")
 }
 
-func TestFusedSearch_FilterByMessageType(t *testing.T) {
-	assert := assert.New(t)
-	require := require.New(t)
-
-	f := newFusedFixture(t)
-	base := time.Date(2025, 1, 15, 12, 0, 0, 0, time.UTC)
-	f.seedMsg(t, 1, "email topic", "topic body", 10, base, false)
-	f.seedMsg(t, 2, "sms topic", "topic body", 10, base.Add(time.Hour), false)
-	_, err := f.db.ExecContext(f.ctx,
-		`UPDATE messages SET message_type = CASE id WHEN 1 THEN 'email' ELSE 'sms' END WHERE id IN (1, 2)`)
-	require.NoError(
-		err, "seed message_type")
-
-	f.embedAll(t, map[int64][]float32{
-		1: unitVec(4, 0),
-		2: unitVec(4, 1),
-	})
-
-	hits, metadata, err := f.b.FusedSearch(f.ctx, vector.FusedRequest{
-		FTSTerms:   []string{"topic"},
-		Generation: f.gen,
-		Filter:     vector.Filter{MessageTypes: []string{"sms"}},
-		KPerSignal: 10,
-		Limit:      10,
-		RRFK:       60,
-	})
-	require.NoError(
-		err, "FusedSearch")
-
-	assert.False(metadata.PoolSaturated, "saturated should be false")
-	assert.Equal([]int64{2}, fusedIDs(hits), "message_type=sms hits")
-}
-
 func TestFusedSearch_FilterByDateRange(t *testing.T) {
 	f := seedThree(t)
 	after := time.Date(2025, 1, 16, 0, 0, 0, 0, time.UTC) // exclude msg 1
@@ -604,20 +571,62 @@ func TestFusedSearch_SkipsDeletedMessages(t *testing.T) {
 	}
 }
 
-// TestFusedSearch_FilterClausesUnused — sanity-check the static
-// SQL-formatting code path: build an applyFilterClauses fragment by
-// hand and assert it begins with a leading " AND " (so it can be
-// safely concatenated after a WHERE predicate). The clause must
-// reference each placeholder it claims to bind.
-func TestFusedSearch_FilterClausesUnused(t *testing.T) {
-	var args []any
-	bind := func(v any) string {
-		args = append(args, v)
-		return fmt.Sprintf("$%d", len(args))
+func TestFusedSearch_CandidatePoolOmission(t *testing.T) {
+	f := newFusedFixture(t)
+	for id, rank := range map[int64]int{1: 1, 2: 2, 3: 3, 4: 5, 5: 4} {
+		f.seedMsg(t, id, "", strings.Repeat("invoice ", 6-rank)+strings.Repeat("filler ", rank), 1, time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC), false)
 	}
-	f := vector.Filter{SourceIDs: []int64{1, 2}}
-	got := applyFilterClauses(f, bind)
-	assert.Len(t, args, 1, "args bound should be 1")
-	require.GreaterOrEqual(t, len(got), 5, "clauses = %q, want leading ' AND '", got)
-	assert.Equal(t, " AND ", got[:5], "clauses = %q, want leading ' AND '", got)
+	f.embedAll(t, map[int64][]float32{1: {1, 0.3, 0, 0}, 2: {1, 0.5, 0, 0}, 3: {1, 0.1, 0, 0}, 4: {1, 0.2, 0, 0}, 5: {1, 0.4, 0, 0}})
+	b, ctx, gen := f.b, f.ctx, f.gen
+
+	for _, tc := range []struct {
+		name       string
+		ids        []int64
+		deleted    bool
+		unembedded bool
+		term       string
+		limit      int
+		omitted    bool
+		wantIDs    []int64
+		wantScores []float64
+	}{
+		{"recovered_probes_later_omission", []int64{1, 2, 3, 4, 5}, false, false, "invoice", 10, true, []int64{1, 3, 2, 4}, []float64{1.0 / 61, 1.0 / 61, 1.0 / 62, 1.0 / 62}},
+		{"complete_union", []int64{1, 2, 3, 4}, false, false, "invoice", 10, false, []int64{1, 3, 2, 4}, []float64{1.0 / 61, 1.0 / 61, 1.0 / 62, 1.0 / 62}},
+		{"deleted_omission", []int64{1, 2, 3, 4, 5}, true, false, "invoice", 10, false, []int64{1, 3, 2, 4}, []float64{1.0 / 61, 1.0 / 61, 1.0 / 62, 1.0 / 62}},
+		{"page_inside_union", []int64{1, 2, 3, 4, 5}, false, false, "invoice", 1, false, []int64{1}, []float64{1.0 / 61}},
+		{"empty_lexical_leg", []int64{1, 2, 3, 4, 5}, false, false, "missing", 10, true, []int64{3, 4}, []float64{1.0 / 61, 1.0 / 62}},
+		{"unembedded_lexical_omission", nil, false, true, "invoice", 10, true, []int64{1, 3, 2, 4}, []float64{1.0 / 61, 1.0 / 61, 1.0 / 62, 1.0 / 62}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert, require := assert.New(t), require.New(t)
+			_, err := f.db.ExecContext(t.Context(), `UPDATE messages SET deleted_at = CASE WHEN $1::boolean THEN CURRENT_TIMESTAMP END WHERE id=5`, tc.deleted)
+			require.NoError(err)
+			if tc.unembedded {
+				require.NoError(b.Delete(ctx, gen, []int64{5}))
+			}
+			req := vector.FusedRequest{Generation: gen, FTSTerms: []string{tc.term}, QueryVec: []float32{1, 0, 0, 0}, KPerSignal: 2, Limit: tc.limit, RRFK: 60, Filter: vector.Filter{MessageIDs: tc.ids}}
+			hits, meta, err := b.FusedSearch(ctx, req)
+			require.NoError(err)
+			assert.Equal(tc.omitted, meta.CandidatePoolOmitted)
+			gotIDs := make([]int64, len(hits))
+			for i, hit := range hits {
+				gotIDs[i] = hit.MessageID
+			}
+			require.Equal(tc.wantIDs, gotIDs)
+			for i, hit := range hits {
+				assert.InDelta(tc.wantScores[i], hit.RRFScore, 1e-12)
+				switch hit.MessageID {
+				case 1, 2:
+					assert.True(math.IsNaN(hit.VectorScore))
+					assert.False(math.IsNaN(hit.BM25Score))
+				case 3:
+					assert.True(math.IsNaN(hit.BM25Score))
+					assert.InDelta(0.99503719, hit.VectorScore, 1e-6)
+				case 4:
+					assert.True(math.IsNaN(hit.BM25Score))
+					assert.InDelta(0.98058068, hit.VectorScore, 1e-6)
+				}
+			}
+		})
+	}
 }

@@ -4,6 +4,7 @@ import (
 	"encoding/json/jsontext"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 
 	"github.com/danielgtaylor/huma/v2"
@@ -342,13 +343,74 @@ import (
 // CLI clients can authorize Microsoft Graph mail before starting the worker.
 // 3.0.0 replaces unguarded identity decisions with review-token routes and adds consented identity scoring.
 // 3.1.0 adds opt-in calendar event control and availability queries.
-const APISchemaVersion = "3.1.0"
+// 3.2.0 adds counts_pending to CLI account listing for callers that opt in by
+// header while the first count refresh runs.
+// 3.3.0 adds POST /api/v1/telemetry/events for web UI usage events. Additive (minor bump).
+// 3.4.0 adds Kata issues that quote exact message and file evidence, the
+// microsoft CardDAV provider, microsoft_authorization_required and
+// microsoft_contact_too_large.
+// 3.5.0 adds the account: and received: search operators.
+// 3.6.0 adds GET /api/v1/messages/{id}/recordings for live audio and transcript coverage.
+// 3.7.0 adds scoped lexical transcript search at GET /api/v1/media/search.
+// 3.8.0 adds reader credentials, HTTP 409 for ambiguous raw references, and HTTP 413 for remote read limits.
+// 3.9.0 adds source-scoped agent read permissions, optional expires_at, and GET /api/v1/agent-tokens/self.
+// 3.10.0 adds person UID lookup and exposes current vCard UIDs and CardDAV
+// bindings on person and directory responses.
+// 3.11.0 adds structured account scopes, the explore account filter, the virtual account catalog on /cli/accounts, GET /api/v1/media/search/status, participant_id to media search, source filename, title and date to media search results, and optional conversation_title to message detail.
+// 3.12.0 adds Kata source lookup and issue evidence context.
+// 3.13.0 adds Docbank transcript evidence.
+// 3.14.0 adds resumable paused source syncs to operation history.
+// 3.14.0 adds filename: filters, optional include_snippet/match_snippet context,
+// attachment names/counts, and hybrid_available on CLI search responses.
+// 3.15.0 adds native Gmail label, IMAP keyword, and Microsoft Graph category
+// reads and delta updates.
+// 3.16.0 adds authenticated implementation-only MCP capability discovery.
+// 3.17.0 adds bounded opt-in filename suggestions, including person scope.
+// 3.18.0 adds optional related_message_id to message detail and conversation windows.
+// 3.19.0 adds pipe OR in full-text search queries.
+// 3.20.0 adds read-only durable contact candidates and archived messaging routes.
+// 3.21.0 adds message embedding coverage and live batch diagnostics.
+// 3.22.0 adds account aliases, source lifecycle fields, account merging, and
+// owner source-maintenance requests. Existing source identifiers and account
+// requests remain valid.
+// 3.23.0 adds the Docbank attachment mirror routes, receipts and status states.
+// 3.24.0 adds authenticated streamed Muesli recording imports.
+// 3.25.0 adds archived chat discovery ranked by the best matching name or title.
+// 3.26.0 adds bounded search-aware deletion resolution with an explicit
+// max_results cap and matched_count for skipped matches.
+// 3.27.0 adds optional attachment text results and recording errors in media search.
+// 3.28.0 adds the typed calendar projection to calendar event message details.
+// 3.29.0 adds literal address filtering to the durable people Directory.
+// 3.30.0 adds the stored hidden_text_present flag to message details and search rows.
+// 3.31.0 adds literal OR warnings to full-text search responses.
+// 3.32.0 adds scheduled-work queue times and CardDAV scheduler activity.
+// 3.33.0 adds the read-only person tier preview and explanation routes.
+// 3.34.0 adds answered-call counts to person tier signals.
+// 3.35.0 adds archived calendar occurrence listing.
+// 3.36.0 adds stored plaintext range counts to document indexing status.
+// 3.37.0 omits first_at and last_at on person summaries with no sent or received messages, and returns participants with no sent or received messages instead of 404.
+// 3.38.0 adds exact sender and To participant identities to conversation windows
+// and canonical entry-kind filters to analytical requests.
+// 3.39.0 adds the optional account to staged deletion list summaries.
+// 3.40.0 adds timezone-aware daily message grouping and sent_only group filtering.
+// It also filters participant timelines to events and meetings attended by the owner.
+// 3.41.0 adds body_text for a single message's stored plain-text body, which can be generated from HTML and is empty when no plain text is stored; conversation windows leave it unset.
+// Older servers omit body_text; body keeps its HTML fallback.
+// 3.42.0 adds iMessage participant and attachment-size limits to settings.
+// 3.43.0 adds receiver-reported sender authentication to single-message reads.
+// 3.44.0 adds owner-only open-loop routes and done, snooze, and reopen decisions.
+// 3.45.0 adds sender labels to message and file search rows.
+// 3.46.0 adds measured CLI full-text pagination and semantic ranking cap overflow.
+// 3.47.0 adds retry hints to CLI and fast search.
+// 3.48.0 adds owner-only local message search activation and progress.
+const APISchemaVersion = "3.48.0"
 
 // OpenAPIDocument builds the API schema from the same Huma route registration
 // used by the daemon. It binds no socket and needs no database.
 func OpenAPIDocument() *huma.OpenAPI {
 	doc := baseOpenAPIDocument(false)
 	hardenSourceStatusPublicSchemas(doc)
+	hardenEmbeddingStatusSchemas(doc, false)
 	relaxResponseAdditionalProperties(doc)
 	hardenOperationSchemas(doc)
 	return doc
@@ -357,6 +419,7 @@ func OpenAPIDocument() *huma.OpenAPI {
 func openAPIClientDocument() *huma.OpenAPI {
 	doc := baseOpenAPIDocument(true)
 	hardenSourceStatusClientSchemas(doc)
+	hardenEmbeddingStatusSchemas(doc, true)
 	clearResponseAdditionalProperties(doc)
 	hardenOperationSchemas(doc)
 	applyClientCodegenExtensions(doc)
@@ -621,15 +684,21 @@ func hardenTaskLinkSchemas(doc *huma.OpenAPI) {
 }
 
 func hardenSourceStatusPublicSchemas(doc *huma.OpenAPI) {
+	nullablePublicObjectRefs(doc, "SourceStatus", "active_sync", "latest_sync", "last_successful_sync")
+}
+
+// nullablePublicObjectRefs publishes nullable object references as a oneOf
+// with null, which Huma does not infer from pointer fields.
+func nullablePublicObjectRefs(doc *huma.OpenAPI, schemaName string, names ...string) {
 	if doc == nil || doc.Components == nil || doc.Components.Schemas == nil {
 		return
 	}
-	schema := doc.Components.Schemas.Map()["SourceStatus"]
+	schema := doc.Components.Schemas.Map()[schemaName]
 	if schema == nil {
 		return
 	}
-	for _, name := range []string{"active_sync", "latest_sync", "last_successful_sync"} {
-		if property := schema.Properties[name]; property != nil {
+	for _, name := range names {
+		if property := schema.Properties[name]; property != nil && property.Ref != "" {
 			ref := property.Ref
 			property.Ref = ""
 			property.Type = ""
@@ -660,6 +729,47 @@ func hardenSourceStatusClientSchemas(doc *huma.OpenAPI) {
 	for name := range nullableRuns {
 		if property := schema.Properties[name]; property != nil {
 			property.Nullable = true
+		}
+	}
+}
+
+// embeddingStatusNullableFields are always-present nullable fields. The
+// public document marks object references with nullablePublicObjectRefs; the
+// Go client uses optional pointers for all of them, as with SourceStatus.
+var embeddingStatusNullableFields = map[string][]string{
+	"EmbeddingStatus":         {"active_generation", "diagnostics", "messages_per_minute", "eta_seconds"},
+	"EmbeddingDiagnostics":    {"current_batch", "last_error", "finished_at", "last_successful_batch_at"},
+	"EmbeddingBatch":          {"error"},
+	"EmbeddingJobState":       {"started_at", "queued_at"},
+	"EmbeddingSchedulerState": {"slot_held_since"},
+}
+
+func hardenEmbeddingStatusSchemas(doc *huma.OpenAPI, client bool) {
+	if doc == nil || doc.Components == nil || doc.Components.Schemas == nil {
+		return
+	}
+	for schemaName, names := range embeddingStatusNullableFields {
+		if !client {
+			nullablePublicObjectRefs(doc, schemaName, names...)
+			continue
+		}
+		schema := doc.Components.Schemas.Map()[schemaName]
+		if schema == nil {
+			continue
+		}
+		for _, name := range names {
+			property := schema.Properties[name]
+			if property == nil {
+				continue
+			}
+			if property.Ref != "" {
+				property.AllOf = []*huma.Schema{{Ref: property.Ref}}
+				property.Ref = ""
+				property.Type = "object"
+			}
+			property.Nullable = true
+			schema.Required = slices.DeleteFunc(schema.Required, func(required string) bool { return required == name })
+			nullableSchemaProperty(schema, name)
 		}
 	}
 }
@@ -726,7 +836,7 @@ func hardenExploreSchemas(doc *huma.OpenAPI) {
 }
 
 func exploreGroupingEnum() []any {
-	dimensions := explorecatalog.GroupingDimensions()
+	dimensions := explorecatalog.RequestGroupingDimensions()
 	values := make([]any, len(dimensions))
 	for index, dimension := range dimensions {
 		values[index] = dimension
@@ -904,7 +1014,48 @@ func applyClientCodegenExtensions(doc *huma.OpenAPI) {
 		return
 	}
 	schemas := doc.Components.Schemas.Map()
+	// These response properties stay required in JSON, but allow empty strings.
+	for _, field := range []struct{ schema, property string }{
+		{"Attendee", "email"},
+		{"Attendee", "display_name"},
+		{"CalendarOccurrence", "start_date"},
+		{"CalendarOccurrence", "end_date"},
+		{"CalendarOccurrence", "subject"},
+		{"ContactCandidate", "display_name"},
+		{"MediaAttachmentResult", "filename"},
+		{"MediaAttachmentResult", "containing_title"},
+		{"MessagingRoute", "merged_into_chat_id"},
+		{"MessagingRoute", "network"},
+		{"MessagingRoute", "network_label"},
+		{"MessagingRoute", "provider_chat_id"},
+		{"PersonMessagingRoutesPage", "alias_reason"},
+	} {
+		if schema := schemas[field.schema]; schema != nil {
+			if property := schema.Properties[field.property]; property != nil {
+				if property.Extensions == nil {
+					property.Extensions = map[string]any{}
+				}
+				property.Extensions["x-omitempty"] = false
+				property.Extensions["x-oapi-codegen-extra-tags"] = map[string]any{
+					"validate": "omitempty",
+				}
+			}
+		}
+	}
 	const emailProperty = "email"
+	if calendar := schemas["CalendarProjection"]; calendar != nil {
+		for name, goType := range map[string]string{"all_day": "*bool", "sequence": "*int64"} {
+			if property := calendar.Properties[name]; property != nil {
+				setCodegenGoType(property, goType)
+			}
+		}
+		// Fields the stored event does not carry are present as null, including
+		// zero-capable scalars. Keep every field nullable through parsing and
+		// encoding.
+		for _, name := range []string{statusFieldName, "sequence", "start", "end", "all_day", "time_zone", "ical_uid"} {
+			nullableSchemaProperty(calendar, name)
+		}
+	}
 	if input := schemas["GCalEventInput"]; input != nil {
 		for name, goType := range map[string]string{"attendees": "*[]GCalAttendee", "recurrence": "*[]string"} {
 			if field := input.Properties[name]; field != nil {
@@ -995,9 +1146,22 @@ func applyClientCodegenExtensions(doc *huma.OpenAPI) {
 		}
 	}
 
-	for _, schemaName := range []string{"FileSearchRow", "FileMetadataResponse", "PersonFileSearchRow"} {
-		if schema := schemas[schemaName]; schema != nil {
-			for _, property := range []string{"filename", "mime_type"} {
+	// An account without an alias still includes the required alias property.
+	if account := schemas["CliAccountResponse"]; account != nil && account.Properties["alias"] != nil {
+		account.Properties["alias"].Nullable = true
+	}
+	for _, fields := range []struct {
+		name       string
+		properties []string
+	}{
+		{"FileSearchRow", []string{"filename", "mime_type"}},
+		{"FileMetadataResponse", []string{"filename", "mime_type"}},
+		{"PersonFileSearchRow", []string{"filename", "mime_type"}},
+		{"MessageRecording", []string{"filename", "mime_type"}},
+		{"ChatDiscoveryResult", []string{"title", "source_display_name", "source_conversation_id", "source_identifier"}},
+	} {
+		if schema := schemas[fields.name]; schema != nil {
+			for _, property := range fields.properties {
 				if schema.Properties[property] != nil {
 					schema.Properties[property].Nullable = true
 				}
@@ -1011,6 +1175,17 @@ func applyClientCodegenExtensions(doc *huma.OpenAPI) {
 			}
 			displayName.Extensions["x-omitempty"] = false
 			displayName.Extensions["x-oapi-codegen-extra-tags"] = map[string]any{
+				"validate": "omitempty",
+			}
+		}
+	}
+	// A changed or unavailable passage carries an empty excerpt.
+	if evidence := schemas["Evidence"]; evidence != nil {
+		if excerpt := evidence.Properties["excerpt"]; excerpt != nil {
+			if excerpt.Extensions == nil {
+				excerpt.Extensions = map[string]any{}
+			}
+			excerpt.Extensions["x-oapi-codegen-extra-tags"] = map[string]any{
 				"validate": "omitempty",
 			}
 		}
@@ -1107,6 +1282,52 @@ func applyClientCodegenExtensions(doc *huma.OpenAPI) {
 		}
 		schema.Extensions["x-enum-names"] = enumNames
 	}
+	for _, name := range []string{"FileSuggestionRow", "PersonFileSuggestionRow"} {
+		schema := schemas[name]
+		nullableSchemaProperty(schema, "occurred_at")
+		if schema == nil {
+			continue
+		}
+		// Unknown MIME is an empty string, not a missing property.
+		if mime := schema.Properties["mime_type"]; mime != nil {
+			mime.Nullable = true
+		}
+	}
+	for _, name := range []string{"FileSuggestionHTTPRequest", "PersonFileSuggestionHTTPRequest", "FileSuggestionRow", "PersonFileSuggestionRow"} {
+		if schema := schemas[name]; schema != nil {
+			for property, suffix := range map[string]string{
+				"mime_families": "MimeFamilies", "mime_family": "MimeFamily",
+				"directions": "Directions", "content_state": "ContentState", "filename_match": "FilenameMatch",
+			} {
+				field := schema.Properties[property]
+				if field == nil {
+					continue
+				}
+				if field.Type == huma.TypeArray {
+					field = field.Items
+				}
+				values := make([]string, len(field.Enum))
+				for i, value := range field.Enum {
+					text, ok := value.(string)
+					if !ok {
+						panic("filename suggestion enum must contain strings")
+					}
+					values[i] = text
+				}
+				setEnumNames(field, qualifiedEnumNames(name+suffix, values))
+			}
+		}
+	}
+	if recording := schemas["MessageRecording"]; recording != nil {
+		setEnumNames(recording.Properties["state"], qualifiedEnumNames("MessageRecordingState",
+			[]string{recordingReady, recordingProcessing, recordingMissing, recordingFailed, recordingUnsupported, recordingMediaMissing, recordingUnavailable}))
+	}
+	if transcript := schemas["MessageTranscript"]; transcript != nil {
+		setEnumNames(transcript.Properties["origin"], qualifiedEnumNames("MessageTranscriptOrigin", []string{"supplied", "generated"}))
+	}
+	if result := schemas["MediaSearchResult"]; result != nil {
+		setEnumNames(result.Properties["origin"], qualifiedEnumNames("MediaSearchResultOrigin", []string{"supplied", "generated"}))
+	}
 	if request := schemas["CalendarRequest"]; request != nil {
 		for property, names := range map[string][]any{
 			"response":     qualifiedEnumNames("CalendarRequestResponse", []string{"accepted", "declined", "tentative"}),
@@ -1163,7 +1384,7 @@ func applyClientCodegenExtensions(doc *huma.OpenAPI) {
 	}
 	setEnumNames(schemas["ExploreGroupDimension"], []any{
 		"ExploreGroupDimensionSource", "ExploreGroupDimensionParticipant", "ExploreGroupDimensionDomain",
-		"ExploreGroupDimensionMessageType", "ExploreGroupDimensionMailingList", "ExploreGroupDimensionKind", "ExploreGroupDimensionYear", "ExploreGroupDimensionMonth",
+		"ExploreGroupDimensionMessageType", "ExploreGroupDimensionMailingList", "ExploreGroupDimensionKind", "ExploreGroupDimensionYear", "ExploreGroupDimensionMonth", "ExploreGroupDimensionDay",
 	})
 	if counter := schemas["OperationPublicCounter"]; counter != nil {
 		setEnumNames(counter.Properties["unit"], []any{
@@ -1245,8 +1466,9 @@ func applyClientCodegenExtensions(doc *huma.OpenAPI) {
 			"readiness": {"ExploreCacheUnavailableResponseReadinessAbsent", "ExploreCacheUnavailableResponseReadinessBuilding", "ExploreCacheUnavailableResponseReadinessInterrupted", "ExploreCacheUnavailableResponseReadinessStaleSchema", "ExploreCacheUnavailableResponseReadinessDrifted"},
 		},
 		"ExploreFilter": {
-			"dimension": {"ExploreFilterDimensionSource", "ExploreFilterDimensionParticipant", "ExploreFilterDimensionDomain", "ExploreFilterDimensionMessageType", "ExploreFilterDimensionMailingList", "ExploreFilterDimensionAfter", "ExploreFilterDimensionBefore", "ExploreFilterDimensionDeletion", "ExploreFilterDimensionIdentity"},
+			"dimension": {"ExploreFilterDimensionSource", "ExploreFilterDimensionParticipant", "ExploreFilterDimensionDomain", "ExploreFilterDimensionMessageType", "ExploreFilterDimensionKind", "ExploreFilterDimensionMailingList", "ExploreFilterDimensionAfter", "ExploreFilterDimensionBefore", "ExploreFilterDimensionDeletion", "ExploreFilterDimensionIdentity", "ExploreFilterDimensionAccount"},
 		},
+		"ExploreGroupRow": {"level": {"ExploreGroupRowLevelNone", "ExploreGroupRowLevelFirstQuartile", "ExploreGroupRowLevelSecondQuartile", "ExploreGroupRowLevelThirdQuartile", "ExploreGroupRowLevelFourthQuartile"}},
 		"ExploreGroupSort": {
 			"direction": {"ExploreGroupSortDirectionAsc", "ExploreGroupSortDirectionDesc"},
 			"field":     {"ExploreGroupSortFieldKey", "ExploreGroupSortFieldCount", "ExploreGroupSortFieldEstimatedBytes", "ExploreGroupSortFieldLatestAt"},
@@ -1271,9 +1493,7 @@ func applyClientCodegenExtensions(doc *huma.OpenAPI) {
 				"ImportJobResponseStatusFailed",
 			},
 		},
-		"ExploreSelection": {
-			"mode": {"ExploreSelectionModeExplicit", "ExploreSelectionModeAllMatching"},
-		},
+		"ExploreSelection": {"mode": {"ExploreSelectionModeExplicit", "ExploreSelectionModeAllMatching"}},
 		"ExploreSort": {
 			"direction": {"ExploreSortDirectionDesc"},
 			"field":     {"ExploreSortFieldOccurredAt"},
@@ -1296,6 +1516,12 @@ func applyClientCodegenExtensions(doc *huma.OpenAPI) {
 			schemaName + "AllowedResolutionsKeepLocal",
 			schemaName + "AllowedResolutionsKeepRemote",
 		})
+	}
+	// Without the override, empty-schema map values generate struct{}, which cannot carry surface="web".
+	if telemetry := schemas["TelemetryEventRequest"]; telemetry != nil && telemetry.Properties["properties"] != nil {
+		if values, ok := telemetry.Properties["properties"].AdditionalProperties.(*huma.Schema); ok {
+			setCodegenGoType(values, "any")
+		}
 	}
 	meeting := schemas["Meeting"]
 	if meeting == nil || meeting.Properties == nil {

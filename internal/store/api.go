@@ -5,10 +5,14 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
+	"go.kenn.io/msgvault/internal/calevent"
 	"go.kenn.io/msgvault/internal/search"
+	"go.kenn.io/msgvault/internal/senderauth"
+	"go.kenn.io/msgvault/internal/sourcescope"
 	"go.kenn.io/msgvault/internal/sqliteutil"
 )
 
@@ -48,6 +52,10 @@ const participantSummarySenderSQL = participantDisplaySQL + ` as from_display,
 
 // APIMessage represents a message for API responses.
 type APIMessage struct {
+	SenderAuth           *senderauth.Verdict
+	RelatedMessageID     *int64
+	ConversationTitle    string
+	Calendar             *CalendarProjection
 	ID                   int64
 	SourceID             int64
 	SourceMessageID      string
@@ -55,6 +63,8 @@ type APIMessage struct {
 	SourceConversationID string
 	Subject              string
 	MessageType          string
+	FromParticipantID    int64
+	ToParticipants       []ParticipantDisplay
 	From                 string
 	FromEmail            string
 	FromName             string
@@ -66,6 +76,7 @@ type APIMessage struct {
 	Snippet              string
 	Labels               []string
 	HasAttachments       bool
+	HiddenTextPresent    bool
 	SizeEstimate         int64
 	DeletedAt            *time.Time
 	Body                 string
@@ -77,18 +88,33 @@ type APIMessage struct {
 	Attachments          []APIAttachment
 }
 
-// MessageRecipient is one archived message-recipient relationship.
-// EmailAddress comes from the immutable message envelope when available,
-// rather than from a participant that may be merged. ParticipantID groups
-// historical envelope aliases that now resolve to the same participant.
-type MessageRecipient struct {
+// ParticipantDisplay retains the archived person behind a recipient label.
+type ParticipantDisplay struct {
 	ParticipantID int64
-	EmailAddress  string
-	DisplayName   string
+	Display       string
+}
+
+func recipientDisplays(values []ParticipantDisplay) []string {
+	var result []string
+	for _, value := range values {
+		result = append(result, value.Display)
+	}
+	return result
+}
+
+// MessageRecipient is one archived message-recipient relationship.
+// EmailAddress falls back to the current participant when the snapshot is absent.
+// EnvelopeAddress contains only the per-message snapshot, empty when absent.
+type MessageRecipient struct {
+	ParticipantID   int64
+	EmailAddress    string
+	EnvelopeAddress string
+	DisplayName     string
 }
 
 // APIAttachment represents attachment metadata for API responses.
 type APIAttachment struct {
+	Docbank     []DocbankAttachmentRef
 	ID          int64
 	Filename    string
 	MimeType    string
@@ -100,25 +126,29 @@ type APIAttachment struct {
 // ListMessages returns a paginated list of messages with batch-loaded
 // recipients and labels.
 func (s *Store) ListMessages(offset, limit int) ([]APIMessage, int64, error) {
-	return s.ListMessagesContext(context.Background(), offset, limit)
+	return s.ListMessagesContext(context.Background(), offset, limit, nil)
 }
 
 // ListMessagesContext is the context-aware form of ListMessages. Request
 // paths pass the request context so the count, list, and hydration queries
 // carry the request_id for SQL logging and are cancelled together when the
 // request is abandoned or times out.
-func (s *Store) ListMessagesContext(ctx context.Context, offset, limit int) ([]APIMessage, int64, error) {
+func (s *Store) ListMessagesContext(ctx context.Context, offset, limit int, sourceIDs []int64) ([]APIMessage, int64, error) {
+	scope := ""
+	var args []any
+	if sourceIDs != nil {
+		predicate := "0 = 1"
+		if len(sourceIDs) > 0 {
+			predicate, args = messageExportInClause("m.source_id", sourceIDs)
+		}
+		scope = " AND " + predicate
+	}
+	authorizedScope, authorizedArgs := sourceScopeClause(ctx, "m.source_id")
+	scope += authorizedScope
+	args = append(args, authorizedArgs...)
 	// Get total count. Use the canonical live-messages predicate so
 	// dedup-hidden rows (deleted_at) are excluded alongside source-
 	// deleted rows.
-	var total int64
-	err := s.db.QueryRowContext(ctx,
-		"SELECT COUNT(*) FROM messages WHERE "+LiveMessagesWhere("", true),
-	).Scan(&total)
-	if err != nil {
-		return nil, 0, err
-	}
-
 	// Query messages with sender info
 	query := fmt.Sprintf(`
 		SELECT
@@ -133,6 +163,7 @@ func (s *Store) ListMessagesContext(ctx context.Context, offset, limit int) ([]A
 			COALESCE(m.sent_at, m.received_at, m.internal_date) as sent_at,
 			COALESCE(m.snippet, '') as snippet,
 			m.has_attachments,
+			m.hidden_text_present,
 			m.size_estimate
 		FROM messages m
 		LEFT JOIN message_recipients mr ON mr.id = (
@@ -145,16 +176,30 @@ func (s *Store) ListMessagesContext(ctx context.Context, offset, limit int) ([]A
 		WHERE %s
 		ORDER BY COALESCE(m.sent_at, m.received_at, m.internal_date) DESC, m.id DESC
 		LIMIT ? OFFSET ?
-	`, participantSummarySenderSQL, LiveMessagesWhere("m", true))
+	`, participantSummarySenderSQL, LiveMessagesWhere("m", true)+scope)
 
-	rows, err := s.db.QueryContext(ctx, query, limit, offset)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer func() { _ = rows.Close() }()
-
-	// Use scanMessageRows for robust date parsing
-	messages, ids, err := scanMessageRows(rows)
+	var (
+		total    int64
+		messages []APIMessage
+		ids      []int64
+	)
+	err := RunIndependentReads(ctx, s.db.DB,
+		func(ctx context.Context) error {
+			return s.db.QueryRowContext(ctx,
+				"SELECT COUNT(*) FROM messages m WHERE "+LiveMessagesWhere("m", true)+scope, args...,
+			).Scan(&total)
+		},
+		func(ctx context.Context) error {
+			rows, err := s.db.QueryContext(ctx, query, append(slices.Clip(args), limit, offset)...)
+			if err != nil {
+				return err
+			}
+			defer func() { _ = rows.Close() }()
+			// Use scanMessageRows for robust date parsing
+			messages, ids, err = scanMessageRows(rows)
+			return err
+		},
+	)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -202,6 +247,7 @@ func (s *Store) GetMessage(id int64) (*APIMessage, error) {
 // pass the request context so the base row, recipient, label, body, and
 // attachment queries carry the request_id for SQL logging and cancel together.
 func (s *Store) GetMessageContext(ctx context.Context, id int64) (*APIMessage, error) {
+	scope, scopeArgs := sourceScopeClause(ctx, "m.source_id")
 	query := fmt.Sprintf(`
 		SELECT
 			m.id,
@@ -209,15 +255,18 @@ func (s *Store) GetMessageContext(ctx context.Context, id int64) (*APIMessage, e
 			COALESCE(m.source_message_id, '') as source_message_id,
 			COALESCE(m.conversation_id, 0) as conversation_id,
 			COALESCE(c.source_conversation_id, '') as source_conversation_id,
+			COALESCE(c.title, ''),
 			COALESCE(m.subject, '') as subject,
 			COALESCE(m.message_type, '') as message_type,
 			%s,
 			COALESCE(m.sent_at, m.received_at, m.internal_date) as sent_at,
 			COALESCE(m.snippet, '') as snippet,
 			m.has_attachments,
+			m.hidden_text_present,
 			m.size_estimate,
 			m.is_from_me,
-			m.deleted_from_source_at
+			m.deleted_from_source_at,
+			CASE WHEN m.message_type IN ('chatwoot', 'meeting_transcript', 'calendar_event') THEN m.metadata ELSE NULL END
 		FROM messages m
 		LEFT JOIN message_recipients mr ON mr.id = (
 			SELECT mr2.id FROM message_recipients mr2
@@ -226,8 +275,8 @@ func (s *Store) GetMessageContext(ctx context.Context, id int64) (*APIMessage, e
 		)
 		LEFT JOIN participants p ON p.id = COALESCE(m.sender_id, mr.participant_id)
 		LEFT JOIN conversations c ON c.id = m.conversation_id
-		WHERE m.id = ?
-	`, participantSummarySenderSQL)
+		WHERE m.id = ?%s
+	`, participantSummarySenderSQL, scope)
 
 	var m APIMessage
 	// sentAt is a COALESCE expression; use nullableTimestamp so
@@ -236,12 +285,14 @@ func (s *Store) GetMessageContext(ctx context.Context, id int64) (*APIMessage, e
 	// keeps the API consistent and tolerant of either driver.
 	var sentAt, deletedAt nullableTimestamp
 	var isFromMe sql.NullBool
-	err := s.db.QueryRowContext(ctx, query, id).Scan(
+	var metadata sql.NullString
+	err := s.db.QueryRowContext(ctx, query, append([]any{id}, scopeArgs...)...).Scan(
 		&m.ID,
 		&m.SourceID,
 		&m.SourceMessageID,
 		&m.ConversationID,
 		&m.SourceConversationID,
+		&m.ConversationTitle,
 		&m.Subject,
 		&m.MessageType,
 		&m.From,
@@ -251,9 +302,11 @@ func (s *Store) GetMessageContext(ctx context.Context, id int64) (*APIMessage, e
 		&sentAt,
 		&m.Snippet,
 		&m.HasAttachments,
+		&m.HiddenTextPresent,
 		&m.SizeEstimate,
 		&isFromMe,
 		&deletedAt,
+		&metadata,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("message %d: %w", id, ErrMessageNotFound)
@@ -261,6 +314,15 @@ func (s *Store) GetMessageContext(ctx context.Context, id int64) (*APIMessage, e
 	if err != nil {
 		return nil, err
 	}
+	m.RelatedMessageID = RelatedMessageCandidate(m.ID, m.MessageType, metadata.String)
+	if m.MessageType == messageTypeCalendarEvent {
+		m.Calendar = ParseCalendarProjection(metadata.String)
+	}
+	messages := []APIMessage{m}
+	if err := s.populateRelatedMessages(ctx, messages); err != nil {
+		return nil, err
+	}
+	m.RelatedMessageID = messages[0].RelatedMessageID
 	m.IsFromMe = isFromMe.Bool
 	if sentAt.Valid {
 		m.SentAt = sentAt.Time
@@ -309,6 +371,7 @@ func (s *Store) GetMessageContext(ctx context.Context, id int64) (*APIMessage, e
 		return nil, fmt.Errorf("get attachments: %w", err)
 	}
 	defer func() { _ = attRows.Close() }()
+	var hashes []string
 	for attRows.Next() {
 		var att APIAttachment
 		var storagePath, sourceAttachmentID string
@@ -318,27 +381,28 @@ func (s *Store) GetMessageContext(ctx context.Context, id int64) (*APIMessage, e
 		); err != nil {
 			return nil, fmt.Errorf("scan attachment: %w", err)
 		}
-		if strings.HasPrefix(storagePath, "http://") || strings.HasPrefix(storagePath, "https://") {
-			att.ContentHash = ""
+		receiptHash := AttachmentReceiptHash(att.ContentHash, storagePath, sourceAttachmentID)
+		att.ContentHash = receiptHash
+		if IsURLStoragePath(storagePath) {
 			att.URL = storagePath
-		} else if att.ContentHash == "" &&
-			(strings.HasPrefix(sourceAttachmentID, "discord:") || strings.HasPrefix(sourceAttachmentID, "slack:")) {
-			// A hashless Discord/Slack row whose storage path validates as
-			// a trusted CAS path is a duplicate-content alias; re-derive
-			// its hash so the attachment stays accessible. The provider
-			// gate is load-bearing: a Beeper hashless local path means
-			// pending/untrusted and must stay hashless (see
-			// TestBeeperHashlessLocalPathRemainsPending).
-			if pathHash, ok := casPathHash(storagePath); ok {
-				att.ContentHash = pathHash
-			}
 		}
 		m.Attachments = append(m.Attachments, att)
+		hashes = append(hashes, receiptHash)
 	}
 	if err := attRows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate attachments: %w", err)
 	}
 
+	if err := attRows.Close(); err != nil {
+		return nil, err
+	}
+	refs, err := LoadDocbankAttachmentRefs(ctx, ReadDBContext(ctx, s.db.DB), s.Rebind, "", hashes)
+	if err != nil {
+		return nil, err
+	}
+	for i := range m.Attachments {
+		m.Attachments[i].Docbank = refs[strings.ToLower(hashes[i])]
+	}
 	m.Headers = make(map[string]string)
 
 	return &m, nil
@@ -387,6 +451,7 @@ func (s *Store) GetMessagesSummariesByIDsContext(ctx context.Context, ids []int6
 			COALESCE(m.sent_at, m.received_at, m.internal_date) as sent_at,
 			COALESCE(m.snippet, '') as snippet,
 			m.has_attachments,
+			m.hidden_text_present,
 			m.size_estimate
 		FROM messages m
 		LEFT JOIN message_recipients mr ON mr.id = (
@@ -480,21 +545,30 @@ func (s *Store) SearchMessagesQueryContext(
 	return s.searchMessagesQueryImpl(ctx, q, offset, limit, s.fts5Available)
 }
 
+type searchOperator struct {
+	condition int
+	matching  string
+	arg       string
+}
+
+const messageSearchDateOrder = "COALESCE(m.sent_at, m.received_at, m.internal_date) DESC, m.id DESC"
+
 type messageSearchSQL struct {
-	join      string
-	where     string
-	orderBy   string
-	args      []any
-	orderArgs []any
-	fts       bool
+	operators  []searchOperator
+	conditions []string
+	join       string
+	where      string
+	orderBy    string
+	rank       string
+	args       []any
+	orderArgs  []any
+	fts        bool
 }
 
 // buildMessageSearchSQL keeps candidate-only and full-message searches on the
 // same filters and ranking, including the subject/snippet fallback without FTS.
-func (s *Store) buildMessageSearchSQL(q *search.Query, ftsAvailable bool) messageSearchSQL {
-	var conditions []string
-	var args []any
-
+func (s *Store) buildMessageSearchSQL(ctx context.Context, q *search.Query, ftsAvailable bool) messageSearchSQL {
+	var visibility string
 	// The FTS index covers source-deleted messages too: soft deletion only
 	// stamps deleted_from_source_at, leaving the FTS5 row (and the PG
 	// tsvector on the surviving messages row) intact. Honoring the
@@ -503,16 +577,40 @@ func (s *Store) buildMessageSearchSQL(q *search.Query, ftsAvailable bool) messag
 	// scope at its zero value keeps the historical active-only behavior.
 	switch q.DeletionScope {
 	case search.DeletionScopeDeleted:
-		conditions = append(conditions, SourceDeletedMessagesWhere("m"))
+		visibility = SourceDeletedMessagesWhere("m")
 	case search.DeletionScopeAny:
-		conditions = append(conditions, LiveMessagesWhere("m", false))
+		visibility = LiveMessagesWhere("m", false)
 	case search.DeletionScopeActive:
-		conditions = append(conditions, LiveMessagesWhere("m", true))
+		visibility = LiveMessagesWhere("m", true)
 	default:
-		// The zero value (no scope chosen) and unknown values fail
-		// closed to the narrowest population.
-		conditions = append(conditions, LiveMessagesWhere("m", true))
+		visibility = LiveMessagesWhere("m", true)
 	}
+
+	plan := s.buildMessageSearchSQLWithVisibility(ctx, q, ftsAvailable, visibility)
+	scope, scopeArgs := sourceScopeClause(ctx, "m.source_id")
+	plan.where += scope
+	plan.args = append(plan.args, scopeArgs...)
+	return plan
+}
+
+func (s *Store) buildMessageSearchSQLWithVisibility(ctx context.Context, q *search.Query, ftsAvailable bool, visibility string) messageSearchSQL {
+	plan := s.buildMessageSearchCriteria(q, ftsAvailable, false)
+	s.preferOperatorLookups(ctx, &plan)
+	plan.conditions = append([]string{visibility}, plan.conditions...)
+	plan.where = strings.Join(plan.conditions, " AND ")
+	return plan
+}
+
+func (s *Store) buildMessageSearchCriteria(q *search.Query, ftsAvailable, rowIDs bool) messageSearchSQL {
+	if q.HasOR() {
+		conditions, args := CombineOR(q, func(branch *search.Query) ([]string, []any) {
+			plan := s.buildMessageSearchCriteria(branch, ftsAvailable, true)
+			return plan.conditions, plan.args
+		})
+		return messageSearchSQL{conditions: conditions, where: strings.Join(conditions, " AND "), args: args, orderBy: messageSearchDateOrder, fts: ftsAvailable && q.HasTextTerms()}
+	}
+	var conditions []string
+	var args []any
 
 	// FTS text terms. ftsEnabled is the authoritative signal that FTS is
 	// active — ftsJoin may be empty on dialects (e.g. PostgreSQL) whose
@@ -534,7 +632,7 @@ func (s *Store) buildMessageSearchSQL(q *search.Query, ftsAvailable bool) messag
 			conditions = append(conditions, "FALSE")
 			ftsEnabled = false
 		} else {
-			join, where, orderBy, orderArgCount := s.dialect.FTSSearchClause()
+			join, where, orderBy, orderArgCount := s.dialect.FTSSearchClause(rowIDs)
 			ftsJoin = join
 			ftsOrder = orderBy
 			ftsOrderArgCount = orderArgCount
@@ -569,70 +667,6 @@ func (s *Store) buildMessageSearchSQL(q *search.Query, ftsAvailable bool) messag
 		}
 	}
 
-	// from: filter
-	for _, addr := range q.FromAddrs {
-		conditions = append(conditions, `EXISTS (
-			SELECT 1 FROM message_recipients mr2
-			JOIN participants p2 ON p2.id = mr2.participant_id
-			WHERE mr2.message_id = m.id
-			AND mr2.recipient_type = 'from'
-			AND LOWER(p2.email_address) LIKE ? ESCAPE '\'
-		)`)
-		args = append(args,
-			"%"+escapeLike(strings.ToLower(addr))+"%")
-	}
-
-	// to: filter
-	for _, addr := range q.ToAddrs {
-		conditions = append(conditions, `EXISTS (
-			SELECT 1 FROM message_recipients mr2
-			JOIN participants p2 ON p2.id = mr2.participant_id
-			WHERE mr2.message_id = m.id
-			AND mr2.recipient_type = 'to'
-			AND LOWER(p2.email_address) LIKE ? ESCAPE '\'
-		)`)
-		args = append(args,
-			"%"+escapeLike(strings.ToLower(addr))+"%")
-	}
-
-	// cc: filter
-	for _, addr := range q.CcAddrs {
-		conditions = append(conditions, `EXISTS (
-			SELECT 1 FROM message_recipients mr2
-			JOIN participants p2 ON p2.id = mr2.participant_id
-			WHERE mr2.message_id = m.id
-			AND mr2.recipient_type = 'cc'
-			AND LOWER(p2.email_address) LIKE ? ESCAPE '\'
-		)`)
-		args = append(args,
-			"%"+escapeLike(strings.ToLower(addr))+"%")
-	}
-
-	// bcc: filter
-	for _, addr := range q.BccAddrs {
-		conditions = append(conditions, `EXISTS (
-			SELECT 1 FROM message_recipients mr2
-			JOIN participants p2 ON p2.id = mr2.participant_id
-			WHERE mr2.message_id = m.id
-			AND mr2.recipient_type = 'bcc'
-			AND LOWER(p2.email_address) LIKE ? ESCAPE '\'
-		)`)
-		args = append(args,
-			"%"+escapeLike(strings.ToLower(addr))+"%")
-	}
-
-	// label: filter
-	for _, lbl := range q.Labels {
-		conditions = append(conditions, `EXISTS (
-			SELECT 1 FROM message_labels ml2
-			JOIN labels l2 ON l2.id = ml2.label_id
-			WHERE ml2.message_id = m.id
-			AND LOWER(l2.name) LIKE ? ESCAPE '\'
-		)`)
-		args = append(args,
-			"%"+escapeLike(strings.ToLower(lbl))+"%")
-	}
-
 	// subject: filter — LOWER on both sides for PG portability.
 	// SQLite's default LIKE is ASCII-case-insensitive; PG's is strict-
 	// case, so a bare `m.subject LIKE '%invoice%'` returned zero hits
@@ -662,6 +696,11 @@ func (s *Store) buildMessageSearchSQL(q *search.Query, ftsAvailable bool) messag
 			s.dialect.UnicodeLowerExpression("?")))
 		args = append(args, "%"+escapeLike(strings.ToLower(listID))+"%")
 	}
+	for _, filename := range q.Filenames {
+		conditions = append(conditions, fmt.Sprintf(`EXISTS (SELECT 1 FROM attachments fa WHERE fa.message_id = m.id AND %s LIKE %s ESCAPE '\')`,
+			s.dialect.UnicodeLowerExpression("COALESCE(fa.filename, '')"), s.dialect.UnicodeLowerExpression("?")))
+		args = append(args, "%"+escapeLike(filename)+"%")
+	}
 	// Structured Explore mailing-list filters use exact membership. Each
 	// request filter is an OR group, and repeated filters are ANDed.
 	for _, group := range q.ListIDExactGroups {
@@ -676,6 +715,16 @@ func (s *Store) buildMessageSearchSQL(q *search.Query, ftsAvailable bool) messag
 			args = append(args, listID)
 		}
 		conditions = append(conditions, "("+strings.Join(parts, " OR ")+")")
+	}
+	// account: and received: match the derived account projection.
+	if accountConditions, accountArgs := search.AccountConditions(q, "m"); len(accountConditions) > 0 {
+		conditions = append(conditions, accountConditions...)
+		args = append(args, accountArgs...)
+	}
+	// Structured scopes narrow candidates before any limit applies.
+	if scopeConditions, scopeArgs := search.AccountScopeConditions(q.AccountScopes, "m"); len(scopeConditions) > 0 {
+		conditions = append(conditions, scopeConditions...)
+		args = append(args, scopeArgs...)
 	}
 
 	// message_type: / message_type= filter. An "email" value also matches an
@@ -777,44 +826,101 @@ func (s *Store) buildMessageSearchSQL(q *search.Query, ftsAvailable bool) messag
 		args = append(args, q.BeforeDate.UTC())
 	}
 
-	orderBy := "COALESCE(m.sent_at, m.received_at, m.internal_date) DESC, m.id DESC"
+	// Operators come last so a condition before them identifies a search
+	// already narrowed by another filter.
+	var operators []searchOperator
+	for _, group := range []struct {
+		role  string
+		addrs []string
+	}{{meetingSenderRole, q.FromAddrs}, {"to", q.ToAddrs}, {"cc", q.CcAddrs}, {"bcc", q.BccAddrs}} {
+		for _, addr := range group.addrs {
+			arg := "%" + escapeLike(strings.ToLower(addr)) + "%"
+			if !rowIDs {
+				operators = append(operators, searchOperator{condition: len(conditions), matching: fmt.Sprintf(`SELECT mr2.message_id FROM message_recipients mr2 INDEXED BY idx_message_recipients_participant
+					WHERE mr2.recipient_type = '%s' AND mr2.participant_id IN
+					(SELECT p2.id FROM participants p2 WHERE LOWER(p2.email_address) LIKE ? ESCAPE '\')`, group.role), arg: arg})
+			}
+			conditions = append(conditions, fmt.Sprintf(`EXISTS (
+			SELECT 1 FROM message_recipients mr2
+			JOIN participants p2 ON p2.id = mr2.participant_id
+			WHERE mr2.message_id = m.id
+			AND mr2.recipient_type = '%s'
+			AND LOWER(p2.email_address) LIKE ? ESCAPE '\'
+		)`, group.role))
+			args = append(args, arg)
+		}
+	}
+	for _, lbl := range q.Labels {
+		arg := "%" + escapeLike(strings.ToLower(lbl)) + "%"
+		if !rowIDs {
+			operators = append(operators, searchOperator{condition: len(conditions), matching: `SELECT ml2.message_id FROM message_labels ml2
+				WHERE ml2.label_id IN (SELECT l2.id FROM labels l2 WHERE LOWER(l2.name) LIKE ? ESCAPE '\')`, arg: arg})
+		}
+		conditions = append(conditions, `EXISTS (
+			SELECT 1 FROM message_labels ml2
+			JOIN labels l2 ON l2.id = ml2.label_id
+			WHERE ml2.message_id = m.id
+			AND LOWER(l2.name) LIKE ? ESCAPE '\'
+		)`)
+		args = append(args, arg)
+	}
+
+	orderBy := messageSearchDateOrder
 	var orderArgs []any
+	var rank string
 	if ftsEnabled {
+		rank = ftsOrder
 		orderBy = ftsOrder + ", " + orderBy
 		for range ftsOrderArgCount {
 			orderArgs = append(orderArgs, ftsExpr)
 		}
 	}
 	return messageSearchSQL{
-		join: ftsJoin, where: strings.Join(conditions, " AND "), orderBy: orderBy,
-		args: args, orderArgs: orderArgs, fts: ftsEnabled,
+		operators: operators, conditions: conditions, join: ftsJoin, where: strings.Join(conditions, " AND "), orderBy: orderBy,
+		args: args, orderArgs: orderArgs, rank: rank, fts: ftsEnabled,
 	}
 }
 
-// searchMessagesQueryImpl runs the actual query. The ftsAvailable flag lets
-// the existing runtime FTS-error fallback retry through subject and snippet.
-func (s *Store) searchMessagesQueryImpl(
-	ctx context.Context, q *search.Query, offset, limit int, ftsAvailable bool,
-) ([]APIMessage, int64, error) {
-	plan := s.buildMessageSearchSQL(q, ftsAvailable)
+// Broad operators pay a capped probe so operators matching up to an eighth
+// of the archive run in time that follows their matches.
+const searchOperatorShare = 8
 
-	// Count query.
-	countSQL := fmt.Sprintf(`
-		SELECT COUNT(*)
-		FROM messages m
-		%s
-		WHERE %s
-	`, plan.join, plan.where)
-
-	var total int64
-	if err := s.db.QueryRowContext(ctx, countSQL, plan.args...).Scan(&total); err != nil {
-		if plan.fts && ctx.Err() == nil {
-			return s.searchMessagesQueryNoFTS(ctx, q, offset, limit)
-		}
-		return nil, 0, fmt.Errorf("count search results: %w", err)
+func (s *Store) preferOperatorLookups(ctx context.Context, plan *messageSearchSQL) {
+	if s.IsPostgreSQL() || len(plan.operators) == 0 || plan.operators[0].condition != 0 || sourcescope.IDs(ctx) != nil {
+		return
 	}
+	var maxID int64
+	if err := s.db.QueryRowContext(ctx, "SELECT COALESCE(MAX(id), 0) FROM messages").Scan(&maxID); err != nil {
+		return
+	}
+	limit := maxID / searchOperatorShare
+	best := -1
+	for i, operator := range plan.operators {
+		var count int64
+		if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM (SELECT DISTINCT message_id FROM ("+operator.matching+") LIMIT ?) AS matches",
+			operator.arg, limit+1).Scan(&count); err != nil {
+			return
+		}
+		if count <= limit {
+			limit = count
+			best = i
+		}
+	}
+	if best >= 0 {
+		operator := plan.operators[best]
+		plan.conditions[operator.condition] = "m.id IN (" + operator.matching + ")"
+	}
+}
 
-	// Results query.
+func messageSearchPageSQL(plan messageSearchSQL, offset, limit int) (string, []any) {
+	rankColumn := ""
+	innerOrder := plan.orderBy
+	outerOrder := messageSearchDateOrder
+	if plan.rank != "" {
+		rankColumn = ", " + plan.rank + " AS search_rank"
+		innerOrder = "search_rank, " + messageSearchDateOrder
+		outerOrder = "page.search_rank, " + outerOrder
+	}
 	searchSQL := fmt.Sprintf(`
 		SELECT
 			m.id,
@@ -828,9 +934,16 @@ func (s *Store) searchMessagesQueryImpl(
 			COALESCE(m.sent_at, m.received_at, m.internal_date) as sent_at,
 			COALESCE(m.snippet, '') as snippet,
 			m.has_attachments,
+			m.hidden_text_present,
 			m.size_estimate
-		FROM messages m
-		%s
+		FROM (
+			SELECT m.id%s FROM messages m
+			%s
+			WHERE %s
+			ORDER BY %s
+			LIMIT ? OFFSET ?
+		) page
+		JOIN messages m ON m.id = page.id
 		LEFT JOIN message_recipients mr ON mr.id = (
 			SELECT mr2.id FROM message_recipients mr2
 			WHERE mr2.message_id = m.id AND mr2.recipient_type = 'from'
@@ -838,33 +951,70 @@ func (s *Store) searchMessagesQueryImpl(
 		)
 		LEFT JOIN participants p ON p.id = COALESCE(m.sender_id, mr.participant_id)
 		LEFT JOIN conversations c ON c.id = m.conversation_id
-		WHERE %s
 		ORDER BY %s
-		LIMIT ? OFFSET ?
-	`, participantSummarySenderSQL, plan.join, plan.where, plan.orderBy)
+	`, participantSummarySenderSQL, rankColumn, plan.join, plan.where, innerOrder, outerOrder)
 
-	// If the dialect's order-by fragment has ? placeholders, bind the FTS
-	// expression that many extra times — right after the WHERE args and
-	// before LIMIT/OFFSET so Rebind assigns them the correct positions.
-	resultArgs := make([]any, 0, len(plan.args)+len(plan.orderArgs)+2)
-	resultArgs = append(resultArgs, plan.args...)
-	resultArgs = append(resultArgs, plan.orderArgs...)
-	resultArgs = append(resultArgs, limit, offset)
-	rows, err := s.db.QueryContext(ctx, searchSQL, resultArgs...)
-	if err != nil {
-		// FTS5 not available -- fall back if we used it. Skip the fallback
-		// when the context was cancelled: the error is the abort we asked
-		// for, not an FTS capability problem, and re-running would ignore it.
-		if plan.fts && ctx.Err() == nil {
-			return s.searchMessagesQueryNoFTS(ctx, q, offset, limit)
-		}
-		return nil, 0, err
+	// Bind rank in the SELECT list before WHERE; ORDER BY reuses its alias.
+	args := make([]any, 0, len(plan.args)+len(plan.orderArgs)+2)
+	args = append(args, plan.orderArgs...)
+	args = append(args, plan.args...)
+	args = append(args, limit, offset)
+	return searchSQL, args
+}
+
+// searchMessagesQueryImpl runs the actual query. The ftsAvailable flag lets
+// the existing runtime FTS-error fallback retry through subject and snippet.
+func (s *Store) searchMessagesQueryImpl(
+	ctx context.Context, q *search.Query, offset, limit int, ftsAvailable bool,
+) ([]APIMessage, int64, error) {
+	plan := s.buildMessageSearchSQL(ctx, q, ftsAvailable)
+
+	// Count query.
+	countSQL := fmt.Sprintf(`
+		SELECT COUNT(*)
+		FROM messages m
+		%s
+		WHERE %s
+	`, plan.join, plan.where)
+
+	searchSQL, resultArgs := messageSearchPageSQL(plan, offset, limit)
+
+	var (
+		total              int64
+		countErr, queryErr error
+		messages           []APIMessage
+		ids                []int64
+	)
+	scanErr := RunIndependentReads(ctx, s.db.DB,
+		func(ctx context.Context) error {
+			countErr = s.db.QueryRowContext(ctx, countSQL, plan.args...).Scan(&total)
+			return nil
+		},
+		func(ctx context.Context) error {
+			rows, err := s.db.QueryContext(ctx, searchSQL, resultArgs...)
+			if err != nil {
+				queryErr = err
+				return nil
+			}
+			defer func() { _ = rows.Close() }()
+			messages, ids, err = scanMessageRows(rows)
+			return err
+		},
+	)
+	// FTS5 not available -- fall back if we used it. Skip the fallback when
+	// the context was cancelled: the error is the abort we asked for, not an
+	// FTS capability problem, and re-running would ignore it.
+	if (countErr != nil || queryErr != nil) && plan.fts && ctx.Err() == nil {
+		return s.searchMessagesQueryNoFTS(ctx, q, offset, limit)
 	}
-	defer func() { _ = rows.Close() }()
-
-	messages, ids, err := scanMessageRows(rows)
-	if err != nil {
-		return nil, 0, err
+	if countErr != nil {
+		return nil, 0, fmt.Errorf("count search results: %w", countErr)
+	}
+	if queryErr != nil {
+		return nil, 0, queryErr
+	}
+	if scanErr != nil {
+		return nil, 0, scanErr
 	}
 
 	if len(ids) > 0 {
@@ -924,6 +1074,7 @@ func (s *Store) searchMessagesLike(query string, offset, limit int) ([]APIMessag
 			COALESCE(m.sent_at, m.received_at, m.internal_date) as sent_at,
 			COALESCE(m.snippet, '') as snippet,
 			m.has_attachments,
+			m.hidden_text_present,
 			m.size_estimate
 		FROM messages m
 		LEFT JOIN message_recipients mr ON mr.id = (
@@ -1023,7 +1174,7 @@ func (r *requiredTimestamp) Scan(src any) error {
 // scanMessageRows scans the standard message row set
 // (id, source_id, source_message_id, conversation_id, source_conversation_id, subject,
 // message_type, from_display, from_email, from_name, from_phone, sent_at,
-// snippet, has_attachments, size_estimate). All SELECT statements that feed
+// snippet, has_attachments, hidden_text_present, size_estimate). All SELECT statements that feed
 // this scanner must produce the same column order.
 // Timestamps go through nullableTimestamp because the sent_at column
 // is a COALESCE(m.sent_at, m.received_at, m.internal_date) computed
@@ -1051,6 +1202,7 @@ func scanMessageRows(rows *loggedRows) ([]APIMessage, []int64, error) {
 			&sentAt,
 			&m.Snippet,
 			&m.HasAttachments,
+			&m.HiddenTextPresent,
 			&m.SizeEstimate,
 		)
 		if err != nil {
@@ -1082,26 +1234,32 @@ func (s *Store) batchPopulate(messages []APIMessage, ids []int64) error {
 // the count/result queries, instead of running to completion on a background
 // context after the request budget is exceeded.
 func (s *Store) batchPopulateContext(ctx context.Context, messages []APIMessage, ids []int64) error {
-	recipientMap, err := s.batchGetRecipients(ctx, ids, "to")
-	if err != nil {
-		return err
+	var recipientMap, ccMap, bccMap map[int64][]ParticipantDisplay
+	var labelMap map[int64][]string
+	recipients := func(dest *map[int64][]ParticipantDisplay, recipientType string) func(context.Context) error {
+		return func(ctx context.Context) error {
+			var err error
+			*dest, err = s.batchGetRecipients(ctx, ids, recipientType)
+			return err
+		}
 	}
-	ccMap, err := s.batchGetRecipients(ctx, ids, "cc")
-	if err != nil {
-		return err
-	}
-	bccMap, err := s.batchGetRecipients(ctx, ids, "bcc")
-	if err != nil {
-		return err
-	}
-	labelMap, err := s.batchGetLabels(ctx, ids)
-	if err != nil {
+	if err := RunIndependentReads(ctx, s.db.DB,
+		recipients(&recipientMap, "to"),
+		recipients(&ccMap, "cc"),
+		recipients(&bccMap, "bcc"),
+		func(ctx context.Context) error {
+			var err error
+			labelMap, err = s.batchGetLabels(ctx, ids)
+			return err
+		},
+	); err != nil {
 		return err
 	}
 	for i := range messages {
-		messages[i].To = recipientMap[messages[i].ID]
-		messages[i].Cc = ccMap[messages[i].ID]
-		messages[i].Bcc = bccMap[messages[i].ID]
+		messages[i].ToParticipants = recipientMap[messages[i].ID]
+		messages[i].To = recipientDisplays(messages[i].ToParticipants)
+		messages[i].Cc = recipientDisplays(ccMap[messages[i].ID])
+		messages[i].Bcc = recipientDisplays(bccMap[messages[i].ID])
 		messages[i].Labels = labelMap[messages[i].ID]
 	}
 	return nil
@@ -1118,11 +1276,11 @@ const batchQueryIDChunk = 500
 
 // batchGetRecipients loads recipients for multiple messages, chunked to stay
 // under the SQLite bound-parameter ceiling.
-func (s *Store) batchGetRecipients(ctx context.Context, messageIDs []int64, recipientType string) (map[int64][]string, error) {
+func (s *Store) batchGetRecipients(ctx context.Context, messageIDs []int64, recipientType string) (map[int64][]ParticipantDisplay, error) {
 	if len(messageIDs) == 0 {
-		return map[int64][]string{}, nil
+		return map[int64][]ParticipantDisplay{}, nil
 	}
-	result := make(map[int64][]string, len(messageIDs))
+	result := make(map[int64][]ParticipantDisplay, len(messageIDs))
 	for start := 0; start < len(messageIDs); start += batchQueryIDChunk {
 		end := min(start+batchQueryIDChunk, len(messageIDs))
 		if err := s.fetchRecipientsInto(ctx, messageIDs[start:end], recipientType, result); err != nil {
@@ -1136,7 +1294,7 @@ func (s *Store) batchGetRecipients(ctx context.Context, messageIDs []int64, reci
 // into result, keyed by message id. Every id belongs to exactly one chunk,
 // so no key is ever written by more than one call.
 func (s *Store) fetchRecipientsInto(
-	ctx context.Context, messageIDs []int64, recipientType string, result map[int64][]string,
+	ctx context.Context, messageIDs []int64, recipientType string, result map[int64][]ParticipantDisplay,
 ) error {
 	placeholders := make([]string, len(messageIDs))
 	args := make([]any, 0, len(messageIDs)+1)
@@ -1147,7 +1305,8 @@ func (s *Store) fetchRecipientsInto(
 	args = append(args, recipientType)
 
 	query := fmt.Sprintf(`
-		SELECT mr.message_id, %s
+		SELECT mr.message_id, p.id, %s, COALESCE(p.domain, ''),
+		       EXISTS (SELECT 1 FROM participant_links l WHERE l.participant_a = p.id OR l.participant_b = p.id)
 		FROM message_recipients mr
 		JOIN participants p ON p.id = mr.participant_id
 		WHERE mr.message_id IN (%s) AND mr.recipient_type = ?
@@ -1161,12 +1320,17 @@ func (s *Store) fetchRecipientsInto(
 
 	for rows.Next() {
 		var msgID int64
-		var display string
-		if err := rows.Scan(&msgID, &display); err != nil {
+		var recipient ParticipantDisplay
+		var domain string
+		var hasIdentityLink bool
+		if err := rows.Scan(&msgID, &recipient.ParticipantID, &recipient.Display, &domain, &hasIdentityLink); err != nil {
 			return fmt.Errorf("scan recipient: %w", err)
 		}
-		if display != "" {
-			result[msgID] = append(result[msgID], display)
+		if !hasIdentityLink && calevent.IsRoomAttendee("@"+domain, false) {
+			recipient.ParticipantID = 0
+		}
+		if recipient.Display != "" {
+			result[msgID] = append(result[msgID], recipient)
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -1269,6 +1433,7 @@ func (s *Store) GetMessageRecipientsContext(
 		SELECT
 			mr.participant_id,
 			COALESCE(NULLIF(mr.email_address, ''), NULLIF(p.email_address, ''), ''),
+			COALESCE(mr.email_address, ''),
 			COALESCE(NULLIF(TRIM(mr.display_name), ''), NULLIF(TRIM(p.display_name), ''), '')
 		FROM message_recipients mr
 		JOIN participants p ON p.id = mr.participant_id
@@ -1284,7 +1449,7 @@ func (s *Store) GetMessageRecipientsContext(
 	for rows.Next() {
 		var recipient MessageRecipient
 		if err := rows.Scan(
-			&recipient.ParticipantID, &recipient.EmailAddress, &recipient.DisplayName,
+			&recipient.ParticipantID, &recipient.EmailAddress, &recipient.EnvelopeAddress, &recipient.DisplayName,
 		); err != nil {
 			return nil, fmt.Errorf("scan structured recipient: %w", err)
 		}
@@ -1301,8 +1466,9 @@ func (s *Store) GetMessageRecipientsContext(
 // ChangedMessage is one row of the content-change feed. Every field is a column
 // of `messages`, but the feed's fields and the watermark's columns are not the
 // same set: sender_id and metadata move the watermark without appearing here,
-// and id, source_id and content_changed_at appear here without moving it — the
-// first two are immutable identity and the third is the watermark itself. See
+// and id and content_changed_at appear here without moving it — the first is
+// immutable identity and the second is the watermark itself. source_id moves
+// the watermark when archive ownership changes during consolidation. See
 // MessagesContentColumns. Labels and recipients live in child tables the
 // watermark does not cover and are deliberately absent: a consumer handed them
 // here would cache them stale forever.

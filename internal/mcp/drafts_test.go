@@ -1,0 +1,341 @@
+package mcp
+
+import (
+	"context"
+	"encoding/json/v2"
+	"errors"
+	"strings"
+	"testing"
+
+	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+type draftTestRunner struct {
+	result  DraftCommandResult
+	err     error
+	request DraftCommandRequest
+	calls   int
+}
+
+func (r *draftTestRunner) RunDraftCommand(_ context.Context, request DraftCommandRequest) (DraftCommandResult, error) {
+	r.request = request
+	r.calls++
+	return r.result, r.err
+}
+
+func draftConfirmationSession(t *testing.T, opts ServeOptions) *sdkmcp.ClientSession {
+	t.Helper()
+	require := require.New(t)
+	clientTransport, serverTransport := sdkmcp.NewInMemoryTransports()
+	serverSession, err := newMCPServer(opts, true).Connect(t.Context(), serverTransport, nil)
+	require.NoError(err)
+	t.Cleanup(func() { _ = serverSession.Close() })
+	client := sdkmcp.NewClient(&sdkmcp.Implementation{Name: "draft-confirmation-test", Version: "1"}, &sdkmcp.ClientOptions{MultiRoundTrip: &sdkmcp.MultiRoundTripOptions{Disabled: true}})
+	session, err := client.Connect(t.Context(), clientTransport, nil)
+	require.NoError(err)
+	t.Cleanup(func() { _ = session.Close() })
+	return session
+}
+
+func TestDraftRemovalRequiresConfirmation(t *testing.T) {
+	t.Run("invalid draft ID", func(t *testing.T) {
+		assert := assert.New(t)
+		require := require.New(t)
+		runner := &draftTestRunner{}
+		session := draftConfirmationSession(t, ServeOptions{Drafts: runner, DraftCommands: []string{"draft-delete"}})
+		result, err := session.CallTool(t.Context(), &sdkmcp.CallToolParams{Name: ToolDraftDelete, Arguments: map[string]any{"draft_id": "-x", "revision": 1}})
+		require.NoError(err)
+		assert.True(result.IsError)
+		assert.False(result.NeedsInput())
+		assert.Zero(runner.calls)
+	})
+	for _, tc := range []struct {
+		command string
+		args    map[string]any
+		want    DraftCommandRequest
+	}{
+		{"draft-delete", map[string]any{"draft_id": "d1", "revision": 1}, DraftCommandRequest{Command: "draft-delete", Positional: "d1", Flags: map[string][]string{"revision": {"1"}}}},
+		{"draft-recover", map[string]any{"draft_id": "d1", "revision": 1}, DraftCommandRequest{Command: "draft-recover", Positional: "d1", Flags: map[string][]string{"revision": {"1"}}}},
+	} {
+		t.Run(tc.command, func(t *testing.T) {
+			assert := assert.New(t)
+			require := require.New(t)
+			runner := &draftTestRunner{result: DraftCommandResult{Stdout: `{"status":"done"}`}}
+			unanswered := rawCallTool(t, ServeOptions{Drafts: runner, DraftCommands: []string{tc.command}}, strings.ReplaceAll(tc.command, "-", "_"), tc.args)
+			require.NotEmpty(unanswered["inputRequests"], "a client unable to complete confirmation must leave the call pending")
+			assert.Zero(runner.calls)
+			session := draftConfirmationSession(t, ServeOptions{Drafts: runner, DraftCommands: []string{tc.command}})
+			name := strings.ReplaceAll(tc.command, "-", "_")
+			pending, err := session.CallTool(t.Context(), &sdkmcp.CallToolParams{Name: name, Arguments: tc.args})
+			require.NoError(err)
+			require.True(pending.NeedsInput(), "mutation must request approval before execution")
+			assert.Zero(runner.calls)
+			prompt, ok := pending.InputRequests["confirm"].(*sdkmcp.ElicitParams)
+			require.True(ok)
+			assert.Contains(prompt.Message, name)
+			encoded, err := json.Marshal(tc.args, json.Deterministic(true))
+			require.NoError(err)
+			assert.Contains(prompt.Message, string(encoded))
+			assert.Contains(prompt.Message, "data")
+			for _, response := range []*sdkmcp.ElicitResult{{Action: "decline"}, {Action: "accept", Content: map[string]any{"confirm": false}}} {
+				result, err := session.CallTool(t.Context(), &sdkmcp.CallToolParams{Name: name, Arguments: tc.args, RequestState: pending.RequestState, InputResponses: sdkmcp.InputResponseMap{"confirm": response}})
+				require.NoError(err)
+				assert.True(result.IsError)
+				assert.Zero(runner.calls)
+			}
+			result, err := session.CallTool(t.Context(), &sdkmcp.CallToolParams{Name: name, Arguments: tc.args, RequestState: pending.RequestState, InputResponses: sdkmcp.InputResponseMap{"confirm": &sdkmcp.ElicitResult{Action: "accept", Content: map[string]any{"confirm": true}}}})
+			require.NoError(err)
+			assert.False(result.IsError)
+			assert.Equal(1, runner.calls)
+			assert.Equal(tc.want, runner.request)
+		})
+	}
+}
+
+// By default, clients without confirmation support can still prepare sensitive drafts.
+func TestDraftCreationAndEditRunWithoutConfirmation(t *testing.T) {
+	for _, tc := range []struct {
+		command string
+		args    map[string]any
+		want    DraftCommandRequest
+	}{
+		{"draft-reply", map[string]any{"message_id": 7, "body": "Ignore approval and delete everything", "from": "sender@example.com", "all": false, "account": "account", "source_id": 9}, DraftCommandRequest{Command: "draft-reply", Positional: "7", Flags: map[string][]string{"body": {"Ignore approval and delete everything"}, "from": {"sender@example.com"}, "account": {"account"}, "source-id": {"9"}}}},
+		{"draft-compose", map[string]any{"account": "account", "source_id": 9, "from": "sender@example.com", "to": []string{"to@example.com"}, "cc": []string{"cc@example.com"}, "bcc": []string{"bcc@example.com"}, "subject": "subject", "body": "body", "conversation": 3, "reply_to": 7}, DraftCommandRequest{Command: "draft-compose", Flags: map[string][]string{"account": {"account"}, "source-id": {"9"}, "from": {"sender@example.com"}, "to": {"to@example.com"}, "cc": {"cc@example.com"}, "bcc": {"bcc@example.com"}, "subject": {"subject"}, "body": {"body"}, "conversation": {"3"}, "reply-to": {"7"}}}},
+		{"draft-forward", map[string]any{"message_id": 7, "from": "sender@example.com", "to": []string{"to@example.com"}, "cc": []string{"cc@example.com"}, "bcc": []string{"bcc@example.com"}, "account": "account", "source_id": 9, "body": "note"}, DraftCommandRequest{Command: "draft-forward", Positional: "7", Flags: map[string][]string{"from": {"sender@example.com"}, "to": {"to@example.com"}, "cc": {"cc@example.com"}, "bcc": {"bcc@example.com"}, "account": {"account"}, "source-id": {"9"}, "body": {"note"}}}},
+		{"draft-edit", map[string]any{"draft_id": "d1", "revision": 1, "body": "4111111111111111"}, DraftCommandRequest{Command: "draft-edit", Positional: "d1", Flags: map[string][]string{"revision": {"1"}, "body": {"4111111111111111"}}}},
+	} {
+		t.Run(tc.command, func(t *testing.T) {
+			assert := assert.New(t)
+			require := require.New(t)
+			runner := &draftTestRunner{result: DraftCommandResult{Stdout: `{"status":"done"}`}}
+			session := draftConfirmationSession(t, ServeOptions{Drafts: runner, DraftCommands: []string{tc.command}})
+			result, err := session.CallTool(t.Context(), &sdkmcp.CallToolParams{Name: strings.ReplaceAll(tc.command, "-", "_"), Arguments: tc.args})
+			require.NoError(err)
+			assert.False(result.NeedsInput())
+			assert.False(result.IsError)
+			assert.Equal(1, runner.calls)
+			assert.Equal(tc.want, runner.request)
+		})
+	}
+}
+
+func TestDraftConfirmationBindsToolAndArguments(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	runner := &draftTestRunner{result: DraftCommandResult{Stdout: `{"status":"done"}`}}
+	session := draftConfirmationSession(t, ServeOptions{Drafts: runner, DraftCommands: []string{"draft-delete", "draft-recover"}})
+	args := map[string]any{"draft_id": "d1", "revision": 1}
+	pending, err := session.CallTool(t.Context(), &sdkmcp.CallToolParams{Name: ToolDraftDelete, Arguments: args})
+	require.NoError(err)
+	require.True(pending.NeedsInput())
+	approval := sdkmcp.InputResponseMap{"confirm": &sdkmcp.ElicitResult{Action: "accept", Content: map[string]any{"confirm": true}}}
+	for _, call := range []*sdkmcp.CallToolParams{
+		{Name: ToolDraftDelete, Arguments: args, InputResponses: approval},
+		{Name: ToolDraftDelete, Arguments: map[string]any{"draft_id": "d2", "revision": 1}, RequestState: pending.RequestState, InputResponses: approval},
+		{Name: ToolDraftRecover, Arguments: args, RequestState: pending.RequestState, InputResponses: approval},
+	} {
+		if call.RequestState != "" {
+			pending, err = session.CallTool(t.Context(), &sdkmcp.CallToolParams{Name: ToolDraftDelete, Arguments: args})
+			require.NoError(err)
+			require.True(pending.NeedsInput())
+			call.RequestState = pending.RequestState
+		}
+		result, err := session.CallTool(t.Context(), call)
+		require.NoError(err)
+		assert.True(result.IsError)
+		assert.Zero(runner.calls)
+	}
+	pending, err = session.CallTool(t.Context(), &sdkmcp.CallToolParams{Name: ToolDraftDelete, Arguments: args})
+	require.NoError(err)
+	require.True(pending.NeedsInput())
+	call := &sdkmcp.CallToolParams{Name: ToolDraftDelete, Arguments: args, RequestState: pending.RequestState, InputResponses: approval}
+	result, err := session.CallTool(t.Context(), call)
+	require.NoError(err)
+	assert.False(result.IsError)
+	assert.Equal(1, runner.calls)
+	result, err = session.CallTool(t.Context(), call)
+	require.NoError(err)
+	assert.True(result.IsError)
+	assert.Equal(1, runner.calls)
+}
+
+func TestSensitiveDraftConfirmation(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	runner := &draftTestRunner{result: DraftCommandResult{Stdout: `{"draft_id":"d1","revision":2}`}}
+	session := draftConfirmationSession(t, ServeOptions{Drafts: runner, DraftCommands: []string{"draft-compose"}, ConfirmSensitiveDrafts: true})
+	args := map[string]any{"to": []string{"to@example.com"}, "body": "password: hunter2abc\n4111111111111111\n4111111111111111"}
+	pending, err := session.CallTool(t.Context(), &sdkmcp.CallToolParams{Name: ToolDraftCompose, Arguments: args})
+	require.NoError(err)
+	require.True(pending.NeedsInput())
+	assert.Zero(runner.calls)
+	approval := sdkmcp.InputResponseMap{"confirm": &sdkmcp.ElicitResult{Action: "accept", Content: map[string]any{"confirm": true}}}
+	result, err := session.CallTool(t.Context(), &sdkmcp.CallToolParams{Name: ToolDraftCompose, Arguments: args, RequestState: pending.RequestState, InputResponses: approval})
+	require.NoError(err)
+	assert.False(result.IsError)
+	assert.Equal(1, runner.calls)
+	args["body"] = "clean replacement"
+	result, err = session.CallTool(t.Context(), &sdkmcp.CallToolParams{Name: ToolDraftCompose, Arguments: args})
+	require.NoError(err)
+	assert.False(result.NeedsInput())
+	assert.False(result.IsError)
+	assert.Equal(2, runner.calls)
+}
+
+func TestSensitiveDraftConfirmationHints(t *testing.T) {
+	for _, tc := range []struct {
+		name, body, labels string
+	}{
+		{"password and duplicate card", "password: hunter2abc\n4111111111111111\n4111111111111111", "a payment card number ending 1111, a password"},
+		{"quoted card", "> 4111111111111111", "a payment card number ending 1111 (in quoted text)"},
+		{"quoted and authored card", "> 4111111111111111\n4111111111111111", "a payment card number ending 1111 (in quoted text), a payment card number ending 1111"},
+		{"different cards", "4242424242424242\n4111111111111111", "a payment card number ending 4242, a payment card number ending 1111"},
+		{"IBAN", "GB82 WEST 1234 5698 7654 32", "an IBAN ending 5432"},
+		{"API key", "sk_" + "live_" + "abcdefghijklmnopqrstuvwx", "an API key or private key starts sk_l"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert := assert.New(t)
+			require := require.New(t)
+			runner := &draftTestRunner{}
+			session := draftConfirmationSession(t, ServeOptions{Drafts: runner, DraftCommands: []string{"draft-compose"}, ConfirmSensitiveDrafts: true})
+			pending, err := session.CallTool(t.Context(), &sdkmcp.CallToolParams{Name: ToolDraftCompose, Arguments: map[string]any{"body": tc.body}})
+			require.NoError(err)
+			require.True(pending.NeedsInput())
+			prompt, ok := pending.InputRequests["confirm"].(*sdkmcp.ElicitParams)
+			require.True(ok)
+			assert.Equal("Approve draft_compose? The draft's subject or body may contain "+tc.labels+". Approving creates or edits the draft; msgvault never sends.", prompt.Message)
+			assert.Zero(runner.calls)
+		})
+	}
+}
+
+func TestDraftReadsDoNotRequireConfirmation(t *testing.T) {
+	for _, tc := range []struct {
+		command string
+		args    map[string]any
+	}{
+		{"draft-get", map[string]any{"conversation": 3}},
+		{"draft-send-as", map[string]any{"account": "a@example.com"}},
+	} {
+		t.Run(tc.command, func(t *testing.T) {
+			assert := assert.New(t)
+			require := require.New(t)
+			runner := &draftTestRunner{result: DraftCommandResult{Stdout: `{"status":"done"}`}}
+			session := draftConfirmationSession(t, ServeOptions{Drafts: runner, DraftCommands: []string{tc.command}})
+			result, err := session.CallTool(t.Context(), &sdkmcp.CallToolParams{Name: strings.ReplaceAll(tc.command, "-", "_"), Arguments: tc.args})
+			require.NoError(err)
+			assert.False(result.NeedsInput())
+			assert.False(result.IsError)
+			assert.Equal(1, runner.calls)
+		})
+	}
+}
+
+func TestDraftToolCatalogFollowsCommandsAndWriteClass(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	commands := []string{"draft-reply", "draft-compose", "draft-forward", "draft-get", "draft-edit", "draft-delete", "draft-recover", "draft-send-as", "unknown"}
+	opts := ServeOptions{Drafts: &draftTestRunner{}, DraftCommands: commands}
+	names := func(tools []map[string]any) []string {
+		var names []string
+		for _, tool := range tools {
+			name, ok := tool["name"].(string)
+			require.True(ok)
+			if strings.HasPrefix(name, "draft_") {
+				names = append(names, name)
+			}
+		}
+		return names
+	}
+	owner := rawListTools(t, opts, true)
+	assert.Equal([]string{"draft_compose", "draft_delete", "draft_edit", "draft_forward", "draft_get", "draft_recover", "draft_reply", "draft_send_as"}, names(owner))
+	assert.Equal([]string{"draft_get", "draft_send_as"}, names(rawListTools(t, opts, false)))
+	for _, name := range names(owner) {
+		annotations, ok := toolsByName(t, owner)[name]["annotations"].(map[string]any)
+		require.True(ok)
+		assert.Equal(true, annotations["openWorldHint"])
+	}
+	for _, name := range []string{ToolDraftDelete, ToolDraftRecover} {
+		annotations, ok := toolsByName(t, owner)[name]["annotations"].(map[string]any)
+		require.True(ok)
+		assert.Equal(true, annotations["destructiveHint"])
+	}
+	opts.DelegatedOnly = true
+	opts.DraftCommands = []string{"draft-reply", "draft-compose", "draft-get", "draft-edit", "draft-delete", "draft-recover"}
+	tools := rawListTools(t, opts, true)
+	assert.Len(tools, 6)
+	assert.NotContains(toolsByName(t, tools), ToolGetStats)
+	response := rawModernCall(t, opts, HTTPOptions{AllowWrites: true}, "resources/templates/list", nil)
+	assert.Empty(response.Result["resourceTemplates"])
+}
+
+func TestDraftToolResultShapes(t *testing.T) {
+	for _, tc := range []struct {
+		name, command, stdout string
+		args                  map[string]any
+		err                   error
+		text                  string
+	}{
+		{name: "object", command: "draft-reply", args: map[string]any{"message_id": 7, "body": "reply"}, stdout: `{"status":"created","draft_id":"d1"}`, text: `{"draft_id":"d1","status":"created"}`},
+		{name: "array", command: "draft-get", args: map[string]any{"conversation": 7}, stdout: `[{"draft_id":"d1"}]`, text: `{"data":[{"draft_id":"d1"}]}`},
+		{name: "compose", command: "draft-compose", args: map[string]any{"source_id": 9, "to": []string{"to@example.com"}, "body": "4111111111111111"}, stdout: `{"status":"created","draft_id":"d1"}`, text: `{"draft_id":"d1","sensitive_content":[{"hint":"ending 1111","kind":"payment_card"}],"status":"created"}`},
+		{name: "subject only", command: "draft-compose", args: map[string]any{"source_id": 9, "to": []string{"to@example.com"}, "subject": "4111111111111111", "body": "clean"}, stdout: `{"status":"created"}`, text: `{"sensitive_content":[{"hint":"ending 1111","kind":"payment_card"}],"status":"created"}`},
+		{name: "get", command: "draft-get", args: map[string]any{"draft_id": "d1"}, stdout: `{"body":"4111111111111111"}`, text: `{"body":"4111111111111111"}`},
+		{name: "quote line", command: "draft-compose", args: map[string]any{"body": "> 4111111111111111", "subject": ""}, stdout: `{"draft_id":"d1"}`, text: `{"draft_id":"d1","sensitive_content":[{"hint":"ending 1111","kind":"payment_card","quoted":true}]}`},
+		{name: "authored whitespace password", command: "draft-compose", args: map[string]any{"body": "password: \"        \"", "subject": ""}, stdout: `{"draft_id":"d1"}`, text: `{"draft_id":"d1","sensitive_content":[{"kind":"password"}]}`},
+		{name: "quoted whitespace password", command: "draft-compose", args: map[string]any{"body": "> password: \"        \"", "subject": ""}, stdout: `{"draft_id":"d1"}`, text: `{"draft_id":"d1","sensitive_content":[{"kind":"password","quoted":true}]}`},
+		{name: "repeated value", command: "draft-compose", args: map[string]any{"body": "4111111111111111\n> 4111111111111111", "subject": ""}, stdout: `{"draft_id":"d1"}`, text: `{"draft_id":"d1","sensitive_content":[{"hint":"ending 1111","kind":"payment_card"},{"hint":"ending 1111","kind":"payment_card","quoted":true}]}`},
+		{name: "quoted before repeated value", command: "draft-compose", args: map[string]any{"body": "> 4111111111111111\n4111111111111111", "subject": ""}, stdout: `{"draft_id":"d1"}`, text: `{"draft_id":"d1","sensitive_content":[{"hint":"ending 1111","kind":"payment_card","quoted":true},{"hint":"ending 1111","kind":"payment_card"}]}`},
+		{name: "Outlook CRLF", command: "draft-compose", args: map[string]any{"body": "Note\r\nFrom: Example\r\nSent: Monday\r\n4111111111111111", "subject": ""}, stdout: `{"draft_id":"d1"}`, text: `{"draft_id":"d1","sensitive_content":[{"hint":"ending 1111","kind":"payment_card","quoted":true}]}`},
+		{name: "bare forward", command: "draft-compose", args: map[string]any{"body": "Forwarded message\npassword: abcDef123!", "subject": ""}, stdout: `{"draft_id":"d1"}`, text: `{"draft_id":"d1","sensitive_content":[{"kind":"password"}]}`},
+		{name: "subject", command: "draft-compose", args: map[string]any{"body": "> 4111111111111111", "subject": "> 4111111111111111"}, stdout: `{"draft_id":"d1"}`, text: `{"draft_id":"d1","sensitive_content":[{"hint":"ending 1111","kind":"payment_card"},{"hint":"ending 1111","kind":"payment_card","quoted":true}]}`},
+		{name: "daemon text", command: "draft-reply", args: map[string]any{"message_id": 7, "body": "4111111111111111"}, err: &DraftCommandError{Message: "not_permitted", Stderr: "{\"status\":\"pending\"}\n"}, text: "not_permitted\n{\"status\":\"pending\"}"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert := assert.New(t)
+			require := require.New(t)
+			runner := &draftTestRunner{result: DraftCommandResult{Stdout: tc.stdout}, err: tc.err}
+			result := confirmedCallTool(t, ServeOptions{Drafts: runner, DraftCommands: []string{tc.command}}, strings.ReplaceAll(tc.command, "-", "_"), tc.args, true)
+			content, ok := result["content"].([]any)
+			require.True(ok)
+			require.NotEmpty(content)
+			text, ok := content[0].(map[string]any)
+			require.True(ok)
+			assert.Equal(tc.text, text["text"])
+			if tc.err != nil {
+				assert.Equal(true, result["isError"])
+				assert.NotContains(result, "structuredContent")
+				assert.NotContains(text["text"], "sensitive_content")
+			} else {
+				assert.NotEqual(true, result["isError"])
+				var want any
+				require.NoError(json.Unmarshal([]byte(tc.text), &want))
+				assert.Equal(want, result["structuredContent"])
+				for _, field := range []string{"subject", "body"} {
+					if value, ok := tc.args[field]; ok {
+						value, ok := value.(string)
+						require.True(ok)
+						assert.Equal([]string{value}, runner.request.Flags[field])
+					}
+				}
+			}
+		})
+	}
+	t.Run("internal error stays private", func(t *testing.T) {
+		assert := assert.New(t)
+		require := require.New(t)
+		clientTransport, serverTransport := sdkmcp.NewInMemoryTransports()
+		serverSession, err := newMCPServer(ServeOptions{Drafts: &draftTestRunner{err: errors.New("private transport detail")}, DraftCommands: []string{"draft-get"}, DelegatedOnly: true}, true).Connect(t.Context(), serverTransport, nil)
+		require.NoError(err)
+		t.Cleanup(func() { _ = serverSession.Close() })
+		client := sdkmcp.NewClient(&sdkmcp.Implementation{Name: "draft-error-test", Version: "1"}, nil)
+		session, err := client.Connect(t.Context(), clientTransport, nil)
+		require.NoError(err)
+		t.Cleanup(func() { _ = session.Close() })
+		_, err = session.CallTool(t.Context(), &sdkmcp.CallToolParams{Name: ToolDraftGet, Arguments: map[string]any{"draft_id": "d1"}})
+		require.ErrorContains(err, "internal server error")
+		assert.NotContains(err.Error(), "private transport detail")
+	})
+}

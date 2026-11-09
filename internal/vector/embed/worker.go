@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
 
+	"go.kenn.io/kit/embedmodel"
 	"go.kenn.io/msgvault/internal/jobctx"
 	"go.kenn.io/msgvault/internal/operations"
 	"go.kenn.io/msgvault/internal/store"
@@ -46,7 +48,7 @@ type WorkStore interface {
 	// Returns the ids whose UPDATE matched 0 rows (the CAS misses) so the
 	// worker can log them and exclude them from its success accounting; the
 	// watermark still advances and the backstop recovers them.
-	SetEmbedGenIfUnchanged(ctx context.Context, items []store.EmbedGenStamp, target int64) (missed []int64, err error)
+	SetEmbedGenIfUnchanged(ctx context.Context, items []store.EmbedGenStamp, target int64) (missed []int64, covered int, err error)
 }
 
 // WorkerDeps bundles the collaborators a Worker needs. Backend, VectorsDB,
@@ -106,7 +108,8 @@ type WorkerDeps struct {
 	// expensive.
 	Progress func(ProgressReport)
 	// Recorder owns archive-side public history for each bounded worker pass.
-	Recorder operations.Recorder
+	Recorder    operations.Recorder
+	Diagnostics vector.EmbeddingDiagnosticWriter
 }
 
 // ProgressReport captures RunOnce progress after a set of messages has
@@ -141,6 +144,31 @@ type Worker struct {
 	runStart         time.Time // valid only during a RunOnce call
 }
 
+// stopError returns the error a pass reports when it stops after err. A pass
+// that was only asked to yield stops cleanly unless err is an independent
+// failure. Once the scheduler cancels the pass, an error that does not carry
+// the cancellation is treated as its fallout, but an independent failure
+// joined with the cancellation is kept without it. A pass cancelled for any
+// other reason reports its cancellation.
+func stopError(ctx context.Context, err error) error {
+	ctxErr := ctx.Err()
+	if ctxErr == nil {
+		return jobctx.ErrorAfterYield(ctx, err)
+	}
+	var failure error
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, jobctx.ErrYieldedToWaiter) {
+		failure = jobctx.ErrorAfterYield(ctx, err)
+	}
+	if jobctx.YieldedToWaiter(ctx) {
+		return failure
+	}
+	if failure != nil && errors.Is(context.Cause(ctx), jobctx.ErrRunBudgetExceeded) {
+		return errors.Join(ctxErr, failure)
+	}
+	return ctxErr
+}
+
 // NewWorker constructs a Worker, applying defaults for BatchSize (32),
 // MaxConsecutiveFailures (5), and Log (slog.Default()).
 func NewWorker(d WorkerDeps) *Worker {
@@ -169,8 +197,23 @@ func NewWorker(d WorkerDeps) *Worker {
 // RunResult summarizes the outcome of RunOnce.
 type RunResult struct {
 	Claimed, Succeeded, Failed, Truncated int
+	// ScanComplete reports an exhausted scan rather than an interrupted pass.
+	ScanComplete bool
+	// PersonsPending preserves unfinished person work when the message scan is complete.
+	PersonsPending bool
 	// Contextual is set by ContextWorker. The ordinary Worker leaves it nil.
 	Contextual *ContextConvergence
+}
+
+func (w *Worker) finishScan(ctx context.Context, gen vector.GenerationID, res RunResult) (RunResult, error) {
+	if err := pruneEmbeddingJournal(ctx, w.deps.Backend, w.deps.Store); err != nil {
+		return res, err
+	}
+	if err := w.pruneDeletedCheckpoints(ctx, gen); err != nil {
+		return res, err
+	}
+	res.ScanComplete = true
+	return res, nil
 }
 
 // msgText is the per-message preprocessed input to the chunker, carried
@@ -305,8 +348,13 @@ func (w *Worker) runOperationPass(
 		return runResultFromOperationRun(terminal)
 	}
 	outcomes := newMessagePassOutcomes(pass)
+	diagnostics := passDiagnostics(ctx, w.deps.Diagnostics, w.deps.Log, gen, w.deps.Backend, pass)
+	ctx = withEmbeddingDiagnostics(ctx, diagnostics)
 	defer func() {
 		retErr = operationRunError(retErr)
+		// Finish the snapshot while the run is still active, so status never
+		// sees a closed run with an unfinished snapshot.
+		diagnostics.finish(retErr)
 		pass.finish(ctx, outcomes.counters(true), retErr)
 	}()
 	return w.run(ctx, gen, backstop, outcomes)
@@ -351,12 +399,17 @@ func (w *Worker) run(
 	}
 
 	for {
+		if jobctx.PreemptionRequested(ctx) && ctx.Err() == nil {
+			return res, nil
+		}
 		if err := ctx.Err(); err != nil {
 			if w.stopIfYielded(ctx, gen) {
 				return res, nil
 			}
 			return res, fmt.Errorf("RunOnce: %w", err)
 		}
+		// Close the previous batch so this scan is not charged to it.
+		diagnosticRun(ctx).completeBatch()
 		batchStart := time.Now()
 		ids, err := w.scanForEmbedding(ctx, int64(gen), afterID)
 		if err != nil {
@@ -366,22 +419,28 @@ func (w *Worker) run(
 			return res, fmt.Errorf("scan for embedding: %w", err)
 		}
 		if len(ids) == 0 {
-			if err := pruneEmbeddingJournal(ctx, w.deps.Backend, w.deps.Store); err != nil {
-				return res, err
-			}
-			return res, nil
+			return w.finishScan(ctx, gen, res)
 		}
 		res.Claimed += len(ids)
+		diagnosticRun(ctx).beginBatch(len(ids), batchStart)
 		outcomes.attempt(ids)
 		// batchMax is the highest id in this scan slice; once the batch is
 		// stamped these rows drop out of the predicate, but advancing the
 		// cursor past them avoids re-scanning the covered prefix.
 		batchMax := ids[len(ids)-1]
 
-		eb, err := w.embedBatch(ctx, ids)
+		eb, err := w.embedBatch(ctx, gen, ids)
+		if errors.Is(err, vector.ErrGenerationRetired) {
+			return res, err
+		}
 		if err != nil {
-			if w.stopIfYielded(ctx, gen) {
-				return res, nil
+			if w.stopIfYielded(ctx, gen) || jobctx.StopRequested(ctx) {
+				return res, stopError(ctx, err)
+			}
+			// The downshift drain below recovers a rejected batch one message
+			// at a time, so only an error it cannot recover is recorded.
+			if !errors.Is(err, ErrPermanent4xx) {
+				diagnosticRun(ctx).failure(err)
 			}
 			consecutiveFailures++
 			lastErr = err
@@ -394,10 +453,14 @@ func (w *Worker) run(
 				w.deps.Log.Info("embed: downshifting to BatchSize=1 to drain failing batch",
 					"gen", gen, "batch_size", len(ids))
 				embedded, embeddedOK, stamped, safeAdvanceID, drainErr := w.downshiftDrain(
-					ctx, gen, ids, &res, &completedRows, outcomes,
+					ctx, gen, ids, eb.fresh, &res, &completedRows, outcomes,
 				)
 				if w.stopIfYielded(ctx, gen) {
-					return res, nil
+					return res, stopError(ctx, drainErr)
+				}
+				if jobctx.StopRequested(ctx) {
+					res.Succeeded += embedded
+					return res, stopError(ctx, drainErr)
 				}
 				w.deps.Log.Warn("embed batch failed", "gen", gen, "ids", len(ids), "error", err)
 				res.Succeeded += embedded
@@ -441,6 +504,7 @@ func (w *Worker) run(
 
 				if drainErr != nil {
 					lastErr = drainErr
+					diagnosticRun(ctx).failure(drainErr)
 					// A retired generation cancels this pass rather than retrying it.
 					if errors.Is(drainErr, vector.ErrGenerationRetired) {
 						return res, drainErr
@@ -490,7 +554,7 @@ func (w *Worker) run(
 					w.deps.Log.Warn("messages missing from main DB", "gen", gen, "ids", eb.missing)
 				}
 				if len(eb.empty) > 0 {
-					w.deps.Log.Warn("messages empty after preprocess", "gen", gen, "ids", eb.empty)
+					w.deps.Log.Warn("messages have no embeddable text after preprocess", "gen", gen, "ids", eb.empty)
 				}
 				missed, serr := w.stampSkipped(ctx, gen, skipIDs, eb.lastModified)
 				if serr != nil {
@@ -522,7 +586,7 @@ func (w *Worker) run(
 		}
 
 		// Step 1: upsert embeddings (VectorsDB side).
-		if err := w.deps.Backend.Upsert(ctx, gen, eb.chunks); err != nil {
+		if err := w.upsertMeasured(ctx, gen, eb.chunks); err != nil {
 			if errors.Is(err, vector.ErrGenerationRetired) {
 				// The generation was retired out from under this worker. Per
 				// the ErrGenerationRetired contract this is a benign "stop"
@@ -569,6 +633,10 @@ func (w *Worker) run(
 				}
 				continue
 			}
+			// The skip stamps are committed, so they succeed even if the
+			// coverage stamp below fails; later scans will not find them.
+			outcomes.succeed(idsWithout(skipIDs, skipMissed))
+			outcomes.checkpoint(ctx)
 		}
 
 		// Safe to stamp after the upsert: the upsert is idempotent, so a crash
@@ -590,6 +658,9 @@ func (w *Worker) run(
 			// (the upsert already ran, so re-embedding is idempotent).
 			continue
 		}
+		if err := w.deleteCheckpoints(ctx, gen, idsWithout(eb.embeddedIDs, missed)); err != nil {
+			w.deps.Log.Warn("embedding checkpoint cleanup deferred", "error", err)
+		}
 		missed = append(missed, skipMissed...)
 		w.logCASMisses(gen, missed)
 		outcomes.succeed(idsWithout(append(append([]int64(nil), eb.embeddedIDs...), skipIDs...), missed))
@@ -599,7 +670,7 @@ func (w *Worker) run(
 			w.deps.Log.Warn("messages missing from main DB", "gen", gen, "ids", eb.missing)
 		}
 		if len(eb.empty) > 0 {
-			w.deps.Log.Warn("messages empty after preprocess", "gen", gen, "ids", eb.empty)
+			w.deps.Log.Warn("messages have no embeddable text after preprocess", "gen", gen, "ids", eb.empty)
 		}
 
 		// Only rows ACTUALLY stamped count as succeeded. A CAS miss (its
@@ -669,15 +740,19 @@ func (w *Worker) advanceWatermark(ctx context.Context, gen vector.GenerationID, 
 // embedBatchResult carries the output of embedBatch. chunks and
 // embeddedIDs are aligned by position and correspond to messages that
 // were actually fetched and embedded. missing lists ids from the
-// input that had no row in the messages table; empty lists ids whose
-// content preprocessed to empty and therefore should not be sent to
-// embedders that reject blank strings.
+// input that had no row in the messages table; empty lists ids with blank
+// preprocessed text or only blank retained chunk windows. These messages
+// should not be sent to embedders that reject blank strings.
 type embedBatchResult struct {
 	chunks      []vector.Chunk
 	embeddedIDs []int64
 	missing     []int64
 	empty       []int64
 	truncated   int
+	// fresh counts vectors the provider returned during this call, as
+	// opposed to output retained from an earlier one. Only fresh output is
+	// evidence that the endpoint currently accepts requests.
+	fresh int
 	// lastModified maps each FETCHED id (embedded or empty) to the CAS token
 	// captured at read time. Missing ids are absent (they have no row, so
 	// there is nothing to CAS-stamp — they are skip-marked unconditionally).
@@ -689,7 +764,7 @@ type embedBatchResult struct {
 // vanished between scan and fetch (e.g. the sync deleted them) are
 // reported in the returned result's missing slice rather than causing
 // a failure — the caller skip-marks them.
-func (w *Worker) embedBatch(ctx context.Context, ids []int64) (embedBatchResult, error) {
+func (w *Worker) embedBatch(ctx context.Context, gen vector.GenerationID, ids []int64) (embedBatchResult, error) {
 	placeholders := make([]string, len(ids))
 	args := make([]any, len(ids))
 	for i, id := range ids {
@@ -750,7 +825,7 @@ func (w *Worker) embedBatch(ctx context.Context, ids []int64) (embedBatchResult,
 		// embed in a later chunk.
 		txt, bodyTrunc := Preprocess(subject, body, 0, preprocessCfg)
 		fetched[id] = struct{}{}
-		if strings.TrimSpace(txt) == "" {
+		if embedmodel.BlankText(txt) {
 			empty = append(empty, id)
 			continue
 		}
@@ -794,10 +869,15 @@ func (w *Worker) embedBatch(ctx context.Context, ids []int64) (embedBatchResult,
 		//     soft break, in which case the per-chunk hard-cut flag
 		//     wouldn't fire).
 		msgTrunc := m.BodyTruncated || chunkTail
+		chunkIndex := 0
 		for j, sp := range spans {
+			// Match the client's blank-input rule while preserving source offsets.
+			if embedmodel.BlankText(sp.Text) {
+				continue
+			}
 			ic := inputChunk{
 				ID:         m.ID,
-				ChunkIndex: j,
+				ChunkIndex: chunkIndex,
 				Text:       sp.Text,
 				Chars:      sp.CharEnd - sp.CharStart,
 				CharStart:  sp.CharStart,
@@ -811,6 +891,30 @@ func (w *Worker) embedBatch(ctx context.Context, ids []int64) (embedBatchResult,
 			}
 			pieces = append(pieces, ic)
 			inputs = append(inputs, sp.Text)
+			chunkIndex++
+		}
+		if chunkIndex == 0 {
+			empty = append(empty, m.ID)
+		}
+	}
+	// Each message's revision is the hash of its chunk inputs, so a saved
+	// response is reused only for unchanged input.
+	messageChunks := make(map[int64][]string, len(ids))
+	for _, p := range pieces {
+		messageChunks[p.ID] = append(messageChunks[p.ID], p.Text)
+	}
+	revisions := make(map[string]string, len(ids))
+	for _, id := range ids {
+		revisions[messageOwner(id)] = savedDocumentKey(DocumentInput{Chunks: messageChunks[id]})
+	}
+	saved, err := w.deps.Backend.EmbeddingCheckpoints().LoadMany(ctx, gen, revisions)
+	if err != nil {
+		return embedBatchResult{}, err
+	}
+	vecs := make([][]float32, len(pieces))
+	for i, p := range pieces {
+		if vectors, ok := saved[messageOwner(p.ID)][strconv.Itoa(p.ChunkIndex)]; ok && len(vectors) == 1 {
+			vecs[i] = vectors[0]
 		}
 	}
 
@@ -822,33 +926,74 @@ func (w *Worker) embedBatch(ctx context.Context, ids []int64) (embedBatchResult,
 	// A message completes only after every one of its chunks has been
 	// embedded and upserted in this same call, so partial-failure
 	// semantics are unchanged.
+	// Resume matching checkpoints, requesting only unfinished chunks.
+	var pending []int
+	for i := range pieces {
+		if vecs[i] == nil {
+			pending = append(pending, i)
+		}
+	}
 	embedSubBatchSize := w.deps.BatchSize
 	if embedSubBatchSize <= 0 {
-		embedSubBatchSize = len(inputs)
+		embedSubBatchSize = len(pending)
 	}
 	start := time.Now()
-	vecs := make([][]float32, 0, len(inputs))
-	for i := 0; i < len(inputs); i += embedSubBatchSize {
-		end := min(i+embedSubBatchSize, len(inputs))
-		got, err := w.deps.Client.Embed(ctx, inputs[i:end])
+	fresh, subBatches := 0, 0
+	for from := 0; from < len(pending); from += embedSubBatchSize {
+		if jobctx.StopRequested(ctx) {
+			return embedBatchResult{}, jobctx.ErrYieldedToWaiter
+		}
+		batch := pending[from:min(from+embedSubBatchSize, len(pending))]
+		batchInputs := make([]string, len(batch))
+		for j, i := range batch {
+			batchInputs[j] = inputs[i]
+		}
+		subBatches++
+		finishProvider := measureEmbeddingProvider(ctx, batchInputs)
+		got, err := w.deps.Client.Embed(ctx, batchInputs)
+		accepted := 0
+		if err == nil {
+			accepted = len(got)
+		}
+		// Worker.run records a rejection only if the downshift drain cannot
+		// recover it.
+		recorded := err
+		if errors.Is(err, ErrPermanent4xx) {
+			recorded = nil
+		}
+		finishProvider(accepted, recorded)
 		if err != nil {
 			return embedBatchResult{
 				missing:      missing,
 				empty:        empty,
 				lastModified: lastModified,
+				fresh:        fresh,
 			}, fmt.Errorf("embed: %w", err)
 		}
-		if len(got) != end-i {
+		if len(got) != len(batch) {
 			return embedBatchResult{}, fmt.Errorf(
 				"embedder returned %d vectors for %d inputs in sub-batch [%d:%d)",
-				len(got), end-i, i, end)
+				len(got), len(batch), from, from+len(batch))
 		}
-		vecs = append(vecs, got...)
+		entries := make([]vector.EmbeddingCheckpoint, 0, len(batch))
+		for j, i := range batch {
+			p := pieces[i]
+			owner := messageOwner(p.ID)
+			entries = append(entries, vector.EmbeddingCheckpoint{Owner: owner, Revision: revisions[owner], Key: strconv.Itoa(p.ChunkIndex), Vectors: [][]float32{got[j]}})
+		}
+		if err := w.deps.Backend.EmbeddingCheckpoints().Save(ctx, gen, entries); err != nil {
+			return embedBatchResult{}, err
+		}
+		jobctx.RecordProgress(ctx)
+		for j, i := range batch {
+			vecs[i] = got[j]
+		}
+		fresh += len(got)
 	}
 	w.deps.Log.Debug("embed batch",
 		"messages", len(msgs), "chunks", len(pieces),
 		"chars", totalPieceChars(pieces),
-		"sub_batches", (len(inputs)+embedSubBatchSize-1)/embedSubBatchSize,
+		"sub_batches", subBatches, "retained", len(pieces)-len(pending),
 		"duration_ms", time.Since(start).Milliseconds())
 
 	if len(vecs) != len(pieces) {
@@ -892,6 +1037,7 @@ func (w *Worker) embedBatch(ctx context.Context, ids []int64) (embedBatchResult,
 		missing:      missing,
 		empty:        empty,
 		truncated:    truncated,
+		fresh:        fresh,
 		lastModified: lastModified,
 	}, nil
 }
@@ -908,8 +1054,10 @@ func (w *Worker) embedBatch(ctx context.Context, ids []int64) (embedBatchResult,
 //     their embed_gen (a singleton that embedded+upserted but whose CAS stamp
 //     missed is excluded — it is recovered by the backstop). This feeds
 //     res.Succeeded / progress.
-//   - embeddedOK: count of singletons that successfully embedded + upserted,
-//     REGARDLESS of whether the subsequent CAS stamp landed. This is the
+//   - embeddedOK: count of fresh provider successes for this batch: the
+//     batch's requests that succeeded before its rejection, plus singletons
+//     that embedded + upserted with at least one fresh response (not only
+//     retained output), REGARDLESS of whether the subsequent CAS stamp landed. This is the
 //     endpoint-health signal: if the endpoint demonstrably embedded something
 //     this drain (embeddedOK > 0), any sibling 4xxs are message-specific drops,
 //     not an endpoint-wide outage — even when those embeds CAS-missed and so
@@ -938,10 +1086,14 @@ func (w *Worker) downshiftDrain(
 	ctx context.Context,
 	gen vector.GenerationID,
 	ids []int64,
+	batchFresh int,
 	res *RunResult,
 	completedRows *int,
 	outcomes *messagePassOutcomes,
 ) (embedded int, embeddedOK int, stamped int, safeAdvanceID int64, err error) {
+	// Requests of the failed batch that succeeded before its rejection are
+	// fresh evidence from this run; output retained from an earlier pass is not.
+	embeddedOK = batchFresh
 	var deferredDrops []int64
 	var lastDeferredErr error
 	// lm accumulates last_modified CAS tokens across the singleton fetches so
@@ -959,6 +1111,9 @@ func (w *Worker) downshiftDrain(
 	brokeContiguity := false
 
 	for _, id := range ids {
+		if jobctx.PreemptionRequested(ctx) && ctx.Err() == nil {
+			return embedded, embeddedOK, stamped, contiguousStampedID, nil
+		}
 		select {
 		case <-ctx.Done():
 			return embedded, embeddedOK, stamped, contiguousStampedID, ctx.Err()
@@ -966,7 +1121,7 @@ func (w *Worker) downshiftDrain(
 		}
 
 		batchStart := time.Now()
-		eb, e := w.embedBatch(ctx, []int64{id})
+		eb, e := w.embedBatch(ctx, gen, []int64{id})
 		if e != nil {
 			if jobctx.YieldedToWaiter(ctx) {
 				return embedded, embeddedOK, stamped, contiguousStampedID, e
@@ -1035,7 +1190,7 @@ func (w *Worker) downshiftDrain(
 			}
 			continue
 		}
-		if uerr := w.deps.Backend.Upsert(ctx, gen, eb.chunks); uerr != nil {
+		if uerr := w.upsertMeasured(ctx, gen, eb.chunks); uerr != nil {
 			if errors.Is(uerr, vector.ErrGenerationRetired) {
 				// Generation retired mid-drain. Stop draining and surface the
 				// benign sentinel; remaining singletons would observe the same
@@ -1045,18 +1200,24 @@ func (w *Worker) downshiftDrain(
 			}
 			return embedded, embeddedOK, stamped, contiguousStampedID, fmt.Errorf("upsert: %w", uerr)
 		}
-		// The endpoint demonstrably embedded + upserted this singleton. Count it
-		// toward endpoint health NOW, before the CAS stamp result — a stamp that
-		// later misses (a concurrent edit moved last_modified) does not mean the
+		// The endpoint demonstrably embedded this singleton. Count it toward
+		// endpoint health NOW, before the CAS stamp result — a stamp that later
+		// misses (a concurrent edit moved last_modified) does not mean the
 		// endpoint failed, so it must not be able to misclassify this drain as an
-		// endpoint-wide all-drop.
-		embeddedOK++
+		// endpoint-wide all-drop. Output retained from an earlier call proves
+		// nothing about the endpoint now, so it publishes without counting.
+		if eb.fresh > 0 {
+			embeddedOK++
+		}
 		missed, serr := w.stampCovered(ctx, gen, eb.embeddedIDs, eb.lastModified)
 		if serr != nil {
 			if jobctx.YieldedToWaiter(ctx) {
 				return embedded, embeddedOK, stamped, contiguousStampedID, serr
 			}
 			return embedded, embeddedOK, stamped, contiguousStampedID, fmt.Errorf("stamp embed_gen: %w", serr)
+		}
+		if err := w.deleteCheckpoints(ctx, gen, idsWithout(eb.embeddedIDs, missed)); err != nil {
+			w.deps.Log.Warn("embedding checkpoint cleanup deferred", "error", err)
 		}
 		w.logCASMisses(gen, missed)
 		// A CAS miss on this singleton means its content changed since the
@@ -1130,6 +1291,11 @@ func (w *Worker) downshiftDrain(
 		w.logCASMisses(gen, missed)
 		stampedDrops := len(deferredDrops) - len(missed)
 		outcomes.fail(idsWithout(deferredDrops, missed))
+		// Dropped messages are not recovered, so their rejection is the batch's
+		// error. A drop whose stamp missed will be retried, so it is not.
+		if stampedDrops > 0 {
+			diagnosticRun(ctx).failure(lastDeferredErr)
+		}
 		outcomes.checkpoint(ctx)
 		stamped += stampedDrops
 		*completedRows += stampedDrops
@@ -1169,6 +1335,8 @@ func (w *Worker) downshiftDrain(
 // recovers them. A missed CAS is NOT an error — only a real driver failure on
 // either path returns err, for the caller's consecutive-failure accounting.
 func (w *Worker) stampCovered(ctx context.Context, gen vector.GenerationID, ids []int64, lm map[int64]any) (missed []int64, err error) {
+	finish := measureEmbeddingWrite(ctx)
+	defer func() { finish(err) }()
 	var cas []store.EmbedGenStamp
 	var plain []int64
 	for _, id := range ids {
@@ -1179,16 +1347,23 @@ func (w *Worker) stampCovered(ctx context.Context, gen vector.GenerationID, ids 
 		}
 	}
 	if len(cas) > 0 {
-		m, err := w.deps.Store.SetEmbedGenIfUnchanged(ctx, cas, int64(gen))
+		m, covered, err := w.deps.Store.SetEmbedGenIfUnchanged(ctx, cas, int64(gen))
+		diagnosticRun(ctx).completed(covered)
+		missed = append(missed, m...)
+		// Stamps commit one row at a time, so some can land before an error.
+		if covered > 0 {
+			jobctx.RecordProgress(ctx)
+		}
 		if err != nil {
 			return missed, err
 		}
-		missed = append(missed, m...)
 	}
 	if len(plain) > 0 {
+		// Missing rows have no message to cover, so they are not counted.
 		if err := w.deps.Store.SetEmbedGen(ctx, plain, int64(gen)); err != nil {
 			return missed, err
 		}
+		jobctx.RecordProgress(ctx)
 	}
 	return missed, nil
 }
@@ -1197,6 +1372,8 @@ func (w *Worker) stampSkipped(ctx context.Context, gen vector.GenerationID, ids 
 	if len(ids) == 0 {
 		return nil, nil
 	}
+	finish := measureEmbeddingWrite(ctx)
+	defer func() { finish(err) }()
 	if w.deps.beforeSkipStamp != nil {
 		w.deps.beforeSkipStamp(ctx, ids)
 	}
@@ -1208,6 +1385,7 @@ func (w *Worker) stampSkipped(ctx context.Context, gen vector.GenerationID, ids 
 	defer func() { _ = tx.Rollback() }()
 
 	deleteIDs := make([]int64, 0, len(ids))
+	covered := 0
 	for _, id := range ids {
 		if tok, ok := lm[id]; ok {
 			res, err := tx.ExecContext(ctx,
@@ -1224,6 +1402,7 @@ func (w *Worker) stampSkipped(ctx context.Context, gen vector.GenerationID, ids 
 				missed = append(missed, id)
 				continue
 			}
+			covered++
 			deleteIDs = append(deleteIDs, id)
 			continue
 		}
@@ -1243,6 +1422,13 @@ func (w *Worker) stampSkipped(ctx context.Context, gen vector.GenerationID, ids 
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit skip stamp tx: %w", err)
+	}
+	if len(deleteIDs) > 0 {
+		jobctx.RecordProgress(ctx)
+	}
+	diagnosticRun(ctx).completed(covered)
+	if err := w.deleteCheckpoints(ctx, gen, deleteIDs); err != nil {
+		w.deps.Log.Warn("embedding checkpoint cleanup deferred", "error", err)
 	}
 	return missed, nil
 }
@@ -1375,4 +1561,67 @@ func chunkOverlapFor(maxRunes int) int {
 		return 0
 	}
 	return maxRunes / 30
+}
+
+func messageOwner(id int64) string { return "message:" + strconv.FormatInt(id, 10) }
+
+func (w *Worker) deleteCheckpoints(ctx context.Context, gen vector.GenerationID, ids []int64) error {
+	owners := make([]string, len(ids))
+	for i, id := range ids {
+		owners[i] = messageOwner(id)
+	}
+	return w.deps.Backend.EmbeddingCheckpoints().Delete(ctx, gen, owners)
+}
+
+// pruneDeletedCheckpoints releases responses for deleted or completed messages.
+func (w *Worker) pruneDeletedCheckpoints(ctx context.Context, gen vector.GenerationID) error {
+	checkpoints := w.deps.Backend.EmbeddingCheckpoints()
+	after := ""
+	for {
+		owners, err := checkpoints.Owners(ctx, gen, "message:", after, 300)
+		if err != nil {
+			return err
+		}
+		if len(owners) == 0 {
+			return nil
+		}
+		args := make([]any, 0, len(owners)+1)
+		args = append(args, int64(gen))
+		for _, owner := range owners {
+			id, err := strconv.ParseInt(strings.TrimPrefix(owner, "message:"), 10, 64)
+			if err != nil {
+				return fmt.Errorf("decode message checkpoint owner: %w", err)
+			}
+			args = append(args, id)
+		}
+		present := make(map[string]bool, len(owners))
+		err = func() error {
+			live, err := w.deps.MainDB.QueryContext(ctx, w.rebind(`SELECT id FROM messages WHERE deleted_at IS NULL AND deleted_from_source_at IS NULL AND (embed_gen IS NULL OR embed_gen <> ?) AND id IN (`+strings.TrimSuffix(strings.Repeat("?,", len(owners)), ",")+`)`), args...)
+			if err != nil {
+				return fmt.Errorf("read checkpoint source messages: %w", err)
+			}
+			defer func() { _ = live.Close() }()
+			for live.Next() {
+				var id int64
+				if err := live.Scan(&id); err != nil {
+					return err
+				}
+				present[messageOwner(id)] = true
+			}
+			return live.Err()
+		}()
+		if err != nil {
+			return err
+		}
+		var obsolete []string
+		for _, owner := range owners {
+			if !present[owner] {
+				obsolete = append(obsolete, owner)
+			}
+		}
+		if err := checkpoints.Delete(ctx, gen, obsolete); err != nil {
+			return err
+		}
+		after = owners[len(owners)-1]
+	}
 }

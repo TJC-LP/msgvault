@@ -84,11 +84,11 @@ func runStartupMigrationsForIngest(s *store.Store) error {
 	return nil
 }
 
-func runPostSourceCreateMigrationsForInvocation(s *store.Store, state *invocation) error {
+func runPostSourceCreateMigrationsForInvocation(ctx context.Context, s *store.Store, state *invocation) error {
 	if state == nil {
 		return errors.New("invocation state is required")
 	}
-	return runStartupMigrationsContext(context.Background(), s, state)
+	return runStartupMigrationsContext(ctx, s, state)
 }
 
 func invocationConfigLogger(state *invocation) (*config.Config, *slog.Logger) {
@@ -131,7 +131,7 @@ func isAgentMode(state *invocation) bool {
 
 // openAgentDelegatedStore creates a daemonclient.Client authenticated with an
 // agent grant secret read from the file named by --agent-token-file.
-func openAgentDelegatedStore(ctx context.Context, state *invocation) (*daemonclient.Client, HTTPStoreInfo, error) {
+func openAgentDelegatedStore(ctx context.Context, state *invocation, minimumSchema ...string) (*daemonclient.Client, HTTPStoreInfo, error) {
 	state = invocationState(ctx, state)
 	if state == nil {
 		return nil, HTTPStoreInfo{}, errors.New("invocation state is required")
@@ -164,10 +164,10 @@ func openAgentDelegatedStore(ctx context.Context, state *invocation) (*daemoncli
 		return nil, HTTPStoreInfo{}, err
 	}
 	st.SetBusyNotifier(reportDaemonBusyWait)
-	if err := verifyRemoteAPISchemaVersion(ctx, st); err != nil {
+	if err := verifyRemoteAPISchemaVersion(ctx, st, minimumSchema...); err != nil {
 		_ = st.Close()
 		if apiErr, ok := errors.AsType[*daemonclient.APIError](err); ok && apiErr.Status == http.StatusUnauthorized {
-			return nil, HTTPStoreInfo{}, fmt.Errorf("agent authentication failed: token is invalid, revoked, or agent access is disabled: %w", apiErr)
+			return nil, HTTPStoreInfo{}, fmt.Errorf("agent authentication failed: token is invalid, expired, revoked, or agent access is disabled: %w", apiErr)
 		}
 		return nil, HTTPStoreInfo{}, err
 	}
@@ -227,18 +227,34 @@ func isRemoteModeFor(state *invocation) bool {
 // A configured [remote].url wins unless --local was passed. Otherwise the local
 // daemon is discovered or started so SQLite remains owned by one long-lived
 // process.
-func OpenHTTPStore(ctx context.Context) (*daemonclient.Client, HTTPStoreInfo, error) {
-	return openHTTPStoreWithStartupCacheIntent(ctx, startupCacheBuildIntentNone)
+func OpenHTTPStore(ctx context.Context, minimumSchema ...string) (*daemonclient.Client, HTTPStoreInfo, error) {
+	return openHTTPStoreWithStartupCacheIntent(ctx, startupCacheBuildIntentNone, minimumSchema...)
+}
+
+// newLocalDaemonClient connects to the local daemon described by rt.
+func newLocalDaemonClient(ctx context.Context, cfg *config.Config, rt *DaemonRuntime) (*daemonclient.Client, error) {
+	st, err := newDaemonCLIClient(ctx, daemonclient.Config{
+		URL:              urlFromDaemonRuntime(rt),
+		APIKey:           cfg.Server.AuthenticationKey(),
+		LocalDaemonToken: rt.Record.Metadata[runtimeShutdownToken],
+		AllowInsecure:    true,
+	})
+	if err != nil {
+		return nil, err
+	}
+	st.SetBusyNotifier(reportDaemonBusyWait)
+	return st, nil
 }
 
 func openHTTPStoreWithStartupCacheIntent(
 	ctx context.Context,
 	intent startupCacheBuildIntent,
+	minimumSchema ...string,
 ) (*daemonclient.Client, HTTPStoreInfo, error) {
 	inv := invocationFromContext(ctx)
 	// Agent-delegated mode is checked first: it operates without a local config.
 	if isAgentMode(inv) {
-		return openAgentDelegatedStore(ctx, inv)
+		return openAgentDelegatedStore(ctx, inv, minimumSchema...)
 	}
 	if inv == nil {
 		return nil, HTTPStoreInfo{}, errors.New("invocation state is required")
@@ -266,16 +282,11 @@ func openHTTPStoreWithStartupCacheIntent(
 		return nil, HTTPStoreInfo{}, fmt.Errorf("resolve server API key after local daemon startup: %w", err)
 	}
 	url := urlFromDaemonRuntime(rt)
-	st, err := newDaemonCLIClient(ctx, daemonclient.Config{
-		URL:              url,
-		APIKey:           currentCfg.Server.AuthenticationKey(),
-		LocalDaemonToken: rt.Record.Metadata[runtimeShutdownToken],
-		AllowInsecure:    true,
-	})
+	st, err := newLocalDaemonClient(ctx, currentCfg, rt)
 	if err != nil {
 		return nil, HTTPStoreInfo{}, err
 	}
-	st.SetBusyNotifier(reportDaemonBusyWait)
+	reportRetainedDaemonVersion(ctx, os.Stderr, rt)
 	return st, HTTPStoreInfo{
 		Kind:                     HTTPStoreLocalDaemon,
 		URL:                      url,
@@ -343,7 +354,7 @@ var remoteAPISchemaCheckEnabled = true
 // analytical /people/{id} became the durable person detail), so decoding a
 // mismatched peer's response would silently produce wrong data rather than
 // an error.
-func verifyRemoteAPISchemaVersion(ctx context.Context, client *daemonclient.Client) error {
+func verifyRemoteAPISchemaVersion(ctx context.Context, client *daemonclient.Client, minimumSchema ...string) error {
 	if !remoteAPISchemaCheckEnabled {
 		return nil
 	}
@@ -361,7 +372,13 @@ func verifyRemoteAPISchemaVersion(ctx context.Context, client *daemonclient.Clie
 	if response.JSON200.APISchemaVersion != nil {
 		version = *response.JSON200.APISchemaVersion
 	}
-	return apiSchemaCompatibilityError(version)
+	if err := apiSchemaCompatibilityError(version); err != nil {
+		return err
+	}
+	if len(minimumSchema) > 0 && minimumSchema[0] != "" && !daemonclient.APISchemaVersionAtLeast(version, minimumSchema[0]) {
+		return fmt.Errorf("agent archive reads require daemon API schema %s or newer (daemon reports %q); upgrade the daemon and issue a read grant", minimumSchema[0], version)
+	}
+	return nil
 }
 
 type localDaemonStartupInfo struct {
@@ -386,13 +403,15 @@ func ensureLocalDaemonRuntimeWithStartupCacheIntent(
 	// daemon that is running instead of restarting it.
 	autoStart := c.Server.DaemonAutoStartEnabled()
 	restartPolicy := c.Server.DaemonAutoRestart
-	if !autoStart {
+	// A daemon must not be replaced by one this config cannot start.
+	configErr := c.DaemonConfigError()
+	if !autoStart || configErr != nil {
 		restartPolicy = config.DaemonAutoRestartNever
 	}
 	if err := os.MkdirAll(c.Data.DataDir, 0o700); err != nil {
 		return nil, localDaemonStartupInfo{}, fmt.Errorf("create data directory: %w", err)
 	}
-	if rt := findDaemonRuntime(c.Data.DataDir); rt != nil &&
+	if rt := findDaemonRuntime(ctx, c.Data.DataDir); rt != nil &&
 		!shouldUpgradeDaemonRuntimeWithPolicy(rt, Version, restartPolicy) {
 		if err := probeLocalDaemonAuth(ctx, rt, c); err != nil {
 			return nil, localDaemonStartupInfo{}, err
@@ -403,7 +422,7 @@ func ensureLocalDaemonRuntimeWithStartupCacheIntent(
 	// No usable daemon was found. If a direct CLI writer owns the archive,
 	// fail fast with a clear message instead of spawning a daemon that cannot
 	// claim the held write-owner lock.
-	if err := daemonAutostartPreflight(c); err != nil {
+	if err := daemonAutostartPreflight(ctx, c); err != nil {
 		return nil, localDaemonStartupInfo{}, err
 	}
 
@@ -454,7 +473,10 @@ func ensureLocalDaemonRuntimeWithStartupCacheIntent(
 	if !autoStart {
 		incompatibleGuidance = "restart or upgrade the supervised service"
 	}
-	prep, err := prepareBackgroundDaemonStart(c, restartPolicy, incompatibleGuidance, loggerFromContext(ctx))
+	prep, err := prepareBackgroundDaemonStart(ctx, c, restartPolicy, incompatibleGuidance, loggerFromContext(ctx))
+	if errors.Is(err, errIncompatibleDaemon) && configErr != nil && autoStart {
+		return nil, localDaemonStartupInfo{}, daemonConfigStartError(configErr)
+	}
 	if err != nil {
 		return nil, localDaemonStartupInfo{}, err
 	}
@@ -466,6 +488,9 @@ func ensureLocalDaemonRuntimeWithStartupCacheIntent(
 	}
 	if !autoStart {
 		return nil, localDaemonStartupInfo{}, localDaemonAutoStartDisabledError(c.Data.DataDir)
+	}
+	if configErr != nil {
+		return nil, localDaemonStartupInfo{}, daemonConfigStartError(configErr)
 	}
 
 	startedAt := time.Now()
@@ -535,6 +560,11 @@ func ensureLocalDaemonRuntimeWithStartupCacheIntent(
 		LogPath: proc.LogPath,
 		Outcome: startupCacheBuildOutcomeFromRuntime(rt),
 	}, nil
+}
+
+// daemonConfigStartError refuses to start a daemon from a config it would reject.
+func daemonConfigStartError(err error) error {
+	return fmt.Errorf("start background daemon: daemon config invalid: %w", err)
 }
 
 // errLocalDaemonAutoStartDisabled marks a local resolution that found no
@@ -1154,7 +1184,7 @@ func waitForUsableBackgroundRuntimeOrLaunchLock(
 // is already returned by the loop-top probe; an incompatible or
 // upgrade-eligible one is stopped by prepareBackgroundDaemonStart).
 func daemonStartInProgress(ctx context.Context, dataDir string) (bool, error) {
-	records, err := listLiveDaemonRuntimeRecords(dataDir)
+	records, err := listLiveDaemonRuntimeRecordsContext(ctx, dataDir)
 	if err != nil {
 		return false, err
 	}

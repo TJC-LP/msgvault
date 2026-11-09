@@ -1,9 +1,50 @@
 package meetingarchive
 
 import (
+	"fmt"
 	"strings"
 	"unicode"
+
+	"go.kenn.io/msgvault/internal/meetingidentity"
+	"go.kenn.io/msgvault/internal/store"
 )
+
+func normalizedPeople(snapshot Snapshot) (Person, []Person) {
+	var organizer Person
+	if snapshot.Organizer != nil {
+		organizer = snapshot.Organizer.Normalized()
+	}
+	attendees := make([]Person, 0, len(snapshot.Attendees))
+	seen := make(map[string]bool, len(snapshot.Attendees))
+	for _, raw := range snapshot.Attendees {
+		attendee := raw.Normalized()
+		key := archiveParticipantKey(attendee)
+		if key != "" && !seen[key] {
+			seen[key] = true
+			attendees = append(attendees, attendee)
+		}
+	}
+	return organizer, attendees
+}
+
+// archiveParticipantKey keeps resolved people distinct even when they share an address.
+func archiveParticipantKey(person Person) string {
+	if person.ParticipantID > 0 {
+		return fmt.Sprintf("participant:%d", person.ParticipantID)
+	}
+	return person.PrimaryKey()
+}
+
+func persistData(person Person) store.ParticipantPersistData {
+	if person.Email != "" {
+		return store.ParticipantPersistData{
+			EmailAddress: person.Email,
+			DisplayName:  person.Name,
+			Domain:       emailDomain(person.Email),
+		}
+	}
+	return store.ParticipantPersistData{PhoneNumber: person.Phone, DisplayName: person.Name}
+}
 
 // Normalized returns the person with trimmed, lowercased emails, E.164-only
 // phones, invalid values dropped, and extra identities de-duplicated against
@@ -11,6 +52,7 @@ import (
 func (p Person) Normalized() Person {
 	out := Person{
 		Name:                  strings.TrimSpace(p.Name),
+		ParticipantID:         p.ParticipantID,
 		Email:                 normalizePersonEmail(p.Email),
 		Phone:                 normalizePersonPhone(p.Phone),
 		Anchor:                strings.TrimSpace(p.Anchor),
@@ -82,7 +124,7 @@ type identity struct {
 // validate their own addresses) while refusing values that cannot be an
 // address at all.
 func normalizePersonEmail(value string) string {
-	value = strings.ToLower(strings.TrimSpace(value))
+	value = meetingidentity.Normalize(value)
 	if !strings.Contains(value, "@") || strings.IndexFunc(value, unicode.IsSpace) >= 0 {
 		return ""
 	}

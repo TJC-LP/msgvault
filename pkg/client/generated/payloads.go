@@ -2,6 +2,10 @@
 
 package generated
 
+import (
+	"github.com/doordash-oss/oapi-codegen-dd/v3/pkg/runtime"
+)
+
 type LoginSessionBody = SessionLoginRequest
 
 type AddAccountBody = AddAccountRequest
@@ -35,6 +39,8 @@ type ApproveCardDAVPublicationBody = CardDAVPublicationApprovalRequest
 type SyncCardDAVBody = CardDAVSyncRequest
 
 type UpdateCLIAccountBody = UpdateRequest
+
+type MergeCLIAccountsBody = MergeRequest
 
 type PlanCLIAddCalendarBody = CLIAddCalendarPlanRequest
 
@@ -102,6 +108,8 @@ type GroupFilesBody = FileGroupsHTTPRequest
 
 type SearchFilesBody = FileSearchHTTPRequest
 
+type SuggestFilesBody = FileSuggestionHTTPRequest
+
 type LinkIdentityParticipantsBody = IdentityLinkRequest
 
 type ReviewAcceptIdentityMatchCandidateBody = DecideIdentityMatchReviewedRequest
@@ -118,13 +126,27 @@ type UnlinkIdentityParticipantsBody = IdentityLinkRequest
 
 type ImportMeetingBody = MeetingImportRequest
 
+type ImportMuesliBody = MuesliRemoteRequest
+
+type ImportMuesliRecordingBody = runtime.File
+
 type CreateImportJobBody = ImportJobRequest
+
+type PrepareKataEvidenceBody = KataEvidencePrepareRequest
+
+type CreateKataIssueBody = KataIssueCreateRequest
+
+type LinkKataEvidenceBody = KataEvidenceLinkRequest
+
+type SnoozeLoopBody = SnoozeLoopRequest
 
 type ListMeetingActionItemsBody = MeetingActionsRequest
 
 type GetMeetingContextBody = MeetingContextRequest
 
 type GetMeetingMetricsBody = MeetingMetricsRequest
+
+type UpdateMessageTagsBody = MessageTagChange
 
 type CreateOrLinkMessageTaskBody = TaskLinkMutationRequest
 
@@ -171,6 +193,8 @@ type RejectPersonBriefBody = RejectPersonBriefRequest
 type SetPersonFactPinBody = SetPersonFactPinRequest
 
 type SearchPersonFilesBody = PersonFileSearchHTTPRequest
+
+type SuggestPersonFilesBody = PersonFileSuggestionHTTPRequest
 
 type MergePersonsBody = MergePersonRequest
 
@@ -229,3 +253,5 @@ type SelectSettingsPeopleInferenceBody = PeopleInferenceSelectionRequest
 type PutSettingsPersonEnrichmentProviderBody = PersonEnrichmentProviderUpdate
 
 type PutSettingsProviderCredentialBody = ProviderCredentialWriteRequest
+
+type CaptureTelemetryEventBody = TelemetryEventRequest

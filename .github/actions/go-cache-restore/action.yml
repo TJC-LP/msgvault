@@ -1,0 +1,87 @@
+name: Restore Go caches
+description: >-
+  Restore the newest main-saved Go build and module caches for one job group.
+  Pair with go-cache-save in the job that owns the group.
+inputs:
+  group:
+    description: Cache group, such as linux-cgo or windows-amd64
+    required: true
+  extra-path:
+    description: Additional cache directory owned by the group
+    required: false
+    default: ""
+  trim:
+    description: Track cache use in the job that owns and saves the group
+    required: false
+    default: "false"
+runs:
+  using: composite
+  steps:
+    - name: Select cache key and paths
+      shell: bash
+      env:
+        GROUP: ${{ inputs.group }}
+        EXTRA_PATH: ${{ inputs.extra-path }}
+        GO_SUM: ${{ hashFiles('go.sum') }}
+      run: |
+        # One key per group and day: main refreshes it daily instead of freezing on go.sum.
+        {
+          echo "GO_CACHE_KEY=go-${GROUP}-${GO_SUM}-$(date -u +%Y-%m-%d)"
+          echo "GO_CACHE_PREFIX=go-${GROUP}-${GO_SUM}-"
+          echo "GO_CACHE_GROUP_PREFIX=go-${GROUP}-"
+          echo "GO_CACHE_PATHS<<EOF"
+          go env GOCACHE
+          go env GOMODCACHE
+          if [ -n "$EXTRA_PATH" ]; then echo "$EXTRA_PATH"; fi
+          echo "EOF"
+        } >> "$GITHUB_ENV"
+
+    - name: Restore caches
+      id: restore
+      uses: actions/cache/restore@v6.1.0
+      with:
+        path: ${{ env.GO_CACHE_PATHS }}
+        key: ${{ env.GO_CACHE_KEY }}
+        restore-keys: |
+          ${{ env.GO_CACHE_PREFIX }}
+          ${{ env.GO_CACHE_GROUP_PREFIX }}
+
+    - name: Record exact cache hit
+      shell: bash
+      run: echo "GO_CACHE_HIT=${{ steps.restore.outputs.cache-hit }}" >> "$GITHUB_ENV"
+
+    - name: Track Go cache use
+      if: >-
+        inputs.trim == 'true' && github.event_name == 'push'
+        && github.ref == 'refs/heads/main' && steps.restore.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        python3 - <<'PY'
+        import json
+        import os
+        from pathlib import Path
+        import shutil
+        import subprocess
+        import time
+
+        paths = json.loads(subprocess.check_output(["go", "env", "-json", "GOCACHE", "GOMODCACHE", "GOPROXY"], text=True))
+        cache = Path(paths["GOCACHE"])
+        modules = Path(paths["GOMODCACHE"])
+        restored = Path(os.environ["RUNNER_TEMP"]) / "go-mod-cache"
+        if modules.exists():
+            shutil.move(str(modules), restored)
+        download = modules / "cache" / "download"
+        download.mkdir(parents=True, exist_ok=True)
+        sumdb = restored / "cache" / "download" / "sumdb"
+        if sumdb.exists():
+            shutil.copytree(sumdb, download / "sumdb")
+        proxy = (restored / "cache" / "download").resolve().as_uri()
+        # Go refreshes entry mtimes at most hourly; age them so every use is recorded.
+        aged = time.time() - 2 * 60 * 60
+        for entry in cache.glob("[0-9a-f][0-9a-f]/*"):
+            if entry.name.endswith(("-a", "-d")):
+                os.utime(entry, (aged, aged))
+        (Path(os.environ["RUNNER_TEMP"]) / "go-cache-used-after").touch()
+        with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
+            env.write(f"GOPROXY={proxy}|{paths['GOPROXY']}\nGO_CACHE_TRIM=true\n")
+        PY

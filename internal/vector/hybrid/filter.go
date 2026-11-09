@@ -40,6 +40,7 @@ func BuildFilter(ctx context.Context, db *sql.DB, rebind func(string) string, q 
 	if q == nil {
 		return f, nil
 	}
+	f.AccountScopes = append(search.AccountScopesFromQuery(q), search.CloneAccountScopes(q.AccountScopes)...)
 	if rebind == nil {
 		rebind = identityRebind
 	}
@@ -93,6 +94,7 @@ func BuildFilter(ctx context.Context, db *sql.DB, rebind func(string) string, q 
 	if len(q.SubjectTerms) > 0 {
 		f.SubjectSubstrings = append([]string(nil), q.SubjectTerms...)
 	}
+	f.FilenameSubstrings = append([]string(nil), q.Filenames...)
 	if len(q.ListIDs) > 0 {
 		f.ListIDSubstrings = append([]string(nil), q.ListIDs...)
 	}
@@ -139,6 +141,7 @@ func ApplyMessageFilter(
 		}
 	}
 
+	f.AccountScopes = append(f.AccountScopes, search.CloneAccountScopes(structured.AccountScopes)...)
 	derived := query.MergeFilterIntoQuery(&search.Query{}, structured)
 	intersectSourceIDs(f, derived.AccountIDs)
 	intersectConversationIDs(f, derived.ConversationIDs)

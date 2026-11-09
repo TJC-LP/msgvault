@@ -1,7 +1,6 @@
 package store_test
 
 import (
-	"context"
 	"fmt"
 	"path/filepath"
 	"testing"
@@ -294,12 +293,12 @@ func TestVCardResourceRejectsStaleWriterAcrossHandles(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
 	dbPath := filepath.Join(t.TempDir(), "vcard-cas.db")
-	first, err := store.OpenForTest(dbPath)
+	first, err := store.OpenForTest(t.Context(), dbPath)
 	require.NoError(err)
 	t.Cleanup(func() { _ = first.Close() })
 	require.NoError(first.InitSchema())
 	person := createEnvelopePerson(t, first, "alice@example.com")
-	second, err := store.OpenForTest(dbPath)
+	second, err := store.OpenForTest(t.Context(), dbPath)
 	require.NoError(err)
 	t.Cleanup(func() { _ = second.Close() })
 
@@ -819,17 +818,20 @@ func TestVCardResourceWritesRetrySQLiteSnapshotContention(t *testing.T) {
 	writerDone := make(chan struct{})
 	go func() {
 		defer close(writerDone)
+		pause := time.NewTicker(2 * time.Millisecond)
+		defer pause.Stop()
 		for {
 			select {
 			case <-stop:
 				return
-			case <-time.After(2 * time.Millisecond):
+			case <-pause.C:
 			}
-			_, _ = st.AddPersonCategoryContext(context.Background(), person.ID,
+			_, _ = st.AddPersonCategoryContext(t.Context(), person.ID,
 				store.PersonCategoryInput{
 					OriginalValue: "contention",
 					Envelope:      store.ValueEnvelopeInput{Source: store.ProvenanceUser},
 				})
+			pause.Reset(2 * time.Millisecond)
 		}
 	}()
 	t.Cleanup(func() {
@@ -882,18 +884,21 @@ func TestVCardSemanticCommitAbsorbsSQLiteWriterContention(t *testing.T) {
 	writerDone := make(chan struct{})
 	go func() {
 		defer close(writerDone)
+		pause := time.NewTicker(300 * time.Microsecond)
+		defer pause.Stop()
 		for i := 0; ; i++ {
 			select {
 			case <-stop:
 				return
-			case <-time.After(300 * time.Microsecond):
+			case <-pause.C:
 			}
-			_, _ = st.AddPersonNameContext(context.Background(), neighbour.ID,
+			_, _ = st.AddPersonNameContext(t.Context(), neighbour.ID,
 				store.PersonNameInput{
 					NameKind:  store.PersonNameFormatted,
 					Formatted: new(fmt.Sprintf("Bob %d", i)),
 					Envelope:  store.ValueEnvelopeInput{Source: store.ProvenanceUser},
 				})
+			pause.Reset(300 * time.Microsecond)
 		}
 	}()
 	t.Cleanup(func() {

@@ -3,7 +3,6 @@
 package pgvector
 
 import (
-	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -25,7 +24,7 @@ import (
 func TestCoverageSplit_EmbeddedBlankMissing(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	db := openPGTestDB(t) // skips when MSGVAULT_TEST_DB is unset
 	b, err := Open(ctx, Options{DB: db, Dimension: 8})
@@ -79,11 +78,15 @@ func TestCoverageSplit_EmbeddedBlankMissing(t *testing.T) {
 
 	embeddedCount, err := b.EmbeddedMessageCount(ctx, gen)
 	require.NoError(err, "EmbeddedMessageCount")
+	coverage, err := b.EmbeddingCoverage(ctx, gen, vector.BuildScope{})
+	require.NoError(err, "EmbeddingCoverage")
 	blank := max(stamped-embeddedCount, 0)
 
 	assert.Equal(int64(5), live, "live = all 5 messages")
 	assert.Equal(int64(4), stamped, "stamped = 4 (2 embedded + 2 blank)")
 	assert.Equal(int64(2), embeddedCount, "embedded = 2 (distinct message_ids with a vector)")
+	assert.Equal(vector.EmbeddingCoverage{Live: 5, Stamped: 4, Embedded: 2}, coverage,
+		"the single-statement split matches the separately computed counts")
 	assert.Equal(int64(2), blank, "blank = stamped - embedded = 2")
 	assert.Equal(int64(1), missing, "missing = 1 (never stamped)")
 
@@ -94,7 +97,7 @@ func TestCoverageSplit_EmbeddedBlankMissing(t *testing.T) {
 func TestCoverageSplit_ScopedEmbeddedHoldsInvariant(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	db := openPGTestDB(t) // skips when MSGVAULT_TEST_DB is unset
 	b, err := Open(ctx, Options{
@@ -157,7 +160,7 @@ func TestCoverageSplit_ScopedEmbeddedHoldsInvariant(t *testing.T) {
 func TestStats_SourceScopeExcludesOutOfScopePendingMessages(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	db := openPGTestDB(t)
 	b, err := Open(ctx, Options{
 		DB:         db,
@@ -192,7 +195,7 @@ func TestStats_SourceScopeExcludesOutOfScopePendingMessages(t *testing.T) {
 func TestFilteredCoverageRequiresLiveGenerationStampAndVector(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	db := openPGTestDB(t)
 	b, err := Open(ctx, Options{DB: db, Dimension: 8})
 	require.NoError(err)
@@ -235,7 +238,7 @@ func TestFilteredCoverageRequiresLiveGenerationStampAndVector(t *testing.T) {
 func TestActivateGeneration_RefusesEmptySourceScope(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	db := openPGTestDB(t) // skips when MSGVAULT_TEST_DB is unset
 	b, err := Open(ctx, Options{

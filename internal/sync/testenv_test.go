@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/msgvault/internal/gmail"
 	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/testutil"
 )
 
 const testEmail = "test@example.com"
@@ -26,15 +27,13 @@ type TestEnv struct {
 
 func newTestEnv(t *testing.T) *TestEnv {
 	t.Helper()
+	testutil.SkipIfPostgres(t, "SQLite fixtures require SQLite")
 
-	tmpDir := t.TempDir()
-
-	dbPath := filepath.Join(tmpDir, "test.db")
-	st, err := store.Open(dbPath)
-	require.NoError(t, err, "open store")
-	t.Cleanup(func() { _ = st.Close() })
-
-	require.NoError(t, st.InitSchema(), "init schema")
+	st := testutil.NewSQLiteTestStore(t)
+	var sequence int
+	var database, dbPath string
+	require.NoError(t, st.DB().QueryRowContext(t.Context(), `PRAGMA database_list`).Scan(&sequence, &database, &dbPath))
+	tmpDir := filepath.Dir(dbPath)
 
 	mock := gmail.NewMockAPI()
 	mock.Profile = &gmail.Profile{
@@ -48,7 +47,7 @@ func newTestEnv(t *testing.T) *TestEnv {
 		Mock:    mock,
 		Syncer:  New(mock, st, nil),
 		TmpDir:  tmpDir,
-		Context: context.Background(),
+		Context: t.Context(),
 	}
 }
 
@@ -266,7 +265,7 @@ func assertDateFallback(t *testing.T, st *store.Store, sourceMessageID, wantDate
 func assertMessageHasLabel(t *testing.T, st *store.Store, sourceMessageID, sourceLabelID string) {
 	t.Helper()
 	var count int
-	err := st.DB().QueryRow(`
+	err := st.DB().QueryRowContext(t.Context(), `
 		SELECT COUNT(*) FROM message_labels ml
 		JOIN messages m ON ml.message_id = m.id
 		JOIN labels l ON ml.label_id = l.id
@@ -280,7 +279,7 @@ func assertMessageHasLabel(t *testing.T, st *store.Store, sourceMessageID, sourc
 func assertMessageNotHasLabel(t *testing.T, st *store.Store, sourceMessageID, sourceLabelID string) {
 	t.Helper()
 	var count int
-	err := st.DB().QueryRow(`
+	err := st.DB().QueryRowContext(t.Context(), `
 		SELECT COUNT(*) FROM message_labels ml
 		JOIN messages m ON ml.message_id = m.id
 		JOIN labels l ON ml.label_id = l.id

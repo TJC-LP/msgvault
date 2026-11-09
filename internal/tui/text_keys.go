@@ -219,6 +219,7 @@ func (m Model) handleTextInlineSearchKeys(
 		if queryStr == "" {
 			return m, nil
 		}
+		m.submittedQuery = queryStr
 		// Timeline search stays scoped to the selected conversation and runs
 		// through the full-text index. Other views use global FTS.
 		if m.textState.level == textLevelTimeline && !m.textState.globalSearchTimeline {
@@ -554,6 +555,8 @@ func (m Model) textGoBack() (tea.Model, tea.Cmd) {
 	// them directly without reloading. This is instant and avoids
 	// re-querying the database.
 	if m.textState.unfilteredMessages != nil {
+		m.nextTextRequestID()
+		m.loading = false
 		m.textState.messages = m.textState.unfilteredMessages
 		m.textState.unfilteredMessages = nil
 		// Pop the search breadcrumb

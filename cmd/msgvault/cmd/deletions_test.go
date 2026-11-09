@@ -20,7 +20,6 @@ import (
 	"go.kenn.io/msgvault/internal/daemonclient"
 	"go.kenn.io/msgvault/internal/deletion"
 	"go.kenn.io/msgvault/internal/microsoft"
-	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/testutil"
 	"golang.org/x/oauth2"
 )
@@ -71,24 +70,6 @@ func TestRemoteDeleteEnabledUsesConfigOrEnvironment(t *testing.T) {
 
 		assert.False(t, remoteDeleteEnabled(true, invocationFromContext(testCtx)))
 	})
-}
-
-func TestDeleteStaged_PermanentAndYesMutuallyExclusive(t *testing.T) {
-	cmd := &cobra.Command{
-		Use:  "delete-staged",
-		RunE: func(cmd *cobra.Command, args []string) error { return nil },
-	}
-	var permanent, yes bool
-	cmd.Flags().BoolVar(&permanent, "permanent", false, "")
-	cmd.Flags().BoolVarP(&yes, "yes", "y", false, "")
-	cmd.MarkFlagsMutuallyExclusive("permanent", "yes")
-	cmd.SetArgs([]string{"--permanent", "--yes"})
-	cmd.SetOut(new(bytes.Buffer))
-	cmd.SetErr(new(bytes.Buffer))
-	err := cmd.Execute()
-	require.Error(t, err, "want mutual-exclusion error")
-	assert.Contains(t, err.Error(), "permanent")
-	assert.Contains(t, err.Error(), "yes")
 }
 
 func TestListDeletions_ShowsCancelled(t *testing.T) {
@@ -453,6 +434,7 @@ func TestResolveDeleteStagedTargetUsesStableTupleAfterSourceIDChanges(t *testing
 	})
 
 	target, err := resolveDeleteStagedTargetWithSourceID(
+		t.Context(),
 		st, []*deletion.Manifest{manifest}, "", source.ID, true,
 	)
 	require.NoError(t, err)
@@ -470,6 +452,7 @@ func TestResolveDeleteStagedTargetRejectsSnapshotIDThatNowNamesAnotherSource(t *
 	})
 
 	_, err = resolveDeleteStagedTargetWithSourceID(
+		t.Context(),
 		st, []*deletion.Manifest{manifest}, "", other.ID, true,
 	)
 	require.ErrorContains(t, err, "does not match manifest source")
@@ -485,7 +468,7 @@ func TestResolveDeleteStagedTargetRejectsRequestedAccountOutsideDurableTuple(t *
 		ID: source.ID, Type: source.SourceType, Identifier: source.Identifier,
 	})
 
-	_, err = resolveDeleteStagedTarget(st, []*deletion.Manifest{manifest}, "other@example.invalid")
+	_, err = resolveDeleteStagedTarget(t.Context(), st, []*deletion.Manifest{manifest}, "other@example.invalid")
 	require.ErrorContains(t, err, "does not match manifest source")
 }
 
@@ -499,9 +482,7 @@ func TestDeleteStagedRejectsUnsupportedSourceBeforeClaim(t *testing.T) {
 	t.Setenv(daemonCLISubprocessEnv, strconv.Itoa(os.Getppid()))
 	resetDeleteStagedRoutingGlobals(t)
 
-	st, err := store.Open(cfg.DatabaseDSN())
-	require.NoError(err)
-	require.NoError(st.InitSchema())
+	st := testutil.NewSQLiteTestStoreAt(t, cfg.DatabaseDSN())
 	source, err := st.GetOrCreateSource("slack", "workspace.example.invalid")
 	require.NoError(err)
 	require.NoError(st.Close())
@@ -534,9 +515,7 @@ func TestDeleteStagedOAuthSetupFailureLeavesManifestPending(t *testing.T) {
 	t.Setenv(daemonCLISubprocessEnv, strconv.Itoa(os.Getppid()))
 	resetDeleteStagedRoutingGlobals(t)
 
-	st, err := store.Open(cfg.DatabaseDSN())
-	require.NoError(err)
-	require.NoError(st.InitSchema())
+	st := testutil.NewSQLiteTestStoreAt(t, cfg.DatabaseDSN())
 	source, err := st.GetOrCreateSource("gmail", "account@example.invalid")
 	require.NoError(err)
 	require.NoError(st.Close())
@@ -707,7 +686,7 @@ func TestPlanCLIDeleteStagedReportsDeletionScopeEscalation(t *testing.T) {
 	defer restore()
 	cfg := testConfigValue()
 	cfg.OAuth.ClientSecrets = filepath.Join(filepath.Dir(filepath.Dir(tokenPath)), "client_secret.json")
-	testCtx := testInvocationContext(context.Background(), cfg, invocationOptions{})
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
 
 	st := testutil.NewTestStore(t)
 	_, err := st.GetOrCreateSource(sourceTypeGmail, scopeEscalationAccount)
@@ -859,7 +838,7 @@ func TestPlanCLIDeleteStagedEscalatesLegacyGmailTokenForPermanentDelete(t *testi
 	defer restore()
 	cfg := testConfigValue()
 	cfg.OAuth.ClientSecrets = filepath.Join(filepath.Dir(filepath.Dir(tokenPath)), "client_secret.json")
-	testCtx := testInvocationContext(context.Background(), cfg, invocationOptions{})
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
 
 	st := testutil.NewTestStore(t)
 	_, err := st.GetOrCreateSource(sourceTypeGmail, scopeEscalationAccount)

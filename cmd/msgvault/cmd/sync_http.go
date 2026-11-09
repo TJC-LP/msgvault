@@ -77,7 +77,7 @@ func runSyncHTTP(cmd *cobra.Command, req daemonclient.CLISyncRequest) error {
 		return err
 	}
 
-	return st.RunCLISync(cmd.Context(), req, func(stream, data string) error {
+	err = st.RunCLISync(cmd.Context(), req, func(stream, data string) error {
 		switch stream {
 		case cliStreamStdout:
 			if _, err := fmt.Fprint(cmd.OutOrStdout(), data); err != nil {
@@ -90,12 +90,15 @@ func runSyncHTTP(cmd *cobra.Command, req daemonclient.CLISyncRequest) error {
 		}
 		return nil
 	})
+	if err == nil {
+		reportCLISyncFinished(cmd, st)
+	}
+	return err
 }
 
 // preflightReauthManager is the subset of oauth.Manager the sync preflight
 // needs. Keeping it an interface lets tests inject a fake without real OAuth.
 type preflightReauthManager interface {
-	HasToken(email string) bool
 	TokenSource(ctx context.Context, email string) (oauth2.TokenSource, error)
 	AuthorizePreservingGrantedScopes(ctx context.Context, email string) error
 }
@@ -104,6 +107,7 @@ type preflightReauthManager interface {
 type preflightAccount struct {
 	ID          int64
 	Email       string
+	Alias       string
 	DisplayName string
 	OAuthApp    string
 }
@@ -126,7 +130,7 @@ type preflightConfig struct {
 	// service account (tokens minted on demand; no browser reauth needed).
 	ServiceAccountKey func(appName string) string
 	// ManagerFor resolves the OAuth manager for a given app name.
-	ManagerFor func(appName string) (preflightReauthManager, error)
+	ManagerFor func(ctx context.Context, appName string) (preflightReauthManager, error)
 }
 
 // buildSyncPreflight wires the production preflight config from global config,
@@ -152,18 +156,19 @@ func buildSyncPreflight(st *daemonclient.Client, info HTTPStoreInfo, state *invo
 		OAuthConfigured: oauthConfigured,
 		Out:             os.Stdout,
 		ListGmailAccounts: func(ctx context.Context) ([]preflightAccount, error) {
-			accounts, err := st.GetCLIAccounts(ctx)
+			accounts, _, err := st.GetCLIAccounts(ctx)
 			if err != nil {
 				return nil, err
 			}
 			gmail := make([]preflightAccount, 0, len(accounts))
 			for _, a := range accounts {
-				if a.Type != sourceTypeGmail {
+				if a.Type != sourceTypeGmail || a.MergedIntoSourceID != 0 {
 					continue
 				}
 				gmail = append(gmail, preflightAccount{
 					ID:          a.ID,
 					Email:       a.Email,
+					Alias:       a.Alias,
 					DisplayName: a.DisplayName,
 					OAuthApp:    a.OAuthApp,
 				})
@@ -171,8 +176,8 @@ func buildSyncPreflight(st *daemonclient.Client, info HTTPStoreInfo, state *invo
 			return gmail, nil
 		},
 		ServiceAccountKey: serviceAccountKey,
-		ManagerFor: func(appName string) (preflightReauthManager, error) {
-			mgr, err := getMgr(appName)
+		ManagerFor: func(ctx context.Context, appName string) (preflightReauthManager, error) {
+			mgr, err := getMgr(ctx, appName)
 			if err != nil {
 				return nil, err
 			}
@@ -219,8 +224,8 @@ func filterPreflightAccountsByID(accounts []preflightAccount, sourceID int64) []
 	return matched
 }
 
-// filterPreflightAccounts keeps the Gmail accounts whose email OR display name
-// matches the requested identifier (case-insensitive). Both are accepted
+// filterPreflightAccounts keeps the Gmail accounts whose email, alias or display
+// name matches the requested identifier (case-insensitive). All are accepted
 // because sync/sync-full resolve their argument via
 // GetSourcesByIdentifierOrDisplayName. All matches are returned so a display
 // name shared by several accounts re-authorizes every one of them. A request
@@ -229,6 +234,7 @@ func filterPreflightAccounts(accounts []preflightAccount, reqIdentifier string) 
 	var matched []preflightAccount
 	for _, a := range accounts {
 		if strings.EqualFold(a.Email, reqIdentifier) ||
+			strings.EqualFold(a.Alias, reqIdentifier) ||
 			strings.EqualFold(a.DisplayName, reqIdentifier) {
 			matched = append(matched, a)
 		}
@@ -242,16 +248,11 @@ func preflightReauthAccount(ctx context.Context, p preflightConfig, target prefl
 		return nil
 	}
 
-	mgr, err := p.ManagerFor(target.OAuthApp)
+	mgr, err := p.ManagerFor(ctx, target.OAuthApp)
 	if err != nil {
 		// A manager build failure is a config problem the daemon reports with
 		// its own skip line; don't abort the whole sync over it.
 		return nil //nolint:nilerr // best-effort: config errors surface via the daemon
-	}
-
-	// A bare sync must not newly enroll an account.
-	if !mgr.HasToken(target.Email) {
-		return nil
 	}
 
 	_, err = mgr.TokenSource(ctx, target.Email)

@@ -11,6 +11,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/mattn/go-isatty"
 	"github.com/spf13/cobra"
@@ -19,6 +20,7 @@ import (
 	"go.kenn.io/msgvault/internal/oauth"
 	"go.kenn.io/msgvault/internal/store"
 	"golang.org/x/oauth2"
+	"golang.org/x/sync/singleflight"
 )
 
 var rootCmd = newRootCommand()
@@ -27,11 +29,23 @@ func newRootCommand() *cobra.Command {
 	root := &cobra.Command{
 		Use:   daemonService,
 		Short: "Offline email, chat, and meeting archive tool",
-		Long: `msgvault is an offline archive tool that exports and stores email,
-chat, and meeting data locally with full-text search capabilities.
+		Long: `Archive email, chats, and meetings offline. Use the daemon
+or config.toml's [remote].url; --local forces local.
 
-This is the Go implementation providing sync, search, and TUI functionality
-in a single binary.`,
+Start here:
+  msgvault list-accounts --json
+  msgvault search 'from:alice@example.com newer_than:30d' --json
+  msgvault show-message <id> --json
+  msgvault export-eml <id> -o msg.eml
+  msgvault export-messages --start 2026-09-01T00:00:00Z --end 2026-10-01T00:00:00Z
+  msgvault person --help
+  msgvault daemon status
+  msgvault setup status --json
+
+Output:
+  --json: JSON stdout (export-messages: JSON Lines). Logs/progress: stderr.
+  --log-level=warn quiets logs. Exit: 0 success, 1 error, 130 interrupted.
+  More: msgvault quickstart.`,
 		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
 			inv := prepareInvocation(cmd)
 			if inv == nil {
@@ -56,6 +70,13 @@ in a single binary.`,
 			// invocation-contract violations.
 			cmd.SilenceUsage = true
 
+			// A help-only group prints help and reads nothing, so it needs
+			// neither config nor the agent-delegated capability gate.
+			if isHelpOnlyGroup(cmd) {
+				cmd.SilenceUsage = false
+				return nil
+			}
+
 			// Agent-delegated mode: detect before any local owner lifecycle.
 			// Only commands in agentDelegatedCapable's set may run this way.
 			// Reject flags that are meaningless in delegated mode, then skip
@@ -72,6 +93,8 @@ in a single binary.`,
 				if inv.options.homeDir != "" {
 					return errors.New("--home is not allowed in agent-delegated mode")
 				}
+				inv.cfg = &config.Config{}
+				inv.logger = slog.New(slog.DiscardHandler)
 				cmd.SilenceUsage = false
 				return nil
 			}
@@ -85,7 +108,11 @@ in a single binary.`,
 
 			// Load config first; logging options live under [log].
 			var err error
-			inv.cfg, err = config.LoadWithOverrides(inv.options.cfgFile, inv.options.homeDir, serveRuntimeOverrides(cmd))
+			load := config.LoadClientWithOverrides
+			if requiresStrictConfig(cmd) {
+				load = config.LoadWithOverrides
+			}
+			inv.cfg, err = load(inv.options.cfgFile, inv.options.homeDir, serveRuntimeOverrides(cmd))
 			if err != nil {
 				return fmt.Errorf("load config: %w", err)
 			}
@@ -211,11 +238,67 @@ in a single binary.`,
 	return root
 }
 
+// strictConfigAnnotation marks the commands that start or replace a daemon,
+// and setup commands that must fail before an OAuth browser flow.
+const strictConfigAnnotation = "msgvault/strict-config"
+
+// requiresStrictConfig reports whether cmd must fail on invalid settings that
+// only the daemon reads. Every other command loads them leniently and warns,
+// so it can still reach a running daemon.
+func requiresStrictConfig(cmd *cobra.Command) bool {
+	return cmd.Annotations[strictConfigAnnotation] != ""
+}
+
+// markStrictConfig makes cmd fail at load on an invalid daemon-only setting.
+func markStrictConfig(cmd *cobra.Command) *cobra.Command {
+	if cmd.Annotations == nil {
+		cmd.Annotations = map[string]string{}
+	}
+	cmd.Annotations[strictConfigAnnotation] = "required"
+	return cmd
+}
+
+// warnDaemonConfigError prints each invalid daemon-only setting once, after
+// the command ran, unless runErr or the stderr a proxied child streamed
+// already reports it. The daemon's own CLI
+// children stay quiet; their parent warned.
+func warnDaemonConfigError(root *cobra.Command, cfg *config.Config, runErr error) {
+	if cfg == nil || isDaemonConsoleSubprocess() {
+		return
+	}
+	err := cfg.DaemonConfigError()
+	if err == nil {
+		return
+	}
+	errs := []error{err}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		errs = joined.Unwrap()
+	}
+	for _, e := range errs {
+		if alreadyReported(runErr, e) {
+			continue
+		}
+		_, _ = fmt.Fprintf(root.ErrOrStderr(), "Warning: invalid daemon config: %v\n", e)
+	}
+}
+
+// alreadyReported reports whether runErr, or the stderr a failed proxied child
+// streamed, already shows err.
+func alreadyReported(runErr, err error) bool {
+	if child, ok := errors.AsType[proxiedChildError](runErr); ok {
+		return child.reported(err)
+	}
+	return runErr != nil && (errors.Is(runErr, err) || strings.Contains(runErr.Error(), err.Error()))
+}
+
 // skipsConfigLoad reports whether cmd must run without loading config
 // or touching the msgvault home directory (e.g. version, completion,
 // and the skills group, which only writes agent skill files).
 func skipsConfigLoad(cmd *cobra.Command) bool {
 	switch cmd.Name() {
+	case "schema-version":
+		database, _ := cmd.Flags().GetBool("database")
+		return !database
 	case "version", "update", "quickstart", "openapi", "completion",
 		embeddingsOptimizeWorkerName,
 		cobra.ShellCompRequestCmd, cobra.ShellCompNoDescRequestCmd:
@@ -239,8 +322,13 @@ func agentDelegatedCapable(cmd *cobra.Command) bool {
 			return true
 		}
 	}
-	switch cmd.Name() {
-	case "draft-reply", "draft-compose", "draft-get", "draft-edit", "draft-delete", "draft-recover", "mcp":
+	return agentDelegatedCommand(cmd.Name()) && (!cmd.HasParent() || cmd.Parent() == cmd.Root())
+}
+
+// agentDelegatedCommand owns the command set offered to an agent grant.
+func agentDelegatedCommand(name string) bool {
+	switch name {
+	case "search", "show-message", "show-thread", "stats", "draft-reply", "draft-compose", "draft-get", "draft-edit", "draft-delete", "draft-recover", "mcp":
 		return true
 	}
 	return false
@@ -322,6 +410,7 @@ func Execute() error {
 // Installs a panic recovery and closes the log file handler on
 // return so every run ends cleanly in the log.
 func ExecuteContext(ctx context.Context) error {
+	ensureHelpLayout(rootCmd)
 	ensureSilenceUsageWrapped(rootCmd)
 	return executeRootContext(ctx, rootCmd)
 }
@@ -342,6 +431,7 @@ func executeRootContext(ctx context.Context, root *cobra.Command) error {
 	// os.Exit (which skips remaining defers), it closes logResult
 	// itself before exiting. Do not reorder these defers.
 	defer func() {
+		inv.sends.Wait(50 * time.Millisecond)
 		if inv.logResult != nil {
 			inv.logResult.Close()
 			inv.logResult = nil
@@ -352,6 +442,7 @@ func executeRootContext(ctx context.Context, root *cobra.Command) error {
 	defer recoverAndLogPanic(inv)
 
 	err := root.ExecuteContext(root.Context())
+	warnDaemonConfigError(root, inv.cfg, err)
 
 	// Record the exit outcome so users can see the per-run
 	// result in the log without parsing error messages.
@@ -487,7 +578,7 @@ Or copy the file to your msgvault home directory:
 // if the root cause is a missing or unreadable secrets file.
 func wrapOAuthError(err error, cfg *config.Config) error {
 	if errors.Is(err, os.ErrNotExist) || errors.Is(err, os.ErrPermission) {
-		return fmt.Errorf("OAuth client secrets file not accessible.%s", oauthSetupHint(cfg))
+		return fmt.Errorf("OAuth client secrets file not accessible: %w%s", errors.Join(oauth.ErrClientConfig, err), oauthSetupHint(cfg))
 	}
 	return err
 }
@@ -507,7 +598,6 @@ func isAuthInvalidError(err error) bool {
 // getTokenSourceWithReauth, making the function testable without real OAuth.
 type tokenReauthorizer interface {
 	TokenSource(ctx context.Context, email string) (oauth2.TokenSource, error)
-	HasToken(email string) bool
 	Authorize(ctx context.Context, email string) error
 	AuthorizeManual(ctx context.Context, email string) error
 }
@@ -521,19 +611,19 @@ type scopePreservingReauthorizer interface {
 // current grant: an account deliberately narrowed to read-only must not be
 // handed a command that would widen it again.
 type grantInspector interface {
-	GrantedScopes(email string) []string
+	GrantedScopes(ctx context.Context, email string) []string
 }
 
 // accountIsNarrowed reports whether the account's recorded grant is Gmail
 // read-only. A manager that cannot report scopes, or a grant with no Gmail
 // scopes at all, is treated as not narrowed, so guidance is unchanged for
 // every pre-existing case.
-func accountIsNarrowed(mgr tokenReauthorizer, email string) bool {
+func accountIsNarrowed(ctx context.Context, mgr tokenReauthorizer, email string) bool {
 	inspector, ok := mgr.(grantInspector)
 	if !ok {
 		return false
 	}
-	return oauth.IsNarrowedGmailGrant(inspector.GrantedScopes(email))
+	return oauth.IsNarrowedGmailGrant(inspector.GrantedScopes(ctx, email))
 }
 
 // readonlyFlagSuffix renders the grant-affecting flag for inclusion in
@@ -603,8 +693,8 @@ func getTokenSourceWithReauth(
 		return tokenSource, nil
 	}
 
-	// No token at all — user needs to run add-account
-	if !mgr.HasToken(email) {
+	// Missing or malformed token files need a new sign-in.
+	if errors.Is(err, os.ErrNotExist) || errors.Is(err, oauth.ErrInvalidTokenJSON) {
 		return nil, fmt.Errorf("get token source: %w (run 'add-account %s' first)", err, email)
 	}
 
@@ -621,7 +711,7 @@ func getTokenSourceWithReauth(
 	// device-code instructions instead (--force is browser-only).
 	// Read the recorded grant before any reauthorization replaces it, so the
 	// guidance reflects what the account holds now.
-	narrowed := accountIsNarrowed(mgr, email)
+	narrowed := accountIsNarrowed(ctx, mgr, email)
 
 	if !interactive {
 		return nil, fmt.Errorf(
@@ -671,31 +761,102 @@ func authorizeManualForReauth(ctx context.Context, mgr tokenReauthorizer, email 
 // oauthManagerCache returns a resolver function that lazily creates and
 // caches oauth.Manager instances keyed by app name. The cache is safe
 // for concurrent use (serve runs scheduled syncs in goroutines).
-func oauthManagerCache(state *invocation) func(appName string) (*oauth.Manager, error) {
-	var mu sync.Mutex
-	managers := map[string]*oauth.Manager{}
-	return func(appName string) (*oauth.Manager, error) {
-		mu.Lock()
-		defer mu.Unlock()
-		if mgr, ok := managers[appName]; ok {
+func oauthManagerCache(state *invocation) func(ctx context.Context, appName string) (*oauth.Manager, error) {
+	cache := &oauthManagers{state: state, managers: map[string]*oauth.Manager{}}
+	return cache.get
+}
+
+// oauthManagers creates a manager per app. Creating one can run
+// client_secrets_command, so the mutex guards only the map. Concurrent callers
+// for one app share a single load, and each caller stops waiting when its own
+// context ends.
+type oauthManagers struct {
+	state    *invocation
+	mu       sync.Mutex
+	loads    singleflight.Group
+	managers map[string]*oauth.Manager
+	// joined lets tests wait until a caller is attached to the in-flight load.
+	joined func(appName string)
+}
+
+// loaderContextEndedError marks a shared load that stopped because the caller
+// that started it was cancelled or ran out of time, not because loading failed.
+type loaderContextEndedError struct{ err error }
+
+func (e *loaderContextEndedError) Error() string { return e.err.Error() }
+func (e *loaderContextEndedError) Unwrap() error { return e.err }
+
+func (c *oauthManagers) cached(appName string) (*oauth.Manager, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	mgr, ok := c.managers[appName]
+	return mgr, ok
+}
+
+func (c *oauthManagers) get(ctx context.Context, appName string) (*oauth.Manager, error) {
+	for {
+		if mgr, ok := c.cached(appName); ok {
 			return mgr, nil
 		}
-		if state == nil || state.cfg == nil || state.logger == nil {
-			return nil, errors.New("configuration is unavailable")
+		result := c.loads.DoChan(appName, func() (any, error) { return c.load(ctx, appName) })
+		if c.joined != nil {
+			c.joined(appName)
 		}
-		currentCfg := state.cfg
-		currentLogger := state.logger
-		secretsPath, err := currentCfg.OAuth.ClientSecretsFor(appName)
-		if err != nil {
-			return nil, err
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case loaded := <-result:
+			// The load ran under another caller's context. If that context
+			// ended, this caller loads again under its own.
+			if _, ended := errors.AsType[*loaderContextEndedError](loaded.Err); ended && ctx.Err() == nil {
+				continue
+			}
+			if loaded.Err != nil {
+				return nil, loaded.Err
+			}
+			mgr, ok := loaded.Val.(*oauth.Manager)
+			if !ok {
+				return nil, fmt.Errorf("load OAuth manager for %q: unexpected result %T", appName, loaded.Val)
+			}
+			return mgr, nil
 		}
-		mgr, err := oauth.NewManager(secretsPath, currentCfg.TokensDir(), currentLogger)
-		if err != nil {
-			return nil, wrapOAuthError(fmt.Errorf("create oauth manager: %w", err), currentCfg)
-		}
-		managers[appName] = mgr
+	}
+}
+
+// load runs once per app at a time. It checks the map again because a load
+// that finished just before this one began may already have published.
+func (c *oauthManagers) load(ctx context.Context, appName string) (*oauth.Manager, error) {
+	if mgr, ok := c.cached(appName); ok {
 		return mgr, nil
 	}
+	mgr, err := loadOAuthManager(ctx, c.state, appName)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, &loaderContextEndedError{err: err}
+		}
+		return nil, err
+	}
+	c.mu.Lock()
+	c.managers[appName] = mgr
+	c.mu.Unlock()
+	return mgr, nil
+}
+
+func loadOAuthManager(ctx context.Context, state *invocation, appName string) (*oauth.Manager, error) {
+	if state == nil || state.cfg == nil || state.logger == nil {
+		return nil, errors.New("configuration is unavailable")
+	}
+	cfg := state.cfg
+	credentials, err := cfg.OAuth.CredentialsFor(appName)
+	if err != nil {
+		return nil, errors.Join(oauth.ErrClientConfig, err)
+	}
+	mgr, err := oauth.NewManagerWithCredentials(ctx, credentials, cfg.TokensDir(), cfg.OAuth.Tokens,
+		state.logger, oauth.Scopes)
+	if err != nil {
+		return nil, wrapOAuthError(fmt.Errorf("create oauth manager: %w", err), cfg)
+	}
+	return mgr, nil
 }
 
 // sourceOAuthApp extracts the oauth app name from a Source, returning ""

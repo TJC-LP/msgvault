@@ -155,16 +155,16 @@ func backfillDiscordSourceMedia(
 	// unreadable roster as unresolved rather than trust a stale count, and a
 	// readable one has to reconcile the archived floor before retry selection
 	// decides which skips the current membership releases.
-	if err := discord.NewImporter(st, client).ArchiveGuildMembership(
+	if err := discord.NewImporter(st, client).ArchiveGuildMembership(ctx,
 		source.ID, guildParticipants, membershipErr,
 	); err != nil {
 		return summary, fmt.Errorf("archive Discord guild membership: %w", err)
 	}
 	var messages []store.DiscordAttachmentMessage
 	if onlyIncomplete {
-		messages, err = st.ListDiscordRetryableAttachmentMessages(source.ID, policy)
+		messages, err = st.ListDiscordRetryableAttachmentMessages(ctx, source.ID, policy)
 	} else {
-		messages, err = st.ListDiscordAttachmentMessages(source.ID)
+		messages, err = st.ListDiscordAttachmentMessages(ctx, source.ID)
 	}
 	if err != nil {
 		return summary, fmt.Errorf("list Discord media messages: %w", err)

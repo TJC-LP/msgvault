@@ -1,7 +1,6 @@
 package slack
 
 import (
-	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,12 +14,13 @@ import (
 )
 
 func TestImportSlackdumpPersistsSlackSemantics(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
 	st := testutil.NewTestStore(t)
 
-	summary, err := ImportSlackdump(context.Background(), st, slackdumpFixture, SlackdumpImportOptions{
+	summary, err := ImportSlackdump(t.Context(), st, slackdumpFixture, SlackdumpImportOptions{
 		Me: "alice@example.com",
 	})
 	require.NoError(err)
@@ -34,7 +34,7 @@ func TestImportSlackdumpPersistsSlackSemantics(t *testing.T) {
 	assert.Equal(sourceTypeSlackdump, source.SourceType)
 	assert.Equal("T_TEST:UALICE", source.Identifier)
 	var syncStatus string
-	require.NoError(st.DB().QueryRow(st.Rebind(`
+	require.NoError(st.DB().QueryRowContext(t.Context(), st.Rebind(`
 		SELECT status FROM sync_runs WHERE source_id = ? ORDER BY id DESC LIMIT 1`),
 		summary.SourceID).Scan(&syncStatus))
 	assert.Equal("completed", syncStatus)
@@ -44,7 +44,7 @@ func TestImportSlackdumpPersistsSlackSemantics(t *testing.T) {
 	assertSlackdumpConversation(t, st, "G002", "mpdm-alice--bob-1", "group_chat")
 
 	var members int
-	require.NoError(st.DB().QueryRow(st.Rebind(`
+	require.NoError(st.DB().QueryRowContext(t.Context(), st.Rebind(`
 		SELECT COUNT(*) FROM conversation_participants cp
 		JOIN conversations c ON c.id = cp.conversation_id
 		WHERE c.source_conversation_id = ?`), "C001").Scan(&members))
@@ -61,7 +61,7 @@ func TestImportSlackdumpPersistsSlackSemantics(t *testing.T) {
 
 	var rootID int64
 	var isFromMe bool
-	require.NoError(st.DB().QueryRow(st.Rebind(
+	require.NoError(st.DB().QueryRowContext(t.Context(), st.Rebind(
 		`SELECT id, is_from_me FROM messages WHERE source_id = ? AND source_message_id = ?`),
 		summary.SourceID, rootSourceID).Scan(&rootID, &isFromMe))
 	assert.True(isFromMe)
@@ -73,7 +73,7 @@ func TestImportSlackdumpPersistsSlackSemantics(t *testing.T) {
 	)
 
 	var linked int
-	require.NoError(st.DB().QueryRow(st.Rebind(`
+	require.NoError(st.DB().QueryRowContext(t.Context(), st.Rebind(`
 		SELECT COUNT(*) FROM messages child
 		JOIN messages parent ON parent.id = child.reply_to_message_id
 		WHERE child.source_id = ? AND child.source_message_id = ?
@@ -82,7 +82,7 @@ func TestImportSlackdumpPersistsSlackSemantics(t *testing.T) {
 	assert.Equal(1, linked)
 
 	var reactions int
-	require.NoError(st.DB().QueryRow(st.Rebind(`
+	require.NoError(st.DB().QueryRowContext(t.Context(), st.Rebind(`
 		SELECT COUNT(*) FROM reactions r
 		JOIN messages m ON m.id = r.message_id
 		WHERE m.source_id = ? AND m.source_message_id = ? AND r.reaction_value = 'eyes'`),
@@ -97,6 +97,7 @@ func TestImportSlackdumpPersistsSlackSemantics(t *testing.T) {
 }
 
 func TestImportSlackdumpRequiresUniqueExportIdentity(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name    string
 		me      string
@@ -122,7 +123,7 @@ func TestImportSlackdumpRequiresUniqueExportIdentity(t *testing.T) {
 				require.NoError(t, os.WriteFile(filepath.Join(root, "users.json"), []byte(tt.users), 0o644))
 			}
 
-			_, err := ImportSlackdump(context.Background(), testutil.NewTestStore(t), root, SlackdumpImportOptions{Me: tt.me})
+			_, err := ImportSlackdump(t.Context(), testutil.NewTestStore(t), root, SlackdumpImportOptions{Me: tt.me})
 			require.Error(t, err)
 			assert.ErrorContains(t, err, tt.wantErr)
 		})
@@ -130,6 +131,7 @@ func TestImportSlackdumpRequiresUniqueExportIdentity(t *testing.T) {
 }
 
 func TestImportSlackdumpRecordsFailedSync(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -141,12 +143,12 @@ func TestImportSlackdumpRecordsFailedSync(t *testing.T) {
 	))
 	st := testutil.NewTestStore(t)
 
-	_, err := ImportSlackdump(context.Background(), st, root, SlackdumpImportOptions{Me: "UALICE"})
+	_, err := ImportSlackdump(t.Context(), st, root, SlackdumpImportOptions{Me: "UALICE"})
 	require.Error(err)
 	require.ErrorContains(err, filepath.ToSlash(filepath.Join("general", "2024-01-02.json")))
 
 	var status, failure string
-	require.NoError(st.DB().QueryRow(`
+	require.NoError(st.DB().QueryRowContext(t.Context(), `
 		SELECT sr.status, sr.error_message
 		FROM sync_runs sr
 		JOIN sources s ON s.id = sr.source_id
@@ -157,6 +159,7 @@ func TestImportSlackdumpRecordsFailedSync(t *testing.T) {
 }
 
 func TestImportSlackdumpLimitDoesNotReadPastCap(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -168,7 +171,7 @@ func TestImportSlackdumpLimitDoesNotReadPastCap(t *testing.T) {
 	))
 	st := testutil.NewTestStore(t)
 
-	summary, err := ImportSlackdump(context.Background(), st, root, SlackdumpImportOptions{
+	summary, err := ImportSlackdump(t.Context(), st, root, SlackdumpImportOptions{
 		Me:    "UALICE",
 		Limit: 1,
 	})
@@ -183,6 +186,7 @@ func TestImportSlackdumpLimitDoesNotReadPastCap(t *testing.T) {
 }
 
 func TestImportSlackdumpMarksMissingConversationRosterUnknown(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 
 	root := copySlackdumpFixture(t)
@@ -193,17 +197,18 @@ func TestImportSlackdumpMarksMissingConversationRosterUnknown(t *testing.T) {
 	))
 	st := testutil.NewTestStore(t)
 
-	_, err := ImportSlackdump(context.Background(), st, root, SlackdumpImportOptions{Me: "UALICE"})
+	_, err := ImportSlackdump(t.Context(), st, root, SlackdumpImportOptions{Me: "UALICE"})
 	require.NoError(err)
 
 	var metadata string
-	require.NoError(st.DB().QueryRow(`
+	require.NoError(st.DB().QueryRowContext(t.Context(), `
 		SELECT COALESCE(CAST(metadata AS TEXT), '') FROM conversations
 		WHERE source_conversation_id = 'G002'`).Scan(&metadata))
 	assert.JSONEq(t, `{"member_count_unknown":true}`, metadata)
 }
 
 func TestImportSlackdumpUnknownRosterFailsParticipantPolicyClosed(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name    string
 		catalog string
@@ -225,7 +230,7 @@ func TestImportSlackdumpUnknownRosterFailsParticipantPolicyClosed(t *testing.T) 
 			require.NoError(os.WriteFile(filepath.Join(root, "channels.json"), []byte(tt.catalog), 0o644))
 			st := testutil.NewTestStore(t)
 
-			summary, err := ImportSlackdump(context.Background(), st, root, SlackdumpImportOptions{
+			summary, err := ImportSlackdump(t.Context(), st, root, SlackdumpImportOptions{
 				Me:             "UALICE",
 				AttachmentsDir: t.TempDir(),
 				MediaPolicy: attachmentpolicy.Policy{
@@ -236,7 +241,7 @@ func TestImportSlackdumpUnknownRosterFailsParticipantPolicyClosed(t *testing.T) 
 			assert.Positive(summary.AttachmentsSkipped)
 
 			var state, reason string
-			require.NoError(st.DB().QueryRow(`
+			require.NoError(st.DB().QueryRowContext(t.Context(), `
 				SELECT attachment_state, attachment_skip_reason FROM attachments
 				WHERE source_attachment_id = 'slack:F_STD'`).Scan(&state, &reason))
 			assert.Equal(string(attachmentpolicy.StateSkipped), state)
@@ -246,6 +251,7 @@ func TestImportSlackdumpUnknownRosterFailsParticipantPolicyClosed(t *testing.T) 
 }
 
 func TestImportSlackdumpUsesCatalogMemberCountWithoutRoster(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 
 	root := copySlackdumpFixture(t)
@@ -256,17 +262,18 @@ func TestImportSlackdumpUsesCatalogMemberCountWithoutRoster(t *testing.T) {
 	))
 	st := testutil.NewTestStore(t)
 
-	_, err := ImportSlackdump(context.Background(), st, root, SlackdumpImportOptions{Me: "UALICE"})
+	_, err := ImportSlackdump(t.Context(), st, root, SlackdumpImportOptions{Me: "UALICE"})
 	require.NoError(err)
 
 	var metadata string
-	require.NoError(st.DB().QueryRow(`
+	require.NoError(st.DB().QueryRowContext(t.Context(), `
 		SELECT COALESCE(CAST(metadata AS TEXT), '') FROM conversations
 		WHERE source_conversation_id = 'C001'`).Scan(&metadata))
 	assert.JSONEq(t, `{"member_count":7}`, metadata)
 }
 
 func TestImportSlackdumpStoresDirectoryAndZIPAttachments(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name string
 		path func(t *testing.T) string
@@ -288,7 +295,7 @@ func TestImportSlackdumpStoresDirectoryAndZIPAttachments(t *testing.T) {
 			st := testutil.NewTestStore(t)
 			attachmentsDir := t.TempDir()
 
-			summary, err := ImportSlackdump(context.Background(), st, tt.path(t), SlackdumpImportOptions{
+			summary, err := ImportSlackdump(t.Context(), st, tt.path(t), SlackdumpImportOptions{
 				Me:             "UALICE",
 				AttachmentsDir: attachmentsDir,
 			})
@@ -301,7 +308,7 @@ func TestImportSlackdumpStoresDirectoryAndZIPAttachments(t *testing.T) {
 			assertSlackdumpStoredAttachment(t, st, attachmentsDir, "slack:F_MM", "mattermost attachment bytes\n")
 
 			var contentHash, mediaType, state string
-			require.NoError(st.DB().QueryRow(`
+			require.NoError(st.DB().QueryRowContext(t.Context(), `
 				SELECT COALESCE(content_hash, ''), COALESCE(media_type, ''), COALESCE(attachment_state, '')
 				FROM attachments WHERE source_attachment_id = 'slack:F_MISSING'`).
 				Scan(&contentHash, &mediaType, &state))
@@ -313,6 +320,7 @@ func TestImportSlackdumpStoresDirectoryAndZIPAttachments(t *testing.T) {
 }
 
 func TestImportSlackdumpStoresPresentEmptyAttachment(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -335,7 +343,7 @@ func TestImportSlackdumpStoresPresentEmptyAttachment(t *testing.T) {
 	attachmentsDir := t.TempDir()
 	st := testutil.NewTestStore(t)
 
-	summary, err := ImportSlackdump(context.Background(), st, root, SlackdumpImportOptions{
+	summary, err := ImportSlackdump(t.Context(), st, root, SlackdumpImportOptions{
 		Me:             "UALICE",
 		AttachmentsDir: attachmentsDir,
 	})
@@ -346,7 +354,7 @@ func TestImportSlackdumpStoresPresentEmptyAttachment(t *testing.T) {
 	const emptySHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 	var storagePath, contentHash, state string
 	var size int
-	require.NoError(st.DB().QueryRow(`
+	require.NoError(st.DB().QueryRowContext(t.Context(), `
 		SELECT storage_path, content_hash, attachment_state, size
 		FROM attachments WHERE source_attachment_id = 'slack:F_EMPTY'`).
 		Scan(&storagePath, &contentHash, &state, &size))
@@ -361,12 +369,13 @@ func TestImportSlackdumpStoresPresentEmptyAttachment(t *testing.T) {
 }
 
 func TestImportSlackdumpAppliesMediaPolicyForExportTeam(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 	st := testutil.NewTestStore(t)
 	var resolvedTeamID string
 
-	summary, err := ImportSlackdump(context.Background(), st, slackdumpFixture, SlackdumpImportOptions{
+	summary, err := ImportSlackdump(t.Context(), st, slackdumpFixture, SlackdumpImportOptions{
 		Me:             "UALICE",
 		AttachmentsDir: t.TempDir(),
 		MediaPolicyForTeam: func(teamID string) attachmentpolicy.Policy {
@@ -382,17 +391,18 @@ func TestImportSlackdumpAppliesMediaPolicyForExportTeam(t *testing.T) {
 	assert.Equal(3, summary.AttachmentsSkipped)
 	assert.Zero(summary.AttachmentsMissing, "policy must be evaluated before reading export bytes")
 	var skipped int
-	require.NoError(st.DB().QueryRow(`
+	require.NoError(st.DB().QueryRowContext(t.Context(), `
 		SELECT COUNT(*) FROM attachments
 		WHERE attachment_state = 'skipped' AND attachment_skip_reason = 'policy_scope'`).Scan(&skipped))
 	assert.Equal(3, skipped)
 	var storagePath string
-	require.NoError(st.DB().QueryRow(`
+	require.NoError(st.DB().QueryRowContext(t.Context(), `
 		SELECT storage_path FROM attachments WHERE source_attachment_id = 'slack:F_MM'`).Scan(&storagePath))
 	assert.Equal("https://files.slack.com/files-pri/T_TEST-F_MM/quarterly-report", storagePath)
 }
 
 func TestSlackdumpMetadataAttachmentUsesCapturedHTTPURLFallbacks(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name string
 		file File
@@ -428,6 +438,7 @@ func TestSlackdumpMetadataAttachmentUsesCapturedHTTPURLFallbacks(t *testing.T) {
 }
 
 func TestImportSlackdumpRerunUpdatesWithoutDuplicates(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -436,7 +447,7 @@ func TestImportSlackdumpRerunUpdatesWithoutDuplicates(t *testing.T) {
 	attachmentsDir := t.TempDir()
 	opts := SlackdumpImportOptions{Me: "UALICE", AttachmentsDir: attachmentsDir}
 
-	first, err := ImportSlackdump(context.Background(), st, root, opts)
+	first, err := ImportSlackdump(t.Context(), st, root, opts)
 	require.NoError(err)
 	require.Equal(6, first.MessagesAdded)
 
@@ -456,22 +467,22 @@ func TestImportSlackdumpRerunUpdatesWithoutDuplicates(t *testing.T) {
 	))
 	require.NoError(os.WriteFile(firstDayPath, firstDay, 0o644))
 
-	second, err := ImportSlackdump(context.Background(), st, root, opts)
+	second, err := ImportSlackdump(t.Context(), st, root, opts)
 	require.NoError(err)
 	assert.Zero(second.MessagesAdded)
 	assert.Equal(6, second.MessagesUpdated)
 	assert.Zero(second.AttachmentsDownloaded, "stored content must be reused on rerun")
 
 	var messages, reactions, attachments int
-	require.NoError(st.DB().QueryRow(`SELECT COUNT(*) FROM messages WHERE message_type = 'slack'`).Scan(&messages))
-	require.NoError(st.DB().QueryRow(`SELECT COUNT(*) FROM reactions`).Scan(&reactions))
-	require.NoError(st.DB().QueryRow(`SELECT COUNT(*) FROM attachments`).Scan(&attachments))
+	require.NoError(st.DB().QueryRowContext(t.Context(), `SELECT COUNT(*) FROM messages WHERE message_type = 'slack'`).Scan(&messages))
+	require.NoError(st.DB().QueryRowContext(t.Context(), `SELECT COUNT(*) FROM reactions`).Scan(&reactions))
+	require.NoError(st.DB().QueryRowContext(t.Context(), `SELECT COUNT(*) FROM attachments`).Scan(&attachments))
 	assert.Equal(6, messages)
 	assert.Equal(2, reactions)
 	assert.Equal(3, attachments)
 	var hasAttachments bool
 	var attachmentCount int
-	require.NoError(st.DB().QueryRow(`
+	require.NoError(st.DB().QueryRowContext(t.Context(), `
 		SELECT has_attachments, attachment_count FROM messages
 		WHERE source_message_id = 'C001:1704067200.000001'`).
 		Scan(&hasAttachments, &attachmentCount))
@@ -492,7 +503,7 @@ func assertSlackdumpStoredAttachment(
 	t.Helper()
 
 	var storagePath, contentHash, state string
-	require.NoError(t, st.DB().QueryRow(st.Rebind(`
+	require.NoError(t, st.DB().QueryRowContext(t.Context(), st.Rebind(`
 		SELECT storage_path, content_hash, attachment_state
 		FROM attachments WHERE source_attachment_id = ?`), sourceAttachmentID).
 		Scan(&storagePath, &contentHash, &state))
@@ -507,7 +518,7 @@ func assertSlackdumpConversation(t *testing.T, st *store.Store, sourceConversati
 	t.Helper()
 
 	var title, conversationType string
-	require.NoError(t, st.DB().QueryRow(st.Rebind(`
+	require.NoError(t, st.DB().QueryRowContext(t.Context(), st.Rebind(`
 		SELECT title, conversation_type FROM conversations
 		WHERE source_conversation_id = ?`), sourceConversationID).Scan(&title, &conversationType))
 	assert.Equal(t, wantTitle, title)

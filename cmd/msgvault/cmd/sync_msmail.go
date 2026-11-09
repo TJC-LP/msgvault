@@ -64,7 +64,7 @@ func newGraphMailSharedManager(state *invocation) *microsoft.GraphManager {
 }
 
 // newGraphMailWriteManager requests Mail.ReadWrite on top of the sync scopes.
-// delete-staged uses it.
+// Tag editing and delete-staged use it.
 func newGraphMailWriteManager(state *invocation) *microsoft.GraphManager {
 	cfg := state.cfg
 	return microsoft.NewGraphMailWriteManager(
@@ -108,8 +108,8 @@ func runMSMailSync(ctx context.Context, s *store.Store, src *store.Source, progr
 // runScheduledMSMailSync is the daemon path. Like runScheduledTeamsSync, it
 // seeds the "me" identity and runs pending migrations before the sync.
 func runScheduledMSMailSync(ctx context.Context, src *store.Source, s *store.Store, state *invocation) error {
-	confirmDefaultIdentity(io.Discard, s, src.ID, src.Identifier, src.Identifier, "account-identifier", state.logger)
-	if err := runPostSourceCreateMigrationsForInvocation(s, state); err != nil {
+	confirmDefaultIdentity(ctx, io.Discard, s, src.ID, src.Identifier, src.Identifier, "account-identifier", state.logger)
+	if err := runPostSourceCreateMigrationsForInvocation(ctx, s, state); err != nil {
 		return fmt.Errorf("post-source-create migrations: %w", err)
 	}
 	_, err := runMSMailSync(ctx, s, src, nil, state)

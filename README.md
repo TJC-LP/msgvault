@@ -26,7 +26,7 @@ Use the browser, terminal, CLI, HTTP API, or an AI assistant through MCP.
 
 > **Alpha software.** APIs, storage format, and CLI flags may change. Back up
 > your data. This README follows current `main`; see the
-> [0.21.0 changelog](docs/changelog.md#0210) for features and upgrade steps.
+> [0.23.0 changelog](docs/changelog.md#0230) for features and upgrade steps.
 
 ## What you can do
 
@@ -52,6 +52,11 @@ services. Sync needs access to those services. Optional model and enrichment
 features send selected data to the endpoints you configure; local embedding
 servers are also supported. See [recommended configuration](docs/usage/recommended-configuration.md)
 for the choices and consent steps.
+
+The daemon also sends anonymous usage telemetry, a daily ping and web, command-line and
+terminal UI usage carrying the version, platform and a random install ID, never archive
+content. See [telemetry](docs/configuration.md#telemetry) for the full list and how to
+turn it off.
 
 ## Installation
 
@@ -102,10 +107,11 @@ For Gmail, first create an OAuth credential with the
 msgvault init-db
 msgvault add-account you@gmail.com
 msgvault sync-full you@gmail.com --limit 100
-msgvault serve
+msgvault daemon start
 ```
 
-Open the `API server` URL printed by `msgvault serve`. The release binary
+Open the URL printed by `msgvault daemon start` in your browser. For foreground
+operation, see the [setup guide](docs/setup.md#open-the-web-ui). The release binary
 includes the browser application; it needs no separate Node or Bun installation
 at runtime. Use `msgvault tui` for the terminal interface.
 
@@ -119,8 +125,8 @@ first sync, and running on your own server.
 | I want to… | Read |
 |---|---|
 | Understand the product | [Product overview](https://msgvault.io/) and [archive lifecycle](https://msgvault.io/guide/) |
-| Upgrade an existing archive | [Changelog and upgrade notes](docs/changelog.md#0210) |
-| Search messages and attachments | [Searching](docs/usage/searching.md) and [document indexing](docs/usage/document-indexing.md) |
+| Upgrade an existing archive | [Changelog and upgrade notes](https://github.com/kenn-io/msgvault/releases/latest) |
+| Find messages by words or meaning, read threads, and locate attachments | [Searching](docs/usage/searching.md) and [document indexing](docs/usage/document-indexing.md) |
 | Maintain contacts and relationships | [People and profiles](docs/usage/people.md) |
 | Import local text-message history | [Text message imports](docs/usage/text-messages.md) |
 | Configure optional AI features | [Recommended configuration](docs/usage/recommended-configuration.md) |

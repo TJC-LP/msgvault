@@ -173,10 +173,7 @@ func (d *PostgreSQLDialect) TimestampParam(t time.Time) any { return t.UTC() }
 const pgWriteLockModes = `('RowExclusiveLock', 'ShareRowExclusiveLock', ` +
 	`'ExclusiveLock', 'AccessExclusiveLock')`
 
-const pgWatermarkBoundsQuery = `
-	SELECT clock_timestamp(),
-	       transaction_timestamp(),
-	       LEAST(transaction_timestamp(),
+const pgContentCommitBoundSQL = `LEAST(transaction_timestamp(),
 	             COALESCE((SELECT MIN(a.xact_start)
 	                       FROM pg_stat_activity a
 	                       JOIN pg_locks l ON l.pid = a.pid
@@ -184,15 +181,22 @@ const pgWatermarkBoundsQuery = `
 	                         AND a.xact_start IS NOT NULL
 	                         AND l.relation = to_regclass('messages')
 	                         AND l.mode IN ` + pgWriteLockModes + `),
-	                      transaction_timestamp())),
-	       to_regclass('messages') IS NOT NULL,
-	       (SELECT count(*)
+	                      transaction_timestamp()))`
+
+const pgRedactedMessageWritersSQL = `(SELECT count(*)
 	          FROM pg_stat_activity a
 	          JOIN pg_locks l ON l.pid = a.pid
 	          WHERE a.datname = current_database()
 	            AND a.backend_type IS NULL
 	            AND l.relation = to_regclass('messages')
 	            AND l.mode IN ` + pgWriteLockModes + `)`
+
+const pgWatermarkBoundsQuery = `
+	SELECT clock_timestamp(),
+	       transaction_timestamp(),
+	       ` + pgContentCommitBoundSQL + `,
+	       to_regclass('messages') IS NOT NULL,
+	       ` + pgRedactedMessageWritersSQL
 
 // ReadWatermarkBounds implements Dialect. See pgWatermarkBoundsQuery for why
 // the bound is what it is.
@@ -499,10 +503,10 @@ func pgFTSVector(doc FTSDoc) (string, []any) {
 // produces the matching shape. Uses `?` placeholders; loggedDB rebinds
 // to `$N` at execution time. ts_rank needs the query term a second time,
 // so orderArgCount is 1.
-func (d *PostgreSQLDialect) FTSSearchClause() (join, where, orderBy string, orderArgCount int) {
+func (d *PostgreSQLDialect) FTSSearchClause(rowIDs bool) (join, where, orderBy string, orderArgCount int) {
 	return "",
 		"m.search_fts @@ to_tsquery('simple', ?)",
-		"ts_rank(ARRAY[0.1, 0.1, 0.4, 1.0]::real[], m.search_fts, to_tsquery('simple', ?)) DESC",
+		"-ts_rank(ARRAY[0.1, 0.1, 0.4, 1.0]::real[], m.search_fts, to_tsquery('simple', ?))",
 		1
 }
 
@@ -523,18 +527,13 @@ func (d *PostgreSQLDialect) InvalidateFTSForMessage(q querier, messageID int64) 
 // Parameters: $1=fromID, $2=toID. Uses LEFT JOIN on message_bodies via a subquery
 // so messages without a body row are still indexed (subject + participants).
 func (d *PostgreSQLDialect) FTSBackfillBatchSQL() string {
+	envelope := storedFTSEnvelopeSQL("STRING_AGG")
 	charCap := strconv.Itoa(maxFTSBodyChars)
 	return `UPDATE messages m SET search_fts =
-		setweight(to_tsvector('simple', LEFT(COALESCE(m.subject, ''), ` + charCap + `)), 'A') ||
-		setweight(to_tsvector('simple', LEFT(COALESCE(
-			CASE WHEN m.message_type != 'email' AND m.message_type IS NOT NULL AND m.message_type != ''
-			     THEN (SELECT COALESCE(p.phone_number, p.email_address) FROM participants p WHERE p.id = m.sender_id)
-			END,
-			(SELECT STRING_AGG(p.email_address, ' ') FROM message_recipients mr JOIN participants p ON p.id = mr.participant_id WHERE mr.message_id = m.id AND mr.recipient_type = 'from'),
-			''
-		), ` + charCap + `)), 'B') ||
-		setweight(to_tsvector('simple', LEFT(COALESCE((SELECT STRING_AGG(p.email_address, ' ') FROM message_recipients mr JOIN participants p ON p.id = mr.participant_id WHERE mr.message_id = m.id AND mr.recipient_type = 'to'), ''), ` + charCap + `)), 'C') ||
-		setweight(to_tsvector('simple', LEFT(COALESCE((SELECT STRING_AGG(p.email_address, ' ') FROM message_recipients mr JOIN participants p ON p.id = mr.participant_id WHERE mr.message_id = m.id AND mr.recipient_type = 'cc'), ''), ` + charCap + `)), 'C') ||
+		setweight(to_tsvector('simple', LEFT(` + envelope.subject + `, ` + charCap + `)), 'A') ||
+		setweight(to_tsvector('simple', LEFT(` + envelope.fromAddr + `, ` + charCap + `)), 'B') ||
+		setweight(to_tsvector('simple', LEFT(` + envelope.toAddrs + `, ` + charCap + `)), 'C') ||
+		setweight(to_tsvector('simple', LEFT(` + envelope.ccAddrs + `, ` + charCap + `)), 'C') ||
 		setweight(to_tsvector('simple', LEFT(COALESCE(src.body_text, ''), ` + charCap + `)), 'D'),
 		indexing_version = ` + strconv.Itoa(CurrentFTSIndexingVersion) + `
 	FROM (
@@ -546,9 +545,16 @@ func (d *PostgreSQLDialect) FTSBackfillBatchSQL() string {
 	WHERE m.id = src.id`
 }
 
+func (d *PostgreSQLDialect) FTSBackfillMissingBatchSQL(_ context.Context, _ *sql.DB) (string, error) {
+	return d.FTSBackfillBatchSQL() + fmt.Sprintf(
+		" AND (m.search_fts IS NULL OR m.indexing_version IS DISTINCT FROM %d)",
+		CurrentFTSIndexingVersion,
+	), nil
+}
+
 // FTSAvailable reports whether tsvector search is available.
 // PostgreSQL always supports tsvector — check that the column exists.
-func (d *PostgreSQLDialect) FTSAvailable(ctx context.Context, db *sql.DB) (bool, error) {
+func (d *PostgreSQLDialect) FTSAvailable(ctx context.Context, db SQLReader) (bool, error) {
 	var count int
 	err := db.QueryRowContext(ctx, postgresColumnExistsSQL("messages", "search_fts")).Scan(&count)
 	if err != nil && ctx.Err() != nil {
@@ -575,13 +581,17 @@ func postgresFTSNeedsBackfillSQL() string {
 // partial btree index created by EnsureFTSIndex makes even the false
 // case index-served and self-pruning as backfill completes.
 func (d *PostgreSQLDialect) FTSNeedsBackfill(db *sql.DB) bool {
+	needs, _ := d.FTSNeedsBackfillContext(context.Background(), db)
+	return needs
+}
+func (d *PostgreSQLDialect) FTSNeedsBackfillContext(ctx context.Context, db *sql.DB) (bool, error) {
 	var exists bool
-	if err := db.QueryRow(
+	if err := ReadDBContext(ctx, db).QueryRowContext(ctx,
 		postgresFTSNeedsBackfillSQL(),
 	).Scan(&exists); err != nil {
-		return false
+		return false, fmt.Errorf("probe FTS completeness: %w", err)
 	}
-	return exists
+	return exists, nil
 }
 
 // FTSNeedsBackfillQuick uses the same exact EXISTS probe as FTSNeedsBackfill:
@@ -598,11 +608,6 @@ func (d *PostgreSQLDialect) FTSNeedsBackfillQuick(ctx context.Context, db *sql.D
 	return exists
 }
 
-// FTSClearSQL returns the SQL to clear all tsvector data.
-func (d *PostgreSQLDialect) FTSClearSQL() string {
-	return "UPDATE messages SET search_fts = NULL"
-}
-
 // SchemaFTS returns "" for PostgreSQL — the tsvector column is part of the
 // main schema_pg.sql, not a separate file.
 func (d *PostgreSQLDialect) SchemaFTS() string {
@@ -616,9 +621,8 @@ func (d *PostgreSQLDialect) SchemaFTS() string {
 // as the SQLite path covers a malformed shadow table.
 //
 // Runs on the querier so RebuildFTS can route it through the maintenance
-// transaction: the full-table `UPDATE messages SET search_fts = NULL` here
-// has the same cost as FTSClearSQL (which is already hatched), and the GIN
-// rebuild over a populated table can likewise exceed the pool-wide 30s
+// transaction: the full-table `UPDATE messages SET search_fts = NULL` and
+// GIN rebuild over a populated table can exceed the pool-wide 30s
 // statement_timeout on a large archive (finding S1).
 func (d *PostgreSQLDialect) FTSRebuildSchema(ctx context.Context, q contextQuerier) error {
 	if _, err := q.ExecContext(ctx, "DROP INDEX IF EXISTS messages_search_fts_idx"); err != nil {
@@ -645,6 +649,8 @@ func (d *PostgreSQLDialect) FTSRebuildSchema(ctx context.Context, q contextQueri
 //	TEXT → TEXT, DATETIME → TIMESTAMPTZ, JSON → JSONB.
 func (d *PostgreSQLDialect) LegacyColumnMigrations() []ColumnMigration {
 	return []ColumnMigration{
+		{`ALTER TABLE carddav_resources ADD COLUMN IF NOT EXISTS owns_display_name BOOLEAN NOT NULL DEFAULT FALSE`, "carddav_resources.owns_display_name"},
+		{`ALTER TABLE carddav_resources ADD COLUMN IF NOT EXISTS locally_published BOOLEAN NOT NULL DEFAULT FALSE`, "carddav_resources.locally_published"},
 		{`ALTER TABLE person_match_judgment_cursor ADD COLUMN IF NOT EXISTS started_at_zero BOOLEAN NOT NULL DEFAULT FALSE`, "person_match_judgment_cursor.started_at_zero"},
 		{`ALTER TABLE carddav_publications ADD COLUMN IF NOT EXISTS outgoing_envelope_metadata BYTEA`, "carddav_publications.outgoing_envelope_metadata"},
 		{`ALTER TABLE carddav_publications ADD COLUMN IF NOT EXISTS approved_body_sha256 TEXT`, "carddav_publications.approved_body_sha256"},
@@ -676,6 +682,11 @@ func (d *PostgreSQLDialect) LegacyColumnMigrations() []ColumnMigration {
 		{`ALTER TABLE imap_folder_state ADD COLUMN IF NOT EXISTS highest_modseq NUMERIC(20, 0) NOT NULL DEFAULT 0`, "imap_folder_state.highest_modseq"},
 		{`ALTER TABLE messages ADD COLUMN IF NOT EXISTS rfc822_message_id TEXT`, "rfc822_message_id"},
 		{`ALTER TABLE messages ADD COLUMN IF NOT EXISTS list_id TEXT`, "list_id"},
+		{`ALTER TABLE messages ADD COLUMN IF NOT EXISTS hidden_text_present BOOLEAN NOT NULL DEFAULT FALSE`, "hidden_text_present"},
+		{`ALTER TABLE messages ADD COLUMN IF NOT EXISTS account_address TEXT`, "account_address"},
+		{`ALTER TABLE messages ADD COLUMN IF NOT EXISTS account_path TEXT`, "account_path"},
+		{`ALTER TABLE messages ADD COLUMN IF NOT EXISTS email_linkage_outcome TEXT`, "email_linkage_outcome"},
+		{`ALTER TABLE messages ADD COLUMN IF NOT EXISTS draft_authored BOOLEAN NOT NULL DEFAULT FALSE`, "draft_authored"},
 		{`ALTER TABLE sources ADD COLUMN IF NOT EXISTS oauth_app TEXT`, "oauth_app"},
 		{`ALTER TABLE participants ADD COLUMN IF NOT EXISTS phone_number TEXT`, "phone_number"},
 		{`ALTER TABLE participants ADD COLUMN IF NOT EXISTS canonical_id TEXT`, "canonical_id"},
@@ -740,6 +751,7 @@ func (d *PostgreSQLDialect) LegacyColumnMigrations() []ColumnMigration {
 		{`ALTER TABLE document_extractions ADD COLUMN IF NOT EXISTS failure_detail TEXT`, "document_extractions.failure_detail"},
 		{`ALTER TABLE document_extractions ADD COLUMN IF NOT EXISTS rebuild_id TEXT REFERENCES document_extraction_rebuilds(id) ON DELETE SET NULL`, "document_extractions.rebuild_id"},
 		{`ALTER TABLE document_extractions ADD COLUMN IF NOT EXISTS request_count INTEGER NOT NULL DEFAULT 0 CHECK (request_count >= 0)`, "document_extractions.request_count"},
+		{`ALTER TABLE document_extractions ADD COLUMN IF NOT EXISTS upload_count INTEGER NOT NULL DEFAULT 0 CHECK (upload_count >= 0)`, "document_extractions.upload_count"},
 		{`ALTER TABLE document_extractions ADD COLUMN IF NOT EXISTS retry_count INTEGER NOT NULL DEFAULT 0 CHECK (retry_count >= 0 AND retry_count <= request_count)`, "document_extractions.retry_count"},
 		{`ALTER TABLE document_extractions ADD COLUMN IF NOT EXISTS provider_latency_ms BIGINT NOT NULL DEFAULT 0 CHECK (provider_latency_ms >= 0)`, "document_extractions.provider_latency_ms"},
 		{`ALTER TABLE document_extractions ADD COLUMN IF NOT EXISTS normalization_version INTEGER`, "document_extractions.normalization_version"},
@@ -1037,7 +1049,8 @@ func (d *PostgreSQLDialect) EnsureTriggers(q querier) error {
 		                 )
 		             ) AND (
 		                 OLD.message_type IS DISTINCT FROM NEW.message_type
-		                 OR OLD.conversation_id IS DISTINCT FROM NEW.conversation_id
+		                 OR OLD.source_id IS DISTINCT FROM NEW.source_id
+		                OR OLD.conversation_id IS DISTINCT FROM NEW.conversation_id
 		                 OR OLD.sent_at IS DISTINCT FROM NEW.sent_at
 		                 OR OLD.received_at IS DISTINCT FROM NEW.received_at
 		                 OR OLD.internal_date IS DISTINCT FROM NEW.internal_date
@@ -1053,7 +1066,8 @@ func (d *PostgreSQLDialect) EnsureTriggers(q querier) error {
 		                 OR (NEW.deleted_at IS NULL AND NEW.deleted_from_source_at IS NULL)
 		             ) AND (
 		                 OLD.message_type IS DISTINCT FROM NEW.message_type
-		                 OR OLD.conversation_id IS DISTINCT FROM NEW.conversation_id
+		                 OR OLD.source_id IS DISTINCT FROM NEW.source_id
+		                OR OLD.conversation_id IS DISTINCT FROM NEW.conversation_id
 		                 OR OLD.subject IS DISTINCT FROM NEW.subject
 		                 OR OLD.deleted_at IS DISTINCT FROM NEW.deleted_at
 		                 OR OLD.deleted_from_source_at IS DISTINCT FROM NEW.deleted_from_source_at
@@ -1310,7 +1324,7 @@ func (d *PostgreSQLDialect) EnsureTriggers(q querier) error {
 		     AFTER UPDATE OF message_id, filename, mime_type, size, content_hash,
 		         storage_path, media_type, width, height, duration_ms,
 		         source_attachment_id, attachment_metadata, attachment_role,
-		         role_source, source_part_key, content_id, encryption_version
+		         role_source, source_part_key, content_id, encryption_version, attachment_state
 		     ON attachments FOR EACH ROW
 		     WHEN (OLD.message_id IS DISTINCT FROM NEW.message_id
 		        OR OLD.filename IS DISTINCT FROM NEW.filename
@@ -1328,7 +1342,8 @@ func (d *PostgreSQLDialect) EnsureTriggers(q querier) error {
 		        OR OLD.role_source IS DISTINCT FROM NEW.role_source
 		        OR OLD.source_part_key IS DISTINCT FROM NEW.source_part_key
 		        OR OLD.content_id IS DISTINCT FROM NEW.content_id
-		        OR OLD.encryption_version IS DISTINCT FROM NEW.encryption_version)
+		        OR OLD.encryption_version IS DISTINCT FROM NEW.encryption_version
+		        OR OLD.attachment_state IS DISTINCT FROM NEW.attachment_state)
 		     EXECUTE FUNCTION capture_attachment_change()`,
 		`DROP TRIGGER IF EXISTS trg_attachment_change_delete ON attachments`,
 		`CREATE TRIGGER trg_attachment_change_delete
@@ -1346,8 +1361,12 @@ func (d *PostgreSQLDialect) EnsureTriggers(q querier) error {
 		          old_source_part_key, new_source_part_key,
 		          old_role, new_role)
 		     SELECT
-		         CASE WHEN NEW.deleted_at IS NULL AND NEW.deleted_from_source_at IS NULL
-		              THEN 'message_live_enter' ELSE 'message_live_exit' END,
+		         CASE WHEN (OLD.deleted_at IS NULL AND OLD.deleted_from_source_at IS NULL)
+		                    IS DISTINCT FROM
+		                    (NEW.deleted_at IS NULL AND NEW.deleted_from_source_at IS NULL)
+		              THEN CASE WHEN NEW.deleted_at IS NULL AND NEW.deleted_from_source_at IS NULL
+		                        THEN 'message_live_enter' ELSE 'message_live_exit' END
+		              ELSE 'attachment_update' END,
 		         CASE WHEN OLD.deleted_at IS NULL AND OLD.deleted_from_source_at IS NULL
 		              THEN OLD.id END,
 		         CASE WHEN NEW.deleted_at IS NULL AND NEW.deleted_from_source_at IS NULL
@@ -1374,10 +1393,16 @@ func (d *PostgreSQLDialect) EnsureTriggers(q querier) error {
 		 $$ LANGUAGE plpgsql`,
 		`DROP TRIGGER IF EXISTS trg_attachment_message_live_change ON messages`,
 		`CREATE TRIGGER trg_attachment_message_live_change
-		     AFTER UPDATE OF deleted_at, deleted_from_source_at ON messages FOR EACH ROW
-		     WHEN ((OLD.deleted_at IS NULL AND OLD.deleted_from_source_at IS NULL)
-		           IS DISTINCT FROM
-		           (NEW.deleted_at IS NULL AND NEW.deleted_from_source_at IS NULL))
+		     AFTER UPDATE OF source_id, conversation_id, deleted_at, deleted_from_source_at ON messages FOR EACH ROW
+		     WHEN (
+		         ((OLD.deleted_at IS NULL AND OLD.deleted_from_source_at IS NULL)
+		          IS DISTINCT FROM
+		          (NEW.deleted_at IS NULL AND NEW.deleted_from_source_at IS NULL))
+		         OR ((OLD.deleted_at IS NULL AND OLD.deleted_from_source_at IS NULL)
+		             AND (NEW.deleted_at IS NULL AND NEW.deleted_from_source_at IS NULL)
+		             AND (OLD.source_id IS DISTINCT FROM NEW.source_id
+		               OR OLD.conversation_id IS DISTINCT FROM NEW.conversation_id))
+		     )
 		     EXECUTE FUNCTION capture_attachment_message_live_change()`,
 		`CREATE OR REPLACE FUNCTION invalidate_visual_publication_attachment() RETURNS trigger AS $$
 		 BEGIN
@@ -2148,22 +2173,29 @@ func (d *PostgreSQLDialect) EnsureActivityProjectionTriggers(q querier) error {
 		     RETURN OLD;
 		 END;
 		 $$ LANGUAGE plpgsql`,
+		`CREATE OR REPLACE FUNCTION mark_activity_projection_conversation(p_conversation_id BIGINT) RETURNS VOID AS $$
+		 BEGIN
+		     INSERT INTO activity_projection_conversation_queue (conversation_id)
+		     VALUES (p_conversation_id)
+		     ON CONFLICT (conversation_id) DO UPDATE SET after_message_id = 0;
+		 END;
+		 $$ LANGUAGE plpgsql`,
 		`CREATE OR REPLACE FUNCTION queue_activity_conversation_people_insert() RETURNS trigger AS $$
 		 BEGIN
-		     PERFORM enqueue_activity_projection_conversation(NEW.conversation_id);
+		     PERFORM mark_activity_projection_conversation(NEW.conversation_id);
 		     RETURN NEW;
 		 END;
 		 $$ LANGUAGE plpgsql`,
 		`CREATE OR REPLACE FUNCTION queue_activity_conversation_people_update() RETURNS trigger AS $$
 		 BEGIN
-		     PERFORM enqueue_activity_projection_conversation(OLD.conversation_id);
-		     PERFORM enqueue_activity_projection_conversation(NEW.conversation_id);
+		     PERFORM mark_activity_projection_conversation(OLD.conversation_id);
+		     PERFORM mark_activity_projection_conversation(NEW.conversation_id);
 		     RETURN NEW;
 		 END;
 		 $$ LANGUAGE plpgsql`,
 		`CREATE OR REPLACE FUNCTION queue_activity_conversation_people_delete() RETURNS trigger AS $$
 		 BEGIN
-		     PERFORM enqueue_activity_projection_conversation(OLD.conversation_id);
+		     PERFORM mark_activity_projection_conversation(OLD.conversation_id);
 		     RETURN OLD;
 		 END;
 		 $$ LANGUAGE plpgsql`,
@@ -2339,18 +2371,24 @@ func (d *PostgreSQLDialect) IsFTSValueTooLargeError(err error) bool {
 //
 //   - source_import_items: written by UpsertSourceImportItem (internal/store/sync.go)
 //     and cascade-reachable from sources — a real race before it was added here.
-//   - sync_checkpoints: cascade-reachable from sources; no writer today, but
-//     included so a future checkpoint writer cannot race the cascade.
+//   - sync_checkpoints: written during authoritative IMAP apply and
+//     cascade-reachable from sources.
 //   - imap_folder_state and imap_message_memberships: written after IMAP syncs
 //     and cascade-reachable from sources.
 //
 // collections is included (despite not being a direct sources cascade target)
 // so a concurrent collection rename cannot race the collection_sources cascade.
 var exclusiveLockTables = []string{
-	"sync_runs", "sources", "conversations", "conversation_participants",
+	// Scoped writes fence sync_runs first. Source-first sync transactions take
+	// lockSyncMaintenanceGate before their source lock, so maintenance waits
+	// here without holding tables those transactions still need.
+	"sync_runs", "sources", "source_messaging_route_failures", "conversations", "conversation_policy", "conversation_participants",
 	"messages", "message_recipients", "message_labels", "message_bodies", "message_raw",
+	"message_delivery_addresses", "email_link_keys",
 	"meeting_details", "meeting_action_items",
-	"attachments", "document_occurrences", "labels", "participants", "participant_identifiers", "reactions",
+	"calendar_events", "calendar_event_attendees",
+	"attachments", "document_occurrences", "labels", "participants", "participant_identifiers", "reactions", "reaction_source_events",
+	"matrix_encrypted_events", "matrix_megolm_claims", "matrix_pending_edits",
 	"participant_contact_observations", identityMatchCandidatesTableName, identityMatchCandidateSourcesTableName,
 	identityMatchEvidenceTableName, identityMatchEvidenceSourcesTableName,
 	// persons and person_participants: MergeParticipants (reached from the
@@ -2362,11 +2400,16 @@ var exclusiveLockTables = []string{
 	// archive. The queue is trigger-written by every message/participant
 	// mutation, so it belongs to the same exclusive write set.
 	"activity_events", "activity_event_persons", "person_contact_state",
-	"activity_projection_queue",
+	"activity_projection_queue", "activity_projection_conversation_queue",
+	// The chat member queue is trigger-written by message and recipient
+	// mutations; the projection cascades with conversations and participants.
+	"chat_members", "chat_members_dirty", "chat_anchors",
 	"collections", "collection_sources", "account_identities", "applied_migrations",
+	"source_merges", "source_settings", "source_merge_preserved_labels",
 	"sync_operations",
 	"source_import_items", "sync_run_items", "sync_checkpoints",
 	"imap_folder_state", "imap_message_memberships", "imap_drafts", "gmail_drafts", "chat_drafts", "beeper_drafts",
+	"loop_decisions",
 }
 
 // BeginExclusive opens a transaction on conn and locks every table the

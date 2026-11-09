@@ -153,18 +153,18 @@ func (s *Store) upgradeCardDAVAccountsPostgreSQL(ctx context.Context) error {
 }
 
 func (s *Store) upgradeCardDAVAccountsSQLite(ctx context.Context) (err error) {
-	conn, err := s.db.Conn(ctx)
-	if err != nil {
-		return fmt.Errorf("acquire CardDAV account upgrade connection: %w", err)
-	}
-	defer func() { _ = conn.Close() }()
 	var definition string
-	if err := conn.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'carddav_accounts'`).Scan(&definition); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'carddav_accounts'`).Scan(&definition); err != nil {
 		return err
 	}
 	if strings.Contains(definition, "connection_name") {
 		return nil
 	}
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire CardDAV account upgrade connection: %w", err)
+	}
+	defer func() { _ = conn.Close() }()
 	// DROP TABLE implicitly deletes parent rows. Disable cascading foreign keys
 	// on this pinned connection before entering the rebuild transaction, then
 	// restore enforcement before the connection returns to the pool.
@@ -209,16 +209,17 @@ func (s *Store) upgradeCardDAVAccountsSQLite(ctx context.Context) (err error) {
 			return fmt.Errorf("rebuild CardDAV accounts: %w", err)
 		}
 	}
-	rows, err := tx.QueryContext(ctx, `PRAGMA foreign_key_check`)
-	if err != nil {
-		return err
+	// Unrelated legacy violations must not block this migration.
+	var violations int
+	if err := tx.QueryRowContext(ctx, `SELECT
+		(SELECT COUNT(*) FROM pragma_foreign_key_check('carddav_account_home_urls') WHERE parent = 'carddav_accounts') +
+		(SELECT COUNT(*) FROM pragma_foreign_key_check('carddav_retry_gate') WHERE parent = 'carddav_accounts') +
+		(SELECT COUNT(*) FROM pragma_foreign_key_check('carddav_address_books') WHERE parent = 'carddav_accounts') +
+		(SELECT COUNT(*) FROM pragma_foreign_key_check('carddav_address_book_urls') WHERE parent = 'carddav_accounts')
+	`).Scan(&violations); err != nil {
+		return fmt.Errorf("check CardDAV account references: %w", err)
 	}
-	defer func() { _ = rows.Close() }()
-	invalid := rows.Next()
-	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
-		return err
-	}
-	if invalid {
+	if violations > 0 {
 		return errors.New("CardDAV account upgrade left dangling references")
 	}
 	return tx.Commit()

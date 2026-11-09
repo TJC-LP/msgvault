@@ -1,7 +1,8 @@
 package store
 
 import (
-	"context"
+	"bytes"
+	"compress/zlib"
 	"database/sql"
 	"fmt"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"go.kenn.io/msgvault/internal/sqliteutil"
 	"go.kenn.io/msgvault/internal/vcard"
 )
 
@@ -45,7 +47,7 @@ func seedSubsetPersonMerge(
 ) subsetPersonMergeFixture {
 	t.Helper()
 	require := require.New(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	st, err := Open(sourcePath)
 	require.NoError(err)
 	t.Cleanup(func() { require.NoError(st.Close()) })
@@ -104,7 +106,7 @@ func seedSubsetPersonMerge(
 func TestSubsetCompletePersonMergePacket(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	sourceDir := t.TempDir()
 	destinationDir := filepath.Join(t.TempDir(), "subset")
 	sourcePath := createTestSourceDB(t, sourceDir, 4)
@@ -114,7 +116,7 @@ func TestSubsetCompletePersonMergePacket(t *testing.T) {
 	sourceIdentityRevision, err := source.IdentityRevision()
 	require.NoError(err)
 	require.NoError(source.Close())
-	_, err = CopySubsetWithOptions(sourcePath, destinationDir, 4, CopySubsetOptions{
+	_, err = CopySubsetWithOptions(t.Context(), sourcePath, destinationDir, 4, CopySubsetOptions{
 		IncludeIdentity: true, IncludeProfiles: true,
 		IncludeAttributes: true, IncludeVCardResources: true,
 	})
@@ -137,7 +139,7 @@ func TestSubsetCompletePersonMergePacket(t *testing.T) {
 	require.NoError(err)
 	assert.NotEmpty(snapshot.JSON)
 	alias, err := destination.ResolveRetiredPersonUIDContext(
-		context.Background(), fixture.absorbedUID)
+		t.Context(), fixture.absorbedUID)
 	require.NoError(err)
 	require.NotNil(alias.SurvivingPersonID)
 	assert.Equal(fixture.sourcePersonID, *alias.SurvivingPersonID)
@@ -172,7 +174,7 @@ func TestSubsetIncludesFullySplitPersonMergePacket(t *testing.T) {
 	require.NoError(source.Close())
 
 	destinationDir := filepath.Join(t.TempDir(), "subset")
-	copyResult, err := CopySubsetWithOptions(sourcePath, destinationDir, 4, CopySubsetOptions{
+	copyResult, err := CopySubsetWithOptions(t.Context(), sourcePath, destinationDir, 4, CopySubsetOptions{
 		IncludeIdentity: true, IncludeProfiles: true,
 		IncludeAttributes: true, IncludeVCardResources: true,
 	})
@@ -196,7 +198,7 @@ func TestSubsetIncludesFullySplitPersonMergePacket(t *testing.T) {
 func TestSubsetPersonMergePacketCanSplitAfterNewPersonCreation(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	sourcePath := createTestSourceDB(t, t.TempDir(), 4)
 	source, err := Open(sourcePath)
 	require.NoError(err)
@@ -215,7 +217,7 @@ func TestSubsetPersonMergePacketCanSplitAfterNewPersonCreation(t *testing.T) {
 	require.NoError(source.Close())
 
 	destinationDir := filepath.Join(t.TempDir(), "subset")
-	copyResult, err := CopySubsetWithOptions(sourcePath, destinationDir, 4, CopySubsetOptions{
+	copyResult, err := CopySubsetWithOptions(t.Context(), sourcePath, destinationDir, 4, CopySubsetOptions{
 		IncludeIdentity: true, IncludeProfiles: true,
 		IncludeAttributes: true, IncludeVCardResources: true,
 	})
@@ -280,7 +282,7 @@ func TestSubsetPersonMergePacketReservesRestorableRowIDs(t *testing.T) {
 	require.NoError(source.Close())
 
 	destinationDir := filepath.Join(t.TempDir(), "subset")
-	copyResult, err := CopySubsetWithOptions(sourcePath, destinationDir, 4, CopySubsetOptions{
+	copyResult, err := CopySubsetWithOptions(t.Context(), sourcePath, destinationDir, 4, CopySubsetOptions{
 		IncludeIdentity: true, IncludeProfiles: true,
 		IncludeAttributes: true, IncludeVCardResources: true,
 	})
@@ -316,7 +318,7 @@ func TestSubsetPersonMergePacketReservesRestorableRowIDs(t *testing.T) {
 
 func TestSubsetCorruptPersonMergeSnapshotIsReported(t *testing.T) {
 	require := require.New(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	sourcePath := createTestSourceDB(t, t.TempDir(), 4)
 	source, err := Open(sourcePath)
 	require.NoError(err)
@@ -337,7 +339,7 @@ func TestSubsetCorruptPersonMergeSnapshotIsReported(t *testing.T) {
 	require.NoError(err)
 	require.NoError(source.Close())
 
-	_, err = CopySubsetWithOptions(sourcePath, filepath.Join(t.TempDir(), "subset"), 4,
+	_, err = CopySubsetWithOptions(t.Context(), sourcePath, filepath.Join(t.TempDir(), "subset"), 4,
 		CopySubsetOptions{
 			IncludeIdentity: true, IncludeProfiles: true,
 			IncludeAttributes: true, IncludeVCardResources: true,
@@ -347,7 +349,7 @@ func TestSubsetCorruptPersonMergeSnapshotIsReported(t *testing.T) {
 
 func TestSubsetPersonMergePacketWithAbsorbedTrackingIsComplete(t *testing.T) {
 	require := require.New(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	sourcePath := createTestSourceDB(t, t.TempDir(), 4)
 	source, err := Open(sourcePath)
 	require.NoError(err)
@@ -367,7 +369,7 @@ func TestSubsetPersonMergePacketWithAbsorbedTrackingIsComplete(t *testing.T) {
 	require.NoError(source.Close())
 
 	destinationDir := filepath.Join(t.TempDir(), "subset")
-	_, err = CopySubsetWithOptions(sourcePath, destinationDir, 4, CopySubsetOptions{
+	_, err = CopySubsetWithOptions(t.Context(), sourcePath, destinationDir, 4, CopySubsetOptions{
 		IncludeIdentity: true, IncludeProfiles: true,
 		IncludeAttributes: true, IncludeVCardResources: true,
 	})
@@ -385,7 +387,7 @@ func TestSubsetPersonMergePacketWithAbsorbedTrackingIsComplete(t *testing.T) {
 func TestSubsetPersonMergePacketRebuildsDerivedActivity(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	sourcePath := createTestSourceDB(t, t.TempDir(), 4)
 	source, err := Open(sourcePath)
 	require.NoError(err)
@@ -436,7 +438,7 @@ func TestSubsetPersonMergePacketRebuildsDerivedActivity(t *testing.T) {
 	require.NoError(source.Close())
 
 	destinationDir := filepath.Join(t.TempDir(), "subset")
-	_, err = CopySubsetWithOptions(sourcePath, destinationDir, 1, CopySubsetOptions{
+	_, err = CopySubsetWithOptions(t.Context(), sourcePath, destinationDir, 1, CopySubsetOptions{
 		IncludeIdentity: true, IncludeProfiles: true,
 		IncludeAttributes: true, IncludeVCardResources: true,
 	})
@@ -453,7 +455,7 @@ func TestSubsetPersonMergePacketRebuildsDerivedActivity(t *testing.T) {
 func TestSubsetPersonMergePacketWithAbsorbedSplitResultIsOmitted(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	sourcePath := createTestSourceDB(t, t.TempDir(), 4)
 	first := seedSubsetPersonMerge(t, sourcePath, false)
 	source, err := Open(sourcePath)
@@ -475,7 +477,7 @@ func TestSubsetPersonMergePacketWithAbsorbedSplitResultIsOmitted(t *testing.T) {
 	require.NoError(source.Close())
 
 	destinationDir := filepath.Join(t.TempDir(), "subset")
-	_, err = CopySubsetWithOptions(sourcePath, destinationDir, 4, CopySubsetOptions{
+	_, err = CopySubsetWithOptions(t.Context(), sourcePath, destinationDir, 4, CopySubsetOptions{
 		IncludeIdentity: true, IncludeProfiles: true,
 		IncludeAttributes: true, IncludeVCardResources: true,
 	})
@@ -497,7 +499,7 @@ func TestSubsetPersonMergePacketWithAbsorbedSplitResultIsOmitted(t *testing.T) {
 func TestSubsetPersonMergePacketWithRemappedDefinitionIsOmitted(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	sourcePath := createTestSourceDB(t, t.TempDir(), 4)
 	source, err := Open(sourcePath)
 	require.NoError(err)
@@ -536,7 +538,7 @@ func TestSubsetPersonMergePacketWithRemappedDefinitionIsOmitted(t *testing.T) {
 	require.NoError(source.Close())
 
 	destinationDir := filepath.Join(t.TempDir(), "subset")
-	_, err = CopySubsetWithOptions(sourcePath, destinationDir, 4, CopySubsetOptions{
+	_, err = CopySubsetWithOptions(t.Context(), sourcePath, destinationDir, 4, CopySubsetOptions{
 		IncludeIdentity: true, IncludeProfiles: true,
 		IncludeAttributes: true, IncludeVCardResources: true,
 	})
@@ -559,7 +561,7 @@ func TestSubsetPersonMergePacketWithRemappedDefinitionIsOmitted(t *testing.T) {
 
 func TestSubsetPersonMergePacketWithRemappedRelationshipTypeIsOmitted(t *testing.T) {
 	require := require.New(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	sourcePath := createTestSourceDB(t, t.TempDir(), 4)
 	source, err := Open(sourcePath)
 	require.NoError(err)
@@ -597,7 +599,7 @@ func TestSubsetPersonMergePacketWithRemappedRelationshipTypeIsOmitted(t *testing
 	require.NoError(source.Close())
 
 	destinationDir := filepath.Join(t.TempDir(), "subset")
-	_, err = CopySubsetWithOptions(sourcePath, destinationDir, 4, CopySubsetOptions{
+	_, err = CopySubsetWithOptions(t.Context(), sourcePath, destinationDir, 4, CopySubsetOptions{
 		IncludeIdentity: true, IncludeProfiles: true,
 		IncludeAttributes: true, IncludeVCardResources: true,
 	})
@@ -614,7 +616,7 @@ func TestSubsetPersonMergePacketWithRemappedRelationshipTypeIsOmitted(t *testing
 
 func TestSubsetPersonMergePacketWithRemappedOrganizationDefinitionIsOmitted(t *testing.T) {
 	require := require.New(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	sourcePath := createTestSourceDB(t, t.TempDir(), 4)
 	source, err := Open(sourcePath)
 	require.NoError(err)
@@ -664,7 +666,7 @@ func TestSubsetPersonMergePacketWithRemappedOrganizationDefinitionIsOmitted(t *t
 	require.NoError(source.Close())
 
 	destinationDir := filepath.Join(t.TempDir(), "subset")
-	_, err = CopySubsetWithOptions(sourcePath, destinationDir, 4, CopySubsetOptions{
+	_, err = CopySubsetWithOptions(t.Context(), sourcePath, destinationDir, 4, CopySubsetOptions{
 		IncludeIdentity: true, IncludeProfiles: true,
 		IncludeAttributes: true, IncludeVCardResources: true,
 	})
@@ -682,7 +684,7 @@ func TestSubsetPersonMergePacketWithRemappedOrganizationDefinitionIsOmitted(t *t
 
 func TestSubsetPersonMergePacketWithRemappedServiceIsOmitted(t *testing.T) {
 	require := require.New(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	sourcePath := createTestSourceDB(t, t.TempDir(), 4)
 	source, err := Open(sourcePath)
 	require.NoError(err)
@@ -719,7 +721,7 @@ func TestSubsetPersonMergePacketWithRemappedServiceIsOmitted(t *testing.T) {
 	require.NoError(source.Close())
 
 	destinationDir := filepath.Join(t.TempDir(), "subset")
-	_, err = CopySubsetWithOptions(sourcePath, destinationDir, 4, CopySubsetOptions{
+	_, err = CopySubsetWithOptions(t.Context(), sourcePath, destinationDir, 4, CopySubsetOptions{
 		IncludeIdentity: true, IncludeProfiles: true,
 		IncludeAttributes: true, IncludeVCardResources: true,
 	})
@@ -740,7 +742,7 @@ func TestSubsetIncompletePersonMergePacketIsOmitted(t *testing.T) {
 	destinationDir := filepath.Join(t.TempDir(), "subset")
 	sourcePath := createTestSourceDB(t, sourceDir, 4)
 	fixture := seedSubsetPersonMerge(t, sourcePath, true)
-	_, err := CopySubsetWithOptions(sourcePath, destinationDir, 4, CopySubsetOptions{
+	_, err := CopySubsetWithOptions(t.Context(), sourcePath, destinationDir, 4, CopySubsetOptions{
 		IncludeIdentity: true, IncludeProfiles: true,
 		IncludeAttributes: true, IncludeVCardResources: true,
 	})
@@ -748,29 +750,30 @@ func TestSubsetIncompletePersonMergePacketIsOmitted(t *testing.T) {
 	destination, err := Open(filepath.Join(destinationDir, "msgvault.db"))
 	require.NoError(err)
 	t.Cleanup(func() { require.NoError(destination.Close()) })
-	_, err = destination.GetPersonContext(context.Background(), fixture.sourcePersonID)
+	_, err = destination.GetPersonContext(t.Context(), fixture.sourcePersonID)
 	require.NoError(err)
 	for _, table := range []string{
 		"person_merges", "person_merge_participants", "person_merge_rows",
 		"person_merge_review_candidates", "person_splits",
 	} {
 		var count int
-		require.NoError(destination.DB().QueryRowContext(context.Background(),
+		require.NoError(destination.DB().QueryRowContext(
+			t.Context(),
 			`SELECT COUNT(*) FROM `+table).Scan(&count))
 		assert.Zero(t, count, table)
 	}
 	_, err = destination.ResolveRetiredPersonUIDContext(
-		context.Background(), fixture.absorbedUID)
+		t.Context(), fixture.absorbedUID)
 	assert.ErrorIs(t, err, ErrPersonUIDAliasNotFound)
 }
 
 func TestSubsetMergeAliasIsOmittedWithoutAttributes(t *testing.T) {
 	require := require.New(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	sourcePath := createTestSourceDB(t, t.TempDir(), 4)
 	fixture := seedSubsetPersonMerge(t, sourcePath, false)
 	destinationDir := filepath.Join(t.TempDir(), "subset")
-	result, err := CopySubsetWithOptions(sourcePath, destinationDir, 4, CopySubsetOptions{
+	result, err := CopySubsetWithOptions(t.Context(), sourcePath, destinationDir, 4, CopySubsetOptions{
 		IncludeIdentity: true, IncludeProfiles: true, IncludeVCardResources: true,
 	})
 	require.NoError(err)
@@ -792,7 +795,7 @@ func TestSubsetPersonMergePacketWithMissingRelationshipDependencyIsOmitted(t *te
 	sourceDir := t.TempDir()
 	destinationDir := filepath.Join(t.TempDir(), "subset")
 	sourcePath := createTestSourceDB(t, sourceDir, 4)
-	ctx := context.Background()
+	ctx := t.Context()
 	st, err := Open(sourcePath)
 	require.NoError(err)
 	hiddenParticipant, err := st.EnsureParticipant(
@@ -823,7 +826,7 @@ func TestSubsetPersonMergePacketWithMissingRelationshipDependencyIsOmitted(t *te
 	absorbedUID := absorbed.VCardUID
 	require.NoError(st.Close())
 
-	_, err = CopySubsetWithOptions(sourcePath, destinationDir, 4, CopySubsetOptions{
+	_, err = CopySubsetWithOptions(t.Context(), sourcePath, destinationDir, 4, CopySubsetOptions{
 		IncludeIdentity: true, IncludeProfiles: true,
 		IncludeAttributes: true, IncludeVCardResources: true,
 	})
@@ -839,7 +842,7 @@ func TestSubsetPersonMergePacketWithMissingRelationshipDependencyIsOmitted(t *te
 
 func TestSubsetPersonMergePacketWithUnchangedHiddenRelationshipIsOmitted(t *testing.T) {
 	require := require.New(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	sourcePath := createTestSourceDB(t, t.TempDir(), 4)
 	source, err := Open(sourcePath)
 	require.NoError(err)
@@ -871,7 +874,7 @@ func TestSubsetPersonMergePacketWithUnchangedHiddenRelationshipIsOmitted(t *test
 	require.NoError(source.Close())
 
 	destinationDir := filepath.Join(t.TempDir(), "subset")
-	_, err = CopySubsetWithOptions(sourcePath, destinationDir, 4, CopySubsetOptions{
+	_, err = CopySubsetWithOptions(t.Context(), sourcePath, destinationDir, 4, CopySubsetOptions{
 		IncludeIdentity: true, IncludeProfiles: true,
 		IncludeAttributes: true, IncludeVCardResources: true,
 	})
@@ -887,7 +890,7 @@ func TestSubsetPersonMergePacketWithMissingRelationshipReviewDependencyIsOmitted
 	for _, dependency := range []string{"matched_person", "accepted_relationship"} {
 		t.Run(dependency, func(t *testing.T) {
 			require := require.New(t)
-			ctx := context.Background()
+			ctx := t.Context()
 			sourcePath := createTestSourceDB(t, t.TempDir(), 4)
 			source, err := Open(sourcePath)
 			require.NoError(err)
@@ -938,7 +941,7 @@ func TestSubsetPersonMergePacketWithMissingRelationshipReviewDependencyIsOmitted
 			require.NoError(source.Close())
 
 			destinationDir := filepath.Join(t.TempDir(), "subset")
-			_, err = CopySubsetWithOptions(sourcePath, destinationDir, 4, CopySubsetOptions{
+			_, err = CopySubsetWithOptions(t.Context(), sourcePath, destinationDir, 4, CopySubsetOptions{
 				IncludeIdentity: true, IncludeProfiles: true,
 				IncludeAttributes: true, IncludeVCardResources: true,
 			})
@@ -958,7 +961,7 @@ func TestSubsetPersonMergePacketWithOmittedPriorMergeIsOmitted(t *testing.T) {
 	destinationDir := filepath.Join(t.TempDir(), "subset")
 	sourcePath := createTestSourceDB(t, sourceDir, 4)
 	first := seedSubsetPersonMerge(t, sourcePath, true)
-	ctx := context.Background()
+	ctx := t.Context()
 	st, err := Open(sourcePath)
 	require.NoError(err)
 	current, err := st.GetPersonContext(ctx, first.sourcePersonID)
@@ -985,7 +988,7 @@ func TestSubsetPersonMergePacketWithOmittedPriorMergeIsOmitted(t *testing.T) {
 	require.NoError(err)
 	require.NoError(st.Close())
 
-	_, err = CopySubsetWithOptions(sourcePath, destinationDir, 4, CopySubsetOptions{
+	_, err = CopySubsetWithOptions(t.Context(), sourcePath, destinationDir, 4, CopySubsetOptions{
 		IncludeIdentity: true, IncludeProfiles: true,
 		IncludeAttributes: true, IncludeVCardResources: true,
 	})
@@ -1056,7 +1059,7 @@ func TestSubsetPersonMergePacketWithOmittedSplitOwnerIsOmitted(t *testing.T) {
 	require.NoError(source.Close())
 
 	destinationDir := filepath.Join(t.TempDir(), "subset")
-	result, err := CopySubsetWithOptions(sourcePath, destinationDir, 4, CopySubsetOptions{
+	result, err := CopySubsetWithOptions(t.Context(), sourcePath, destinationDir, 4, CopySubsetOptions{
 		IncludeIdentity: true, IncludeProfiles: true,
 		IncludeAttributes: true, IncludeVCardResources: true,
 	})
@@ -1093,7 +1096,7 @@ func TestSubsetPersonMergePacketsPruneAliasDependenciesToFixedPoint(t *testing.T
 	require.NoError(source.Close())
 
 	destinationDir := filepath.Join(t.TempDir(), "subset")
-	_, err = CopySubsetWithOptions(sourcePath, destinationDir, 4, CopySubsetOptions{
+	_, err = CopySubsetWithOptions(t.Context(), sourcePath, destinationDir, 4, CopySubsetOptions{
 		IncludeIdentity: true, IncludeProfiles: true,
 		IncludeAttributes: true, IncludeVCardResources: true,
 	})
@@ -1124,15 +1127,15 @@ func createTestSourceDB(t *testing.T, dir string, msgCount int) string {
 	require.NoError(st.InitSchema(), "InitSchema")
 	_ = st.Close()
 
-	db, err := sql.Open("sqlite3", dbPath+"?_foreign_keys=OFF")
+	db, err := sql.Open(sqliteutil.DriverName(), dbPath+"?_foreign_keys=OFF")
 	require.NoError(err, "open db")
 	defer func() { _ = db.Close() }()
 
-	_, err = db.Exec(`INSERT INTO sources (id, source_type, identifier)
+	_, err = db.ExecContext(t.Context(), `INSERT INTO sources (id, source_type, identifier)
 		VALUES (1, 'gmail', 'test@example.com')`)
 	require.NoError(err, "insert source")
 
-	_, err = db.Exec(`
+	_, err = db.ExecContext(t.Context(), `
 		INSERT INTO participants
 			(id, email_address, display_name, domain)
 		VALUES
@@ -1141,7 +1144,7 @@ func createTestSourceDB(t *testing.T, dir string, msgCount int) string {
 			(3, 'charlie@example.com', 'Charlie', 'example.com')`)
 	require.NoError(err, "insert participants")
 
-	_, err = db.Exec(`
+	_, err = db.ExecContext(t.Context(), `
 		INSERT INTO participant_identifiers
 			(id, participant_id, identifier_type, identifier_value)
 		VALUES
@@ -1150,7 +1153,7 @@ func createTestSourceDB(t *testing.T, dir string, msgCount int) string {
 			(3, 3, 'email', 'charlie@example.com')`)
 	require.NoError(err, "insert participant_identifiers")
 
-	_, err = db.Exec(`
+	_, err = db.ExecContext(t.Context(), `
 		INSERT INTO conversations
 			(id, source_id, conversation_type, title,
 			 message_count, participant_count)
@@ -1159,13 +1162,13 @@ func createTestSourceDB(t *testing.T, dir string, msgCount int) string {
 			(2, 1, 'email_thread', 'Thread 2', 5, 2)`)
 	require.NoError(err, "insert conversations")
 
-	_, err = db.Exec(`
+	_, err = db.ExecContext(t.Context(), `
 		INSERT INTO conversation_participants
 			(conversation_id, participant_id)
 		VALUES (1, 1), (1, 2), (2, 2), (2, 3)`)
 	require.NoError(err, "insert conversation_participants")
 
-	_, err = db.Exec(`
+	_, err = db.ExecContext(t.Context(), `
 		INSERT INTO labels (id, source_id, name, label_type)
 		VALUES
 			(1, 1, 'INBOX', 'system'),
@@ -1181,7 +1184,7 @@ func createTestSourceDB(t *testing.T, dir string, msgCount int) string {
 			senderID = 2
 		}
 
-		_, err = db.Exec(`
+		_, err = db.ExecContext(t.Context(), `
 			INSERT INTO messages
 				(id, conversation_id, source_id, source_message_id,
 				 message_type, sent_at, sender_id, subject)
@@ -1193,13 +1196,15 @@ func createTestSourceDB(t *testing.T, dir string, msgCount int) string {
 			i, senderID, "Subject "+string(rune('A'+i%26)))
 		require.NoError(err, "insert message %d", i)
 
-		_, err = db.Exec(
+		_, err = db.ExecContext(
+			t.Context(),
 			`INSERT INTO message_bodies (message_id, body_text)
 			 VALUES (?, ?)`,
 			i, "Body of message "+string(rune('A'+i%26)))
 		require.NoError(err, "insert message_body %d", i)
 
-		_, err = db.Exec(
+		_, err = db.ExecContext(
+			t.Context(),
 			`INSERT INTO message_recipients
 				(message_id, participant_id, recipient_type)
 			 VALUES (?, ?, 'from')`,
@@ -1210,7 +1215,8 @@ func createTestSourceDB(t *testing.T, dir string, msgCount int) string {
 		if senderID == 2 {
 			toID = 3
 		}
-		_, err = db.Exec(
+		_, err = db.ExecContext(
+			t.Context(),
 			`INSERT INTO message_recipients
 				(message_id, participant_id, recipient_type)
 			 VALUES (?, ?, 'to')`,
@@ -1218,7 +1224,8 @@ func createTestSourceDB(t *testing.T, dir string, msgCount int) string {
 		require.NoError(err, "insert message_recipient to %d", i)
 
 		labelID := (i % 3) + 1
-		_, err = db.Exec(
+		_, err = db.ExecContext(
+			t.Context(),
 			`INSERT INTO message_labels (message_id, label_id)
 			 VALUES (?, ?)`,
 			i, labelID)
@@ -1226,6 +1233,146 @@ func createTestSourceDB(t *testing.T, dir string, msgCount int) string {
 	}
 
 	return dbPath
+}
+
+// Route freshness reads only sources.last_sync_at, which an importer sets after
+// a complete pass. Sync history can include stopped runs, so a subset must not
+// derive freshness from it.
+func TestCopySubsetCopiesStoredSourceSyncTimeOnly(t *testing.T) {
+	stored := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	completed := time.Date(2026, 1, 2, 12, 0, 0, 0, time.UTC)
+	for _, test := range []struct {
+		name          string
+		stored        *time.Time
+		completedRuns bool
+		want          sql.NullTime
+	}{
+		{"stored timestamp is copied", &stored, true, sql.NullTime{Time: stored, Valid: true}},
+		{"completed runs do not set freshness", nil, true, sql.NullTime{}},
+		{"no stored timestamp", nil, false, sql.NullTime{}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			requirements := require.New(t)
+			sourcePath := createTestSourceDB(t, t.TempDir(), 1)
+			source, err := Open(sourcePath)
+			requirements.NoError(err)
+			t.Cleanup(func() { requirements.NoError(source.Close()) })
+			_, err = source.DB().ExecContext(t.Context(), `UPDATE sources SET last_sync_at=? WHERE id=1`, test.stored)
+			requirements.NoError(err)
+			_, err = source.DB().ExecContext(t.Context(), `INSERT INTO sources (id, source_type, identifier)
+				VALUES (2, 'beeper', 'other-account')`)
+			requirements.NoError(err)
+			for _, run := range []struct {
+				sourceID int
+				status   string
+				errors   int
+			}{
+				{1, "completed", 1},
+				{1, "failed", 0},
+				{1, "cancelled", 0},
+				{2, "completed", 0},
+			} {
+				_, err = source.DB().ExecContext(t.Context(), `INSERT INTO sync_runs
+					(source_id, started_at, completed_at, status, errors_count)
+					VALUES (?, ?, ?, ?, ?)`, run.sourceID, stored, completed.Add(time.Hour), run.status, run.errors)
+				requirements.NoError(err)
+			}
+			if test.completedRuns {
+				for _, timestamp := range []time.Time{completed, stored} {
+					_, err = source.DB().ExecContext(t.Context(), `INSERT INTO sync_runs
+						(source_id, started_at, completed_at, status, errors_count)
+						VALUES (1, ?, ?, 'completed', 0)`, stored, timestamp)
+					requirements.NoError(err)
+				}
+			}
+
+			destinationDir := filepath.Join(t.TempDir(), "subset")
+			_, err = CopySubset(t.Context(), sourcePath, destinationDir, 1, false)
+			requirements.NoError(err)
+			destination, err := Open(filepath.Join(destinationDir, "msgvault.db"))
+			requirements.NoError(err)
+			t.Cleanup(func() { requirements.NoError(destination.Close()) })
+			copied, err := destination.GetSourceByID(1)
+			requirements.NoError(err)
+			assert.Equal(t, test.want, copied.LastSyncAt)
+		})
+	}
+}
+
+func TestCopySubsetPreservesSourceMessagingRouteFailure(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	ctx := t.Context()
+	sourcePath := createTestSourceDB(t, t.TempDir(), 5)
+	source, err := Open(sourcePath)
+	require.NoError(err)
+	_, err = source.DB().ExecContext(ctx, `
+		UPDATE sources
+		SET source_type='beeper', identifier='account-a', last_sync_at=CURRENT_TIMESTAMP
+		WHERE id=1`)
+	require.NoError(err)
+	_, err = source.DB().ExecContext(ctx, `
+		UPDATE conversations
+		SET conversation_type='direct_chat', source_conversation_id='!quiet:example.test'
+		WHERE id=1`)
+	require.NoError(err)
+	person, _, err := source.CreatePersonFromParticipant(1)
+	require.NoError(err)
+	require.NoError(source.SetConversationMessagingRouteEvidence(ctx, 1, MessagingRouteEvidence{
+		ChatID: "!quiet:example.test", AccountID: "account-a", Network: "whatsapp",
+		ProviderType: "single", ObservedAt: time.Now().UTC(), MembershipComplete: true,
+		ParticipantIDs: []int64{1, 2}, SelfParticipantIDs: []int64{}, MemberChatIDs: []string{},
+	}))
+	require.NoError(source.SetSourceMessagingRouteFailureContext(ctx, 1, "account_lookup_failed"))
+	before, err := source.GetPersonMessagingRoutesContext(ctx, PersonMessagingRouteQuery{
+		PersonUID: person.VCardUID,
+	})
+	require.NoError(err)
+	require.Len(before.Routes.Items, 1)
+	assert.Equal("unresolved", before.Routes.Items[0].Status)
+	assert.Contains(before.Routes.Items[0].Reasons, "account_lookup_failed")
+	personUID := person.VCardUID
+	require.NoError(source.Close())
+
+	destinationDir := filepath.Join(t.TempDir(), "subset")
+	_, err = CopySubsetWithOptions(t.Context(), sourcePath, destinationDir, 5, CopySubsetOptions{
+		IncludeIdentity: true,
+	})
+	require.NoError(err)
+	destination, err := Open(filepath.Join(destinationDir, "msgvault.db"))
+	require.NoError(err)
+	t.Cleanup(func() { require.NoError(destination.Close()) })
+	after, err := destination.GetPersonMessagingRoutesContext(ctx, PersonMessagingRouteQuery{
+		PersonUID: personUID,
+	})
+	require.NoError(err)
+	require.Len(after.Routes.Items, 1)
+	assert.Equal("unresolved", after.Routes.Items[0].Status)
+	assert.Contains(after.Routes.Items[0].Reasons, "account_lookup_failed")
+}
+
+func TestCopySubsetSupportsSourceWithoutMessagingRouteFailuresTable(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	sourcePath := createTestSourceDB(t, t.TempDir(), 5)
+	sourceDB, err := sql.Open("sqlite3", sourcePath+"?_foreign_keys=OFF")
+	require.NoError(err)
+	_, err = sourceDB.ExecContext(t.Context(), `DROP TABLE source_messaging_route_failures`)
+	require.NoError(err)
+	require.NoError(sourceDB.Close())
+
+	destinationDir := filepath.Join(t.TempDir(), "subset")
+	_, err = CopySubset(t.Context(), sourcePath, destinationDir, 5, false)
+	require.NoError(err)
+	destination, err := Open(filepath.Join(destinationDir, "msgvault.db"))
+	require.NoError(err)
+	t.Cleanup(func() { require.NoError(destination.Close()) })
+	var failures int
+	require.NoError(destination.DB().QueryRowContext(
+		t.Context(),
+		`SELECT COUNT(*) FROM source_messaging_route_failures`,
+	).Scan(&failures))
+	assert.Zero(failures)
 }
 
 func seedAcceptedSubsetParticipantLink(t *testing.T, srcDB string) int64 {
@@ -1236,7 +1383,7 @@ func seedAcceptedSubsetParticipantLink(t *testing.T, srcDB string) int64 {
 	defer func() { _ = st.Close() }()
 
 	candidate, created, err := st.UpsertIdentityMatchCandidateContext(
-		context.Background(), IdentityMatchCandidateInput{
+		t.Context(), IdentityMatchCandidateInput{
 			LeftKind:        IdentityMatchParticipant,
 			LeftID:          2,
 			RightKind:       IdentityMatchParticipant,
@@ -1250,7 +1397,7 @@ func seedAcceptedSubsetParticipantLink(t *testing.T, srcDB string) int64 {
 	require.NoError(err, "create identity match candidate")
 	require.True(created, "identity match candidate must be new")
 	accepted, _, err := st.AcceptIdentityMatchCandidateContext(
-		context.Background(), candidate.ID, "system", nil,
+		t.Context(), candidate.ID, "system", nil,
 	)
 	require.NoError(err, "accept identity match candidate")
 	require.Equal(IdentityMatchStateAccepted, accepted.State)
@@ -1265,48 +1412,54 @@ func TestCopySubset_Basic(t *testing.T) {
 
 	srcDB := createTestSourceDB(t, srcDir, 10)
 
-	result, err := CopySubset(srcDB, dstDir, 5, false)
+	result, err := CopySubset(t.Context(), srcDB, dstDir, 5, false)
 	require.NoError(err, "CopySubset")
 
 	assert.Equal(int64(5), result.Messages, "Messages")
 
-	db, err := sql.Open("sqlite3", filepath.Join(dstDir, "msgvault.db"))
+	db, err := sql.Open(sqliteutil.DriverName(), filepath.Join(dstDir, "msgvault.db"))
 	require.NoError(err)
 	defer func() { _ = db.Close() }()
 
 	var count int64
 
-	require.NoError(db.QueryRow(
+	require.NoError(db.QueryRowContext(
+		t.Context(),
 		"SELECT COUNT(*) FROM messages",
 	).Scan(&count), "count messages")
 	assert.Equal(int64(5), count, "destination messages")
 
-	require.NoError(db.QueryRow(
+	require.NoError(db.QueryRowContext(
+		t.Context(),
 		"SELECT COUNT(*) FROM participants",
 	).Scan(&count), "count participants")
 	assert.NotZero(count, "expected participants to be copied")
 
-	require.NoError(db.QueryRow(
+	require.NoError(db.QueryRowContext(
+		t.Context(),
 		"SELECT COUNT(*) FROM conversations",
 	).Scan(&count), "count conversations")
 	assert.NotZero(count, "expected conversations to be copied")
 
-	require.NoError(db.QueryRow(
+	require.NoError(db.QueryRowContext(
+		t.Context(),
 		"SELECT COUNT(*) FROM labels",
 	).Scan(&count), "count labels")
 	assert.NotZero(count, "expected labels to be copied")
 
-	require.NoError(db.QueryRow(
+	require.NoError(db.QueryRowContext(
+		t.Context(),
 		"SELECT COUNT(*) FROM message_labels",
 	).Scan(&count), "count message_labels")
 	assert.NotZero(count, "expected message_labels to be copied")
 
-	require.NoError(db.QueryRow(
+	require.NoError(db.QueryRowContext(
+		t.Context(),
 		"SELECT COUNT(*) FROM message_bodies",
 	).Scan(&count), "count message_bodies")
 	assert.Equal(int64(5), count, "destination message_bodies")
 
-	fkRows, err := db.Query("PRAGMA foreign_key_check")
+	fkRows, err := db.QueryContext(t.Context(), "PRAGMA foreign_key_check")
 	require.NoError(err)
 	defer func() { _ = fkRows.Close() }()
 	hasViolation := fkRows.Next()
@@ -1314,15 +1467,208 @@ func TestCopySubset_Basic(t *testing.T) {
 	assert.False(hasViolation, "foreign key violations found in destination database")
 }
 
+func TestCopySubsetCopiesPortableSourceMergeMarkersForSelectedRows(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	sourcePath := createTestSourceDB(t, t.TempDir(), 2)
+	sourceDB, err := sql.Open("sqlite3", sourcePath+"?_foreign_keys=ON")
+	require.NoError(err)
+	_, err = sourceDB.ExecContext(t.Context(), `
+		INSERT INTO attachments (id, message_id, storage_path)
+		VALUES (11, 1, '11/attachment'), (22, 2, '22/attachment');
+		INSERT INTO source_merge_archive_only_messages (message_id)
+		VALUES (1), (2);
+		INSERT INTO source_merge_preserved_attachments (attachment_id)
+		VALUES (11), (22);
+	`)
+	require.NoError(err)
+	require.NoError(sourceDB.Close())
+
+	destinationDir := filepath.Join(t.TempDir(), "subset")
+	_, err = CopySubset(t.Context(), sourcePath, destinationDir, 1, false)
+	require.NoError(err)
+	destination, err := Open(filepath.Join(destinationDir, "msgvault.db"))
+	require.NoError(err)
+	t.Cleanup(func() { require.NoError(destination.Close()) })
+
+	var selectedMessageMarker, excludedMessageMarker int
+	require.NoError(destination.DB().QueryRowContext(t.Context(), `
+		SELECT COUNT(*) FROM source_merge_archive_only_messages WHERE message_id = 2
+	`).Scan(&selectedMessageMarker))
+	require.NoError(destination.DB().QueryRowContext(t.Context(), `
+		SELECT COUNT(*) FROM source_merge_archive_only_messages WHERE message_id = 1
+	`).Scan(&excludedMessageMarker))
+	assert.Equal(1, selectedMessageMarker, "the selected message marker must survive the subset")
+	assert.Zero(excludedMessageMarker, "a marker for an unselected message must not cross the subset")
+
+	var selectedAttachmentMarker, excludedAttachmentMarker int
+	require.NoError(destination.DB().QueryRowContext(t.Context(), `
+		SELECT COUNT(*) FROM source_merge_preserved_attachments WHERE attachment_id = 22
+	`).Scan(&selectedAttachmentMarker))
+	require.NoError(destination.DB().QueryRowContext(t.Context(), `
+		SELECT COUNT(*) FROM source_merge_preserved_attachments WHERE attachment_id = 11
+	`).Scan(&excludedAttachmentMarker))
+	assert.Equal(1, selectedAttachmentMarker, "the selected attachment marker must survive the subset")
+	assert.Zero(excludedAttachmentMarker, "a marker for an unselected attachment must not cross the subset")
+}
+
+func TestCopySubsetPreservesSourceMergeLifecycleMarkers(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	ctx := t.Context()
+	sourcePath := filepath.Join(t.TempDir(), "source", "msgvault.db")
+	source, err := Open(sourcePath)
+	require.NoError(err)
+	t.Cleanup(func() { require.NoError(source.Close()) })
+	require.NoError(source.InitSchema())
+
+	history, err := source.GetOrCreateSource("gmail", "history@example.test")
+	require.NoError(err)
+	destination, err := source.GetOrCreateSource("gmail", "current@example.test")
+	require.NoError(err)
+	alias := "Primary mailbox"
+	_, err = source.UpdateSourceSettingsContext(ctx, destination.ID, SourceSettingsUpdate{
+		Alias: &alias,
+	})
+	require.NoError(err)
+
+	senderID, err := source.EnsureParticipant(
+		"sender@example.test", "Example Sender", "example.test")
+	require.NoError(err)
+	createMessage := func(sourceID int64, conversationID, providerID, rfc822ID string, sentAt time.Time) int64 {
+		t.Helper()
+		conversation, err := source.EnsureConversationWithType(
+			sourceID, conversationID, "email_thread", "Example subject")
+		require.NoError(err)
+		messageID, err := source.UpsertMessage(&Message{
+			SourceID: sourceID, ConversationID: conversation,
+			SourceMessageID: providerID,
+			RFC822MessageID: sql.NullString{String: rfc822ID, Valid: rfc822ID != ""},
+			MessageType:     "email",
+			SentAt:          sql.NullTime{Time: sentAt, Valid: true},
+			SenderID:        sql.NullInt64{Int64: senderID, Valid: true},
+			Subject:         sql.NullString{String: "Example subject", Valid: true},
+		})
+		require.NoError(err)
+		require.NoError(source.UpsertMessageBody(messageID,
+			sql.NullString{String: "Synthetic message body", Valid: true}, sql.NullString{}))
+		return messageID
+	}
+
+	baseTime := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	survivorMessageID := createMessage(
+		destination.ID, "destination-thread", "destination-copy", "<shared@example.test>", baseTime)
+	duplicateMessageID := createMessage(
+		history.ID, "history-thread", "history-copy", "<shared@example.test>", baseTime)
+	historicalMessageID := createMessage(
+		history.ID, "unique-history-thread", "history-unique", "<unique@example.test>", baseTime.Add(time.Hour))
+	recipientID, err := source.EnsureParticipant(
+		"recipient@example.test", "Example Recipient", "example.test")
+	require.NoError(err)
+	for _, messageID := range []int64{survivorMessageID, duplicateMessageID} {
+		_, err = source.DB().ExecContext(t.Context(), source.Rebind(`
+			INSERT INTO message_recipients(message_id, participant_id, recipient_type, email_address)
+			VALUES (?, ?, 'to', 'recipient@example.test')
+		`), messageID, recipientID)
+		require.NoError(err)
+	}
+	for _, attachment := range []struct {
+		messageID int64
+		partKey   string
+		path      string
+	}{
+		{messageID: survivorMessageID, partKey: "mime:destination", path: "d/" + strings.Repeat("c", 64)},
+		{messageID: duplicateMessageID, partKey: "mime:history", path: strings.Repeat("c", 2) + "/" + strings.Repeat("c", 64)},
+	} {
+		_, err = source.DB().ExecContext(t.Context(), source.Rebind(`
+			INSERT INTO attachments (
+				message_id, filename, mime_type, size, content_hash, storage_path,
+				source_part_key, attachment_state, attachment_role, role_source
+			) VALUES (?, 'history.txt', 'text/plain', 17, ?, ?, ?, 'stored', 'standalone', 'mime_disposition')
+		`), attachment.messageID, strings.Repeat("c", 64), attachment.path, attachment.partKey)
+		require.NoError(err)
+	}
+
+	_, err = source.DB().ExecContext(t.Context(), source.Rebind(`UPDATE attachments SET filename = 'destination.txt' WHERE message_id = ?`), survivorMessageID)
+	require.NoError(err)
+
+	_, err = source.MergeSourcesContext(ctx, MergeSourcesRequest{
+		FromSourceID: history.ID, IntoSourceID: destination.ID,
+	})
+	require.NoError(err)
+	countRows := func(db *sql.DB, query string, args ...any) int64 {
+		t.Helper()
+		var count int64
+		require.NoError(db.QueryRowContext(t.Context(), query, args...).Scan(&count))
+		return count
+	}
+	for _, record := range []struct {
+		table string
+		count int64
+	}{
+		{table: "source_merge_messages", count: 2},
+		{table: "source_merge_conversations", count: 2},
+		{table: "source_merge_attachments", count: 1},
+		{table: "source_merges", count: 1},
+		{table: "source_settings", count: 2},
+	} {
+		require.Equal(record.count, countRows(source.DB(), "SELECT COUNT(*) FROM "+record.table),
+			"the merge fixture must contain source %s rows", record.table)
+	}
+	var archiveOnlyMarkerCount, protectedAttachmentMarkerCount int
+	require.NoError(source.DB().QueryRowContext(t.Context(), source.Rebind(`
+		SELECT COUNT(*) FROM source_merge_archive_only_messages WHERE message_id = ?
+	`), historicalMessageID).Scan(&archiveOnlyMarkerCount))
+	require.NoError(source.DB().QueryRowContext(t.Context(), source.Rebind(`
+		SELECT COUNT(*) FROM source_merge_preserved_attachments marker
+		JOIN attachments attachment ON attachment.id = marker.attachment_id
+		WHERE attachment.message_id = ?
+	`), survivorMessageID).Scan(&protectedAttachmentMarkerCount))
+	require.Equal(1, archiveOnlyMarkerCount)
+	require.Equal(1, protectedAttachmentMarkerCount)
+
+	destinationDir := filepath.Join(t.TempDir(), "subset")
+	_, err = CopySubset(t.Context(), sourcePath, destinationDir, 2, false)
+	require.NoError(err)
+	subset, err := Open(filepath.Join(destinationDir, "msgvault.db"))
+	require.NoError(err)
+	t.Cleanup(func() { require.NoError(subset.Close()) })
+
+	settings, err := subset.GetSourceSettingsContext(ctx, destination.ID)
+	require.NoError(err)
+	assert.Equal(alias, settings.Alias)
+	assert.Equal(int64(1), countRows(subset.DB(), `
+		SELECT COUNT(*) FROM source_settings
+	`), "only the selected source's settings should cross the subset boundary")
+	assert.Equal(int64(2), countRows(subset.DB(), `
+		SELECT COUNT(*) FROM messages WHERE id IN (?, ?)
+	`, survivorMessageID, historicalMessageID))
+	assert.Equal(int64(1), countRows(subset.DB(), `
+		SELECT COUNT(*) FROM source_merge_archive_only_messages WHERE message_id = ?
+	`, historicalMessageID))
+	assert.Equal(int64(1), countRows(subset.DB(), `
+		SELECT COUNT(*) FROM source_merge_preserved_attachments marker
+		JOIN attachments attachment ON attachment.id = marker.attachment_id
+		WHERE attachment.message_id = ?
+	`, survivorMessageID))
+	for _, table := range []string{
+		"source_merge_messages", "source_merge_conversations",
+		"source_merge_attachments", "source_merges",
+	} {
+		assert.Equal(int64(0), countRows(subset.DB(), "SELECT COUNT(*) FROM "+table),
+			"incomplete %s provenance must not be copied", table)
+	}
+}
+
 func TestCopySubsetExcludesDocumentDerivativesAndHostedConsent(t *testing.T) {
 	require := require.New(t)
 	srcDir := t.TempDir()
 	dstDir := filepath.Join(t.TempDir(), "dst")
 	srcDB := createTestSourceDB(t, srcDir, 1)
-	db, err := sql.Open("sqlite3", srcDB+"?_foreign_keys=ON")
+	db, err := sql.Open(sqliteutil.DriverName(), srcDB+"?_foreign_keys=ON")
 	require.NoError(err)
 	fingerprint := strings.Repeat("a", 64)
-	_, err = db.Exec(`
+	_, err = db.ExecContext(t.Context(), `
 		INSERT INTO document_extraction_profiles
 			(id, fingerprint, provider, endpoint, region, model,
 			 retention_posture, training_posture, allowed_media_types, policy_json, enabled)
@@ -1346,9 +1692,9 @@ func TestCopySubsetExcludesDocumentDerivativesAndHostedConsent(t *testing.T) {
 		VALUES (?, 'openai_compatible', 'https://api.example.test/v1',
 		        'gpt-test', 'TEST_KEY', 'zero_retention', 'no_training',
 		        '["conversation_text"]', '2025-01-01', '{}');
-		INSERT INTO person_inference_consents
-			(profile_fingerprint, granted_by)
-		VALUES (?, 'cli');
+		INSERT INTO provider_consents
+			(purpose, id, fingerprint, granted_by)
+		VALUES ('people_inference', 1, ?, 'cli');
 		INSERT INTO person_semantic_embedding_profiles
 			(fingerprint, purpose, destination, api_format, model, api_key_env,
 			 retention_posture, training_posture, renderer_policy,
@@ -1357,9 +1703,9 @@ func TestCopySubsetExcludesDocumentDerivativesAndHostedConsent(t *testing.T) {
 		        'openai', 'synthetic-model', 'TEST_KEY', 'zero_data_retention',
 		        'no_training', 'person-semantic-v1', '["person_display_name"]',
 		        'all_durable_people', '{}');
-		INSERT INTO person_semantic_embedding_consents
-			(profile_fingerprint, granted_by)
-		VALUES (?, 'cli')`,
+		INSERT INTO provider_consents
+			(purpose, id, fingerprint, granted_by)
+		VALUES ('person_semantic_embedding', 1, ?, 'cli')`,
 		fingerprint, fingerprint, strings.Repeat("b", 64), strings.Repeat("c", 64), strings.Repeat("d", 64),
 		strings.Repeat("e", 64), strings.Repeat("e", 64),
 		strings.Repeat("f", 64), strings.Repeat("f", 64),
@@ -1367,9 +1713,9 @@ func TestCopySubsetExcludesDocumentDerivativesAndHostedConsent(t *testing.T) {
 	require.NoError(err)
 	require.NoError(db.Close())
 
-	_, err = CopySubset(srcDB, dstDir, 1, false)
+	_, err = CopySubset(t.Context(), srcDB, dstDir, 1, false)
 	require.NoError(err)
-	destination, err := sql.Open("sqlite3", filepath.Join(dstDir, "msgvault.db"))
+	destination, err := sql.Open(sqliteutil.DriverName(), filepath.Join(dstDir, "msgvault.db"))
 	require.NoError(err)
 	defer func() { _ = destination.Close() }()
 	for _, table := range []string{
@@ -1377,11 +1723,10 @@ func TestCopySubsetExcludesDocumentDerivativesAndHostedConsent(t *testing.T) {
 		"document_extraction_rebuilds", "document_extraction_rebuild_targets",
 		"document_extraction_heads", "document_units", "document_chunks", "document_chunk_spans",
 		"document_occurrences", "document_extraction_claims",
-		"person_inference_profiles", "person_inference_consents",
-		"person_semantic_embedding_profiles", "person_semantic_embedding_consents",
+		"person_inference_profiles", "person_semantic_embedding_profiles", "provider_consents",
 	} {
 		var count int
-		require.NoError(destination.QueryRow(`SELECT COUNT(*) FROM `+table).Scan(&count), table)
+		require.NoError(destination.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM `+table).Scan(&count), table)
 		assert.Zero(t, count, table+" must require a target-side rebuild")
 	}
 }
@@ -1410,8 +1755,8 @@ func TestCopySubsetExcludesPersonEnrichmentSuppressionAndOperations(t *testing.T
 			 endpoint, api_key_env, policy_json)
 		 VALUES (?, 'subset-provider', 'exa', 'https://provider.example.test',
 			 'https://provider.example.test/search', 'SUBSET_PROVIDER_KEY', '{}')`, []any{fingerprint}},
-		{`INSERT INTO person_enrichment_consents
-			(profile_fingerprint, granted_by) VALUES (?, 'subset-test')`, []any{fingerprint}},
+		{`INSERT INTO provider_consents
+			(purpose, id, fingerprint, granted_by) VALUES ('person_enrichment', 1, ?, 'subset-test')`, []any{fingerprint}},
 		{`INSERT INTO person_enrichment_suppressions
 			(provider_namespace, identifier_class, normalization_version, key_id,
 			 digest, reason, actor)
@@ -1485,7 +1830,7 @@ func TestCopySubsetExcludesPersonEnrichmentSuppressionAndOperations(t *testing.T
 
 	tables := []string{
 		"person_enrichment_profiles",
-		"person_enrichment_consents",
+		"provider_consents",
 		"person_enrichment_suppressions",
 		"person_enrichment_runs",
 		"person_enrichment_manual_run_targets",
@@ -1501,26 +1846,26 @@ func TestCopySubsetExcludesPersonEnrichmentSuppressionAndOperations(t *testing.T
 		"person_enrichment_day_counters",
 		"person_enrichment_profile_accounting",
 	}
-	sourceDB, err := sql.Open("sqlite3", srcDB)
+	sourceDB, err := sql.Open(sqliteutil.DriverName(), srcDB)
 	require.NoError(err)
 	for _, table := range tables {
 		var count int
-		require.NoError(sourceDB.QueryRow(`SELECT COUNT(*) FROM `+table).Scan(&count), table)
+		require.NoError(sourceDB.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM `+table).Scan(&count), table)
 		assert.Positive(count, table+" source fixture")
 	}
 	require.NoError(sourceDB.Close())
 
 	dstDir := filepath.Join(t.TempDir(), "dst")
-	_, err = CopySubsetWithOptions(srcDB, dstDir, 5, CopySubsetOptions{
+	_, err = CopySubsetWithOptions(t.Context(), srcDB, dstDir, 5, CopySubsetOptions{
 		IncludeProfiles: true, IncludeAttributes: true,
 	})
 	require.NoError(err)
-	destination, err := sql.Open("sqlite3", filepath.Join(dstDir, "msgvault.db"))
+	destination, err := sql.Open(sqliteutil.DriverName(), filepath.Join(dstDir, "msgvault.db"))
 	require.NoError(err)
 	defer func() { require.NoError(destination.Close()) }()
 	for _, table := range tables {
 		var count int
-		require.NoError(destination.QueryRow(`SELECT COUNT(*) FROM `+table).Scan(&count), table)
+		require.NoError(destination.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM `+table).Scan(&count), table)
 		assert.Zero(count, table+" must not cross the subset boundary")
 	}
 }
@@ -1534,21 +1879,24 @@ func TestCopySubset_UpgradedMessageColumnOrder(t *testing.T) {
 
 	st, err := Open(srcDB)
 	require.NoError(err, "open source for upgrade")
-	// A pre-attribution archive predates both triggers that name source_is_from_me.
-	// The upgrade below reinstalls them through their migrations.
-	_, err = st.DB().Exec(`
+	// A pre-attribution archive predates both triggers and the chat owner
+	// index that name source_is_from_me. The upgrade below reinstalls them
+	// through their migrations.
+	_, err = st.DB().ExecContext(t.Context(), `
 		DROP TRIGGER trg_activity_queue_messages_update;
 		DROP TRIGGER trg_cache_message_facts_update;
+		DROP INDEX idx_messages_source_owner;
 		ALTER TABLE messages DROP COLUMN identity_is_from_me;
 		ALTER TABLE messages DROP COLUMN source_is_from_me;
 		DELETE FROM applied_migrations
 		WHERE name IN ('message_attribution_provenance_v3',
-		               'activity_projection_triggers_v4',
-		               'cache_message_source_attribution');
+		               'activity_projection_triggers_v6',
+		               'cache_message_source_attribution',
+		               'chat_members_v1');
 	`)
 	require.NoError(err, "simulate pre-attribution schema")
 	require.NoError(st.InitSchema(), "upgrade source schema")
-	_, err = st.DB().Exec(`
+	_, err = st.DB().ExecContext(t.Context(), `
 		UPDATE messages
 		SET is_from_me = TRUE,
 		    source_is_from_me = FALSE,
@@ -1560,18 +1908,18 @@ func TestCopySubset_UpgradedMessageColumnOrder(t *testing.T) {
 	require.NoError(err, "seed upgraded message columns")
 	require.NoError(st.Close(), "close upgraded source")
 
-	result, err := CopySubset(srcDB, dstDir, 1, false)
+	result, err := CopySubset(t.Context(), srcDB, dstDir, 1, false)
 	require.NoError(err, "CopySubset from upgraded schema")
 	assert.Equal(int64(1), result.Messages)
 
-	db, err := sql.Open("sqlite3", filepath.Join(dstDir, "msgvault.db"))
+	db, err := sql.Open(sqliteutil.DriverName(), filepath.Join(dstDir, "msgvault.db"))
 	require.NoError(err, "open copied database")
 	defer func() { _ = db.Close() }()
 
 	var sourceMessageID, messageType, subject, metadata string
 	var isFromMe, sourceIsFromMe, identityIsFromMe bool
 	var embedGen int64
-	require.NoError(db.QueryRow(`
+	require.NoError(db.QueryRowContext(t.Context(), `
 		SELECT source_message_id, message_type, subject,
 		       is_from_me, source_is_from_me, identity_is_from_me,
 		       metadata, embed_gen
@@ -1603,9 +1951,9 @@ func TestCopySubset_UpgradedAttachmentColumnOrder(t *testing.T) {
 	srcDB := createTestSourceDB(t, t.TempDir(), 1)
 	dstDir := filepath.Join(t.TempDir(), "dst")
 
-	legacy, err := sql.Open("sqlite3", srcDB+"?_foreign_keys=OFF")
+	legacy, err := sql.Open(sqliteutil.DriverName(), srcDB+"?_foreign_keys=OFF")
 	require.NoError(err)
-	_, err = legacy.Exec(`
+	_, err = legacy.ExecContext(t.Context(), `
 		DROP TRIGGER IF EXISTS trg_attachment_message_live_change;
 		DROP TABLE attachments;
 		CREATE TABLE attachments (
@@ -1629,7 +1977,7 @@ func TestCopySubset_UpgradedAttachmentColumnOrder(t *testing.T) {
 		);
 	`)
 	require.NoError(err, "restore pre-occurrence attachment schema")
-	_, err = legacy.Exec(`DELETE FROM applied_migrations WHERE name = ?`, migrationAttachmentOccurrenceUnique)
+	_, err = legacy.ExecContext(t.Context(), `DELETE FROM applied_migrations WHERE name = ?`, migrationAttachmentOccurrenceUnique)
 	require.NoError(err, "reopen attachment occurrence migration")
 	require.NoError(legacy.Close())
 
@@ -1644,15 +1992,15 @@ func TestCopySubset_UpgradedAttachmentColumnOrder(t *testing.T) {
 		Role: AttachmentRoleStandalone, RoleSource: AttachmentRoleSourceProviderExplicit,
 		SourcePartKey: "teams:link:a1", ContentID: "evidence@example.invalid",
 	}))
-	_, err = upgraded.DB().Exec(`UPDATE attachments SET encryption_version = 7 WHERE message_id = 1`)
+	_, err = upgraded.DB().ExecContext(t.Context(), `UPDATE attachments SET encryption_version = 7 WHERE message_id = 1`)
 	require.NoError(err)
 	require.NoError(upgraded.Close())
 
-	result, err := CopySubset(srcDB, dstDir, 1, false)
+	result, err := CopySubset(t.Context(), srcDB, dstDir, 1, false)
 	require.NoError(err, "copy subset from upgraded attachment schema")
 	assert.Equal(int64(1), result.Messages)
 
-	destination, err := sql.Open("sqlite3", filepath.Join(dstDir, "msgvault.db"))
+	destination, err := sql.Open(sqliteutil.DriverName(), filepath.Join(dstDir, "msgvault.db"))
 	require.NoError(err)
 	defer func() { _ = destination.Close() }()
 	var (
@@ -1661,7 +2009,7 @@ func TestCopySubset_UpgradedAttachmentColumnOrder(t *testing.T) {
 		sourcePartKey, contentID                       string
 		size, encryptionVersion                        int64
 	)
-	require.NoError(destination.QueryRow(`
+	require.NoError(destination.QueryRowContext(t.Context(), `
 		SELECT filename, mime_type, size, content_hash, storage_path,
 		       source_attachment_id, attachment_metadata, attachment_role,
 		       role_source, source_part_key, content_id, encryption_version
@@ -1691,7 +2039,7 @@ func TestCopySubset_AllRows(t *testing.T) {
 
 	srcDB := createTestSourceDB(t, srcDir, 5)
 
-	result, err := CopySubset(srcDB, dstDir, 100, false)
+	result, err := CopySubset(t.Context(), srcDB, dstDir, 100, false)
 	require.NoError(t, err, "CopySubset")
 
 	assert.Equal(t, int64(5), result.Messages, "Messages (all available)")
@@ -1711,7 +2059,7 @@ func TestCopySubset_PreservesPersonProfiles(t *testing.T) {
 	require.NoError(source.Close())
 
 	dstDir := filepath.Join(t.TempDir(), "dst")
-	_, err = CopySubset(srcDB, dstDir, 1, false)
+	_, err = CopySubset(t.Context(), srcDB, dstDir, 1, false)
 	require.NoError(err)
 	destination, err := Open(filepath.Join(dstDir, "msgvault.db"))
 	require.NoError(err)
@@ -1744,7 +2092,7 @@ func TestCopySubset_ExcludesStructuredProfilesByDefault(t *testing.T) {
 	require.NoError(source.Close())
 
 	dstDir := filepath.Join(t.TempDir(), "dst")
-	_, err = CopySubset(srcDB, dstDir, 5, false)
+	_, err = CopySubset(t.Context(), srcDB, dstDir, 5, false)
 	require.NoError(err)
 	destination, err := Open(filepath.Join(dstDir, "msgvault.db"))
 	require.NoError(err)
@@ -1761,9 +2109,9 @@ func TestCopySubset_LegacyParticipantIdentifiersCopyByColumnName(t *testing.T) {
 	assert := assert.New(t)
 	srcDB := createTestSourceDB(t, t.TempDir(), 1)
 
-	db, err := sql.Open("sqlite3", srcDB+"?_foreign_keys=OFF")
+	db, err := sql.Open(sqliteutil.DriverName(), srcDB+"?_foreign_keys=OFF")
 	require.NoError(err)
-	_, err = db.Exec(`
+	_, err = db.ExecContext(t.Context(), `
 		DROP INDEX IF EXISTS idx_participant_identifiers_service_scope;
 		ALTER TABLE participant_identifiers RENAME TO participant_identifiers_current;
 		CREATE TABLE participant_identifiers (
@@ -1788,15 +2136,15 @@ func TestCopySubset_LegacyParticipantIdentifiersCopyByColumnName(t *testing.T) {
 	require.NoError(db.Close())
 
 	dstDir := filepath.Join(t.TempDir(), "dst")
-	_, err = CopySubset(srcDB, dstDir, 1, false)
+	_, err = CopySubset(t.Context(), srcDB, dstDir, 1, false)
 	require.NoError(err, "copy legacy participant identifiers")
-	destination, err := sql.Open("sqlite3", filepath.Join(dstDir, "msgvault.db"))
+	destination, err := sql.Open(sqliteutil.DriverName(), filepath.Join(dstDir, "msgvault.db"))
 	require.NoError(err)
 	t.Cleanup(func() { _ = destination.Close() })
 
 	var participantID int64
 	var serviceID sql.NullInt64
-	require.NoError(destination.QueryRow(`SELECT participant_id, service_id
+	require.NoError(destination.QueryRowContext(t.Context(), `SELECT participant_id, service_id
 		FROM participant_identifiers
 		WHERE identifier_type = 'email' AND identifier_value = 'bob@example.com'`).
 		Scan(&participantID, &serviceID))
@@ -1832,7 +2180,7 @@ func TestCopySubsetRemapsParticipantIdentifierServicesWithoutProfiles(t *testing
 	require.NoError(source.Close())
 
 	dstDir := filepath.Join(t.TempDir(), "dst")
-	_, err = CopySubset(srcDB, dstDir, 1, false)
+	_, err = CopySubset(t.Context(), srcDB, dstDir, 1, false)
 	require.NoError(err)
 	destination, err := Open(filepath.Join(dstDir, "msgvault.db"))
 	require.NoError(err)
@@ -1877,7 +2225,7 @@ func TestCopySubsetPreservesStructuredProfileHistoryAndDependencies(t *testing.T
 	require.NoError(err)
 	profileSource, err := source.GetOrCreateSource("profile-fixture", "profile-only")
 	require.NoError(err)
-	_, err = source.DB().Exec(`INSERT INTO labels (
+	_, err = source.DB().ExecContext(t.Context(), `INSERT INTO labels (
 		id, source_id, source_label_id, name, label_type
 	) VALUES (?, ?, ?, ?, ?)`,
 		9001, profileSource.ID, "profile-private", "Profile Private", "user",
@@ -1954,7 +2302,7 @@ func TestCopySubsetPreservesStructuredProfileHistoryAndDependencies(t *testing.T
 	require.NoError(source.Close())
 
 	dstDir := filepath.Join(t.TempDir(), "dst")
-	_, err = CopySubsetWithOptions(srcDB, dstDir, 1, CopySubsetOptions{
+	_, err = CopySubsetWithOptions(t.Context(), srcDB, dstDir, 1, CopySubsetOptions{
 		IncludeProfiles: true,
 	})
 	require.NoError(err)
@@ -1996,7 +2344,8 @@ func TestCopySubsetPreservesStructuredProfileHistoryAndDependencies(t *testing.T
 	require.NotNil(copiedCandidate.Evidence[0].EvidenceRef)
 	assert.Equal("fixture-evidence", *copiedCandidate.Evidence[0].EvidenceRef)
 	var leakedProfileLabels int
-	require.NoError(destination.DB().QueryRow(
+	require.NoError(destination.DB().QueryRowContext(
+		t.Context(),
 		`SELECT COUNT(*) FROM labels WHERE source_id = ?`, profileSource.ID,
 	).Scan(&leakedProfileLabels))
 	assert.Zero(leakedProfileLabels,
@@ -2052,7 +2401,7 @@ func TestCopySubsetPreservesIdentityMatchSourceSupport(t *testing.T) {
 	require.NoError(source.Close())
 
 	dstDir := filepath.Join(t.TempDir(), "dst")
-	_, err = CopySubsetWithOptions(srcDB, dstDir, 5, CopySubsetOptions{
+	_, err = CopySubsetWithOptions(t.Context(), srcDB, dstDir, 5, CopySubsetOptions{
 		IncludeProfiles: true,
 	})
 	require.NoError(err)
@@ -2064,11 +2413,11 @@ func TestCopySubsetPreservesIdentityMatchSourceSupport(t *testing.T) {
 	require.NoError(err, "support-only source must be copied before support rows")
 	assert.Equal("support-only", copiedSource.Identifier)
 	var candidateSupport, evidenceSupport int
-	require.NoError(destination.DB().QueryRow(`SELECT COUNT(*)
+	require.NoError(destination.DB().QueryRowContext(t.Context(), `SELECT COUNT(*)
 		FROM identity_match_candidate_sources
 		WHERE candidate_id = ? AND source_id = ?`, candidate.ID, supportSource.ID).
 		Scan(&candidateSupport))
-	require.NoError(destination.DB().QueryRow(`SELECT COUNT(*)
+	require.NoError(destination.DB().QueryRowContext(t.Context(), `SELECT COUNT(*)
 		FROM identity_match_evidence_sources
 		WHERE evidence_id = ? AND source_id = ?`, evidence.ID, supportSource.ID).
 		Scan(&evidenceSupport))
@@ -2096,7 +2445,8 @@ func TestCopySubsetOmitsConservativeIdentitySourceMetadata(t *testing.T) {
 	require.NoError(err)
 	legacySource, err := source.GetOrCreateSource("beeper", "legacy-private")
 	require.NoError(err)
-	_, err = source.DB().Exec(
+	_, err = source.DB().ExecContext(
+		t.Context(),
 		`UPDATE sources SET sync_config = ? WHERE id = ?`,
 		`{"account_email":"excluded@example.invalid","sync_token":"synthetic"}`,
 		legacySource.ID,
@@ -2123,13 +2473,15 @@ func TestCopySubsetOmitsConservativeIdentitySourceMetadata(t *testing.T) {
 		},
 	)
 	require.NoError(err)
-	_, err = source.DB().Exec(
+	_, err = source.DB().ExecContext(
+		t.Context(),
 		`INSERT INTO identity_match_candidate_sources
 			(candidate_id, source_id, is_conservative) VALUES (?, ?, TRUE)`,
 		candidate.ID, legacySource.ID,
 	)
 	require.NoError(err)
-	_, err = source.DB().Exec(
+	_, err = source.DB().ExecContext(
+		t.Context(),
 		`INSERT INTO identity_match_evidence_sources
 			(evidence_id, source_id, is_conservative) VALUES (?, ?, TRUE)`,
 		evidence.ID, legacySource.ID,
@@ -2138,7 +2490,7 @@ func TestCopySubsetOmitsConservativeIdentitySourceMetadata(t *testing.T) {
 	require.NoError(source.Close())
 
 	dstDir := filepath.Join(t.TempDir(), "dst")
-	_, err = CopySubsetWithOptions(srcDB, dstDir, 5, CopySubsetOptions{
+	_, err = CopySubsetWithOptions(t.Context(), srcDB, dstDir, 5, CopySubsetOptions{
 		IncludeProfiles: true,
 	})
 	require.NoError(err)
@@ -2147,11 +2499,13 @@ func TestCopySubsetOmitsConservativeIdentitySourceMetadata(t *testing.T) {
 	t.Cleanup(func() { _ = destination.Close() })
 
 	var leakedSource, leakedAccountMetadata int
-	require.NoError(destination.DB().QueryRow(
+	require.NoError(destination.DB().QueryRowContext(
+		t.Context(),
 		destination.Rebind(`SELECT COUNT(*) FROM sources WHERE id = ?`),
 		legacySource.ID,
 	).Scan(&leakedSource))
-	require.NoError(destination.DB().QueryRow(
+	require.NoError(destination.DB().QueryRowContext(
+		t.Context(),
 		`SELECT COUNT(*) FROM sources WHERE sync_config LIKE '%excluded@example.invalid%'`,
 	).Scan(&leakedAccountMetadata))
 	assert.Zero(leakedSource,
@@ -2160,11 +2514,11 @@ func TestCopySubsetOmitsConservativeIdentitySourceMetadata(t *testing.T) {
 		"excluded source account metadata must remain absent from the subset")
 
 	var copiedLegacyCandidateSupport, copiedLegacyEvidenceSupport int
-	require.NoError(destination.DB().QueryRow(destination.Rebind(`
+	require.NoError(destination.DB().QueryRowContext(t.Context(), destination.Rebind(`
 		SELECT COUNT(*) FROM identity_match_candidate_sources
 		WHERE candidate_id = ? AND source_id = ?
 	`), candidate.ID, legacySource.ID).Scan(&copiedLegacyCandidateSupport))
-	require.NoError(destination.DB().QueryRow(destination.Rebind(`
+	require.NoError(destination.DB().QueryRowContext(t.Context(), destination.Rebind(`
 		SELECT COUNT(*) FROM identity_match_evidence_sources
 		WHERE evidence_id = ? AND source_id = ?
 	`), evidence.ID, legacySource.ID).Scan(&copiedLegacyEvidenceSupport))
@@ -2223,13 +2577,15 @@ func TestCopySubsetPreservesConservativeSupportForIncludedSources(t *testing.T) 
 		ctx, candidate.ID, string(ProvenanceSystem), nil,
 	)
 	require.NoError(err)
-	_, err = source.DB().Exec(
+	_, err = source.DB().ExecContext(
+		t.Context(),
 		`INSERT INTO identity_match_candidate_sources
 			(candidate_id, source_id, is_conservative) VALUES (?, ?, TRUE)`,
 		candidate.ID, selectedSourceID,
 	)
 	require.NoError(err)
-	_, err = source.DB().Exec(
+	_, err = source.DB().ExecContext(
+		t.Context(),
 		`INSERT INTO identity_match_evidence_sources
 			(evidence_id, source_id, is_conservative) VALUES (?, ?, TRUE)`,
 		evidence.ID, selectedSourceID,
@@ -2238,7 +2594,7 @@ func TestCopySubsetPreservesConservativeSupportForIncludedSources(t *testing.T) 
 	require.NoError(source.Close())
 
 	dstDir := filepath.Join(t.TempDir(), "dst")
-	_, err = CopySubsetWithOptions(srcDB, dstDir, 5, CopySubsetOptions{
+	_, err = CopySubsetWithOptions(t.Context(), srcDB, dstDir, 5, CopySubsetOptions{
 		IncludeProfiles: true,
 	})
 	require.NoError(err)
@@ -2247,11 +2603,11 @@ func TestCopySubsetPreservesConservativeSupportForIncludedSources(t *testing.T) 
 	t.Cleanup(func() { _ = destination.Close() })
 
 	var candidateSupport, evidenceSupport int
-	require.NoError(destination.DB().QueryRow(`SELECT COUNT(*)
+	require.NoError(destination.DB().QueryRowContext(t.Context(), `SELECT COUNT(*)
 		FROM identity_match_candidate_sources
 		WHERE candidate_id = ? AND source_id = ? AND is_conservative = TRUE`,
 		candidate.ID, selectedSourceID).Scan(&candidateSupport))
-	require.NoError(destination.DB().QueryRow(`SELECT COUNT(*)
+	require.NoError(destination.DB().QueryRowContext(t.Context(), `SELECT COUNT(*)
 		FROM identity_match_evidence_sources
 		WHERE evidence_id = ? AND source_id = ? AND is_conservative = TRUE`,
 		evidence.ID, selectedSourceID).Scan(&evidenceSupport))
@@ -2265,7 +2621,7 @@ func TestCopySubsetPreservesConservativeSupportForIncludedSources(t *testing.T) 
 	require.Len(reloaded.Evidence, 1)
 	assert.Equal(evidence.ID, reloaded.Evidence[0].ID)
 	var linkCount int
-	require.NoError(destination.DB().QueryRow(`SELECT COUNT(*) FROM participant_links
+	require.NoError(destination.DB().QueryRowContext(t.Context(), `SELECT COUNT(*) FROM participant_links
 		WHERE participant_a = 2 AND participant_b = 3`).Scan(&linkCount))
 	assert.Equal(1, linkCount)
 }
@@ -2273,7 +2629,7 @@ func TestCopySubsetPreservesConservativeSupportForIncludedSources(t *testing.T) 
 func TestCopySubset_AttributesRequireExplicitOptIn(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	srcDB := createTestSourceDB(t, t.TempDir(), 5)
 	source, err := Open(srcDB)
 	require.NoError(err)
@@ -2316,7 +2672,7 @@ func TestCopySubset_AttributesRequireExplicitOptIn(t *testing.T) {
 	require.NoError(source.Close())
 
 	dstDir := filepath.Join(t.TempDir(), "dst")
-	_, err = CopySubset(srcDB, dstDir, 5, false)
+	_, err = CopySubset(t.Context(), srcDB, dstDir, 5, false)
 	require.NoError(err)
 	destination, err := Open(filepath.Join(dstDir, "msgvault.db"))
 	require.NoError(err)
@@ -2337,7 +2693,7 @@ func TestCopySubset_AttributesRequireExplicitOptIn(t *testing.T) {
 		"shared subsets must not copy current or historical person attribute values by default")
 
 	attributesDir := filepath.Join(t.TempDir(), "attributes")
-	_, err = CopySubsetWithOptions(srcDB, attributesDir, 5, CopySubsetOptions{
+	_, err = CopySubsetWithOptions(t.Context(), srcDB, attributesDir, 5, CopySubsetOptions{
 		IncludeAttributes: true,
 	})
 	require.NoError(err)
@@ -2378,14 +2734,14 @@ func TestCopySubset_AttributesRequireExplicitOptIn(t *testing.T) {
 func TestCopySubsetPreservesRawLegacySeedCollision(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	srcDB := createTestSourceDB(t, t.TempDir(), 5)
 	source, err := Open(srcDB)
 	require.NoError(err)
 	person, _, err := source.CreatePersonFromParticipant(2)
 	require.NoError(err)
 
-	_, err = source.DB().Exec(source.Rebind(`
+	_, err = source.DB().ExecContext(t.Context(), source.Rebind(`
 		DELETE FROM attribute_definitions WHERE universal_id = ?
 	`), AttributeUniversalIDLocation)
 	require.NoError(err)
@@ -2407,7 +2763,7 @@ func TestCopySubsetPreservesRawLegacySeedCollision(t *testing.T) {
 	require.NoError(source.Close())
 
 	destinationDir := filepath.Join(t.TempDir(), "legacy-seed-collision")
-	_, err = CopySubsetWithOptions(srcDB, destinationDir, 5, CopySubsetOptions{
+	_, err = CopySubsetWithOptions(t.Context(), srcDB, destinationDir, 5, CopySubsetOptions{
 		IncludeAttributes: true,
 	})
 	require.NoError(err)
@@ -2447,11 +2803,11 @@ func TestCopySubsetPreservesRawLegacySeedCollision(t *testing.T) {
 func TestCopySubsetResolvesCombinedRawSeedIdentityCollision(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	srcDB := createTestSourceDB(t, t.TempDir(), 5)
 	source, err := Open(srcDB)
 	require.NoError(err)
-	_, err = source.DB().Exec(source.Rebind(`
+	_, err = source.DB().ExecContext(t.Context(), source.Rebind(`
 		UPDATE attribute_definitions
 		SET slug = 'location_custom'
 		WHERE universal_id = ?
@@ -2464,7 +2820,7 @@ func TestCopySubsetResolvesCombinedRawSeedIdentityCollision(t *testing.T) {
 	require.NoError(source.Close())
 
 	destinationDir := filepath.Join(t.TempDir(), "combined-seed-collision")
-	_, err = CopySubsetWithOptions(srcDB, destinationDir, 5, CopySubsetOptions{
+	_, err = CopySubsetWithOptions(t.Context(), srcDB, destinationDir, 5, CopySubsetOptions{
 		IncludeAttributes: true,
 	})
 	require.NoError(err)
@@ -2486,14 +2842,14 @@ func TestCopySubsetResolvesCombinedRawSeedIdentityCollision(t *testing.T) {
 func TestCopySubset_AttributesDefaultLegacySensitivityToFalse(t *testing.T) {
 	require := require.New(t)
 	srcDB := createTestSourceDB(t, t.TempDir(), 3)
-	db, err := sql.Open("sqlite3", srcDB+"?_foreign_keys=OFF")
+	db, err := sql.Open(sqliteutil.DriverName(), srcDB+"?_foreign_keys=OFF")
 	require.NoError(err)
-	_, err = db.Exec(`ALTER TABLE attribute_definitions DROP COLUMN is_sensitive`)
+	_, err = db.ExecContext(t.Context(), `ALTER TABLE attribute_definitions DROP COLUMN is_sensitive`)
 	require.NoError(err)
 	require.NoError(db.Close())
 
 	dstDir := filepath.Join(t.TempDir(), "legacy-attributes")
-	_, err = CopySubsetWithOptions(srcDB, dstDir, 3, CopySubsetOptions{
+	_, err = CopySubsetWithOptions(t.Context(), srcDB, dstDir, 3, CopySubsetOptions{
 		IncludeAttributes: true,
 	})
 	require.NoError(err)
@@ -2510,7 +2866,7 @@ func TestCopySubset_AttributesDefaultLegacySensitivityToFalse(t *testing.T) {
 func TestCopySubset_RecordReferencesFollowIdentityPolicy(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	srcDB := createTestSourceDB(t, t.TempDir(), 5)
 	source, err := Open(srcDB)
 	require.NoError(err)
@@ -2542,7 +2898,7 @@ func TestCopySubset_RecordReferencesFollowIdentityPolicy(t *testing.T) {
 	require.NoError(source.Close())
 
 	defaultDir := filepath.Join(t.TempDir(), "default")
-	_, err = CopySubset(srcDB, defaultDir, 5, false)
+	_, err = CopySubset(t.Context(), srcDB, defaultDir, 5, false)
 	require.NoError(err)
 	defaultSubset, err := Open(filepath.Join(defaultDir, "msgvault.db"))
 	require.NoError(err)
@@ -2562,7 +2918,7 @@ func TestCopySubset_RecordReferencesFollowIdentityPolicy(t *testing.T) {
 		"record references to excluded identities must not dangle in the subset")
 
 	identityDir := filepath.Join(t.TempDir(), "identity")
-	_, err = CopySubsetWithOptions(srcDB, identityDir, 5, CopySubsetOptions{
+	_, err = CopySubsetWithOptions(t.Context(), srcDB, identityDir, 5, CopySubsetOptions{
 		IncludeIdentity:   true,
 		IncludeAttributes: true,
 	})
@@ -2604,7 +2960,7 @@ func TestCopySubset_IncludeIdentityPreservesClusters(t *testing.T) {
 	require.NoError(source.Close())
 
 	dstDir := filepath.Join(t.TempDir(), "dst")
-	_, err = CopySubset(srcDB, dstDir, 5, true)
+	_, err = CopySubset(t.Context(), srcDB, dstDir, 5, true)
 	require.NoError(err)
 	destination, err := Open(filepath.Join(dstDir, "msgvault.db"))
 	require.NoError(err)
@@ -2639,20 +2995,23 @@ func TestCopySubset_DefaultExcludesOffMessageIdentities(t *testing.T) {
 	require.NoError(source.Close())
 
 	dstDir := filepath.Join(t.TempDir(), "dst")
-	_, err = CopySubset(srcDB, dstDir, 5, false)
+	_, err = CopySubset(t.Context(), srcDB, dstDir, 5, false)
 	require.NoError(err)
-	db, err := sql.Open("sqlite3", filepath.Join(dstDir, "msgvault.db"))
+	db, err := sql.Open(sqliteutil.DriverName(), filepath.Join(dstDir, "msgvault.db"))
 	require.NoError(err)
 	t.Cleanup(func() { _ = db.Close() })
 
 	var count int64
-	require.NoError(db.QueryRow(
+	require.NoError(db.QueryRowContext(
+		t.Context(),
 		"SELECT COUNT(*) FROM participants WHERE id = ?", alias).Scan(&count))
 	assert.Zero(count, "off-message cluster-mate must not be copied")
-	require.NoError(db.QueryRow(
+	require.NoError(db.QueryRowContext(
+		t.Context(),
 		"SELECT COUNT(*) FROM participant_links").Scan(&count))
 	assert.Zero(count, "link edge to an excluded participant must not be copied")
-	require.NoError(db.QueryRow(
+	require.NoError(db.QueryRowContext(
+		t.Context(),
 		"SELECT COUNT(*) FROM persons WHERE id = ?", person.ID).Scan(&count))
 	assert.Zero(count, "person with out-of-subset bindings must be skipped, not truncated")
 }
@@ -2678,7 +3037,7 @@ func TestCopySubset_IncludeIdentitySpansUnlinkedClusters(t *testing.T) {
 	require.NoError(source.Close())
 
 	dstDir := filepath.Join(t.TempDir(), "dst")
-	_, err = CopySubset(srcDB, dstDir, 5, true)
+	_, err = CopySubset(t.Context(), srcDB, dstDir, 5, true)
 	require.NoError(err)
 	destination, err := Open(filepath.Join(dstDir, "msgvault.db"))
 	require.NoError(err)
@@ -2696,15 +3055,15 @@ func TestCopySubset_FTSPopulated(t *testing.T) {
 
 	srcDB := createTestSourceDB(t, srcDir, 5)
 
-	_, err := CopySubset(srcDB, dstDir, 5, false)
+	_, err := CopySubset(t.Context(), srcDB, dstDir, 5, false)
 	require.NoError(t, err, "CopySubset")
 
-	db, err := sql.Open("sqlite3", filepath.Join(dstDir, "msgvault.db"))
+	db, err := sql.Open(sqliteutil.DriverName(), filepath.Join(dstDir, "msgvault.db"))
 	require.NoError(t, err)
 	defer func() { _ = db.Close() }()
 
 	var count int64
-	err = db.QueryRow("SELECT COUNT(*) FROM messages_fts").Scan(&count)
+	err = db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM messages_fts").Scan(&count)
 	if err != nil {
 		t.Skip("FTS5 not available")
 	}
@@ -2718,14 +3077,14 @@ func TestCopySubset_ConversationCounts(t *testing.T) {
 
 	srcDB := createTestSourceDB(t, srcDir, 10)
 
-	_, err := CopySubset(srcDB, dstDir, 5, false)
+	_, err := CopySubset(t.Context(), srcDB, dstDir, 5, false)
 	require.NoError(err, "CopySubset")
 
-	db, err := sql.Open("sqlite3", filepath.Join(dstDir, "msgvault.db"))
+	db, err := sql.Open(sqliteutil.DriverName(), filepath.Join(dstDir, "msgvault.db"))
 	require.NoError(err)
 	defer func() { _ = db.Close() }()
 
-	rows, err := db.Query(`
+	rows, err := db.QueryContext(t.Context(), `
 		SELECT c.id, c.message_count,
 			(SELECT COUNT(*) FROM messages m
 			 WHERE m.conversation_id = c.id) AS actual_count
@@ -2752,7 +3111,7 @@ func TestCopySubset_DestinationEmptyDir(t *testing.T) {
 
 	require.NoError(os.MkdirAll(dstDir, 0755))
 
-	result, err := CopySubset(srcDB, dstDir, 5, false)
+	result, err := CopySubset(t.Context(), srcDB, dstDir, 5, false)
 	require.NoError(err, "CopySubset with pre-existing empty dir")
 
 	assert.Equal(int64(5), result.Messages, "Messages")
@@ -2773,7 +3132,7 @@ func TestCopySubset_DestinationDBExists(t *testing.T) {
 		filepath.Join(dstDir, "msgvault.db"), []byte("existing"), 0644,
 	))
 
-	_, err := CopySubset(srcDB, dstDir, 5, false)
+	_, err := CopySubset(t.Context(), srcDB, dstDir, 5, false)
 	require.Error(err, "expected error when destination DB exists")
 	assert.ErrorContains(t, err, "destination database already exists")
 }
@@ -2786,14 +3145,14 @@ func TestCopySubset_SQLInjectionInPath(t *testing.T) {
 	require.NoError(t, os.MkdirAll(quotedDir, 0755))
 	srcDB := createTestSourceDB(t, quotedDir, 3)
 
-	result, err := CopySubset(srcDB, dstDir, 3, false)
+	result, err := CopySubset(t.Context(), srcDB, dstDir, 3, false)
 	require.NoError(t, err, "CopySubset with quoted path")
 	assert.Equal(t, int64(3), result.Messages, "Messages")
 }
 
 func TestCopySubset_NonPositiveRowCount(t *testing.T) {
 	for _, n := range []int{0, -1, -100} {
-		_, err := CopySubset("/tmp/fake.db", t.TempDir(), n, false)
+		_, err := CopySubset(t.Context(), "/tmp/fake.db", t.TempDir(), n, false)
 		assert.Error(t, err, "CopySubset(rowCount=%d) should error", n)
 	}
 }
@@ -2810,18 +3169,18 @@ func TestCopySubset_TimestampFallback(t *testing.T) {
 	require.NoError(st.InitSchema(), "InitSchema")
 	_ = st.Close()
 
-	db, err := sql.Open("sqlite3", dbPath+"?_foreign_keys=OFF")
+	db, err := sql.Open(sqliteutil.DriverName(), dbPath+"?_foreign_keys=OFF")
 	require.NoError(err)
 
-	_, err = db.Exec(`
+	_, err = db.ExecContext(t.Context(), `
 		INSERT INTO sources (id, source_type, identifier)
 		VALUES (1, 'gmail', 'test@example.com')`)
 	require.NoError(err)
-	_, err = db.Exec(`
+	_, err = db.ExecContext(t.Context(), `
 		INSERT INTO participants (id, email_address, domain)
 		VALUES (1, 'alice@example.com', 'example.com')`)
 	require.NoError(err)
-	_, err = db.Exec(`
+	_, err = db.ExecContext(t.Context(), `
 		INSERT INTO conversations
 			(id, source_id, conversation_type, title,
 			 message_count, participant_count)
@@ -2829,7 +3188,7 @@ func TestCopySubset_TimestampFallback(t *testing.T) {
 	require.NoError(err)
 
 	// msg 1: only received_at (no sent_at), most recent
-	_, err = db.Exec(`
+	_, err = db.ExecContext(t.Context(), `
 		INSERT INTO messages
 			(id, conversation_id, source_id, source_message_id,
 			 message_type, received_at, sender_id, subject)
@@ -2838,7 +3197,7 @@ func TestCopySubset_TimestampFallback(t *testing.T) {
 	require.NoError(err)
 
 	// msg 2: only internal_date (no sent_at), second most recent
-	_, err = db.Exec(`
+	_, err = db.ExecContext(t.Context(), `
 		INSERT INTO messages
 			(id, conversation_id, source_id, source_message_id,
 			 message_type, internal_date, sender_id, subject)
@@ -2847,7 +3206,7 @@ func TestCopySubset_TimestampFallback(t *testing.T) {
 	require.NoError(err)
 
 	// msg 3: has sent_at, oldest
-	_, err = db.Exec(`
+	_, err = db.ExecContext(t.Context(), `
 		INSERT INTO messages
 			(id, conversation_id, source_id, source_message_id,
 			 message_type, sent_at, sender_id, subject)
@@ -2856,7 +3215,7 @@ func TestCopySubset_TimestampFallback(t *testing.T) {
 	require.NoError(err)
 
 	for i := 1; i <= 3; i++ {
-		_, err = db.Exec(`
+		_, err = db.ExecContext(t.Context(), `
 			INSERT INTO message_recipients
 				(message_id, participant_id, recipient_type)
 			VALUES (?, 1, 'from')`, i)
@@ -2866,17 +3225,17 @@ func TestCopySubset_TimestampFallback(t *testing.T) {
 
 	// Request 2 most recent — should get msg 1 and 2 (by fallback
 	// timestamps), not just msg 3 (the only one with sent_at).
-	result, err := CopySubset(dbPath, dstDir, 2, false)
+	result, err := CopySubset(t.Context(), dbPath, dstDir, 2, false)
 	require.NoError(err, "CopySubset")
 	assert.Equal(int64(2), result.Messages, "Messages")
 
-	dstDB, err := sql.Open("sqlite3",
+	dstDB, err := sql.Open(sqliteutil.DriverName(),
 		filepath.Join(dstDir, "msgvault.db"))
 	require.NoError(err)
 	defer func() { _ = dstDB.Close() }()
 
 	var subjects []string
-	rows, err := dstDB.Query("SELECT subject FROM messages")
+	rows, err := dstDB.QueryContext(t.Context(), "SELECT subject FROM messages")
 	require.NoError(err)
 	defer func() { _ = rows.Close() }()
 	for rows.Next() {
@@ -2893,7 +3252,8 @@ func TestCopySubset_TimestampFallback(t *testing.T) {
 
 	// last_message_at must use the fallback timestamp, not be NULL
 	var lastMsg sql.NullString
-	require.NoError(dstDB.QueryRow(
+	require.NoError(dstDB.QueryRowContext(
+		t.Context(),
 		"SELECT last_message_at FROM conversations",
 	).Scan(&lastMsg))
 	assert.True(lastMsg.Valid, "last_message_at is NULL; should use fallback timestamp")
@@ -2911,18 +3271,18 @@ func TestCopySubset_TieBreaker(t *testing.T) {
 	require.NoError(st.InitSchema(), "InitSchema")
 	_ = st.Close()
 
-	db, err := sql.Open("sqlite3", dbPath+"?_foreign_keys=OFF")
+	db, err := sql.Open(sqliteutil.DriverName(), dbPath+"?_foreign_keys=OFF")
 	require.NoError(err)
 
-	_, err = db.Exec(`
+	_, err = db.ExecContext(t.Context(), `
 		INSERT INTO sources (id, source_type, identifier)
 		VALUES (1, 'gmail', 'test@example.com')`)
 	require.NoError(err)
-	_, err = db.Exec(`
+	_, err = db.ExecContext(t.Context(), `
 		INSERT INTO participants (id, email_address, domain)
 		VALUES (1, 'alice@example.com', 'example.com')`)
 	require.NoError(err)
-	_, err = db.Exec(`
+	_, err = db.ExecContext(t.Context(), `
 		INSERT INTO conversations
 			(id, source_id, conversation_type, title,
 			 message_count, participant_count)
@@ -2932,7 +3292,7 @@ func TestCopySubset_TieBreaker(t *testing.T) {
 	// 4 messages with identical timestamps; higher IDs should win
 	sameTime := "2025-06-01 12:00:00"
 	for i := 1; i <= 4; i++ {
-		_, err = db.Exec(`
+		_, err = db.ExecContext(t.Context(), `
 			INSERT INTO messages
 				(id, conversation_id, source_id, source_message_id,
 				 message_type, sent_at, sender_id, subject)
@@ -2940,7 +3300,7 @@ func TestCopySubset_TieBreaker(t *testing.T) {
 			i, fmt.Sprintf("msg_%d", i), sameTime,
 			fmt.Sprintf("Msg %d", i))
 		require.NoError(err, "insert message %d", i)
-		_, err = db.Exec(`
+		_, err = db.ExecContext(t.Context(), `
 			INSERT INTO message_recipients
 				(message_id, participant_id, recipient_type)
 			VALUES (?, 1, 'from')`, i)
@@ -2949,16 +3309,17 @@ func TestCopySubset_TieBreaker(t *testing.T) {
 	_ = db.Close()
 
 	// Select 2 of 4 — should get IDs 4 and 3 (highest IDs)
-	result, err := CopySubset(dbPath, dstDir, 2, false)
+	result, err := CopySubset(t.Context(), dbPath, dstDir, 2, false)
 	require.NoError(err, "CopySubset")
 	assert.Equal(int64(2), result.Messages, "Messages")
 
-	dstDB, err := sql.Open("sqlite3",
+	dstDB, err := sql.Open(sqliteutil.DriverName(),
 		filepath.Join(dstDir, "msgvault.db"))
 	require.NoError(err)
 	defer func() { _ = dstDB.Close() }()
 
-	rows, err := dstDB.Query(
+	rows, err := dstDB.QueryContext(
+		t.Context(),
 		"SELECT id FROM messages ORDER BY id")
 	require.NoError(err)
 	defer func() { _ = rows.Close() }()
@@ -2985,18 +3346,18 @@ func TestCopySubset_ReplyToOrphanNulled(t *testing.T) {
 	require.NoError(st.InitSchema(), "InitSchema")
 	_ = st.Close()
 
-	db, err := sql.Open("sqlite3", dbPath+"?_foreign_keys=OFF")
+	db, err := sql.Open(sqliteutil.DriverName(), dbPath+"?_foreign_keys=OFF")
 	require.NoError(err)
 
-	_, err = db.Exec(`
+	_, err = db.ExecContext(t.Context(), `
 		INSERT INTO sources (id, source_type, identifier)
 		VALUES (1, 'gmail', 'test@example.com')`)
 	require.NoError(err)
-	_, err = db.Exec(`
+	_, err = db.ExecContext(t.Context(), `
 		INSERT INTO participants (id, email_address, domain)
 		VALUES (1, 'alice@example.com', 'example.com')`)
 	require.NoError(err)
-	_, err = db.Exec(`
+	_, err = db.ExecContext(t.Context(), `
 		INSERT INTO conversations
 			(id, source_id, conversation_type, title,
 			 message_count, participant_count)
@@ -3004,7 +3365,7 @@ func TestCopySubset_ReplyToOrphanNulled(t *testing.T) {
 	require.NoError(err)
 
 	// Old parent message (won't be selected with limit 1)
-	_, err = db.Exec(`
+	_, err = db.ExecContext(t.Context(), `
 		INSERT INTO messages
 			(id, conversation_id, source_id, source_message_id,
 			 message_type, sent_at, sender_id, subject)
@@ -3013,7 +3374,7 @@ func TestCopySubset_ReplyToOrphanNulled(t *testing.T) {
 	require.NoError(err)
 
 	// Recent reply referencing the parent
-	_, err = db.Exec(`
+	_, err = db.ExecContext(t.Context(), `
 		INSERT INTO messages
 			(id, conversation_id, source_id, source_message_id,
 			 message_type, sent_at, sender_id, subject,
@@ -3023,7 +3384,7 @@ func TestCopySubset_ReplyToOrphanNulled(t *testing.T) {
 	require.NoError(err)
 
 	for i := 1; i <= 2; i++ {
-		_, err = db.Exec(`
+		_, err = db.ExecContext(t.Context(), `
 			INSERT INTO message_recipients
 				(message_id, participant_id, recipient_type)
 			VALUES (?, 1, 'from')`, i)
@@ -3032,11 +3393,11 @@ func TestCopySubset_ReplyToOrphanNulled(t *testing.T) {
 	_ = db.Close()
 
 	// Select only 1 most recent — the reply, not the parent
-	result, err := CopySubset(dbPath, dstDir, 1, false)
+	result, err := CopySubset(t.Context(), dbPath, dstDir, 1, false)
 	require.NoError(err, "CopySubset")
 	assert.Equal(int64(1), result.Messages, "Messages")
 
-	dstDB, err := sql.Open("sqlite3",
+	dstDB, err := sql.Open(sqliteutil.DriverName(),
 		filepath.Join(dstDir, "msgvault.db"))
 	require.NoError(err)
 	defer func() { _ = dstDB.Close() }()
@@ -3044,7 +3405,7 @@ func TestCopySubset_ReplyToOrphanNulled(t *testing.T) {
 	// reply_to_message_id should be nulled out since parent
 	// wasn't included
 	var replyTo sql.NullInt64
-	require.NoError(dstDB.QueryRow(`
+	require.NoError(dstDB.QueryRowContext(t.Context(), `
 		SELECT reply_to_message_id FROM messages
 		WHERE subject = 'Reply'`,
 	).Scan(&replyTo))
@@ -3052,7 +3413,7 @@ func TestCopySubset_ReplyToOrphanNulled(t *testing.T) {
 		"reply_to_message_id = %d, want NULL (parent excluded)", replyTo.Int64)
 
 	// FK integrity must pass
-	fkRows, err := dstDB.Query("PRAGMA foreign_key_check")
+	fkRows, err := dstDB.QueryContext(t.Context(), "PRAGMA foreign_key_check")
 	require.NoError(err)
 	defer func() { _ = fkRows.Close() }()
 	hasViolation := fkRows.Next()
@@ -3069,9 +3430,9 @@ func TestCopySubset_ExcludesSoftDeleted(t *testing.T) {
 	srcDB := createTestSourceDB(t, srcDir, 10)
 
 	// Soft-delete the 5 most recent messages
-	db, err := sql.Open("sqlite3", srcDB+"?_foreign_keys=OFF")
+	db, err := sql.Open(sqliteutil.DriverName(), srcDB+"?_foreign_keys=OFF")
 	require.NoError(err)
-	_, err = db.Exec(`
+	_, err = db.ExecContext(t.Context(), `
 		UPDATE messages SET deleted_from_source_at = '2025-01-01'
 		WHERE id IN (
 			SELECT id FROM messages ORDER BY sent_at DESC LIMIT 5
@@ -3080,18 +3441,18 @@ func TestCopySubset_ExcludesSoftDeleted(t *testing.T) {
 	_ = db.Close()
 
 	// Request 5 messages — should get the 5 non-deleted ones
-	result, err := CopySubset(srcDB, dstDir, 5, false)
+	result, err := CopySubset(t.Context(), srcDB, dstDir, 5, false)
 	require.NoError(err, "CopySubset")
 	assert.Equal(int64(5), result.Messages, "Messages")
 
-	dstDB, err := sql.Open("sqlite3",
+	dstDB, err := sql.Open(sqliteutil.DriverName(),
 		filepath.Join(dstDir, "msgvault.db"))
 	require.NoError(err)
 	defer func() { _ = dstDB.Close() }()
 
 	// None of the copied messages should be soft-deleted
 	var deletedCount int64
-	require.NoError(dstDB.QueryRow(`
+	require.NoError(dstDB.QueryRowContext(t.Context(), `
 		SELECT COUNT(*) FROM messages
 		WHERE deleted_from_source_at IS NOT NULL`,
 	).Scan(&deletedCount))
@@ -3107,33 +3468,40 @@ func TestCopySubset_ReactionParticipants(t *testing.T) {
 	srcDB := createTestSourceDB(t, srcDir, 5)
 
 	// Add a reactor participant who is neither sender nor recipient
-	db, err := sql.Open("sqlite3", srcDB+"?_foreign_keys=OFF")
+	db, err := sql.Open(sqliteutil.DriverName(), srcDB+"?_foreign_keys=OFF")
 	require.NoError(err)
-	_, err = db.Exec(`
+	_, err = db.ExecContext(t.Context(), `
 		INSERT INTO participants
 			(id, email_address, display_name, domain)
 		VALUES (100, 'reactor@example.com', 'Reactor', 'example.com')`)
 	require.NoError(err, "insert reactor")
-	_, err = db.Exec(`
+	_, err = db.ExecContext(t.Context(), `
 		INSERT INTO reactions
 			(id, message_id, participant_id,
 			 reaction_type, reaction_value)
 		VALUES (1, 1, 100, 'emoji', 'thumbsup')`)
 	require.NoError(err, "insert reaction")
+	_, err = db.ExecContext(t.Context(), `
+		INSERT INTO reaction_source_events (source_id, source_reaction_id, reaction_id)
+		SELECT source_id, '$reaction', 1 FROM messages WHERE id = 1`)
+	require.NoError(err, "insert reaction source event")
+	_, err = db.ExecContext(t.Context(), `UPDATE sources SET source_type = 'matrix', sync_cursor = '{"rooms":{"!private":{"deferred_relations":["secret"]}}}'
+		WHERE id = (SELECT source_id FROM messages WHERE id = 1)`)
+	require.NoError(err, "seed Matrix cursor")
 	_ = db.Close()
 
-	result, err := CopySubset(srcDB, dstDir, 5, false)
+	result, err := CopySubset(t.Context(), srcDB, dstDir, 5, false)
 	require.NoError(err, "CopySubset")
 	assert.Equal(int64(5), result.Messages, "Messages")
 
-	dstDB, err := sql.Open("sqlite3",
+	dstDB, err := sql.Open(sqliteutil.DriverName(),
 		filepath.Join(dstDir, "msgvault.db"))
 	require.NoError(err)
 	defer func() { _ = dstDB.Close() }()
 
 	// Reactor participant must be present
 	var reactorCount int64
-	require.NoError(dstDB.QueryRow(`
+	require.NoError(dstDB.QueryRowContext(t.Context(), `
 		SELECT COUNT(*) FROM participants
 		WHERE email_address = 'reactor@example.com'`,
 	).Scan(&reactorCount))
@@ -3141,13 +3509,23 @@ func TestCopySubset_ReactionParticipants(t *testing.T) {
 
 	// Reaction must be present
 	var rxnCount int64
-	require.NoError(dstDB.QueryRow(
+	require.NoError(dstDB.QueryRowContext(
+		t.Context(),
 		"SELECT COUNT(*) FROM reactions",
 	).Scan(&rxnCount))
+	var sourceEventCount int64
+	require.NoError(dstDB.QueryRowContext(
+		t.Context(),
+		"SELECT COUNT(*) FROM reaction_source_events WHERE source_reaction_id = '$reaction'",
+	).Scan(&sourceEventCount))
+	assert.Equal(int64(1), sourceEventCount, "reaction source events")
+	var cursor sql.NullString
+	require.NoError(dstDB.QueryRowContext(t.Context(), "SELECT sync_cursor FROM sources WHERE source_type = 'matrix'").Scan(&cursor))
+	assert.False(cursor.Valid, "Matrix cursors stay out of subsets")
 	assert.Equal(int64(1), rxnCount, "reactions count")
 
 	// FK integrity
-	fkRows, err := dstDB.Query("PRAGMA foreign_key_check")
+	fkRows, err := dstDB.QueryContext(t.Context(), "PRAGMA foreign_key_check")
 	require.NoError(err)
 	defer func() { _ = fkRows.Close() }()
 	hasViolation := fkRows.Next()
@@ -3167,44 +3545,44 @@ func TestCopySubset_NullSourceIDLabels(t *testing.T) {
 
 	// Add a user-created label with NULL source_id and attach it
 	// to message 1.
-	db, err := sql.Open("sqlite3", srcDB+"?_foreign_keys=OFF")
+	db, err := sql.Open(sqliteutil.DriverName(), srcDB+"?_foreign_keys=OFF")
 	require.NoError(err)
-	_, err = db.Exec(`
+	_, err = db.ExecContext(t.Context(), `
 		INSERT INTO labels (id, source_id, name, label_type)
 		VALUES (100, NULL, 'My Custom Label', 'user')`)
 	require.NoError(err, "insert null-source label")
-	_, err = db.Exec(`
+	_, err = db.ExecContext(t.Context(), `
 		INSERT INTO message_labels (message_id, label_id)
 		VALUES (1, 100)`)
 	require.NoError(err, "insert message_label")
 	_ = db.Close()
 
-	result, err := CopySubset(srcDB, dstDir, 5, false)
+	result, err := CopySubset(t.Context(), srcDB, dstDir, 5, false)
 	require.NoError(err, "CopySubset")
 
 	// The 3 source-scoped labels + 1 user-created label
 	assert.Equal(int64(4), result.Labels, "Labels")
 
-	dstDB, err := sql.Open("sqlite3",
+	dstDB, err := sql.Open(sqliteutil.DriverName(),
 		filepath.Join(dstDir, "msgvault.db"))
 	require.NoError(err)
 	defer func() { _ = dstDB.Close() }()
 
 	var labelName string
-	require.NoError(dstDB.QueryRow(`
+	require.NoError(dstDB.QueryRowContext(t.Context(), `
 		SELECT name FROM labels WHERE source_id IS NULL`,
 	).Scan(&labelName), "query null-source label")
 	assert.Equal("My Custom Label", labelName, "label name")
 
 	// message_labels link must be preserved
 	var mlCount int64
-	require.NoError(dstDB.QueryRow(`
+	require.NoError(dstDB.QueryRowContext(t.Context(), `
 		SELECT COUNT(*) FROM message_labels WHERE label_id = 100`,
 	).Scan(&mlCount))
 	assert.Equal(int64(1), mlCount, "message_labels for label 100")
 
 	// FK integrity
-	fkRows, err := dstDB.Query("PRAGMA foreign_key_check")
+	fkRows, err := dstDB.QueryContext(t.Context(), "PRAGMA foreign_key_check")
 	require.NoError(err)
 	defer func() { _ = fkRows.Close() }()
 	hasViolation := fkRows.Next()
@@ -3225,16 +3603,16 @@ func TestCopySubset_SourceFKViolationIgnored(t *testing.T) {
 
 	// Inject an FK violation in the source: a message_labels row
 	// referencing a non-existent label_id.
-	db, err := sql.Open("sqlite3", srcDB+"?_foreign_keys=OFF")
+	db, err := sql.Open(sqliteutil.DriverName(), srcDB+"?_foreign_keys=OFF")
 	require.NoError(err)
-	_, err = db.Exec(`
+	_, err = db.ExecContext(t.Context(), `
 		INSERT INTO message_labels (message_id, label_id)
 		VALUES (1, 9999)`)
 	require.NoError(err, "inject FK violation")
 	_ = db.Close()
 
 	// CopySubset should succeed — FK check must only scan destination
-	result, err := CopySubset(srcDB, dstDir, 3, false)
+	result, err := CopySubset(t.Context(), srcDB, dstDir, 3, false)
 	require.NoError(err, "CopySubset (source FK leak)")
 	assert.Equal(t, int64(3), result.Messages, "Messages")
 }
@@ -3244,7 +3622,7 @@ func TestCopySubset_MissingSourceDB(t *testing.T) {
 	dstDir := filepath.Join(t.TempDir(), "dst")
 	fakeSrc := filepath.Join(t.TempDir(), "nonexistent.db")
 
-	_, err := CopySubset(fakeSrc, dstDir, 5, false)
+	_, err := CopySubset(t.Context(), fakeSrc, dstDir, 5, false)
 	require.Error(t, err, "expected error for missing source DB")
 	require.ErrorContains(t, err, "source database not found")
 
@@ -3270,17 +3648,17 @@ func TestCopySubset_MultiSourceScoping(t *testing.T) {
 	require.NoError(st.InitSchema(), "InitSchema")
 	_ = st.Close()
 
-	db, err := sql.Open("sqlite3", dbPath+"?_foreign_keys=OFF")
+	db, err := sql.Open(sqliteutil.DriverName(), dbPath+"?_foreign_keys=OFF")
 	require.NoError(err, "open db")
 
 	// Two sources: only source 1 will have recent messages
-	_, err = db.Exec(`
+	_, err = db.ExecContext(t.Context(), `
 		INSERT INTO sources (id, source_type, identifier) VALUES
 			(1, 'gmail', 'alice@example.com'),
 			(2, 'gmail', 'bob@example.com')`)
 	require.NoError(err, "insert sources")
 
-	_, err = db.Exec(`
+	_, err = db.ExecContext(t.Context(), `
 		INSERT INTO participants
 			(id, email_address, display_name, domain)
 		VALUES
@@ -3288,7 +3666,7 @@ func TestCopySubset_MultiSourceScoping(t *testing.T) {
 			(2, 'bob@example.com', 'Bob', 'example.com')`)
 	require.NoError(err, "insert participants")
 
-	_, err = db.Exec(`
+	_, err = db.ExecContext(t.Context(), `
 		INSERT INTO conversations
 			(id, source_id, conversation_type, title,
 			 message_count, participant_count)
@@ -3298,7 +3676,7 @@ func TestCopySubset_MultiSourceScoping(t *testing.T) {
 	require.NoError(err, "insert conversations")
 
 	// Labels for both sources
-	_, err = db.Exec(`
+	_, err = db.ExecContext(t.Context(), `
 		INSERT INTO labels (id, source_id, name, label_type) VALUES
 			(1, 1, 'INBOX', 'system'),
 			(2, 1, 'Work', 'user'),
@@ -3308,7 +3686,7 @@ func TestCopySubset_MultiSourceScoping(t *testing.T) {
 
 	// Source 1 messages: recent (will be selected)
 	for i := 1; i <= 3; i++ {
-		_, err = db.Exec(`
+		_, err = db.ExecContext(t.Context(), `
 			INSERT INTO messages
 				(id, conversation_id, source_id, source_message_id,
 				 message_type, sent_at, sender_id, subject)
@@ -3318,7 +3696,8 @@ func TestCopySubset_MultiSourceScoping(t *testing.T) {
 			i, fmt.Sprintf("msg_%d", i), i,
 			fmt.Sprintf("Alice msg %d", i))
 		require.NoError(err, "insert alice message %d", i)
-		_, err = db.Exec(
+		_, err = db.ExecContext(
+			t.Context(),
 			`INSERT INTO message_recipients
 				(message_id, participant_id, recipient_type)
 			 VALUES (?, 1, 'from')`, i)
@@ -3327,7 +3706,7 @@ func TestCopySubset_MultiSourceScoping(t *testing.T) {
 
 	// Source 2 messages: older (won't be selected with limit 3)
 	for i := 4; i <= 6; i++ {
-		_, err = db.Exec(`
+		_, err = db.ExecContext(t.Context(), `
 			INSERT INTO messages
 				(id, conversation_id, source_id, source_message_id,
 				 message_type, sent_at, sender_id, subject)
@@ -3337,7 +3716,8 @@ func TestCopySubset_MultiSourceScoping(t *testing.T) {
 			i, fmt.Sprintf("msg_%d", i), i,
 			fmt.Sprintf("Bob msg %d", i))
 		require.NoError(err, "insert bob message %d", i)
-		_, err = db.Exec(
+		_, err = db.ExecContext(
+			t.Context(),
 			`INSERT INTO message_recipients
 				(message_id, participant_id, recipient_type)
 			 VALUES (?, 2, 'from')`, i)
@@ -3347,46 +3727,50 @@ func TestCopySubset_MultiSourceScoping(t *testing.T) {
 	_ = db.Close()
 
 	// Select only 3 most recent = all Alice, no Bob
-	result, err := CopySubset(dbPath, dstDir, 3, false)
+	result, err := CopySubset(t.Context(), dbPath, dstDir, 3, false)
 	require.NoError(err, "CopySubset")
 
 	assert.Equal(int64(1), result.Sources, "Sources (only Alice's)")
 	assert.Equal(int64(3), result.Messages, "Messages")
 
-	dstDB, err := sql.Open("sqlite3",
+	dstDB, err := sql.Open(sqliteutil.DriverName(),
 		filepath.Join(dstDir, "msgvault.db"))
 	require.NoError(err)
 	defer func() { _ = dstDB.Close() }()
 
 	// Only source 1 should be present
 	var srcCount int64
-	require.NoError(dstDB.QueryRow(
+	require.NoError(dstDB.QueryRowContext(
+		t.Context(),
 		"SELECT COUNT(*) FROM sources",
 	).Scan(&srcCount))
 	assert.Equal(int64(1), srcCount, "sources count")
 
 	var identifier string
-	require.NoError(dstDB.QueryRow(
+	require.NoError(dstDB.QueryRowContext(
+		t.Context(),
 		"SELECT identifier FROM sources",
 	).Scan(&identifier))
 	assert.Equal("alice@example.com", identifier, "source identifier")
 
 	// Only source 1 labels should be present
 	var labelCount int64
-	require.NoError(dstDB.QueryRow(
+	require.NoError(dstDB.QueryRowContext(
+		t.Context(),
 		"SELECT COUNT(*) FROM labels",
 	).Scan(&labelCount))
 	assert.Equal(int64(2), labelCount, "labels count (Alice's labels only)")
 
 	// No Bob conversations
 	var convCount int64
-	require.NoError(dstDB.QueryRow(
+	require.NoError(dstDB.QueryRowContext(
+		t.Context(),
 		"SELECT COUNT(*) FROM conversations",
 	).Scan(&convCount))
 	assert.Equal(int64(1), convCount, "conversations (Alice's only)")
 
 	// FK integrity check
-	fkRows, err := dstDB.Query("PRAGMA foreign_key_check")
+	fkRows, err := dstDB.QueryContext(t.Context(), "PRAGMA foreign_key_check")
 	require.NoError(err)
 	defer func() { _ = fkRows.Close() }()
 	hasViolation := fkRows.Next()
@@ -3404,11 +3788,11 @@ func TestCopySubset_LegacySourceWithoutOAuthApp(t *testing.T) {
 	// a pre-oauth_app database.
 	srcDB := createTestSourceDB(t, srcDir, 3)
 
-	db, err := sql.Open("sqlite3", srcDB+"?_foreign_keys=OFF")
+	db, err := sql.Open(sqliteutil.DriverName(), srcDB+"?_foreign_keys=OFF")
 	require.NoError(err)
 	// SQLite doesn't support DROP COLUMN before 3.35. Rebuild the
 	// table without oauth_app to simulate an old schema.
-	_, err = db.Exec(`
+	_, err = db.ExecContext(t.Context(), `
 		CREATE TABLE sources_old AS
 			SELECT id, source_type, identifier, display_name,
 			       google_user_id, last_sync_at, sync_cursor,
@@ -3421,18 +3805,19 @@ func TestCopySubset_LegacySourceWithoutOAuthApp(t *testing.T) {
 	_ = db.Close()
 
 	// CopySubset should succeed with NULL oauth_app in destination
-	result, err := CopySubset(srcDB, dstDir, 3, false)
+	result, err := CopySubset(t.Context(), srcDB, dstDir, 3, false)
 	require.NoError(err, "CopySubset from legacy DB")
 	assert.Equal(int64(3), result.Messages, "Messages")
 
 	// Verify oauth_app is NULL in the destination
-	dstDB, err := sql.Open("sqlite3",
+	dstDB, err := sql.Open(sqliteutil.DriverName(),
 		filepath.Join(dstDir, "msgvault.db"))
 	require.NoError(err)
 	defer func() { _ = dstDB.Close() }()
 
 	var oauthApp sql.NullString
-	require.NoError(dstDB.QueryRow(
+	require.NoError(dstDB.QueryRowContext(
+		t.Context(),
 		"SELECT oauth_app FROM sources",
 	).Scan(&oauthApp), "query oauth_app")
 	assert.False(oauthApp.Valid, "oauth_app = %q, want NULL", oauthApp.String)
@@ -3449,7 +3834,7 @@ func TestCopySubset_ControlCharInPath(t *testing.T) {
 		filepath.Join(base, "test\x01db", "msgvault.db"),
 	}
 	for _, p := range controlPaths {
-		_, err := CopySubset(p, dstDir, 5, false)
+		_, err := CopySubset(t.Context(), p, dstDir, 5, false)
 		assert.Error(t, err, "CopySubset(%q) should reject control chars", p)
 	}
 }
@@ -3482,55 +3867,91 @@ func TestCopySubset_LegacySourceMissingAttributionColumns(t *testing.T) {
 
 	srcDB := createTestSourceDB(t, srcDir, 3)
 
-	db, err := sql.Open("sqlite3", srcDB+"?_foreign_keys=OFF")
+	db, err := sql.Open(sqliteutil.DriverName(), srcDB+"?_foreign_keys=OFF")
 	require.NoError(err, "open source db")
 
-	_, err = db.Exec(`DROP TRIGGER trg_activity_queue_messages_update;
-		DROP TRIGGER trg_cache_message_facts_update`)
-	require.NoError(err, "drop triggers that name source_is_from_me")
+	_, err = db.ExecContext(t.Context(), `DROP TRIGGER trg_activity_queue_messages_update;
+		DROP TRIGGER trg_cache_message_facts_update;
+		DROP INDEX idx_messages_source_owner`)
+	require.NoError(err, "drop triggers and index that name source_is_from_me")
 
 	for _, col := range []string{"source_is_from_me", "identity_is_from_me"} {
-		_, err = db.Exec(
-			`ALTER TABLE messages DROP COLUMN ` + col,
+		_, err = db.ExecContext(
+			t.Context(),
+			`ALTER TABLE messages DROP COLUMN `+col,
 		)
 		require.NoError(err, "drop messages.%s", col)
 	}
 
 	var srcCount int
-	require.NoError(db.QueryRow(`SELECT COUNT(*) FROM messages`).Scan(&srcCount),
+	require.NoError(db.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM messages`).Scan(&srcCount),
 		"count source messages")
 	require.Equal(3, srcCount, "source messages")
 	require.NoError(db.Close(), "close source db")
 
-	result, err := CopySubset(srcDB, dstDir, 100, false)
+	result, err := CopySubset(t.Context(), srcDB, dstDir, 100, false)
 	require.NoError(err, "CopySubset from a source missing attribution columns")
 	assert.Equal(int64(srcCount), result.Messages, "Messages")
 
-	dstDB, err := sql.Open("sqlite3", filepath.Join(dstDir, "msgvault.db"))
+	dstDB, err := sql.Open(sqliteutil.DriverName(), filepath.Join(dstDir, "msgvault.db"))
 	require.NoError(err, "open destination db")
 	defer func() { _ = dstDB.Close() }()
 
 	var dstCount int
 	require.NoError(
-		dstDB.QueryRow(`SELECT COUNT(*) FROM messages`).Scan(&dstCount),
+		dstDB.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM messages`).Scan(&dstCount),
 		"count destination messages")
 	assert.Equal(srcCount, dstCount, "destination message count")
 
 	// The absent columns take the destination schema's defaults:
 	// source_is_from_me has none (NULL), identity_is_from_me defaults to FALSE.
 	var sourceDefaults int
-	require.NoError(dstDB.QueryRow(
+	require.NoError(dstDB.QueryRowContext(
+		t.Context(),
 		`SELECT COUNT(*) FROM messages WHERE source_is_from_me IS NULL`,
 	).Scan(&sourceDefaults), "count source_is_from_me defaults")
 	assert.Equal(dstCount, sourceDefaults,
 		"source_is_from_me should hold its schema default (NULL)")
 
 	var identityDefaults int
-	require.NoError(dstDB.QueryRow(
+	require.NoError(dstDB.QueryRowContext(
+		t.Context(),
 		`SELECT COUNT(*) FROM messages WHERE identity_is_from_me = 0`,
 	).Scan(&identityDefaults), "count identity_is_from_me defaults")
 	assert.Equal(dstCount, identityDefaults,
 		"identity_is_from_me should hold its schema default (FALSE)")
+}
+
+// TestCopySubset_LegacySourceMissingHiddenTextFlag covers a source archive
+// written before messages.hidden_text_present. The copy must derive the flag
+// from the copied HTML bodies instead of leaving the column at its default.
+func TestCopySubset_LegacySourceMissingHiddenTextFlag(t *testing.T) {
+	require := require.New(t)
+	srcDB := createTestSourceDB(t, t.TempDir(), 1)
+
+	db, err := sql.Open(sqliteutil.DriverName(), srcDB+"?_foreign_keys=OFF")
+	require.NoError(err, "open source db")
+	_, err = db.ExecContext(t.Context(), `UPDATE message_bodies SET body_html = '<p>Hi</p><div style="display:none">Hidden</div>'`)
+	require.NoError(err, "store hidden HTML body")
+	var triggers string
+	require.NoError(db.QueryRowContext(t.Context(), `SELECT group_concat('DROP TRIGGER "' || name || '"', ';') FROM sqlite_master
+		WHERE type = 'trigger' AND sql LIKE '%hidden_text_present%'`).Scan(&triggers), "list triggers that name hidden_text_present")
+	_, err = db.ExecContext(t.Context(), triggers)
+	require.NoError(err, "drop triggers that name hidden_text_present")
+	_, err = db.ExecContext(t.Context(), `ALTER TABLE messages DROP COLUMN hidden_text_present`)
+	require.NoError(err, "drop messages.hidden_text_present")
+	require.NoError(db.Close(), "close source db")
+
+	dstDir := filepath.Join(t.TempDir(), "dst")
+	_, err = CopySubset(t.Context(), srcDB, dstDir, 1, false)
+	require.NoError(err, "CopySubset from a source without hidden_text_present")
+	dstDB, err := sql.Open(sqliteutil.DriverName(), filepath.Join(dstDir, "msgvault.db"))
+	require.NoError(err, "open destination db")
+	defer func() { _ = dstDB.Close() }()
+
+	var flagged int
+	require.NoError(dstDB.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM messages WHERE hidden_text_present`).Scan(&flagged))
+	assert.Equal(t, 1, flagged, "copied hidden HTML must set hidden_text_present")
 }
 
 // TestCopySubset_SourceOnlyColumnWithQuoteInName covers a source archive whose
@@ -3546,23 +3967,23 @@ func TestCopySubset_SourceOnlyColumnWithQuoteInName(t *testing.T) {
 
 	srcDB := createTestSourceDB(t, srcDir, 3)
 
-	db, err := sql.Open("sqlite3", srcDB+"?_foreign_keys=OFF")
+	db, err := sql.Open(sqliteutil.DriverName(), srcDB+"?_foreign_keys=OFF")
 	require.NoError(err, "open source db")
-	_, err = db.Exec(`ALTER TABLE messages ADD COLUMN "we""ird" TEXT`)
+	_, err = db.ExecContext(t.Context(), `ALTER TABLE messages ADD COLUMN "we""ird" TEXT`)
 	require.NoError(err, `add messages."we""ird"`)
 	require.NoError(db.Close(), "close source db")
 
-	result, err := CopySubset(srcDB, dstDir, 100, false)
+	result, err := CopySubset(t.Context(), srcDB, dstDir, 100, false)
 	require.NoError(err, "CopySubset from a source with a quoted column name")
 	assert.Equal(int64(3), result.Messages, "Messages")
 
-	dstDB, err := sql.Open("sqlite3", filepath.Join(dstDir, "msgvault.db"))
+	dstDB, err := sql.Open(sqliteutil.DriverName(), filepath.Join(dstDir, "msgvault.db"))
 	require.NoError(err, "open destination db")
 	defer func() { _ = dstDB.Close() }()
 
 	var dstCount int
 	require.NoError(
-		dstDB.QueryRow(`SELECT COUNT(*) FROM messages`).Scan(&dstCount),
+		dstDB.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM messages`).Scan(&dstCount),
 		"count destination messages")
 	assert.Equal(3, dstCount, "destination message count")
 }
@@ -3586,47 +4007,48 @@ func TestCopySubset_CommonColumnWithQuoteIsEscapedAndCopied(t *testing.T) {
 	quoted := `"` + strings.ReplaceAll(hostile, `"`, `""`) + `"`
 
 	for _, path := range []string{srcPath, dstPath} {
-		db, err := sql.Open("sqlite3", path)
+		db, err := sql.Open(sqliteutil.DriverName(), path)
 		require.NoError(err, "open %s", path)
-		_, err = db.Exec(`CREATE TABLE t (id INTEGER, ` + quoted + ` TEXT)`)
+		_, err = db.ExecContext(t.Context(), `CREATE TABLE t (id INTEGER, `+quoted+` TEXT)`)
 		require.NoError(err, "create t in %s", path)
 		require.NoError(db.Close(), "close %s", path)
 	}
 
-	srcDB, err := sql.Open("sqlite3", srcPath)
+	srcDB, err := sql.Open(sqliteutil.DriverName(), srcPath)
 	require.NoError(err, "open source db")
-	_, err = srcDB.Exec(`INSERT INTO t (id, ` + quoted + `) VALUES (1, 'carried')`)
+	_, err = srcDB.ExecContext(t.Context(), `INSERT INTO t (id, `+quoted+`) VALUES (1, 'carried')`)
 	require.NoError(err, "seed source row")
 	require.NoError(srcDB.Close(), "close source db")
 
-	db, err := sql.Open("sqlite3", dstPath)
+	db, err := sql.Open(sqliteutil.DriverName(), dstPath)
 	require.NoError(err, "open destination db")
 	defer func() { _ = db.Close() }()
-	_, err = db.Exec(fmt.Sprintf("ATTACH DATABASE '%s' AS src", srcPath))
+	_, err = db.ExecContext(t.Context(), fmt.Sprintf("ATTACH DATABASE '%s' AS src", srcPath))
 	require.NoError(err, "attach source db")
 
-	tx, err := db.Begin()
+	tx, err := db.BeginTx(t.Context(), nil)
 	require.NoError(err, "begin transaction")
 	defer func() { _ = tx.Rollback() }()
 
-	cols, err := commonColumns(tx, "t")
+	cols, err := commonColumns(t.Context(), tx, "t")
 	require.NoError(err, "commonColumns must render a quoted column name, not refuse it")
 	assert.Equal([]string{`"id"`, quoted}, cols,
 		"the embedded quote must be doubled, not dropped and not rejected")
 
 	// The rendered list is what the copy interpolates, so run the copy it feeds.
 	list := strings.Join(cols, ", ")
-	_, err = tx.Exec(fmt.Sprintf(
+	_, err = tx.ExecContext(t.Context(), fmt.Sprintf(
 		`INSERT INTO t (%s) SELECT %s FROM src.t`, list, list))
 	require.NoError(err, "copy through the escaped column list")
 
 	var carried string
-	require.NoError(tx.QueryRow(`SELECT `+quoted+` FROM t WHERE id = 1`).Scan(&carried),
+	require.NoError(tx.QueryRowContext(t.Context(), `SELECT `+quoted+` FROM t WHERE id = 1`).Scan(&carried),
 		"read the copied value")
 	assert.Equal("carried", carried, "the copy must carry the oddly named column's value")
 
 	var tables int
-	require.NoError(tx.QueryRow(
+	require.NoError(tx.QueryRowContext(
+		t.Context(),
 		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 't'`).Scan(&tables),
 		"read sqlite_master")
 	assert.Equal(1, tables, "the payload riding in the column name must not have executed")
@@ -3644,26 +4066,27 @@ func TestCopySubset_SourceColumnCaseDiffers(t *testing.T) {
 
 	srcDB := createTestSourceDB(t, srcDir, 3)
 
-	db, err := sql.Open("sqlite3", srcDB+"?_foreign_keys=OFF")
+	db, err := sql.Open(sqliteutil.DriverName(), srcDB+"?_foreign_keys=OFF")
 	require.NoError(err, "open source db")
-	_, err = db.Exec(`ALTER TABLE messages DROP COLUMN identity_is_from_me`)
+	_, err = db.ExecContext(t.Context(), `ALTER TABLE messages DROP COLUMN identity_is_from_me`)
 	require.NoError(err, "drop messages.identity_is_from_me")
-	_, err = db.Exec(`ALTER TABLE messages ADD COLUMN Identity_Is_From_Me BOOLEAN`)
+	_, err = db.ExecContext(t.Context(), `ALTER TABLE messages ADD COLUMN Identity_Is_From_Me BOOLEAN`)
 	require.NoError(err, "add messages.Identity_Is_From_Me")
-	_, err = db.Exec(`UPDATE messages SET Identity_Is_From_Me = TRUE`)
+	_, err = db.ExecContext(t.Context(), `UPDATE messages SET Identity_Is_From_Me = TRUE`)
 	require.NoError(err, "set messages.Identity_Is_From_Me")
 	require.NoError(db.Close(), "close source db")
 
-	result, err := CopySubset(srcDB, dstDir, 100, false)
+	result, err := CopySubset(t.Context(), srcDB, dstDir, 100, false)
 	require.NoError(err, "CopySubset from a source whose column case differs")
 	assert.Equal(int64(3), result.Messages, "Messages")
 
-	dstDB, err := sql.Open("sqlite3", filepath.Join(dstDir, "msgvault.db"))
+	dstDB, err := sql.Open(sqliteutil.DriverName(), filepath.Join(dstDir, "msgvault.db"))
 	require.NoError(err, "open destination db")
 	defer func() { _ = dstDB.Close() }()
 
 	var copied int
-	require.NoError(dstDB.QueryRow(
+	require.NoError(dstDB.QueryRowContext(
+		t.Context(),
 		`SELECT COUNT(*) FROM messages WHERE identity_is_from_me = 1`,
 	).Scan(&copied), "count copied identity_is_from_me")
 	assert.Equal(3, copied,
@@ -3695,26 +4118,27 @@ func TestCopySubset_SourceOnlyColumnUnicodeLookalike(t *testing.T) {
 
 	srcDB := createTestSourceDB(t, srcDir, 3)
 
-	db, err := sql.Open("sqlite3", srcDB+"?_foreign_keys=OFF")
+	db, err := sql.Open(sqliteutil.DriverName(), srcDB+"?_foreign_keys=OFF")
 	require.NoError(err, "open source db")
-	_, err = db.Exec(`ALTER TABLE messages DROP COLUMN identity_is_from_me`)
+	_, err = db.ExecContext(t.Context(), `ALTER TABLE messages DROP COLUMN identity_is_from_me`)
 	require.NoError(err, "drop messages.identity_is_from_me")
-	_, err = db.Exec(`ALTER TABLE messages ADD COLUMN "İdentity_is_from_me" TEXT`)
+	_, err = db.ExecContext(t.Context(), `ALTER TABLE messages ADD COLUMN "İdentity_is_from_me" TEXT`)
 	require.NoError(err, "add messages.İdentity_is_from_me")
-	_, err = db.Exec(`UPDATE messages SET "İdentity_is_from_me" = 'source value'`)
+	_, err = db.ExecContext(t.Context(), `UPDATE messages SET "İdentity_is_from_me" = 'source value'`)
 	require.NoError(err, "set messages.İdentity_is_from_me")
 	require.NoError(db.Close(), "close source db")
 
-	result, err := CopySubset(srcDB, dstDir, 100, false)
+	result, err := CopySubset(t.Context(), srcDB, dstDir, 100, false)
 	require.NoError(err, "CopySubset from a source with a Unicode-lookalike column")
 	assert.Equal(int64(3), result.Messages, "Messages")
 
-	dstDB, err := sql.Open("sqlite3", filepath.Join(dstDir, "msgvault.db"))
+	dstDB, err := sql.Open(sqliteutil.DriverName(), filepath.Join(dstDir, "msgvault.db"))
 	require.NoError(err, "open destination db")
 	defer func() { _ = dstDB.Close() }()
 
 	var defaulted int
-	require.NoError(dstDB.QueryRow(
+	require.NoError(dstDB.QueryRowContext(
+		t.Context(),
 		`SELECT COUNT(*) FROM messages WHERE identity_is_from_me = 0`,
 	).Scan(&defaulted), "count identity_is_from_me defaults")
 	assert.Equal(3, defaulted,
@@ -3724,7 +4148,8 @@ func TestCopySubset_SourceOnlyColumnUnicodeLookalike(t *testing.T) {
 	// Name the failure the Unicode fold produces: the quoted column name
 	// degrading to a string literal writes its own text into every row.
 	var literals int
-	require.NoError(dstDB.QueryRow(
+	require.NoError(dstDB.QueryRowContext(
+		t.Context(),
 		`SELECT COUNT(*) FROM messages WHERE identity_is_from_me = 'identity_is_from_me'`,
 	).Scan(&literals), "count identity_is_from_me string literals")
 	assert.Equal(0, literals,
@@ -3752,16 +4177,17 @@ func TestCopySubset_NullWatermarkIsRestamped(t *testing.T) {
 	dstDir := filepath.Join(t.TempDir(), "dst")
 
 	srcPath := createTestSourceDB(t, srcDir, 4)
-	srcDB, err := sql.Open("sqlite3", srcPath+"?_foreign_keys=OFF")
+	srcDB, err := sql.Open(sqliteutil.DriverName(), srcPath+"?_foreign_keys=OFF")
 	require.NoError(err, "open source")
-	_, err = srcDB.Exec(`
+	_, err = srcDB.ExecContext(t.Context(), `
 		INSERT INTO messages
 			(id, conversation_id, source_id, source_message_id, message_type,
 			 subject, content_changed_at)
 		VALUES (99, 1, 1, 'msg_unwatermarked', 'email', 'No watermark', NULL)`)
 	require.NoError(err, "insert a message with no watermark")
 	var srcWatermark sql.NullString
-	require.NoError(srcDB.QueryRow(
+	require.NoError(srcDB.QueryRowContext(
+		t.Context(),
 		"SELECT content_changed_at FROM messages WHERE id = 99").Scan(&srcWatermark),
 		"read the source watermark")
 	require.False(srcWatermark.Valid,
@@ -3769,15 +4195,16 @@ func TestCopySubset_NullWatermarkIsRestamped(t *testing.T) {
 			"DEFAULT does not apply to a column the statement names")
 	require.NoError(srcDB.Close(), "close source")
 
-	_, err = CopySubset(srcPath, dstDir, 100, false)
+	_, err = CopySubset(t.Context(), srcPath, dstDir, 100, false)
 	require.NoError(err, "CopySubset")
 
-	dstDB, err := sql.Open("sqlite3", filepath.Join(dstDir, "msgvault.db"))
+	dstDB, err := sql.Open(sqliteutil.DriverName(), filepath.Join(dstDir, "msgvault.db"))
 	require.NoError(err, "open destination")
 	defer func() { _ = dstDB.Close() }()
 
 	var missing int64
-	require.NoError(dstDB.QueryRow(
+	require.NoError(dstDB.QueryRowContext(
+		t.Context(),
 		"SELECT COUNT(*) FROM messages WHERE content_changed_at IS NULL").Scan(&missing),
 		"count unwatermarked messages")
 	assert.Zero(missing,
@@ -3791,7 +4218,8 @@ func TestCopySubset_NullWatermarkIsRestamped(t *testing.T) {
 	// the feed actually compares. The feed's cursor comparison is lexical, so a
 	// substitute in any other shape sorts into the wrong place.
 	var copied string
-	require.NoError(dstDB.QueryRow(
+	require.NoError(dstDB.QueryRowContext(
+		t.Context(),
 		"SELECT CAST(content_changed_at AS TEXT) FROM messages WHERE id = 99").Scan(&copied),
 		"read the copied watermark")
 	_, parseErr := time.Parse(SQLiteTimestampLayout, copied)
@@ -3800,7 +4228,7 @@ func TestCopySubset_NullWatermarkIsRestamped(t *testing.T) {
 			"ContentChangedNow writes", copied)
 
 	var oddlyShaped int64
-	require.NoError(dstDB.QueryRow(`
+	require.NoError(dstDB.QueryRowContext(t.Context(), `
 		SELECT COUNT(*) FROM messages
 		WHERE CAST(content_changed_at AS TEXT) NOT GLOB
 			'[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]'`,
@@ -3829,7 +4257,7 @@ func TestCopySubset_LegacySourceWithoutContentChangedAt(t *testing.T) {
 	dstDir := filepath.Join(t.TempDir(), "dst")
 
 	srcPath := createTestSourceDB(t, srcDir, 3)
-	srcDB, err := sql.Open("sqlite3", srcPath+"?_foreign_keys=OFF")
+	srcDB, err := sql.Open(sqliteutil.DriverName(), srcPath+"?_foreign_keys=OFF")
 	require.NoError(err, "open source")
 
 	// Remove every schema object that references the column, then the column
@@ -3841,14 +4269,17 @@ func TestCopySubset_LegacySourceWithoutContentChangedAt(t *testing.T) {
 		`DROP TRIGGER IF EXISTS trg_message_bodies_content_changed_ins`,
 		`DROP TRIGGER IF EXISTS trg_message_bodies_content_changed_upd`,
 		`DROP INDEX IF EXISTS idx_messages_content_changed_at`,
+		`DROP INDEX IF EXISTS idx_messages_conversation_content_changed`,
+		`DROP INDEX IF EXISTS idx_messages_source_content_changed`,
 		`ALTER TABLE messages DROP COLUMN content_changed_at`,
 	} {
-		_, err = srcDB.Exec(stmt)
+		_, err = srcDB.ExecContext(t.Context(), stmt)
 		require.NoErrorf(err, "prepare pre-feature source: %s", stmt)
 	}
 
 	var present int
-	require.NoError(srcDB.QueryRow(
+	require.NoError(srcDB.QueryRowContext(
+		t.Context(),
 		`SELECT COUNT(*) FROM pragma_table_info('messages')
 		 WHERE name = 'content_changed_at'`).Scan(&present),
 		"inspect the source's messages columns")
@@ -3856,19 +4287,21 @@ func TestCopySubset_LegacySourceWithoutContentChangedAt(t *testing.T) {
 		"the fixture is only meaningful if the source genuinely lacks the column")
 	require.NoError(srcDB.Close(), "close source")
 
-	result, err := CopySubset(srcPath, dstDir, 100, false)
+	result, err := CopySubset(t.Context(), srcPath, dstDir, 100, false)
 	require.NoError(err, "CopySubset from a source without content_changed_at")
 	assert.Equal(int64(3), result.Messages, "Messages")
 
-	dstDB, err := sql.Open("sqlite3", filepath.Join(dstDir, "msgvault.db"))
+	dstDB, err := sql.Open(sqliteutil.DriverName(), filepath.Join(dstDir, "msgvault.db"))
 	require.NoError(err, "open destination")
 	defer func() { _ = dstDB.Close() }()
 
 	var copied, missing int64
-	require.NoError(dstDB.QueryRow(
+	require.NoError(dstDB.QueryRowContext(
+		t.Context(),
 		"SELECT COUNT(*) FROM messages").Scan(&copied), "count copied messages")
 	assert.Equal(int64(3), copied, "copied messages")
-	require.NoError(dstDB.QueryRow(
+	require.NoError(dstDB.QueryRowContext(
+		t.Context(),
 		"SELECT COUNT(*) FROM messages WHERE content_changed_at IS NULL").Scan(&missing),
 		"count unwatermarked messages")
 	assert.Zero(missing,
@@ -3877,7 +4310,7 @@ func TestCopySubset_LegacySourceWithoutContentChangedAt(t *testing.T) {
 			"feed could never report it")
 
 	var oddlyShaped int64
-	require.NoError(dstDB.QueryRow(`
+	require.NoError(dstDB.QueryRowContext(t.Context(), `
 		SELECT COUNT(*) FROM messages
 		WHERE CAST(content_changed_at AS TEXT) NOT GLOB
 			'[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]'`,
@@ -3890,7 +4323,8 @@ func TestCopySubset_LegacySourceWithoutContentChangedAt(t *testing.T) {
 	// would still copy three rows.
 	var subject string
 	var sourceMessageID string
-	require.NoError(dstDB.QueryRow(
+	require.NoError(dstDB.QueryRowContext(
+		t.Context(),
 		"SELECT source_message_id, subject FROM messages WHERE id = 1").
 		Scan(&sourceMessageID, &subject), "read a copied row")
 	assert.Equal("msg_1", sourceMessageID, "source_message_id")
@@ -3927,12 +4361,12 @@ func TestCopySubset_BodyTriggersRestampWatermarks(t *testing.T) {
 	)
 
 	srcPath := createTestSourceDB(t, srcDir, messagesWithBodyLast)
-	srcDB, err := sql.Open("sqlite3", srcPath+"?_foreign_keys=OFF")
+	srcDB, err := sql.Open(sqliteutil.DriverName(), srcPath+"?_foreign_keys=OFF")
 	require.NoError(err, "open source")
 
 	// createTestSourceDB gives every message a body. Add one without, because
 	// the presence of a body is the whole variable here.
-	_, err = srcDB.Exec(`
+	_, err = srcDB.ExecContext(t.Context(), `
 		INSERT INTO messages
 			(id, conversation_id, source_id, source_message_id, message_type, subject)
 		VALUES (?, 1, 1, 'msg_bodyless', 'email', 'No body')`, bodylessMessageID)
@@ -3940,16 +4374,17 @@ func TestCopySubset_BodyTriggersRestampWatermarks(t *testing.T) {
 
 	// Force both watermarks to a known instant far in the past, so a copy-time
 	// stamp is unmistakable.
-	_, err = srcDB.Exec(
+	_, err = srcDB.ExecContext(
+		t.Context(),
 		`UPDATE messages SET last_modified = ?, content_changed_at = ?`,
 		srcLastModified, srcContentChangedAt)
 	require.NoError(err, "age the source watermarks")
 	require.NoError(srcDB.Close(), "close source")
 
-	_, err = CopySubset(srcPath, dstDir, 100, false)
+	_, err = CopySubset(t.Context(), srcPath, dstDir, 100, false)
 	require.NoError(err, "CopySubset")
 
-	dstDB, err := sql.Open("sqlite3", filepath.Join(dstDir, "msgvault.db"))
+	dstDB, err := sql.Open(sqliteutil.DriverName(), filepath.Join(dstDir, "msgvault.db"))
 	require.NoError(err, "open destination")
 	defer func() { _ = dstDB.Close() }()
 
@@ -3958,7 +4393,7 @@ func TestCopySubset_BodyTriggersRestampWatermarks(t *testing.T) {
 	// stored form the feed compares lexically.
 	read := func(id int64) (lastModified, contentChangedAt string) {
 		t.Helper()
-		require.NoError(dstDB.QueryRow(`
+		require.NoError(dstDB.QueryRowContext(t.Context(), `
 			SELECT CAST(last_modified AS TEXT), CAST(content_changed_at AS TEXT)
 			FROM messages WHERE id = ?`, id).Scan(&lastModified, &contentChangedAt),
 			"read the copied watermarks for message %d", id)
@@ -3996,7 +4431,8 @@ func TestCopySubset_BodyTriggersRestampWatermarks(t *testing.T) {
 	// range predicate excludes NULL and nothing in the destination would ever
 	// stamp it later.
 	var missing int64
-	require.NoError(dstDB.QueryRow(
+	require.NoError(dstDB.QueryRowContext(
+		t.Context(),
 		"SELECT COUNT(*) FROM messages WHERE content_changed_at IS NULL").Scan(&missing),
 		"count unwatermarked messages")
 	assert.Zero(missing, "every copied message must carry a watermark")
@@ -4019,7 +4455,7 @@ func TestCopySubset_UpgradedAuxiliaryColumnOrder(t *testing.T) {
 	dstDir := filepath.Join(t.TempDir(), "dst")
 	srcDB := createTestSourceDB(t, srcDir, 2)
 
-	db, err := sql.Open("sqlite3", srcDB+"?_foreign_keys=OFF")
+	db, err := sql.Open(sqliteutil.DriverName(), srcDB+"?_foreign_keys=OFF")
 	require.NoError(err, "open source db")
 	// This fixture starts from today's schema and reverses column migrations to
 	// reproduce an upgraded archive's physical order. Real upgrades add these
@@ -4041,6 +4477,9 @@ func TestCopySubset_UpgradedAuxiliaryColumnOrder(t *testing.T) {
 		`DROP INDEX IF EXISTS idx_participants_phone`,
 		`DROP INDEX IF EXISTS idx_participants_canonical`,
 		`DROP TRIGGER IF EXISTS trg_embedding_changes_participant_display_name`,
+		`DROP TRIGGER IF EXISTS participants_metadata_fts_insert`,
+		`DROP TRIGGER IF EXISTS participants_metadata_fts_update`,
+		`DROP TRIGGER IF EXISTS participants_metadata_fts_delete`,
 		`ALTER TABLE participants DROP COLUMN phone_number`,
 		`ALTER TABLE participants DROP COLUMN canonical_id`,
 		`ALTER TABLE participants ADD COLUMN phone_number TEXT`,
@@ -4049,6 +4488,11 @@ func TestCopySubset_UpgradedAuxiliaryColumnOrder(t *testing.T) {
 		`DROP INDEX IF EXISTS idx_conversations_type`,
 		`DROP TRIGGER IF EXISTS trg_embedding_changes_conversation_title`,
 		`DROP TRIGGER IF EXISTS trg_activity_queue_conversation_type_update`,
+		`DROP TRIGGER IF EXISTS trg_chat_members_messages_update`,
+		`DROP TRIGGER IF EXISTS trg_chat_members_messages_delete`,
+		`DROP TRIGGER IF EXISTS trg_chat_members_recipients_update`,
+		`DROP TRIGGER IF EXISTS trg_chat_members_recipients_delete`,
+		`DROP TRIGGER IF EXISTS trg_chat_members_conversation_type`,
 		`ALTER TABLE conversations DROP COLUMN conversation_type`,
 		`ALTER TABLE conversations DROP COLUMN title`,
 		`ALTER TABLE conversations ADD COLUMN title TEXT`,
@@ -4065,42 +4509,50 @@ func TestCopySubset_UpgradedAuxiliaryColumnOrder(t *testing.T) {
 		         queued_at = CURRENT_TIMESTAMP;
 		 END`,
 	} {
-		_, err = db.Exec(stmt)
+		_, err = db.ExecContext(t.Context(), stmt)
 		require.NoError(err, "rebuild upgraded order: %s", stmt)
 	}
 	for _, stmt := range personSweepSQLiteTriggerStatements() {
-		_, err = db.Exec(stmt)
+		_, err = db.ExecContext(t.Context(), stmt)
 		require.NoError(err, "restore sweep triggers after reverse migration: %s", stmt)
 	}
 
-	_, err = db.Exec(`UPDATE labels
+	_, err = db.ExecContext(t.Context(), `UPDATE labels
 		SET system_role = 'sent', color = '#16a765' WHERE id = 2`)
 	require.NoError(err, "seed upgraded label columns")
-	_, err = db.Exec(`UPDATE participants
+	_, err = db.ExecContext(t.Context(), `UPDATE participants
 		SET phone_number = '+15550100', canonical_id = 'alice@example.com'
 		WHERE id = 1`)
 	require.NoError(err, "seed upgraded participant columns")
-	_, err = db.Exec(`UPDATE conversations
+	_, err = db.ExecContext(t.Context(), `UPDATE conversations
 		SET title = 'Thread 1', conversation_type = 'email_thread'`)
 	require.NoError(err, "seed upgraded conversation columns")
 	require.NoError(db.Close(), "close source db")
+	// Restore current index maintenance through the real setup path after
+	// reconstructing the historical column order.
+	upgraded, err := Open(srcDB)
+	require.NoError(err)
+	require.NoError(upgraded.InitSchema())
+	require.NoError(upgraded.Close())
 
-	_, err = CopySubset(srcDB, dstDir, 100, false)
+	_, err = CopySubset(t.Context(), srcDB, dstDir, 100, false)
 	require.NoError(err, "CopySubset from upgraded column order")
 
-	dstDB, err := sql.Open("sqlite3", filepath.Join(dstDir, "msgvault.db"))
+	dstDB, err := sql.Open(sqliteutil.DriverName(), filepath.Join(dstDir, "msgvault.db"))
 	require.NoError(err, "open destination db")
 	defer func() { _ = dstDB.Close() }()
 
 	var systemRole, color sql.NullString
-	require.NoError(dstDB.QueryRow(
+	require.NoError(dstDB.QueryRowContext(
+		t.Context(),
 		`SELECT system_role, color FROM labels WHERE id = 2`,
 	).Scan(&systemRole, &color), "read copied label")
 	assert.Equal("sent", systemRole.String, "labels.system_role")
 	assert.Equal("#16a765", color.String, "labels.color")
 
 	var phone, canonical, displayName, domain sql.NullString
-	require.NoError(dstDB.QueryRow(
+	require.NoError(dstDB.QueryRowContext(
+		t.Context(),
 		`SELECT phone_number, canonical_id, display_name, domain
 		 FROM participants WHERE id = 1`,
 	).Scan(&phone, &canonical, &displayName, &domain),
@@ -4112,7 +4564,8 @@ func TestCopySubset_UpgradedAuxiliaryColumnOrder(t *testing.T) {
 	assert.Equal("example.com", domain.String, "participants.domain")
 
 	var title, convType string
-	require.NoError(dstDB.QueryRow(
+	require.NoError(dstDB.QueryRowContext(
+		t.Context(),
 		`SELECT title, conversation_type FROM conversations WHERE id = 1`,
 	).Scan(&title, &convType), "read copied conversation")
 	assert.Equal("Thread 1", title, "conversations.title")
@@ -4130,7 +4583,7 @@ func TestCopySubset_UpgradedParticipantLinkColumnOrder(t *testing.T) {
 
 	st, err := Open(srcDB)
 	require.NoError(err, "open source for participant link upgrade")
-	_, err = st.DB().Exec(`
+	_, err = st.DB().ExecContext(t.Context(), `
 		ALTER TABLE participant_links DROP COLUMN identity_match_candidate_id;
 		ALTER TABLE participant_links ADD COLUMN identity_match_candidate_id INTEGER;
 	`)
@@ -4138,27 +4591,27 @@ func TestCopySubset_UpgradedParticipantLinkColumnOrder(t *testing.T) {
 	require.NoError(st.Close(), "close upgraded source")
 
 	candidateID := seedAcceptedSubsetParticipantLink(t, srcDB)
-	sourceDB, err := sql.Open("sqlite3", srcDB+"?_foreign_keys=OFF")
+	sourceDB, err := sql.Open(sqliteutil.DriverName(), srcDB+"?_foreign_keys=OFF")
 	require.NoError(err, "open source for timestamp check")
 	var sourceCreatedAt string
-	require.NoError(sourceDB.QueryRow(`
+	require.NoError(sourceDB.QueryRowContext(t.Context(), `
 		SELECT created_at FROM participant_links
 		WHERE participant_a = 2 AND participant_b = 3
 	`).Scan(&sourceCreatedAt), "read source participant link timestamp")
 	require.NoError(sourceDB.Close(), "close source timestamp check")
 	dstDir := filepath.Join(t.TempDir(), "dst")
-	_, err = CopySubsetWithOptions(srcDB, dstDir, 5, CopySubsetOptions{
+	_, err = CopySubsetWithOptions(t.Context(), srcDB, dstDir, 5, CopySubsetOptions{
 		IncludeProfiles: true,
 	})
 	require.NoError(err, "copy upgraded participant links")
 
-	dstDB, err := sql.Open("sqlite3", filepath.Join(dstDir, "msgvault.db"))
+	dstDB, err := sql.Open(sqliteutil.DriverName(), filepath.Join(dstDir, "msgvault.db"))
 	require.NoError(err, "open copied database")
 	defer func() { _ = dstDB.Close() }()
 
 	var owner sql.NullInt64
 	var createdAt string
-	require.NoError(dstDB.QueryRow(`
+	require.NoError(dstDB.QueryRowContext(t.Context(), `
 		SELECT identity_match_candidate_id, created_at
 		FROM participant_links
 		WHERE participant_a = 2 AND participant_b = 3
@@ -4175,15 +4628,15 @@ func TestCopySubset_ExcludesParticipantLinkOwnershipWithoutProfiles(t *testing.T
 	candidateID := seedAcceptedSubsetParticipantLink(t, srcDB)
 	dstDir := filepath.Join(t.TempDir(), "dst")
 
-	_, err := CopySubsetWithOptions(srcDB, dstDir, 5, CopySubsetOptions{})
+	_, err := CopySubsetWithOptions(t.Context(), srcDB, dstDir, 5, CopySubsetOptions{})
 	require.NoError(err, "copy without profiles")
 
-	dstDB, err := sql.Open("sqlite3", filepath.Join(dstDir, "msgvault.db"))
+	dstDB, err := sql.Open(sqliteutil.DriverName(), filepath.Join(dstDir, "msgvault.db"))
 	require.NoError(err, "open copied database")
 	defer func() { _ = dstDB.Close() }()
 
 	var owner sql.NullInt64
-	require.NoError(dstDB.QueryRow(`
+	require.NoError(dstDB.QueryRowContext(t.Context(), `
 		SELECT identity_match_candidate_id
 		FROM participant_links
 		WHERE participant_a = 2 AND participant_b = 3
@@ -4191,7 +4644,8 @@ func TestCopySubset_ExcludesParticipantLinkOwnershipWithoutProfiles(t *testing.T
 	assert.False(owner.Valid, "profile-free copies must not retain candidate ownership")
 
 	var copiedCandidates int
-	require.NoError(dstDB.QueryRow(
+	require.NoError(dstDB.QueryRowContext(
+		t.Context(),
 		`SELECT COUNT(*) FROM identity_match_candidates WHERE id = ?`, candidateID,
 	).Scan(&copiedCandidates), "count omitted identity match candidate")
 	assert.Zero(copiedCandidates, "profile-free copies omit candidate metadata")
@@ -4204,18 +4658,18 @@ func TestCopySubset_PreservesParticipantLinkOwnershipWithProfiles(t *testing.T) 
 	candidateID := seedAcceptedSubsetParticipantLink(t, srcDB)
 	dstDir := filepath.Join(t.TempDir(), "dst")
 
-	_, err := CopySubsetWithOptions(srcDB, dstDir, 5, CopySubsetOptions{
+	_, err := CopySubsetWithOptions(t.Context(), srcDB, dstDir, 5, CopySubsetOptions{
 		IncludeProfiles: true,
 	})
 	require.NoError(err, "copy with profiles")
 
-	dstDB, err := sql.Open("sqlite3", filepath.Join(dstDir, "msgvault.db"))
+	dstDB, err := sql.Open(sqliteutil.DriverName(), filepath.Join(dstDir, "msgvault.db"))
 	require.NoError(err, "open copied database")
 	defer func() { _ = dstDB.Close() }()
 
 	var owner sql.NullInt64
 	var state string
-	require.NoError(dstDB.QueryRow(`
+	require.NoError(dstDB.QueryRowContext(t.Context(), `
 		SELECT link.identity_match_candidate_id, candidate.state
 		FROM participant_links link
 		JOIN identity_match_candidates candidate
@@ -4237,7 +4691,7 @@ func TestCopySubset_LegacyMessageRecipientsWithoutEnvelopeAddress(t *testing.T) 
 	srcDB := createTestSourceDB(t, t.TempDir(), 2)
 	dstDir := filepath.Join(t.TempDir(), "dst")
 
-	db, err := sql.Open("sqlite3", srcDB+"?_foreign_keys=OFF")
+	db, err := sql.Open(sqliteutil.DriverName(), srcDB+"?_foreign_keys=OFF")
 	require.NoError(err, "open source db")
 	// A source old enough to lack the envelope column predates person-sweep
 	// triggers. The fixture is constructed backwards from today's schema, so
@@ -4266,20 +4720,21 @@ func TestCopySubset_LegacyMessageRecipientsWithoutEnvelopeAddress(t *testing.T) 
 		`CREATE INDEX idx_message_recipients_participant
 			ON message_recipients(participant_id, recipient_type)`,
 	} {
-		_, err = db.Exec(stmt)
+		_, err = db.ExecContext(t.Context(), stmt)
 		require.NoError(err, "rebuild legacy message_recipients: %s", stmt)
 	}
 	require.NoError(db.Close(), "close source db")
 
-	_, err = CopySubset(srcDB, dstDir, 100, false)
+	_, err = CopySubset(t.Context(), srcDB, dstDir, 100, false)
 	require.NoError(err, "CopySubset from source without email_address")
 
-	dstDB, err := sql.Open("sqlite3", filepath.Join(dstDir, "msgvault.db"))
+	dstDB, err := sql.Open(sqliteutil.DriverName(), filepath.Join(dstDir, "msgvault.db"))
 	require.NoError(err, "open destination db")
 	defer func() { _ = dstDB.Close() }()
 
 	var count int64
-	require.NoError(dstDB.QueryRow(
+	require.NoError(dstDB.QueryRowContext(
+		t.Context(),
 		`SELECT COUNT(*) FROM message_recipients WHERE email_address IS NULL`,
 	).Scan(&count), "count legacy recipients without envelope snapshots")
 	assert.Equal(int64(4), count)
@@ -4331,7 +4786,7 @@ func TestCopySubsetPreservesRelationshipsAndDecisionLedgerWithProfiles(t *testin
 	require.NoError(source.Close())
 
 	dstDir := filepath.Join(t.TempDir(), "dst")
-	_, err = CopySubsetWithOptions(srcDB, dstDir, 5, CopySubsetOptions{IncludeProfiles: true})
+	_, err = CopySubsetWithOptions(t.Context(), srcDB, dstDir, 5, CopySubsetOptions{IncludeProfiles: true})
 	require.NoError(err)
 	destination, err := Open(filepath.Join(dstDir, "msgvault.db"))
 	require.NoError(err)
@@ -4390,7 +4845,7 @@ func TestCopySubsetExcludesRelationshipsByDefault(t *testing.T) {
 	require.NoError(source.Close())
 
 	dstDir := filepath.Join(t.TempDir(), "dst")
-	_, err = CopySubset(srcDB, dstDir, 5, false)
+	_, err = CopySubset(t.Context(), srcDB, dstDir, 5, false)
 	require.NoError(err)
 	destination, err := Open(filepath.Join(dstDir, "msgvault.db"))
 	require.NoError(err)
@@ -4444,7 +4899,7 @@ func TestCopySubset_ProfilesIncludeEmploymentsAndOrganizations(t *testing.T) {
 	require.NoError(source.Close())
 
 	dstDir := filepath.Join(t.TempDir(), "dst")
-	copied, err := CopySubsetWithOptions(srcDB, dstDir, 5, CopySubsetOptions{
+	copied, err := CopySubsetWithOptions(t.Context(), srcDB, dstDir, 5, CopySubsetOptions{
 		IncludeProfiles: true, IncludeAttributes: true,
 	})
 	require.NoError(err)
@@ -4497,7 +4952,7 @@ func TestCopySubset_ExcludesEmploymentsByDefault(t *testing.T) {
 	require.NoError(source.Close())
 
 	dstDir := filepath.Join(t.TempDir(), "dst")
-	_, err = CopySubset(srcDB, dstDir, 5, false)
+	_, err = CopySubset(t.Context(), srcDB, dstDir, 5, false)
 	require.NoError(err)
 	destination, err := Open(filepath.Join(dstDir, "msgvault.db"))
 	require.NoError(err)
@@ -4515,7 +4970,7 @@ func TestCopySubset_ExcludesEmploymentsByDefault(t *testing.T) {
 func TestCopySubset_OrganizationRecordReferencesFollowIdentityPolicy(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	srcDB := createTestSourceDB(t, t.TempDir(), 5)
 	source, err := Open(srcDB)
 	require.NoError(err)
@@ -4557,7 +5012,7 @@ func TestCopySubset_OrganizationRecordReferencesFollowIdentityPolicy(t *testing.
 	require.NoError(source.Close())
 
 	boundedDir := filepath.Join(t.TempDir(), "bounded")
-	_, err = CopySubsetWithOptions(srcDB, boundedDir, 5, CopySubsetOptions{
+	_, err = CopySubsetWithOptions(t.Context(), srcDB, boundedDir, 5, CopySubsetOptions{
 		IncludeProfiles: true, IncludeAttributes: true,
 	})
 	require.NoError(err)
@@ -4574,7 +5029,7 @@ func TestCopySubset_OrganizationRecordReferencesFollowIdentityPolicy(t *testing.
 		"organization references to excluded identities must not dangle in the subset")
 
 	identityDir := filepath.Join(t.TempDir(), "identity")
-	_, err = CopySubsetWithOptions(srcDB, identityDir, 5, CopySubsetOptions{
+	_, err = CopySubsetWithOptions(t.Context(), srcDB, identityDir, 5, CopySubsetOptions{
 		IncludeIdentity: true, IncludeProfiles: true, IncludeAttributes: true,
 	})
 	require.NoError(err)
@@ -4624,9 +5079,9 @@ func TestCopySubsetVCardResourcesRequireExplicitOptIn(t *testing.T) {
 	// separately, so nothing short of its own opt-in may copy it.
 	requireResourcesWithheld := func(name string, options CopySubsetOptions) {
 		dir := filepath.Join(t.TempDir(), name)
-		_, err := CopySubsetWithOptions(srcDB, dir, 1, options)
+		_, err := CopySubsetWithOptions(t.Context(), srcDB, dir, 1, options)
 		require.NoError(err, name)
-		subset, err := Open(filepath.Join(dir, "msgvault.db"))
+		subset, err := OpenContext(t.Context(), filepath.Join(dir, "msgvault.db"))
 		require.NoError(err, name)
 		t.Cleanup(func() { _ = subset.Close() })
 		_, err = subset.GetVCardResourceEnvelopeContext(
@@ -4643,7 +5098,7 @@ func TestCopySubsetVCardResourcesRequireExplicitOptIn(t *testing.T) {
 	// can be built, and the caller must hear that rather than get an
 	// archive with the resources quietly missing.
 	orphanDir := filepath.Join(t.TempDir(), "resources-without-profiles")
-	_, err = CopySubsetWithOptions(srcDB, orphanDir, 1,
+	_, err = CopySubsetWithOptions(t.Context(), srcDB, orphanDir, 1,
 		CopySubsetOptions{IncludeVCardResources: true})
 	require.ErrorIs(err, ErrSubsetVCardResourcesRequireProfiles)
 	_, statErr := os.Stat(filepath.Join(orphanDir, "msgvault.db"))
@@ -4651,7 +5106,7 @@ func TestCopySubsetVCardResourcesRequireExplicitOptIn(t *testing.T) {
 		"a refused subset must leave no database behind")
 
 	resourcesDir := filepath.Join(t.TempDir(), "resources")
-	_, err = CopySubsetWithOptions(srcDB, resourcesDir, 1, CopySubsetOptions{
+	_, err = CopySubsetWithOptions(t.Context(), srcDB, resourcesDir, 1, CopySubsetOptions{
 		IncludeProfiles: true, IncludeVCardResources: true,
 	})
 	require.NoError(err)
@@ -4711,7 +5166,7 @@ func TestCopySubsetVCardResourcesFollowProfileBoundary(t *testing.T) {
 	require.NoError(source.Close())
 
 	dstDir := filepath.Join(t.TempDir(), "resources")
-	_, err = CopySubsetWithOptions(srcDB, dstDir, 1, CopySubsetOptions{
+	_, err = CopySubsetWithOptions(t.Context(), srcDB, dstDir, 1, CopySubsetOptions{
 		IncludeProfiles: true, IncludeVCardResources: true,
 	})
 	require.NoError(err)
@@ -4805,7 +5260,7 @@ func TestCopySubsetReleasesVCardMappingsToOwnersLeftBehind(t *testing.T) {
 	require.NoError(source.Close())
 
 	dstDir := filepath.Join(t.TempDir(), "resources")
-	_, err = CopySubsetWithOptions(srcDB, dstDir, 1, CopySubsetOptions{
+	_, err = CopySubsetWithOptions(t.Context(), srcDB, dstDir, 1, CopySubsetOptions{
 		IncludeProfiles: true, IncludeVCardResources: true,
 	})
 	require.NoError(err)
@@ -4858,7 +5313,7 @@ func TestCopySubsetCopiesRelationshipsFromSourcesWithoutResourceColumn(t *testin
 	// An archive whose relationship tables predate the resource column: the
 	// column and the index that names it are gone, exactly as before the
 	// upgrade that added them.
-	_, err = source.DB().Exec(`
+	_, err = source.DB().ExecContext(t.Context(), `
 		DROP INDEX idx_person_relationship_reviews_occurrence_unique;
 		ALTER TABLE person_relationship_reviews DROP COLUMN source_resource_uid;
 		ALTER TABLE person_relationships DROP COLUMN source_resource_uid;
@@ -4867,7 +5322,7 @@ func TestCopySubsetCopiesRelationshipsFromSourcesWithoutResourceColumn(t *testin
 	require.NoError(source.Close())
 
 	dstDir := filepath.Join(t.TempDir(), "dst")
-	_, err = CopySubsetWithOptions(srcDB, dstDir, 5, CopySubsetOptions{IncludeProfiles: true})
+	_, err = CopySubsetWithOptions(t.Context(), srcDB, dstDir, 5, CopySubsetOptions{IncludeProfiles: true})
 	require.NoError(err, "profiles copy from a pre-upgrade source")
 	destination, err := Open(filepath.Join(dstDir, "msgvault.db"))
 	require.NoError(err)
@@ -4940,7 +5395,7 @@ func TestCopySubsetReleasesReviewMappingsWhoseAcceptedEdgeWasFiltered(t *testing
 	require.NoError(source.Close())
 
 	dstDir := filepath.Join(t.TempDir(), "resources")
-	_, err = CopySubsetWithOptions(srcDB, dstDir, 1, CopySubsetOptions{
+	_, err = CopySubsetWithOptions(t.Context(), srcDB, dstDir, 1, CopySubsetOptions{
 		IncludeProfiles: true, IncludeVCardResources: true,
 	})
 	require.NoError(err)
@@ -4963,4 +5418,471 @@ func TestCopySubsetReleasesReviewMappingsWhoseAcceptedEdgeWasFiltered(t *testing
 			"next projection")
 	require.Len(copied.Residue, 2)
 	assert.Equal("RELATED", copied.Residue[1].Property.Name)
+}
+
+func TestCopySubsetKeepsAccountAttributionConsistent(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	srcDB := createTestSourceDB(t, t.TempDir(), 3)
+	db, err := sql.Open(sqliteutil.DriverName(), srcDB)
+	require.NoError(err)
+	for _, stmt := range []string{
+		// Message 1 (alice to bob) stays in source 1; messages 2 and 3 (bob
+		// to charlie) move to source 2, so only source 2 uses charlie.
+		`INSERT INTO sources (id, source_type, identifier) VALUES (2, 'gmail', 'other@example.com')`,
+		`UPDATE messages SET source_id = 2 WHERE id IN (2, 3)`,
+		`UPDATE messages SET account_address = 'work@example.org', account_path = 'inbound'`,
+		// Message 1 predates attribution: pending, with an alias named only
+		// in its stored delivery headers.
+		`UPDATE messages SET account_address = NULL, account_path = NULL WHERE id = 1`,
+		`INSERT INTO account_identities (source_id, address, address_key, source_signal) VALUES
+			(1, 'hidden@example.org', 'hidden@example.org', 'manual'),
+			(1, 'charlie@example.com', 'charlie@example.com', 'manual'),
+			(1, 'unused@example.org', 'unused@example.org', 'manual'),
+			(2, 'work@example.org', 'work@example.org', 'manual')`,
+	} {
+		_, err = db.ExecContext(t.Context(), stmt)
+		require.NoError(err, stmt)
+	}
+	var raw bytes.Buffer
+	zw := zlib.NewWriter(&raw)
+	_, err = zw.Write([]byte("X-Delivered-To: hidden@example.org\r\n\r\nbody"))
+	require.NoError(err)
+	require.NoError(zw.Close())
+	_, err = db.ExecContext(t.Context(), `INSERT INTO message_raw (message_id, raw_data, raw_format, compression)
+		VALUES (1, ?, 'mime', 'zlib')`, raw.Bytes())
+	require.NoError(err)
+	require.NoError(db.Close())
+
+	copiedIdentities := func(includeIdentity bool) []string {
+		dstDir := filepath.Join(t.TempDir(), "dst")
+		_, err := CopySubset(t.Context(), srcDB, dstDir, 3, includeIdentity)
+		require.NoError(err)
+		dst, err := Open(filepath.Join(dstDir, "msgvault.db"))
+		require.NoError(err)
+		t.Cleanup(func() { _ = dst.Close() })
+		require.NoError(dst.InitSchema())
+		rows, err := dst.DB().QueryContext(t.Context(), `SELECT source_id || ':' || address_key FROM account_identities
+			ORDER BY source_id, address_key`)
+		require.NoError(err)
+		defer func() { _ = rows.Close() }()
+		var keys []string
+		for rows.Next() {
+			var key string
+			require.NoError(rows.Scan(&key))
+			keys = append(keys, key)
+		}
+		require.NoError(rows.Err())
+		return keys
+	}
+	assert.Equal([]string{"1:hidden@example.org", "2:work@example.org"}, copiedIdentities(false),
+		"each source keeps only the addresses its own messages use, including a pending message's headers")
+	assert.Equal([]string{
+		"1:charlie@example.com", "1:hidden@example.org", "1:unused@example.org", "2:work@example.org",
+	}, copiedIdentities(true), "--include-identity copies every confirmed address of an included source")
+}
+
+func TestCopySubsetKeepsPendingDraftOutOfReceived(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	srcDB := createTestSourceDB(t, t.TempDir(), 3)
+	db, err := sql.Open(sqliteutil.DriverName(), srcDB)
+	require.NoError(err)
+	// Message 1 (alice to bob) is a draft archived before attribution: its
+	// only draft evidence is an IMAP \Draft flag, which subsets do not copy.
+	for _, stmt := range []string{
+		`UPDATE messages SET account_address = NULL, account_path = NULL, draft_authored = FALSE`,
+		`INSERT INTO imap_message_memberships (source_id, mailbox, uidvalidity, uid, message_id, flags)
+		 VALUES (1, 'Scratch', 7, 1, 1, '["\\Draft"]')`,
+		`INSERT INTO account_identities (source_id, address, address_key, source_signal)
+		 VALUES (1, 'bob@example.com', 'bob@example.com', 'manual')`,
+	} {
+		_, err = db.ExecContext(t.Context(), stmt)
+		require.NoError(err, stmt)
+	}
+	require.NoError(db.Close())
+
+	dstDir := filepath.Join(t.TempDir(), "dst")
+	_, err = CopySubset(t.Context(), srcDB, dstDir, 3, false)
+	require.NoError(err)
+	dst, err := Open(filepath.Join(dstDir, "msgvault.db"))
+	require.NoError(err)
+	t.Cleanup(func() { _ = dst.Close() })
+	require.NoError(dst.InitSchema())
+	_, err = dst.RepairAccountAttributionContext(t.Context(), 1, nil)
+	require.NoError(err)
+
+	var authored bool
+	var path sql.NullString
+	require.NoError(dst.DB().QueryRowContext(t.Context(), `SELECT draft_authored, account_path FROM messages WHERE id = 1`).
+		Scan(&authored, &path))
+	assert.True(authored, "the subset keeps the draft mark its IMAP flag gave it")
+	assert.Equal(accountPathSent, path.String, "a copied draft is written, not received")
+}
+
+func TestCopySubsetPreservesUnsentDraft(t *testing.T) {
+	for _, evidence := range []struct {
+		name, sourceType, statement string
+	}{
+		{"imap-flags", "imap", `INSERT INTO imap_message_memberships
+			(source_id, mailbox, uidvalidity, uid, message_id, flags)
+			VALUES (1, 'Scratch', 7, 1, 1, '["\\Draft"]')`},
+		{"imap-record", "imap", `INSERT INTO imap_drafts
+			(draft_id, source_id, current_message_id, current_mailbox, current_uidvalidity, current_uid, revision)
+			VALUES ('managed-draft', 1, 1, 'Scratch', 7, 1, 1)`},
+		{"imap-pending-record", "imap", `INSERT INTO imap_drafts
+			(draft_id, source_id, current_message_id, current_mailbox, current_uidvalidity, current_uid, revision,
+			 pending_operation, pending_original_message_id, pending_original_mailbox,
+			 pending_original_uidvalidity, pending_original_uid, pending_raw)
+			VALUES ('managed-draft', 1, 2, 'Scratch', 7, 2, 2, 'edit', 1, 'Scratch', 7, 1, X'78')`},
+		{"gmail-record", "gmail", `INSERT INTO gmail_drafts
+			(draft_id, source_id, gmail_draft_id, current_message_id, current_gmail_message_id, thread_id, revision)
+			VALUES ('managed-draft', 1, 'provider-draft', 1, 'msg_1', 'thread_1', 1)`},
+		{"gmail-pending-record", "gmail", `INSERT INTO gmail_drafts
+			(draft_id, source_id, gmail_draft_id, current_message_id, current_gmail_message_id, thread_id, revision,
+			 pending_operation, pending_original_message_id, pending_original_gmail_message_id, pending_raw)
+			VALUES ('managed-draft', 1, 'provider-draft', 2, 'msg_2', 'thread_1', 2, 'edit', 1, 'msg_1', X'78')`},
+	} {
+		for _, sentEvidence := range []string{"none", "label", "origin"} {
+			if evidence.sourceType == "gmail" && sentEvidence == "origin" {
+				continue
+			}
+			t.Run(evidence.name+"/"+sentEvidence, func(t *testing.T) {
+				require := require.New(t)
+				assert := assert.New(t)
+				srcDB := createTestSourceDB(t, t.TempDir(), 3)
+				src, err := Open(srcDB)
+				require.NoError(err)
+				_, err = src.DB().ExecContext(t.Context(), `UPDATE sources SET source_type = ?`, evidence.sourceType)
+				require.NoError(err)
+				_, err = src.DB().ExecContext(t.Context(), evidence.statement)
+				require.NoError(err)
+				// A colliding user label must not turn an ordinary message into a draft.
+				_, err = src.DB().ExecContext(t.Context(), `INSERT INTO labels(source_id, name, label_type)
+					VALUES (1, 'msgvault-archive:1:draft', 'user')`)
+				require.NoError(err)
+				_, err = src.DB().ExecContext(t.Context(), `INSERT INTO message_labels(message_id, label_id)
+					SELECT 3, id FROM labels WHERE source_id = 1 AND name = 'msgvault-archive:1:draft'`)
+				require.NoError(err)
+				if sentEvidence == "label" {
+					labels, err := src.EnsureLabelsBatch(t.Context(), 1, map[string]LabelInfo{
+						"sent": {Name: "Sent", Type: "system", SystemRole: LabelSystemRoleSent},
+					})
+					require.NoError(err)
+					require.NoError(src.AddMessageLabels(t.Context(), 1, []int64{labels["sent"]}))
+				}
+				if sentEvidence == "origin" {
+					require.NoError(src.SetMessageMetadata(1, sql.NullString{String: `{"imap_content_origin":"sent"}`, Valid: true}))
+				}
+				before, err := src.LoadActivityCandidatesByIDContext(t.Context(), []int64{1, 3})
+				require.NoError(err)
+				require.Len(before, 2)
+				require.Equal(sentEvidence == "none", before[0].Unsent)
+				require.True(before[1].Eligible)
+				var originalIsSent sql.NullBool
+				require.NoError(src.DB().QueryRowContext(t.Context(), `SELECT is_sent FROM messages WHERE id = 1`).Scan(&originalIsSent))
+				require.NoError(src.Close())
+
+				dstDir := filepath.Join(t.TempDir(), "dst")
+				_, err = CopySubset(t.Context(), srcDB, dstDir, 3, false)
+				require.NoError(err)
+				dst, err := Open(filepath.Join(dstDir, "msgvault.db"))
+				require.NoError(err)
+				t.Cleanup(func() { _ = dst.Close() })
+				after, err := dst.LoadActivityCandidatesByIDContext(t.Context(), []int64{1, 3})
+				require.NoError(err)
+				require.Len(after, 2)
+				assert.Equal(sentEvidence == "none", after[0].Unsent)
+				assert.Equal(sentEvidence != "none", after[0].Eligible)
+				assert.True(after[1].Eligible, "ordinary messages remain contact activity")
+				var isSent sql.NullBool
+				require.NoError(dst.DB().QueryRowContext(t.Context(), `SELECT is_sent FROM messages WHERE id = 1`).Scan(&isSent))
+				assert.Equal(originalIsSent, isSent)
+
+				labels, err := dst.EnsureLabelsBatch(t.Context(), 1, map[string]LabelInfo{
+					"sent": {Name: "Sent", Type: "system", SystemRole: LabelSystemRoleSent},
+				})
+				require.NoError(err)
+				require.NoError(dst.AddMessageLabels(t.Context(), 1, []int64{labels["sent"]}))
+				after, err = dst.LoadActivityCandidatesByIDContext(t.Context(), []int64{1})
+				require.NoError(err)
+				require.Len(after, 1)
+				assert.False(after[0].Unsent)
+				assert.True(after[0].Eligible, "Sent evidence makes the former draft contact activity")
+				require.NoError(dst.DB().QueryRowContext(t.Context(), `SELECT is_sent FROM messages WHERE id = 1`).Scan(&isSent))
+				assert.Equal(originalIsSent, isSent)
+			})
+		}
+	}
+}
+
+func TestCopySubsetPreservesBeeperReanchorMarker(t *testing.T) {
+	requirements := require.New(t)
+	sourcePath := createTestSourceDB(t, t.TempDir(), 1)
+	source, err := Open(sourcePath)
+	requirements.NoError(err)
+	t.Cleanup(func() { requirements.NoError(source.Close()) })
+	requirements.NoError(source.SetArchiveMarker(t.Context(), BeeperReanchorMarkerKey(1), "re-anchor required"))
+	requirements.NoError(source.SetArchiveMarker(t.Context(), BeeperReanchorMarkerKey(99), "unrelated source"))
+
+	destinationDir := filepath.Join(t.TempDir(), "subset")
+	_, err = CopySubset(t.Context(), sourcePath, destinationDir, 1, false)
+	requirements.NoError(err)
+	destination, err := Open(filepath.Join(destinationDir, "msgvault.db"))
+	requirements.NoError(err)
+	t.Cleanup(func() { requirements.NoError(destination.Close()) })
+	value, found, err := destination.GetArchiveMarker(t.Context(), BeeperReanchorMarkerKey(1))
+	requirements.NoError(err)
+	assert.True(t, found)
+	assert.Equal(t, "re-anchor required", value)
+	_, found, err = destination.GetArchiveMarker(t.Context(), BeeperReanchorMarkerKey(99))
+	requirements.NoError(err)
+	assert.False(t, found, "markers for sources outside the subset stay behind")
+}
+
+func TestCopySubsetPreservesSelectedMessageEligibility(t *testing.T) {
+	for _, tc := range []struct {
+		name, provider, evidence string
+		merged, sent             bool
+	}{
+		{name: "flag_only_imap", provider: "imap", evidence: "flag"},
+		{name: "imap_record_only", provider: "imap", evidence: "record"},
+		{name: "gmail_record_only", provider: "gmail", evidence: "record"},
+		{name: "imap_pending_original_only", provider: "imap", evidence: "pending"},
+		{name: "gmail_pending_original_only", provider: "gmail", evidence: "pending"},
+		{name: "record_on_merged_away_source", provider: "imap", evidence: "record", merged: true},
+		{name: "draft_and_sent", provider: "imap", evidence: "flag", sent: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require := require.New(t)
+			sourcePath := createTestSourceDB(t, t.TempDir(), 1)
+			source, err := Open(sourcePath)
+			require.NoError(err)
+			t.Cleanup(func() { require.NoError(source.Close()) })
+			_, err = source.DB().ExecContext(t.Context(), `UPDATE sources SET source_type = ?`, tc.provider)
+			require.NoError(err)
+			currentID := int64(1)
+			if tc.evidence == "pending" {
+				// Only the old snapshot is selected; the newer, undated replacement stays behind.
+				currentID, err = source.UpsertMessage(&Message{
+					SourceID: 1, ConversationID: 2, SourceMessageID: "replacement", MessageType: MessageTypeEmail,
+				})
+				require.NoError(err)
+				require.NotEqual(int64(1), currentID)
+			}
+			switch tc.evidence {
+			case "flag":
+				_, err = source.DB().ExecContext(t.Context(), `INSERT INTO imap_message_memberships
+					(source_id, mailbox, uidvalidity, uid, message_id, flags)
+					VALUES (1, 'Scratch', 7, 1, 1, '["\\Draft"]')`)
+				require.NoError(err)
+			case "record", "pending":
+				if tc.provider == "imap" {
+					_, err = source.DB().ExecContext(t.Context(), `INSERT INTO imap_drafts
+						(draft_id, source_id, current_message_id, current_mailbox, current_uidvalidity, current_uid, revision)
+						VALUES ('draft', 1, ?, 'Scratch', 7, 2, 2)`, currentID)
+				} else {
+					_, err = source.DB().ExecContext(t.Context(), `INSERT INTO gmail_drafts
+						(draft_id, source_id, gmail_draft_id, current_message_id, current_gmail_message_id, thread_id, revision)
+						VALUES ('draft', 1, 'provider-draft', ?, 'replacement', 'thread', 2)`, currentID)
+				}
+				require.NoError(err)
+				if tc.evidence == "pending" {
+					if tc.provider == "imap" {
+						_, err = source.DB().ExecContext(t.Context(), `UPDATE imap_drafts SET pending_operation = 'edit',
+							pending_original_message_id = 1, pending_original_mailbox = 'Scratch',
+							pending_original_uidvalidity = 7, pending_original_uid = 1, pending_raw = X'01'`)
+					} else {
+						_, err = source.DB().ExecContext(t.Context(), `UPDATE gmail_drafts SET pending_operation = 'edit',
+							pending_original_message_id = 1, pending_original_gmail_message_id = 'msg_1', pending_raw = X'01'`)
+					}
+					require.NoError(err)
+				}
+			}
+			if tc.sent {
+				labels, err := source.EnsureLabelsBatch(t.Context(), 1, map[string]LabelInfo{
+					"sent": {Name: "Sent", Type: "system", SystemRole: LabelSystemRoleSent},
+				})
+				require.NoError(err)
+				require.NoError(source.AddMessageLabels(t.Context(), 1, []int64{labels["sent"]}))
+			}
+			if tc.merged {
+				// A retained, discarded draft record permits the account merge.
+				_, err = source.DB().ExecContext(t.Context(), `UPDATE imap_drafts SET discarded_at = CURRENT_TIMESTAMP`)
+				require.NoError(err)
+				destination, err := source.GetOrCreateSource(tc.provider, "destination@example.com")
+				require.NoError(err)
+				_, err = source.MergeSourcesContext(t.Context(), MergeSourcesRequest{FromSourceID: 1, IntoSourceID: destination.ID})
+				require.NoError(err)
+				var evidenceSourceID int64
+				require.NoError(source.DB().QueryRowContext(t.Context(), `SELECT source_id FROM imap_drafts WHERE current_message_id = 1`).Scan(&evidenceSourceID))
+				require.Equal(int64(1), evidenceSourceID, "the only draft evidence belongs to the retired source")
+			}
+			before, err := source.LoadActivityCandidatesByIDContext(t.Context(), []int64{1})
+			require.NoError(err)
+			require.Len(before, 1)
+			require.Equal(!tc.sent, before[0].Unsent)
+			require.Equal(tc.sent, before[0].Eligible)
+
+			destinationDir := filepath.Join(t.TempDir(), "subset")
+			_, err = CopySubset(t.Context(), sourcePath, destinationDir, 1, false)
+			require.NoError(err, "export must succeed with the selected draft evidence")
+			subset, err := Open(filepath.Join(destinationDir, "msgvault.db"))
+			require.NoError(err)
+			t.Cleanup(func() { require.NoError(subset.Close()) })
+			after, err := subset.LoadActivityCandidatesByIDContext(t.Context(), []int64{1})
+			require.NoError(err)
+			require.Len(after, 1)
+			assert.Equal(t, !tc.sent, after[0].Unsent, "the selected snapshot must retain its unsent status")
+			assert.Equal(t, tc.sent, after[0].Eligible, "only sent messages may count as contact")
+			if tc.evidence == "pending" {
+				var replacementCount int
+				require.NoError(subset.DB().QueryRowContext(t.Context(), `SELECT COUNT(*) FROM messages WHERE id = ?`, currentID).Scan(&replacementCount))
+				assert.Zero(t, replacementCount, "the original must stay unsent without copying its replacement")
+			}
+		})
+	}
+}
+
+func TestSubsetCopiesLoopDecisions(t *testing.T) {
+	require := require.New(t)
+	ctx := t.Context()
+	sourcePath := createTestSourceDB(t, t.TempDir(), 4)
+	source, err := Open(sourcePath)
+	require.NoError(err)
+	require.NoError(source.MarkMessageDeleted(1, "msg_4"))
+	_, err = source.DB().ExecContext(ctx, `INSERT INTO loop_decisions(message_id,state,snoozed_until) VALUES (1,'snoozed','2026-10-25T12:00:00Z'),(2,'done',NULL),(4,'done',NULL)`)
+	require.NoError(err)
+	require.NoError(source.Close())
+
+	destinationDir := filepath.Join(t.TempDir(), "subset")
+	_, err = CopySubset(t.Context(), sourcePath, destinationDir, 3, false)
+	require.NoError(err)
+	destination, err := Open(filepath.Join(destinationDir, "msgvault.db"))
+	require.NoError(err)
+	t.Cleanup(func() { require.NoError(destination.Close()) })
+	var state string
+	require.NoError(destination.DB().QueryRowContext(ctx, `SELECT state FROM loop_decisions WHERE message_id = 2`).Scan(&state))
+	require.Equal(LoopStateDone, state)
+	var count int
+	require.NoError(destination.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM loop_decisions`).Scan(&count))
+	require.Equal(2, count, "only selected questions carry their decisions")
+	var until time.Time
+	require.NoError(destination.DB().QueryRowContext(ctx, `SELECT snoozed_until FROM loop_decisions WHERE message_id = 1`).Scan(&until))
+	require.Equal(time.Date(2026, time.October, 25, 12, 0, 0, 0, time.UTC), until.UTC())
+}
+
+func TestSubsetCopiesMatrixRecoveryStateForSelectedMessages(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	sourceDir := t.TempDir()
+	destinationDir := filepath.Join(t.TempDir(), "subset")
+	sourcePath := createTestSourceDB(t, sourceDir, 2)
+	db, err := sql.Open(sqliteutil.DriverName(), sourcePath+"?_foreign_keys=OFF")
+	require.NoError(err)
+	for _, messageID := range []int64{1, 2} {
+		_, err = db.ExecContext(t.Context(), `INSERT INTO matrix_encrypted_events (message_id, conversation_id, session_id, ciphertext) VALUES (?, ?, 'session', '{}')`, messageID, messageID)
+		require.NoError(err)
+		_, err = db.ExecContext(t.Context(), `INSERT INTO matrix_pending_edits (target_message_id, event_id, origin_ts, event) VALUES (?, ?, 1, '{}')`, messageID, fmt.Sprintf("$edit-%d", messageID))
+		require.NoError(err)
+		_, err = db.ExecContext(t.Context(), `INSERT INTO matrix_megolm_claims (conversation_id, session_id, message_index, event_id) VALUES (?, 'session', 0, ?)`, messageID, fmt.Sprintf("$event-%d", messageID))
+		require.NoError(err)
+	}
+	require.NoError(db.Close())
+
+	// The newest message is message 2, in conversation 2.
+	_, err = CopySubset(t.Context(), sourcePath, destinationDir, 1, false)
+	require.NoError(err)
+
+	destination, err := sql.Open(sqliteutil.DriverName(), filepath.Join(destinationDir, "msgvault.db"))
+	require.NoError(err)
+	t.Cleanup(func() { require.NoError(destination.Close()) })
+	for table, column := range map[string]string{
+		"matrix_encrypted_events": "message_id",
+		"matrix_pending_edits":    "target_message_id",
+		"matrix_megolm_claims":    "conversation_id",
+	} {
+		ids := func() []int64 {
+			rows, err := destination.QueryContext(t.Context(), `SELECT `+column+` FROM `+table)
+			require.NoError(err)
+			defer func() { require.NoError(rows.Close()) }()
+			var ids []int64
+			for rows.Next() {
+				var id int64
+				require.NoError(rows.Scan(&id))
+				ids = append(ids, id)
+			}
+			require.NoError(rows.Err())
+			return ids
+		}()
+		assert.Equal([]int64{2}, ids, table)
+	}
+}
+
+func TestSubsetRegistersPlaceholdersFromSourceWithoutMatrixTables(t *testing.T) {
+	require := require.New(t)
+	sourceDir := t.TempDir()
+	destinationDir := filepath.Join(t.TempDir(), "subset")
+	sourcePath := createTestSourceDB(t, sourceDir, 2)
+	db, err := sql.Open(sqliteutil.DriverName(), sourcePath+"?_foreign_keys=OFF")
+	require.NoError(err)
+	// Message 2 is the newest, so the one-row subset selects it.
+	_, err = db.ExecContext(t.Context(), `UPDATE messages SET message_type = 'matrix', snippet = ? WHERE id = 2`, MatrixEncryptedPlaceholder)
+	require.NoError(err)
+	_, err = db.ExecContext(t.Context(), `INSERT INTO message_raw (message_id, raw_data, raw_format, compression) VALUES (2, ?, 'matrix_json', NULL)`,
+		[]byte(`{"type":"m.room.encrypted","content":{"session_id":"session","ciphertext":"opaque"}}`))
+	require.NoError(err)
+	for _, table := range []string{"matrix_encrypted_events", "matrix_megolm_claims", "matrix_pending_edits"} {
+		_, err = db.ExecContext(t.Context(), `DROP TABLE `+table)
+		require.NoError(err)
+	}
+	require.NoError(db.Close())
+
+	_, err = CopySubset(t.Context(), sourcePath, destinationDir, 1, false)
+	require.NoError(err)
+
+	destination, err := sql.Open(sqliteutil.DriverName(), filepath.Join(destinationDir, "msgvault.db"))
+	require.NoError(err)
+	t.Cleanup(func() { require.NoError(destination.Close()) })
+	var registered int64
+	require.NoError(destination.QueryRowContext(t.Context(), `SELECT message_id FROM matrix_encrypted_events`).Scan(&registered))
+	assert.Equal(t, int64(2), registered)
+}
+
+func TestSubsetKeepsMergedMatrixRoomsOutOfSync(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	ctx := t.Context()
+	sourcePath := filepath.Join(t.TempDir(), "msgvault.db")
+	st, err := Open(sourcePath)
+	require.NoError(err)
+	require.NoError(st.InitSchema())
+	into, err := st.GetOrCreateSource("matrix", "@archive:example.org")
+	require.NoError(err)
+	old, err := st.GetOrCreateSource("matrix", "@old:example.org")
+	require.NoError(err)
+	room, err := st.EnsureConversationWithType(old.ID, "!dm:example.org", "direct_chat", "Old DM")
+	require.NoError(err)
+	_, err = st.PersistMatrixMessageContext(ctx, &MessagePersistData{
+		Message: &Message{SourceID: old.ID, ConversationID: room, SourceMessageID: "$old", MessageType: "matrix", Snippet: sql.NullString{String: MatrixEncryptedPlaceholder, Valid: true}},
+		RawMIME: []byte(`{"type":"m.room.encrypted","content":{"session_id":"session","ciphertext":"opaque"}}`), RawFormat: "matrix_json",
+	}, MatrixPersist{SessionID: "session"})
+	require.NoError(err)
+	_, err = st.MergeSourcesContext(ctx, MergeSourcesRequest{FromSourceID: old.ID, IntoSourceID: into.ID})
+	require.NoError(err)
+	require.NoError(st.Close())
+
+	destinationDir := filepath.Join(t.TempDir(), "subset")
+	_, err = CopySubset(t.Context(), sourcePath, destinationDir, 10, false)
+	require.NoError(err)
+	destination, err := Open(filepath.Join(destinationDir, "msgvault.db"))
+	require.NoError(err)
+	t.Cleanup(func() { require.NoError(destination.Close()) })
+
+	rooms, err := destination.ListMatrixRoomIDsContext(ctx, into.ID)
+	require.NoError(err)
+	assert.Empty(rooms, "the merged room keeps its stored type")
+	pending, err := destination.CountMatrixPending(ctx, into.ID, nil, nil)
+	require.NoError(err)
+	assert.Zero(pending, "the merged room's placeholder is not retried")
 }

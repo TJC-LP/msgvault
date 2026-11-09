@@ -19,6 +19,7 @@ import (
 	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/testutil"
 )
 
 type relationshipIndexHTTPFixture struct {
@@ -41,10 +42,7 @@ func newRelationshipIndexHTTPFixture(t *testing.T) relationshipIndexHTTPFixture 
 
 	root := t.TempDir()
 	dbPath := filepath.Join(root, "msgvault.db")
-	st, err := store.OpenForTest(dbPath)
-	requirementsForTest.NoError(err)
-	t.Cleanup(func() { require.NoError(t, st.Close()) })
-	requirementsForTest.NoError(st.InitSchema())
+	st := testutil.NewSQLiteTestStoreAt(t, dbPath)
 
 	source, err := st.GetOrCreateSource("gmail", "owner@example.test")
 	requirementsForTest.NoError(err)
@@ -56,7 +54,7 @@ func newRelationshipIndexHTTPFixture(t *testing.T) relationshipIndexHTTPFixture 
 	requirementsForTest.NoError(err)
 	requirementsForTest.NoError(st.AddAccountIdentity(source.ID, "owner@example.test", "test"))
 
-	conversationID, err := st.EnsureConversation(source.ID, "thread-index-http", "Index HTTP")
+	conversationID, err := st.EnsureConversation(t.Context(), source.ID, "thread-index-http", "Index HTTP")
 	requirementsForTest.NoError(err)
 	requirementsForTest.NoError(st.EnsureConversationParticipant(conversationID, ownerID, "member"))
 	requirementsForTest.NoError(st.EnsureConversationParticipant(conversationID, personID, "member"))
@@ -99,7 +97,7 @@ func newRelationshipIndexHTTPFixture(t *testing.T) relationshipIndexHTTPFixture 
 	requirementsForTest.NoError(err)
 
 	analyticsDir := filepath.Join(root, "analytics")
-	result, err := buildCache(dbPath, analyticsDir, true)
+	result, err := buildCache(t.Context(), dbPath, analyticsDir, true)
 	requirementsForTest.NoError(err)
 	requirementsForTest.False(result.Skipped)
 
@@ -120,6 +118,7 @@ func insertRelationshipIndexMessage(t *testing.T, st *store.Store, message store
 func (f relationshipIndexHTTPFixture) newServer(t *testing.T, disableLegacyViews bool) *api.Server {
 	t.Helper()
 	engine, err := query.NewDuckDBEngine(
+		t.Context(),
 		f.analyticsDir,
 		f.dbPath,
 		f.store.DB(),
@@ -162,7 +161,7 @@ func relationshipIndexHTTPJSON(t *testing.T, handler http.Handler, method, path 
 		require.NoError(t, err)
 		content = bytes.NewReader(data)
 	}
-	request := httptest.NewRequest(method, path, content)
+	request := httptest.NewRequestWithContext(t.Context(), method, path, content)
 	if body != nil {
 		request.Header.Set("Content-Type", "application/json")
 	}

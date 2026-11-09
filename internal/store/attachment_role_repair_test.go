@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"fmt"
 	"strings"
@@ -11,6 +12,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	internalmime "go.kenn.io/msgvault/internal/mime"
+	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/testutil"
 	"go.kenn.io/msgvault/internal/testutil/storetest"
 )
 
@@ -27,7 +30,7 @@ func TestRepairHistoricalAttachmentRolesUsesUnambiguousRawMIME(t *testing.T) {
 	assert.Equal(messageID, progress.LastMessageID)
 
 	var role, roleSource, sourcePartKey, contentID string
-	require.NoError(t, f.Store.DB().QueryRow(f.Store.Rebind(`
+	require.NoError(t, f.Store.DB().QueryRowContext(t.Context(), f.Store.Rebind(`
 		SELECT attachment_role, role_source, source_part_key, content_id
 		FROM attachments WHERE message_id = ?`), messageID).
 		Scan(&role, &roleSource, &sourcePartKey, &contentID))
@@ -51,7 +54,7 @@ func TestRepairHistoricalAttachmentRolesLeavesAmbiguousBytesUnknown(t *testing.T
 	assert.Zero(progress.AttachmentsUpdated)
 
 	var role, roleSource string
-	require.NoError(t, f.Store.DB().QueryRow(f.Store.Rebind(`
+	require.NoError(t, f.Store.DB().QueryRowContext(t.Context(), f.Store.Rebind(`
 		SELECT attachment_role, role_source FROM attachments WHERE message_id = ?`), messageID).
 		Scan(&role, &roleSource))
 	assert.Equal("unknown", role)
@@ -88,7 +91,7 @@ func TestRepairHistoricalAttachmentRolesResumesFromDurableCursor(t *testing.T) {
 	assert.Equal(1, second.AttachmentsUpdated)
 
 	var role, roleSource string
-	require.NoError(f.Store.DB().QueryRow(f.Store.Rebind(`
+	require.NoError(f.Store.DB().QueryRowContext(t.Context(), f.Store.Rebind(`
 		SELECT attachment_role, role_source FROM attachments WHERE message_id = ?`), secondID).
 		Scan(&role, &roleSource))
 	assert.Equal("inline", role)
@@ -117,7 +120,7 @@ func TestRepairHistoricalAttachmentRolesSkipsCorruptRawWithoutWedging(t *testing
 	assert := assert.New(t)
 	f := storetest.New(t)
 	messageID := seedHistoricalMIMEAttachment(t, f, "repair-corrupt", "attachment", "", "bytes")
-	_, err := f.Store.DB().Exec(f.Store.Rebind(`
+	_, err := f.Store.DB().ExecContext(t.Context(), f.Store.Rebind(`
 		UPDATE message_raw SET raw_data = ?, compression = 'zlib' WHERE message_id = ?`),
 		[]byte("not-zlib"), messageID)
 	require.NoError(t, err)
@@ -129,7 +132,7 @@ func TestRepairHistoricalAttachmentRolesSkipsCorruptRawWithoutWedging(t *testing
 	assert.Zero(progress.AttachmentsUpdated)
 
 	var role string
-	require.NoError(t, f.Store.DB().QueryRow(f.Store.Rebind(`
+	require.NoError(t, f.Store.DB().QueryRowContext(t.Context(), f.Store.Rebind(`
 		SELECT attachment_role FROM attachments WHERE message_id = ?`), messageID).Scan(&role))
 	assert.Equal("unknown", role)
 }
@@ -166,14 +169,14 @@ func TestRepairHistoricalAttachmentRolesCollapsesResyncDuplicate(t *testing.T) {
 	require.Len(parsed.Attachments, 1)
 	part := parsed.Attachments[0]
 
-	_, err = f.Store.DB().Exec(f.Store.Rebind(`
+	_, err = f.Store.DB().ExecContext(t.Context(), f.Store.Rebind(`
 		INSERT INTO attachments
 			(message_id, filename, mime_type, storage_path, content_hash, size,
 			 attachment_role, role_source, created_at)
 		VALUES (?, 'legacy.pdf', 'application/pdf', 'legacy/path', ?, 10,
 		        'unknown', 'legacy_api', CURRENT_TIMESTAMP)`), messageID, part.ContentHash)
 	require.NoError(err)
-	_, err = f.Store.DB().Exec(f.Store.Rebind(`
+	_, err = f.Store.DB().ExecContext(t.Context(), f.Store.Rebind(`
 		INSERT INTO attachments
 			(message_id, filename, mime_type, storage_path, content_hash, size,
 			 attachment_role, role_source, source_part_key, created_at)
@@ -182,10 +185,10 @@ func TestRepairHistoricalAttachmentRolesCollapsesResyncDuplicate(t *testing.T) {
 		messageID, part.ContentHash, part.PartKey)
 	require.NoError(err)
 	var keyedID int64
-	require.NoError(f.Store.DB().QueryRow(f.Store.Rebind(`
+	require.NoError(f.Store.DB().QueryRowContext(t.Context(), f.Store.Rebind(`
 		SELECT id FROM attachments WHERE message_id = ? AND source_part_key = ?`),
 		messageID, part.PartKey).Scan(&keyedID))
-	_, err = f.Store.DB().Exec(f.Store.Rebind(`
+	_, err = f.Store.DB().ExecContext(t.Context(), f.Store.Rebind(`
 		UPDATE messages SET has_attachments = TRUE, attachment_count = 2 WHERE id = ?`), messageID)
 	require.NoError(err)
 
@@ -197,7 +200,7 @@ func TestRepairHistoricalAttachmentRolesCollapsesResyncDuplicate(t *testing.T) {
 	var id int64
 	var count int
 	var filename, storagePath, role, roleSource, partKey string
-	require.NoError(f.Store.DB().QueryRow(f.Store.Rebind(`
+	require.NoError(f.Store.DB().QueryRowContext(t.Context(), f.Store.Rebind(`
 		SELECT MIN(id), COUNT(*), MIN(filename), MIN(storage_path),
 		       MIN(attachment_role), MIN(role_source), MIN(source_part_key)
 		FROM attachments WHERE message_id = ?`), messageID).
@@ -210,9 +213,117 @@ func TestRepairHistoricalAttachmentRolesCollapsesResyncDuplicate(t *testing.T) {
 	assert.Equal("mime_disposition", roleSource)
 	assert.Equal(part.PartKey, partKey)
 	var attachmentCount int
-	require.NoError(f.Store.DB().QueryRow(f.Store.Rebind(`
+	require.NoError(f.Store.DB().QueryRowContext(t.Context(), f.Store.Rebind(`
 		SELECT attachment_count FROM messages WHERE id = ?`), messageID).Scan(&attachmentCount))
 	assert.Equal(1, attachmentCount)
+}
+
+func TestRepairHistoricalAttachmentRolesPreservesMergedLegacyAttachment(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	st := testutil.NewTestStore(t)
+	from, err := st.GetOrCreateSource("gmail", "repair-history@example.test")
+	require.NoError(err)
+	into, err := st.GetOrCreateSource("gmail", "repair-live@example.test")
+	require.NoError(err)
+	recipients := []string{"recipient@example.test"}
+	survivorID := emailMergeFixtureMessage(t, st, into.ID, "live-message", recipients, true)
+	historyID := emailMergeFixtureMessage(t, st, from.ID, "history-message", recipients, true)
+	raw := historicalMIME(t, "attachment", "history-part", "same-bytes")
+	parsed, err := internalmime.Parse(raw)
+	require.NoError(err)
+	require.Len(parsed.Attachments, 1)
+	part := parsed.Attachments[0]
+	_, err = st.DB().ExecContext(t.Context(), st.Rebind(`
+		INSERT INTO attachments(
+			message_id, filename, mime_type, size, content_hash, storage_path,
+			attachment_role, role_source, source_part_key
+		) VALUES (?, 'current-old.pdf', 'application/pdf', 10, ?, 'current/old-path',
+		         'unknown', 'unknown', ?)
+	`), survivorID, part.ContentHash, part.PartKey)
+	require.NoError(err)
+	var originalAttachmentID int64
+	require.NoError(st.DB().QueryRowContext(t.Context(), st.Rebind(`
+		INSERT INTO attachments(
+			message_id, filename, mime_type, size, content_hash, storage_path,
+			attachment_role, role_source, source_part_key
+		) VALUES (?, 'historical-legacy.pdf', 'application/pdf', 10, ?, 'history/path',
+		         'unknown', 'unknown', NULL)
+		RETURNING id
+	`), historyID, part.ContentHash).Scan(&originalAttachmentID))
+	merge, err := st.MergeSourcesContext(t.Context(), store.MergeSourcesRequest{
+		FromSourceID: from.ID, IntoSourceID: into.ID,
+	})
+	require.NoError(err)
+	assert.Equal(int64(1), merge.DuplicatesHidden)
+
+	var preservedAttachmentID int64
+	var preservedPartKey, preservedRole string
+	require.NoError(st.DB().QueryRowContext(t.Context(), st.Rebind(`
+		SELECT a.id, COALESCE(a.source_part_key, ''), a.attachment_role
+		FROM attachments a
+		JOIN source_merge_attachments sa ON sa.attachment_id = a.id
+		WHERE a.message_id = ? AND sa.original_attachment_id = ?
+	`), survivorID, originalAttachmentID).Scan(
+		&preservedAttachmentID, &preservedPartKey, &preservedRole,
+	))
+	assert.Empty(preservedPartKey)
+	assert.Equal("unknown", preservedRole)
+	require.NoError(st.UpsertMessageRaw(survivorID, raw))
+
+	// A later provider refresh adds the current keyed occurrence with a known
+	// role. The durable MIME repair must not collapse the preserved legacy row.
+	message, err := st.GetMessageContext(t.Context(), survivorID)
+	require.NoError(err)
+	replacement := []store.AttachmentWrite{{
+		Filename: "current.pdf", MIMEType: "application/pdf", Size: 10,
+		ContentHash: part.ContentHash, StoragePath: "current/path",
+		Role: store.AttachmentRoleInline, RoleSource: store.AttachmentRoleSourceMIMEDisposition,
+		SourcePartKey: part.PartKey, ContentID: part.ContentID,
+	}}
+	_, err = st.PersistRepairMessageWithParticipantsContext(
+		t.Context(), store.MessageIdentityGuard{
+			ID: survivorID, SourceID: into.ID, SourceMessageID: "live-message",
+		}, nil, func([]int64) *store.MessagePersistData {
+			return &store.MessagePersistData{
+				Message: &store.Message{
+					SourceID: into.ID, SourceMessageID: "live-message",
+					ConversationID: message.ConversationID, MessageType: store.MessageTypeEmail,
+					Subject: sql.NullString{String: message.Subject, Valid: message.Subject != ""},
+				},
+				BodyText:       sql.NullString{String: message.BodyText, Valid: true},
+				PreserveLabels: true, MIMEAttachmentReplacement: &replacement,
+			}
+		},
+	)
+	require.NoError(err)
+	var currentRole string
+	require.NoError(st.DB().QueryRowContext(t.Context(), st.Rebind(`
+		SELECT attachment_role FROM attachments WHERE message_id = ? AND source_part_key = ?
+	`), survivorID, part.PartKey).Scan(&currentRole))
+	assert.Equal("inline", currentRole, "the refreshed keyed occurrence has explicit MIME role evidence")
+
+	progress, err := st.RepairHistoricalAttachmentRolesBatch(t.Context(), 10)
+	require.NoError(err)
+	assert.True(progress.Completed)
+	assert.Zero(progress.AttachmentsUpdated)
+
+	var remainingCount, markerCount int
+	var filename, role, roleSource, partKey string
+	require.NoError(st.DB().QueryRowContext(t.Context(), st.Rebind(`
+		SELECT COUNT(*), COALESCE(MIN(filename), ''), COALESCE(MIN(attachment_role), ''),
+		       COALESCE(MIN(role_source), ''), COALESCE(MIN(source_part_key), '')
+		FROM attachments WHERE id = ?
+	`), preservedAttachmentID).Scan(&remainingCount, &filename, &role, &roleSource, &partKey))
+	assert.Equal(1, remainingCount)
+	assert.Equal("historical-legacy.pdf", filename)
+	assert.Equal("unknown", role)
+	assert.Equal("unknown", roleSource)
+	assert.Empty(partKey)
+	require.NoError(st.DB().QueryRowContext(t.Context(), st.Rebind(`
+		SELECT COUNT(*) FROM source_merge_preserved_attachments WHERE attachment_id = ?
+	`), preservedAttachmentID).Scan(&markerCount))
+	assert.Equal(1, markerCount)
 }
 
 func TestRepairHistoricalAttachmentRolesDoesNotApplyStaleMIMEEvidence(t *testing.T) {
@@ -224,7 +335,7 @@ func TestRepairHistoricalAttachmentRolesDoesNotApplyStaleMIMEEvidence(t *testing
 	)
 	newHash := digestString("new-bytes")
 	restore := f.Store.SetAttachmentRoleRepairPreparedHookForTest(func() {
-		_, err := f.Store.DB().Exec(f.Store.Rebind(`
+		_, err := f.Store.DB().ExecContext(t.Context(), f.Store.Rebind(`
 			UPDATE attachments
 			SET content_hash = ?, storage_path = ?, size = ?
 			WHERE message_id = ?`),
@@ -239,7 +350,7 @@ func TestRepairHistoricalAttachmentRolesDoesNotApplyStaleMIMEEvidence(t *testing
 	assert.Zero(progress.AttachmentsUpdated)
 
 	var hash, role, roleSource string
-	require.NoError(f.Store.DB().QueryRow(f.Store.Rebind(`
+	require.NoError(f.Store.DB().QueryRowContext(t.Context(), f.Store.Rebind(`
 		SELECT content_hash, attachment_role, role_source
 		FROM attachments WHERE message_id = ?`), messageID).
 		Scan(&hash, &role, &roleSource))
@@ -264,7 +375,7 @@ func seedHistoricalMIMEAttachment(
 func insertHistoricalAttachment(t *testing.T, f *storetest.Fixture, messageID int64, content string) {
 	t.Helper()
 	hash := digestString(content)
-	_, err := f.Store.DB().Exec(f.Store.Rebind(`
+	_, err := f.Store.DB().ExecContext(t.Context(), f.Store.Rebind(`
 		INSERT INTO attachments
 			(message_id, filename, mime_type, storage_path, content_hash, size, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`),

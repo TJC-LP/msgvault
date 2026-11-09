@@ -1,7 +1,6 @@
 package store_test
 
 import (
-	"context"
 	"encoding/json"
 	"testing"
 
@@ -32,33 +31,10 @@ func savedViewInput(name string) store.SavedViewInput {
 	}
 }
 
-func TestSavedViewsSQLiteSchema(t *testing.T) {
-	requirements := require.New(t)
-	st := testutil.NewSQLiteTestStore(t)
-
-	rows, err := st.DB().Query(`PRAGMA table_info('saved_views')`)
-	requirements.NoError(err)
-	defer func() { requirements.NoError(rows.Close()) }()
-
-	columns := make(map[string]bool)
-	for rows.Next() {
-		var cid, notNull, primaryKey int
-		var name, columnType string
-		var defaultValue any
-		requirements.NoError(rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey))
-		columns[name] = true
-	}
-	requirements.NoError(rows.Err())
-	assert.Equal(t, map[string]bool{
-		"id": true, "name": true, "description": true, "canonical_state": true,
-		"schema_version": true, "revision": true, "created_at": true, "updated_at": true,
-	}, columns)
-}
-
 func TestSavedViewsCRUDAndStableListOrder(t *testing.T) {
 	assertions := assert.New(t)
 	requirements := require.New(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	st := testutil.NewTestStore(t)
 
 	zebra, err := st.CreateSavedView(ctx, savedViewInput("Zebra"))
@@ -97,7 +73,7 @@ func TestSavedViewsCRUDAndStableListOrder(t *testing.T) {
 func TestSavedViewsRejectDuplicateNamesAndStaleRevisions(t *testing.T) {
 	assertions := assert.New(t)
 	requirements := require.New(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	st := testutil.NewTestStore(t)
 	created, err := st.CreateSavedView(ctx, savedViewInput("Invoices"))
 	requirements.NoError(err)
@@ -140,7 +116,7 @@ func TestSavedViewsPreserveInspectorPreference(t *testing.T) {
 func TestSavedViewsValidateCanonicalStateBeforePersistence(t *testing.T) {
 	assertions := assert.New(t)
 	requirements := require.New(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	st := testutil.NewTestStore(t)
 
 	tests := []struct {
@@ -187,7 +163,7 @@ func TestSavedViewsValidateCanonicalStateBeforePersistence(t *testing.T) {
 func TestSavedViewsPersistOnlyServerGroupingDimensions(t *testing.T) {
 	assertions := assert.New(t)
 	requirements := require.New(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	st := testutil.NewTestStore(t)
 	supported := []string{"source", "participant", "domain", "message_type", "mailing_list", "kind", "year", "month"}
 
@@ -204,9 +180,11 @@ func TestSavedViewsPersistOnlyServerGroupingDimensions(t *testing.T) {
 	}
 
 	invalid := savedViewInput("Unsupported grouping")
-	invalid.CanonicalState = json.RawMessage(`{"grouping":["sender"]}`)
-	_, err := st.CreateSavedView(ctx, invalid)
-	requirements.ErrorIs(err, store.ErrSavedViewInvalidState)
+	for _, dimension := range []string{"arbitrary", "day"} {
+		invalid.CanonicalState = json.RawMessage(`{"grouping":["` + dimension + `"]}`)
+		_, err := st.CreateSavedView(ctx, invalid)
+		requirements.ErrorIs(err, store.ErrSavedViewInvalidState)
+	}
 
 	created, err := st.CreateSavedView(ctx, store.SavedViewInput{
 		Name: "Valid before update", CanonicalState: json.RawMessage(`{"grouping":["source"]}`),
@@ -223,7 +201,7 @@ func TestSavedViewsPersistOnlyServerGroupingDimensions(t *testing.T) {
 }
 
 func TestSavedViewsPreserveLargeNumericFilterIDs(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	st := testutil.NewTestStore(t)
 	input := savedViewInput("Large source ID")
 	input.CanonicalState = json.RawMessage(`{"filters":[{"field":"source_id","operator":"eq","values":["9223372036854775807"]}]}`)

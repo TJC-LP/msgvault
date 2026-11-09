@@ -45,6 +45,7 @@ enabled = true
 identifier = "notion-work"
 account_email = " Notion.User@Example.COM "
 token = "ntn_test"
+users_token = "ntn-example"
 schedule = "15 */6 * * *"
 enabled = true
 `)
@@ -72,6 +73,7 @@ enabled = true
 	require.NotNil(notion)
 	assert.Equal("notion.user@example.com", notion.AccountEmail)
 	assert.Equal("ntn_test", notion.Token)
+	assert.Equal("ntn-example", notion.UsersToken)
 	require.Len(cfg.ScheduledNotionMeetingsSources(), 1)
 }
 
@@ -206,8 +208,9 @@ token = "ntn_b"
 }
 
 func TestLoadMeetingSourceDuplicateIdentifiersRejected(t *testing.T) {
-	require := require.New(t)
-	configPath := writeMeetingConfig(t, `
+	twilio := "account_email='user@example.com'\naccount_sid='AC00000000000000000000000000000001'\nauth_token='synthetic'\n"
+	for name, body := range map[string]string{
+		"granola": `
 [[granola]]
 identifier = "same"
 api_key = "grn_a"
@@ -215,11 +218,14 @@ api_key = "grn_a"
 [[granola]]
 identifier = "SAME"
 api_key = "grn_b"
-`)
-
-	_, err := Load(configPath, "")
-	require.Error(err)
-	require.Contains(err.Error(), "duplicate identifier")
+`,
+		"twilio": "[[twilio]]\nidentifier='work'\n" + twilio + "[[twilio]]\nidentifier='WORK'\n" + twilio,
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := Load(writeMeetingConfig(t, body), "")
+			require.ErrorContains(t, err, "duplicate identifier")
+		})
+	}
 }
 
 func TestLoadMeetingSourceMissingIdentifierRejected(t *testing.T) {
@@ -253,6 +259,8 @@ enabled = true
 
 	require.Len(cfg.Muesli, 1)
 	src := cfg.Muesli[0]
+	assert.False(src.Recordings)
+	assert.Equal(int64(4)<<30, src.EffectiveRecordingMaxBytes())
 	assert.Equal("default", src.Identifier)
 	assert.Equal("you@example.com", src.AccountEmail)
 	home, err := os.UserHomeDir()
@@ -343,4 +351,37 @@ phone_country_code = "UK"
 `), "")
 	require.Error(err)
 	assert.Contains(err.Error(), "phone_country_code")
+}
+
+func TestLoadMuesliRecordingCaps(t *testing.T) {
+	for _, tt := range []struct {
+		name, sourceCap, serverCap string
+		wantError                  bool
+	}{
+		{"configured", "8589934592", "8589934592", false},
+		{"default", "0", "0", false},
+		{"negative source", "-1", "0", true},
+		{"negative server", "0", "-1", true},
+		{"overflow sentinel", "9223372036854775807", "0", true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			assert := assert.New(t)
+			require := require.New(t)
+
+			path := writeMeetingConfig(t, "[server]\nmuesli_recording_max_bytes = "+tt.serverCap+"\n[[muesli]]\naccount_email = \"user@example.com\"\nrecordings = true\nrecording_max_bytes = "+tt.sourceCap+"\n")
+			cfg, err := Load(path, "")
+			if tt.wantError {
+				require.Error(err)
+				return
+			}
+			require.NoError(err)
+			require.Len(cfg.Muesli, 1)
+			assert.True(cfg.Muesli[0].Recordings)
+			want := int64(4) << 30
+			if tt.sourceCap != "0" {
+				want = int64(8) << 30
+			}
+			assert.Equal(want, cfg.Muesli[0].EffectiveRecordingMaxBytes())
+		})
+	}
 }

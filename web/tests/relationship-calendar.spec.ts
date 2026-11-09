@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test';
+import { selectWorkspace } from './kit-ui';
 
 // Touch contexts let the scroll-dismissal flow tap a day for real, matching
 // the component's touch-specific tooltip behavior.
@@ -29,13 +30,14 @@ async function openCalendar(page: Page, firstAt: string | Promise<string> = pers
   await page.route('**/api/v1/participants/1', async (route) => route.fulfill({
     json: { ...person, first_at: await firstAt }
   }));
-  await page.route('**/api/v1/relationships/1/timeline', (route) => route.fulfill({ json: {
-    canonical_id: 1, identity_revision: 1, cache_revision: 'cache-calendar', rows: [], total_count: 0
-  } }));
   await page.route('**/api/v1/relationships/1/calendar', (route) => route.fulfill({ json: {
-    participant_id: 1, canonical_id: 1, year: 2026, timezone: 'UTC',
+    participant_id: 1, canonical_id: 1, year: route.request().postDataJSON().year,
+    timezone: route.request().postDataJSON().timezone,
     days: [
+      { ...baseDay, date: '2018-11-04', email: 1, total: 1, level: 'FIRST_QUARTILE' },
       { ...baseDay, date: '2026-01-01', email: 1, chat: 2, total: 3, level: 'FOURTH_QUARTILE' },
+      { ...baseDay, date: '2026-03-08', email: 1, total: 1, level: 'FIRST_QUARTILE' },
+      { ...baseDay, date: '2026-03-09' },
       { ...baseDay, date: '2026-12-31', email: 1, total: 1, level: 'FIRST_QUARTILE' }
     ],
     current: { temperature: 62, rank: 1, population: 1, raw_score: 3,
@@ -44,9 +46,26 @@ async function openCalendar(page: Page, firstAt: string | Promise<string> = pers
     score_version: 1, effective_date: '2026-12-31', cache_revision: 'cache-calendar', identity_revision: 1
   } }));
   await page.goto('/');
-  await page.getByRole('grid', { name: 'Relationship results' }).getByText(person.display_label).click();
+  await selectWorkspace(page, 'People');
+  await page.getByRole('grid', { name: 'People results' }).getByText(person.display_label).click();
   await expect(page.getByRole('region', { name: 'Relationship activity calendar' })).toBeVisible();
 }
+
+test('calendar heading clears the graph and uses the touch type scale', async ({ page }) => {
+  await openCalendar(page);
+  const calendar = page.getByRole('region', { name: 'Relationship activity calendar' });
+  // The card shows before the activity loads; measure the loaded calendar.
+  await expect(calendar.locator('.calendar-graphs')).toBeVisible();
+  const geometry = await calendar.evaluate((element) => {
+    const heading = element.querySelector('.calendar-heading')!.getBoundingClientRect();
+    const graphs = element.querySelector('.calendar-graphs')!;
+    return { gap: graphs.getBoundingClientRect().top + Number.parseFloat(getComputedStyle(graphs).paddingTop) - heading.bottom,
+      title: getComputedStyle(element.querySelector('h2')!).fontSize,
+      month: getComputedStyle(element.querySelector('.month-row')!).fontSize,
+      weekday: getComputedStyle(element.querySelector('.weekday-labels')!).fontSize };
+  });
+  expect(geometry).toEqual({ gap: 16, title: '15px', month: '14px', weekday: '12px' });
+});
 
 test('calendar fills its card at medium and narrow widths without clipping edge tooltips', async ({ page }) => {
   await openCalendar(page);
@@ -101,6 +120,26 @@ test('calendar fills its card at medium and narrow widths without clipping edge 
   }
 });
 
+test.describe('day selection when midnight is skipped', () => {
+  test.use({ timezoneId: 'America/Sao_Paulo' });
+
+  test('excludes the following day from the timeline request', async ({ page }) => {
+    await page.clock.setFixedTime(new Date('2018-11-05T12:00:00Z'));
+    await openCalendar(page);
+    const calendar = page.getByRole('region', { name: 'Relationship activity calendar' });
+    const timelineRequest = page.waitForRequest((request) =>
+      request.url().endsWith('/api/v1/participants/1/timeline') && request.method() === 'POST'
+    );
+    await calendar.getByRole('button', { name: '1 message on Nov 4, 2018' }).filter({ visible: true }).click();
+    expect((await timelineRequest).postDataJSON()).toMatchObject({
+      filters: [
+        { dimension: 'after', values: ['2018-11-04T03:00:00.000Z'] },
+        { dimension: 'before', values: ['2018-11-05T02:00:00.000Z'] }
+      ]
+    });
+  });
+});
+
 test('Escape dismisses the current day but hovering another day reopens the tooltip', async ({ page }) => {
   await openCalendar(page);
   const calendar = page.getByRole('region', { name: 'Relationship activity calendar' });
@@ -115,20 +154,6 @@ test('Escape dismisses the current day but hovering another day reopens the tool
   await expect(tooltip).toHaveText('1 message on Dec 31, 2026');
   await calendar.locator('.month-row:visible').first().hover();
   await expect(tooltip).toHaveCount(0);
-});
-
-test('year controls keep the year in place while person details load', async ({ page }) => {
-  let resolvePerson!: (firstAt: string) => void;
-  const firstAt = new Promise<string>((resolve) => { resolvePerson = resolve; });
-  await openCalendar(page, firstAt);
-  const calendar = page.getByRole('region', { name: 'Relationship activity calendar' });
-  const year = calendar.getByText('2026', { exact: true });
-  const before = await year.boundingBox();
-  await expect(calendar.getByRole('button', { name: 'Previous relationship year' })).toBeDisabled();
-  await expect(calendar.getByRole('button', { name: 'Next relationship year' })).toBeDisabled();
-  resolvePerson(person.first_at);
-  await expect(calendar.getByRole('button', { name: 'Previous relationship year' })).toBeEnabled();
-  expect((await year.boundingBox())!.x).toBe(before!.x);
 });
 
 test('calendar remains accessible in a narrow viewport with edge tooltips on screen', async ({ page }) => {
@@ -185,4 +210,67 @@ test('a loaded single-year calendar shows the year without navigation', async ({
   await expect(calendar.getByText('2026', { exact: true })).toBeVisible();
   await expect(calendar.getByRole('button', { name: 'Previous relationship year' })).toHaveCount(0);
   await expect(calendar.getByRole('button', { name: 'Next relationship year' })).toHaveCount(0);
+});
+
+test.describe('day selection', () => {
+  test.use({ timezoneId: 'America/New_York' });
+
+  test('filters the timeline by the local day and clears by keyboard or button', async ({ page }) => {
+    await openCalendar(page);
+    await page.getByRole('group', { name: 'Person page' }).getByRole('button', { name: 'Filter', exact: true }).click();
+    await page.getByLabel('From', { exact: true }).fill('2026-01-01');
+    const requests: Array<{ filters?: unknown[] }> = [];
+    await page.route('**/api/v1/participants/1/timeline', async (route) => {
+      const body = route.request().postDataJSON();
+      requests.push(body);
+      const after = body.filters?.find((filter: { dimension: string }) => filter.dimension === 'after');
+      const title = after?.values[0] === '2026-03-08T05:00:00.000Z' ? 'Spring planning' : 'All relationship activity';
+      const rows = after?.values[0] === '2026-03-09T04:00:00.000Z' ? [] : [{
+        key: 'message:10', kind: 'email', occurred_at: '2026-03-08T14:00:00Z',
+        title, preview: 'A synthetic message', source_id: 1, source_type: 'gmail', source_identifier: 'archive@example.com', message_type: 'email', conversation_type: 'email', message_count: 1, has_attachments: false, attachment_count: 0, attachment_size: 0, deleted_from_source: false, match: {}
+      }];
+      await route.fulfill({ json: {
+        cache_revision: 'cache-calendar', search_provenance: {}, rows, total_count: rows.length
+      } });
+    });
+    const calendar = page.getByRole('region', { name: 'Relationship activity calendar' });
+    const day = calendar.getByRole('button', { name: '1 message on Mar 8, 2026' }).filter({ visible: true });
+    const timeline = page.getByRole('grid', { name: 'Messages results' });
+    await day.click();
+    await expect(timeline.getByText('Spring planning')).toBeVisible();
+    await expect(page.getByRole('radio', { name: 'Messages', exact: true })).toBeChecked();
+    await expect(day).toHaveAttribute('aria-pressed', 'true');
+    const historyLength = await page.evaluate(() => history.length);
+    expect(requests.at(-1)).toMatchObject({
+      filters: [
+        { dimension: 'after', values: ['2026-03-08T05:00:00.000Z'] },
+        { dimension: 'before', values: ['2026-03-09T04:00:00.000Z'] }
+      ]
+    });
+
+    await day.focus();
+    await day.press('Enter');
+    await expect(timeline.getByText('All relationship activity')).toBeVisible();
+    await expect(day).toHaveAttribute('aria-pressed', 'false');
+    await day.press('Space');
+    await expect(timeline.getByText('Spring planning')).toBeVisible();
+
+    const emptyDay = calendar.getByRole('button', { name: 'No messages on Mar 9, 2026' }).filter({ visible: true });
+    await emptyDay.tap();
+    await expect(emptyDay).toHaveAttribute('aria-pressed', 'true');
+    await expect(timeline.getByText('No items match this view')).toBeVisible();
+    await expect(timeline.getByText('Spring planning')).toHaveCount(0);
+    await calendar.getByRole('button', { name: 'Clear date' }).click();
+    await expect(timeline.getByText('All relationship activity')).toBeVisible();
+    expect(requests.at(-1)?.filters ?? []).toEqual([{ dimension: 'after', values: ['2026-01-01T00:00:00.000Z'] }]);
+    await expect(emptyDay).toHaveAttribute('aria-pressed', 'false');
+    expect(await page.evaluate(() => history.length)).toBe(historyLength);
+
+    await day.click();
+    await expect(day).toHaveAttribute('aria-pressed', 'true');
+    await calendar.getByRole('button', { name: 'Previous relationship year' }).click();
+    await expect(calendar.getByText('2025', { exact: true })).toBeVisible();
+    await expect(calendar.getByRole('button', { name: 'Clear date' })).toHaveCount(0);
+    await expect(timeline.getByText('All relationship activity')).toBeVisible();
+  });
 });

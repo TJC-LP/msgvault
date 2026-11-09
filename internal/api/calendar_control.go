@@ -17,19 +17,26 @@ import (
 	"go.kenn.io/msgvault/internal/gcal"
 )
 
-// Calendar domain types share short names such as Person and Result with the
-// archive. Prefix only the new calendar types to preserve existing wire names.
-func calendarSchemaName(t reflect.Type, hint string) string {
+// Calendar, Muesli, and person tier types have short names such as Person,
+// Result, and Signals. Prefix only those packages' types to preserve existing
+// wire names.
+func prefixedSchemaName(t reflect.Type, hint string) string {
 	original := t
 	for t.Kind() == reflect.Pointer || t.Kind() == reflect.Slice || t.Kind() == reflect.Array {
 		t = t.Elem()
 	}
 	name := huma.DefaultSchemaNamer(original, hint)
 	switch t.PkgPath() {
-	case "go.kenn.io/msgvault/internal/gcal":
+	case "go.kenn.io/msgvault/internal/gcal", "go.kenn.io/msgvault/internal/gcal/gcalmodel":
 		return "GCal" + name
 	case "go.kenn.io/msgvault/internal/calcontrol":
 		return "Calendar" + name
+	case "go.kenn.io/msgvault/internal/muesli":
+		return "Muesli" + name
+	case "go.kenn.io/msgvault/internal/persontiers":
+		return "PersonTier" + name
+	case "go.kenn.io/msgvault/internal/senderauth":
+		return "SenderAuth" + name
 	default:
 		return name
 	}
@@ -40,8 +47,6 @@ func calendarSchemaName(t reflect.Type, hint string) string {
 type CalendarController interface {
 	ControlCalendar(ctx context.Context, request calcontrol.Request, grant *agentgrant.Grant, acquireWrite func(context.Context) (func(), error)) (*calcontrol.Result, error)
 }
-
-var errCalendarGateBusy = errors.New("archive is busy or shutting down")
 
 func (s *Server) registerCalendarControlRoute(api huma.API) {
 	op := rawAPIV1Operation("controlCalendar", http.MethodPost, "/calendar/control", "Control a live calendar event or query availability")
@@ -66,9 +71,9 @@ func (s *Server) handleCalendarControl(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "calendar_unavailable", "Calendar control is unavailable")
 		return
 	}
-	result, err := controller.ControlCalendar(r.Context(), request, s.requestAuthentication(r).Grant, s.beginCalendarMutation)
+	result, err := controller.ControlCalendar(r.Context(), request, s.requestAuthentication(r).Grant, s.beginMutation("calendar event change"))
 	if err != nil {
-		if errors.Is(err, errCalendarGateBusy) {
+		if errors.Is(err, errMutationGateBusy) {
 			writeOperationGateBusy(w, r, s.operationGate)
 			return
 		}
@@ -106,17 +111,6 @@ func (s *Server) handleCalendarControl(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, result)
-}
-
-func (s *Server) beginCalendarMutation(ctx context.Context) (func(), error) {
-	if s.operationGate == nil {
-		return func() {}, nil
-	}
-	done, ok := beginGateWorkBounded(ctx, s.operationGate, "calendar event change")
-	if !ok {
-		return nil, errCalendarGateBusy
-	}
-	return done, nil
 }
 
 func decodeCalendarControlRequest(w http.ResponseWriter, r *http.Request, destination *calcontrol.Request) bool {

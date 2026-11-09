@@ -271,7 +271,11 @@ func projectPersonName(name store.PersonName) (projectedProperty, bool, error) {
 	if err := appendNameParameters(&property, name); err != nil {
 		return projectedProperty{}, false, err
 	}
-	return ownedProjection(owner, name.Envelope, nameOwnedParameters, property), true, nil
+	projected := ownedProjection(owner, name.Envelope, nameOwnedParameters, property)
+	if name.Envelope.Source == store.ProvenanceCardDAVImport {
+		projected.CarriedParameters = []string{"TYPE", "PREF"}
+	}
+	return projected, true, nil
 }
 
 // personNameValue picks the property, owner field, and raw value one name row
@@ -475,6 +479,9 @@ func projectContactPoint(point store.PersonContactPoint) (projectedProperty, boo
 		return projectedProperty{}, false, err
 	}
 	projected := ownedProjection(ownerContactPoint, point.Envelope, valueOwnedParameters, property)
+	if point.Envelope.Source == store.ProvenanceCardDAVImport {
+		projected.CarriedParameters = []string{"TYPE", "PREF"}
+	}
 	return projected, true, nil
 }
 

@@ -41,10 +41,7 @@ type OperationPublicCounter struct {
 	Value int64                  `json:"value"`
 }
 
-type OperationPublicError struct {
-	Code    operations.PublicErrorCode `json:"code" enum:"archive_gap,authentication_failed,budget,cancelled,carddav_sync_failed,daemon_restarted,google_authorization_required,internal,invalid_output,invocation_archive_drift,invocation_authentication_failed,invocation_cancelled,invocation_daemon_restarted,invocation_internal,invocation_invalid_output,invocation_rate_limited,invocation_safety_limit,invocation_timeout,invocation_unsafe_error_redacted,invocation_upstream_failed,lease_lost,person_sweep_failed,policy,provider_http,rate_limited,retry_after,safety_limit,source_sync_failed,sync_failed,timeout,unsafe_error_redacted,upstream_failed"`
-	Message string                     `json:"message"`
-}
+type OperationPublicError = operations.OperationPublicError
 
 // OperationErrorResponse is the closed public error envelope for Operations
 // routes. Keep this separate from the legacy ErrorResponse: unrelated routes
@@ -61,7 +58,7 @@ type OperationRunSummary struct {
 	ID         string                   `json:"id"`
 	Kind       operations.Kind          `json:"kind" enum:"carddav_sync,document_embedding,document_extraction,message_embedding,person_embedding,person_enrichment,person_sweep,source_sync,visual_embedding"`
 	Lane       operations.Lane          `json:"lane" enum:"contacts,documents,messages,person_facts,visual_attachments"`
-	State      operations.State         `json:"state" enum:"cancelled,failed,partial,queued,running,succeeded"`
+	State      operations.State         `json:"state" enum:"cancelled,failed,partial,paused,queued,running,succeeded"`
 	Trigger    *operations.Trigger      `json:"trigger,omitzero" nullable:"false" enum:"manual,scheduled"`
 	StartedAt  time.Time                `json:"started_at"`
 	FinishedAt *time.Time               `json:"finished_at,omitempty"`
@@ -570,6 +567,7 @@ func operationStateValues() []string {
 		string(operations.StateRunning),
 		string(operations.StateSucceeded),
 		string(operations.StatePartial),
+		string(operations.StatePaused),
 		string(operations.StateFailed),
 		string(operations.StateCancelled),
 	}
@@ -812,7 +810,7 @@ func (s *Server) operationLaneConfigured(
 	if s.cfg == nil {
 		return false
 	}
-	switch kind {
+	switch _, _, cfg := s.vectorComponents(); kind {
 	case operations.KindCardDAVSync:
 		if s.cardDAV == nil {
 			return false
@@ -826,7 +824,7 @@ func (s *Server) operationLaneConfigured(
 			return status.Enabled && status.Configured && status.Available && status.CredentialConfigured
 		})
 	case operations.KindDocumentEmbedding:
-		return s.cfg.Vector.Enabled && s.cfg.Attachments.Documents.Index.Embeddings.Enabled
+		return cfg.Enabled && s.cfg.Attachments.Documents.Index.Embeddings.Enabled
 	case operations.KindDocumentExtraction:
 		if !s.cfg.Attachments.Documents.Enabled {
 			return false
@@ -834,9 +832,9 @@ func (s *Server) operationLaneConfigured(
 		_, err := s.currentDocumentIndexStatusRequest(ctx)
 		return !errors.Is(err, store.ErrDocumentIndexStatusScopeUnavailable)
 	case operations.KindMessageEmbedding:
-		return s.cfg.Vector.Enabled
+		return cfg.Enabled
 	case operations.KindPersonEmbedding:
-		return s.cfg.Vector.Enabled && s.cfg.Vector.People.Enabled
+		return cfg.Enabled && cfg.People.Enabled
 	case operations.KindPersonEnrichment:
 		if !s.cfg.People.Enrichment.Enabled || s.scheduler == nil ||
 			!s.scheduler.IsJobScheduled(operationPersonEnrichmentJob) {

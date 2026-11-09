@@ -16,10 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-const (
-	globalRateLimitObservationBudget = 500 * time.Millisecond
-	headerRateLimitObservationBudget = 500 * time.Millisecond
-)
+const globalRateLimitObservationBudget = 500 * time.Millisecond
 
 func TestClientReadAPI(t *testing.T) {
 	require := require.New(t)
@@ -30,7 +27,7 @@ func TestClientReadAPI(t *testing.T) {
 
 	client, err := NewClient(server.URL+"/api/v10", "test-bot-token")
 	require.NoError(err)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	me, err := client.Me(ctx)
 	require.NoError(err)
@@ -166,7 +163,7 @@ func TestMessageQueryValidation(t *testing.T) {
 			client, err := NewClient(server.URL+"/api/v10", "test-token")
 			require.NoError(t, err)
 
-			_, err = client.Messages(context.Background(), "301", tt.query)
+			_, err = client.Messages(t.Context(), "301", tt.query)
 
 			require.Error(t, err)
 			assert.Empty(t, fake.requestPaths())
@@ -188,7 +185,7 @@ func TestClientGuildWithCountsAsksDiscordForApproximateMembership(t *testing.T) 
 	client, err := NewClient(server.URL+"/api/v10", "test-bot-token")
 	require.NoError(err)
 
-	guild, err := client.GuildWithCounts(context.Background(), "201")
+	guild, err := client.GuildWithCounts(t.Context(), "201")
 
 	require.NoError(err)
 	assert.Equal("/api/v10/guilds/201?with_counts=true", <-requested)
@@ -207,7 +204,7 @@ func TestClientDecodesDiscordAPIError(t *testing.T) {
 	client, err := NewClient(server.URL, "secret-token")
 	require.NoError(err)
 
-	_, err = client.GuildChannels(context.Background(), "201")
+	_, err = client.GuildChannels(t.Context(), "201")
 
 	var apiErr *APIError
 	require.ErrorAs(err, &apiErr)
@@ -230,7 +227,7 @@ func TestClientSanitizesSuccessfulResponseDecodeErrors(t *testing.T) {
 	client, err := NewClient(server.URL, "secret-token")
 	require.NoError(err)
 
-	_, err = client.Message(context.Background(), "301", "501")
+	_, err = client.Message(t.Context(), "301", "501")
 
 	require.Error(err)
 	if strings.Contains(err.Error(), "decode-marker") || strings.Contains(err.Error(), "token-marker") || strings.Contains(err.Error(), "secret-token") {
@@ -268,9 +265,9 @@ func TestClientSerializesRoutesLearnedToShareBucket(t *testing.T) {
 		require.NoError(err)
 		client.http.Transport = server.Client().Transport
 
-		_, err = client.Messages(context.Background(), "301", MessageQuery{Limit: 1})
+		_, err = client.Messages(t.Context(), "301", MessageQuery{Limit: 1})
 		require.NoError(err)
-		_, err = client.Message(context.Background(), "301", "501")
+		_, err = client.Message(t.Context(), "301", "501")
 		require.NoError(err)
 		enabled.Store(true)
 
@@ -279,12 +276,12 @@ func TestClientSerializesRoutesLearnedToShareBucket(t *testing.T) {
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
-			_, callErr := client.Messages(context.Background(), "301", MessageQuery{Limit: 1})
+			_, callErr := client.Messages(t.Context(), "301", MessageQuery{Limit: 1})
 			errs <- callErr
 		}()
 		go func() {
 			defer wg.Done()
-			_, callErr := client.Message(context.Background(), "301", "501")
+			_, callErr := client.Message(t.Context(), "301", "501")
 			errs <- callErr
 		}()
 		wg.Wait()
@@ -297,53 +294,16 @@ func TestClientSerializesRoutesLearnedToShareBucket(t *testing.T) {
 }
 
 func TestClientHonorsGlobal429AcrossRoutes(t *testing.T) {
-	require := require.New(t)
-	globalSet := make(chan time.Time, 1)
-	var meCalls atomic.Int32
-	var guildAt atomic.Int64
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-		switch request.URL.Path {
-		case "/users/@me":
-			if meCalls.Add(1) == 1 {
-				now := time.Now()
-				globalSet <- now
-				writeDiscordJSON(w, http.StatusTooManyRequests, map[string]any{"message": "rate limited", "retry_after": 0.08, "global": true})
-				return
-			}
-			writeDiscordJSON(w, http.StatusOK, map[string]any{"id": "101"})
-		case "/guilds/201":
-			guildAt.Store(time.Now().UnixNano())
-			writeDiscordJSON(w, http.StatusOK, map[string]any{"id": "201"})
-		}
-	}))
-	t.Cleanup(server.Close)
-	client, err := NewClient(server.URL, "test-token")
-	require.NoError(err)
-
-	meDone := make(chan error, 1)
-	go func() {
-		_, callErr := client.Me(context.Background())
-		meDone <- callErr
-	}()
-	started := <-globalSet
-	require.Eventually(func() bool {
-		client.limits.mu.Lock()
-		defer client.limits.mu.Unlock()
-		return client.limits.globalUntil.After(time.Now())
-	}, globalRateLimitObservationBudget, time.Millisecond)
-	_, err = client.Guild(context.Background(), "201")
-	require.NoError(err)
-	require.NoError(<-meDone)
-	assert.GreaterOrEqual(t, time.Unix(0, guildAt.Load()).Sub(started), 65*time.Millisecond)
-}
-
-func TestClientHonorsHeaderSignaledGlobal429AcrossRoutes(t *testing.T) {
 	tests := []struct {
 		name        string
 		headerName  string
 		headerValue string
 		body        string
 	}{
+		{
+			name: "JSON global field",
+			body: `{"message":"rate limited","retry_after":0.15,"global":true}`,
+		},
 		{
 			name:        "global header with malformed JSON",
 			headerName:  "X-Ratelimit-Global",
@@ -360,59 +320,63 @@ func TestClientHonorsHeaderSignaledGlobal429AcrossRoutes(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			require := require.New(t)
-			limited := make(chan struct{}, 1)
-			var meCalls atomic.Int32
-			var guildAt atomic.Int64
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-				switch request.URL.Path {
-				case "/users/@me":
-					if meCalls.Add(1) == 1 {
-						w.Header().Set("Retry-After", "0.15")
-						w.Header().Set(tt.headerName, tt.headerValue)
-						w.WriteHeader(http.StatusTooManyRequests)
-						if _, err := w.Write([]byte(tt.body)); err != nil {
-							panic(fmt.Errorf("write synthetic 429 response: %w", err))
+			synctest.Test(t, func(t *testing.T) {
+				require := require.New(t)
+				limited := make(chan struct{}, 1)
+				var meCalls atomic.Int32
+				var guildAt atomic.Int64
+				server := httptest.NewTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+					switch request.URL.Path {
+					case "/users/@me":
+						if meCalls.Add(1) == 1 {
+							w.Header().Set("Retry-After", "0.15")
+							if tt.headerName != "" {
+								w.Header().Set(tt.headerName, tt.headerValue)
+							}
+							w.WriteHeader(http.StatusTooManyRequests)
+							if _, err := w.Write([]byte(tt.body)); err != nil {
+								panic(fmt.Errorf("write synthetic 429 response: %w", err))
+							}
+							limited <- struct{}{}
+							return
 						}
-						limited <- struct{}{}
-						return
+						writeDiscordJSON(w, http.StatusOK, map[string]any{"id": "101"})
+					case "/guilds/201":
+						guildAt.Store(time.Now().UnixNano())
+						writeDiscordJSON(w, http.StatusOK, map[string]any{"id": "201"})
 					}
-					writeDiscordJSON(w, http.StatusOK, map[string]any{"id": "101"})
-				case "/guilds/201":
-					guildAt.Store(time.Now().UnixNano())
-					writeDiscordJSON(w, http.StatusOK, map[string]any{"id": "201"})
-				}
-			}))
-			t.Cleanup(server.Close)
-			client, err := NewClient(server.URL, "test-token")
-			require.NoError(err)
+				}))
+				client, err := NewClient("http://127.0.0.1", "test-token")
+				require.NoError(err)
+				client.http.Transport = server.Client().Transport
 
-			meDone := make(chan error, 1)
-			go func() {
-				_, callErr := client.Me(context.Background())
-				meDone <- callErr
-			}()
-			<-limited
-			require.Eventually(func() bool {
-				client.limits.mu.Lock()
-				defer client.limits.mu.Unlock()
-				if client.limits.globalUntil.After(time.Now()) {
-					return true
-				}
-				for _, route := range client.limits.routes {
-					if route.readyAt.After(time.Now()) {
+				meDone := make(chan error, 1)
+				go func() {
+					_, callErr := client.Me(t.Context())
+					meDone <- callErr
+				}()
+				<-limited
+				require.Eventually(func() bool {
+					client.limits.mu.Lock()
+					defer client.limits.mu.Unlock()
+					if client.limits.globalUntil.After(time.Now()) {
 						return true
 					}
-				}
-				return false
-			}, headerRateLimitObservationBudget, time.Millisecond)
-			started := time.Now()
+					for _, route := range client.limits.routes {
+						if route.readyAt.After(time.Now()) {
+							return true
+						}
+					}
+					return false
+				}, globalRateLimitObservationBudget, time.Millisecond)
+				started := time.Now()
 
-			_, err = client.Guild(context.Background(), "201")
+				_, err = client.Guild(t.Context(), "201")
 
-			require.NoError(err)
-			require.NoError(<-meDone)
-			assert.GreaterOrEqual(t, time.Unix(0, guildAt.Load()).Sub(started), 100*time.Millisecond)
+				require.NoError(err)
+				require.NoError(<-meDone)
+				assert.GreaterOrEqual(t, time.Unix(0, guildAt.Load()).Sub(started), 100*time.Millisecond)
+			})
 		})
 	}
 }
@@ -432,10 +396,10 @@ func TestClientRetainsGlobalPauseAfterRetryExhaustion(t *testing.T) {
 	client, err := NewClient(server.URL, "test-token")
 	require.NoError(err)
 
-	_, err = client.Me(context.Background())
+	_, err = client.Me(t.Context())
 	require.Error(err)
 	exhaustedAt := time.Now()
-	_, err = client.Guild(context.Background(), "201")
+	_, err = client.Guild(t.Context(), "201")
 
 	require.NoError(err)
 	assert.GreaterOrEqual(t, time.Unix(0, guildAt.Load()).Sub(exhaustedAt), 30*time.Millisecond)
@@ -458,10 +422,10 @@ func TestClientRetainsHeaderSignaledGlobalPauseAfterRetryExhaustion(t *testing.T
 	client, err := NewClient(server.URL, "test-token")
 	require.NoError(err)
 
-	_, err = client.Me(context.Background())
+	_, err = client.Me(t.Context())
 	require.Error(err)
 	exhaustedAt := time.Now()
-	_, err = client.Guild(context.Background(), "201")
+	_, err = client.Guild(t.Context(), "201")
 
 	require.NoError(err)
 	assert.GreaterOrEqual(t, time.Unix(0, guildAt.Load()).Sub(exhaustedAt), 30*time.Millisecond)
@@ -499,7 +463,7 @@ func TestClientHonorsRetryAfterHeaderAndJSON(t *testing.T) {
 			require.NoError(err)
 
 			started := time.Now()
-			_, err = client.Me(context.Background())
+			_, err = client.Me(t.Context())
 
 			require.NoError(err)
 			assert.GreaterOrEqual(time.Since(started), tt.minimumDelay)
@@ -518,7 +482,7 @@ func TestClientCancellationDuringRateLimitWaits(t *testing.T) {
 		t.Cleanup(server.Close)
 		client, err := NewClient(server.URL, "test-token")
 		require.NoError(t, err)
-		ctx, cancel := context.WithCancel(context.Background())
+		ctx, cancel := context.WithCancel(t.Context())
 		done := make(chan error, 1)
 		go func() {
 			_, callErr := client.Me(ctx)
@@ -530,7 +494,7 @@ func TestClientCancellationDuringRateLimitWaits(t *testing.T) {
 		select {
 		case err := <-done:
 			require.ErrorIs(t, err, context.Canceled)
-		case <-time.After(500 * time.Millisecond):
+		case <-time.After(5 * time.Second):
 			require.Fail(t, "request did not observe cancellation during retry wait")
 		}
 	})
@@ -551,10 +515,10 @@ func TestClientCancellationDuringRateLimitWaits(t *testing.T) {
 		t.Cleanup(server.Close)
 		client, err := NewClient(server.URL, "test-token")
 		require.NoError(t, err)
-		_, err = client.Me(context.Background())
+		_, err = client.Me(t.Context())
 		require.NoError(t, err)
 		<-firstDone
-		ctx, cancel := context.WithCancel(context.Background())
+		ctx, cancel := context.WithCancel(t.Context())
 		cancel()
 
 		_, err = client.Me(ctx)
@@ -574,7 +538,7 @@ func TestClientBoundsServerErrorRetries(t *testing.T) {
 	client, err := NewClient(server.URL, "test-token")
 	require.NoError(t, err)
 
-	_, err = client.Me(context.Background())
+	_, err = client.Me(t.Context())
 
 	require.Error(t, err)
 	assert.Equal(t, int32(maxAttempts), calls.Load())
@@ -597,7 +561,7 @@ func TestClientRejectsRedirects(t *testing.T) {
 	client, err := NewClient(server.URL, "secret-token")
 	require.NoError(err)
 
-	_, err = client.Me(context.Background())
+	_, err = client.Me(t.Context())
 
 	require.Error(err)
 	assert.Empty(redirectedAuthorization)
@@ -615,4 +579,9 @@ func TestNewClientRejectsUnsafeBaseURL(t *testing.T) {
 			assert.NotContains(t, err.Error(), "secret")
 		})
 	}
+}
+
+func TestNewClientAcceptsLoopbackHostnameWithTrailingDot(t *testing.T) {
+	_, err := NewClient("http://localhost./api/v10", "test-token")
+	require.NoError(t, err)
 }

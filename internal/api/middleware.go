@@ -11,6 +11,7 @@ import (
 
 	"go.kenn.io/msgvault/internal/agentgrant"
 	"go.kenn.io/msgvault/internal/apiprotocol"
+	"go.kenn.io/msgvault/internal/config"
 	"golang.org/x/time/rate"
 )
 
@@ -130,7 +131,7 @@ func CORSMiddleware(cfg CORSConfig) func(http.Handler) http.Handler {
 // routes (SPA shell, static assets) keep the web handler's own caching policy.
 func apiCacheControlMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasPrefix(r.URL.Path, "/api/") {
+		if strings.HasPrefix(r.URL.Path, "/api/") || isNativeMCPPath(r.URL.Path) {
 			w.Header().Set("Cache-Control", "no-store")
 		}
 		next.ServeHTTP(w, r)
@@ -232,6 +233,7 @@ type requestAuthentication struct {
 	Session               browserSession
 	trustedForCLIDuration bool
 	Grant                 *agentgrant.Grant
+	RemoteClient          *config.RemoteClientConfig
 }
 
 func (s *Server) requestAuthentication(r *http.Request) requestAuthentication {
@@ -271,10 +273,22 @@ func (s *Server) classifyAPIRequestDirect(r *http.Request) requestAuthentication
 	if len(authHeader) > 7 && authHeader[:7] == "Bearer " {
 		authHeader = authHeader[7:]
 	}
+	if credential, ok := apiprotocol.BearerAuthorization(r); ok {
+		authHeader = credential
+	}
 	if constantTimeAPIKeyEqual(authHeader, s.cfg.Server.AuthenticationKey()) {
 		return requestAuthentication{
 			Mode:                  AuthModeAPIKey,
 			trustedForCLIDuration: true,
+		}
+	}
+	for i := range s.cfg.Server.RemoteClients {
+		if client := &s.cfg.Server.RemoteClients[i]; client.APIKey != "" && constantTimeAPIKeyEqual(authHeader, client.APIKey) {
+			return requestAuthentication{
+				Mode:                  AuthModeRemoteClient,
+				RemoteClient:          client,
+				trustedForCLIDuration: true,
+			}
 		}
 	}
 
@@ -325,7 +339,7 @@ func ownerCredentialPresented(r *http.Request) bool {
 
 func (s *Server) apiRequestAuthorized(r *http.Request) bool {
 	switch s.requestAuthentication(r).Mode {
-	case AuthModeLoopback, AuthModeAPIKey, AuthModeSession:
+	case AuthModeLoopback, AuthModeAPIKey, AuthModeSession, AuthModeCaller:
 		return true
 	default:
 		return false
@@ -337,13 +351,17 @@ func (s *Server) apiRequestAuthorized(r *http.Request) bool {
 // holders on any gated route. Delegated callers reach this predicate on
 // /api/v1/cli/run and /api/v1/calendar/control. CLI requests use
 // cliRunGateDecision; calendar control acquires the gate only for actual writes. Other
-// delegated routes skip the gate and their handlers reject them.
+// delegated reads use a SQL snapshot during scoped route admission.
+// Remote clients reach the gate only for collection writes they are granted.
 // Unauthenticated requests (AuthModeRequired) pass straight through so they
 // reach the API auth layer without touching gate state.
 func (s *Server) requestGateEligible(r *http.Request) bool {
 	auth := s.requestAuthentication(r)
 	if auth.Mode == AuthModeDelegated {
 		return r.URL.Path == "/api/v1/cli/run" || r.URL.Path == "/api/v1/calendar/control"
+	}
+	if auth.Mode == AuthModeRemoteClient {
+		return auth.RemoteClient.CollectionsWrite && strings.HasPrefix(r.URL.Path, "/api/v1/cli/collections")
 	}
 	return auth.Mode != AuthModeRequired
 }
@@ -358,7 +376,8 @@ func (s *Server) requestGateEligible(r *http.Request) bool {
 // reverse proxy, SSH tunnel, or TLS terminator forwarding to loopback, remote
 // traffic arrives as 127.0.0.1 and could brute-force the API key unthrottled.
 // The predicate (see Server.loopbackRateLimitExempt) therefore also requires
-// that the request be authenticated or that no API key be configured. The
+// that the request be authenticated or that no API key be configured, except
+// for credential-free discovery GETs to ping and daemon identity. The
 // loopback check inside it uses r.RemoteAddr, never forwarded-for headers, so
 // it cannot be spoofed remotely.
 func RateLimitMiddleware(

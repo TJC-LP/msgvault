@@ -24,6 +24,8 @@ var operationGateWaitLimit = 10 * time.Second
 
 var errCLIRunGateInspectionBodyTooLarge = errors.New("cli run request body is too large to inspect before routing")
 
+var errMutationGateBusy = errors.New("archive is busy or shutting down")
+
 // OperationGate serializes daemon-owned mutating work.
 type OperationGate interface {
 	BeginWork() (func(), bool)
@@ -324,6 +326,19 @@ func beginGateWorkBounded(ctx context.Context, gate OperationGate, label string)
 	return gate.BeginWorkContext(waitCtx)
 }
 
+func (s *Server) beginMutation(label string) func(context.Context) (func(), error) {
+	return func(ctx context.Context) (func(), error) {
+		if s.operationGate == nil {
+			return func() {}, nil
+		}
+		done, ok := beginGateWorkBounded(ctx, s.operationGate, label)
+		if !ok {
+			return nil, errMutationGateBusy
+		}
+		return done, nil
+	}
+}
+
 func writeOperationGateBusy(w http.ResponseWriter, r *http.Request, gate OperationGate) {
 	lg, ok := gate.(LabeledOperationGate)
 	if !ok {
@@ -336,7 +351,7 @@ func writeOperationGateBusy(w http.ResponseWriter, r *http.Request, gate Operati
 	}
 	message := "another operation is running"
 	security, _ := securityFromRequest(r)
-	if security.auth.Mode != AuthModeDelegated {
+	if security.auth.Mode != AuthModeDelegated && security.auth.Mode != AuthModeRemoteClient {
 		if label, since, held := lg.Holder(); held && label != "" {
 			message = fmt.Sprintf("%s has been running for %s",
 				label, time.Since(since).Round(time.Second))
@@ -353,7 +368,8 @@ func writeOperationGateBusy(w http.ResponseWriter, r *http.Request, gate Operati
 // and runs schema init/migrations.
 //
 // Backup freeze begin, meeting import, and historical import jobs coordinate
-// the gate in their handlers.
+// the gate in their handlers. Local search acquires it in its controller after
+// installing shared files.
 // Meeting import first reads and validates its bounded request body so a slow
 // authenticated upload cannot hold the gate. Backup freeze end bypasses the
 // gate so it can release the freeze held by begin. Routing these through the
@@ -362,6 +378,9 @@ func writeOperationGateBusy(w http.ResponseWriter, r *http.Request, gate Operati
 // DELETE /api/v1/agent-tokens/{id} uses a dynamic path; its exemption is
 // handled by the strings.HasPrefix check in operationGateRequest below.
 var operationGateExemptPaths = map[string]bool{
+	// MCP envelopes delegate gate acquisition to their nested API requests.
+	"/mcp":        true,
+	"/mcp/writes": true,
 	// Calendar control acquires the gate after parsing, authorization, and preview.
 	"/api/v1/calendar/control": true,
 	// Scoring coordinates the gate around local mutations, never provider I/O.
@@ -376,13 +395,18 @@ var operationGateExemptPaths = map[string]bool{
 	agentTokensPath:                    true,
 	sessionLoginPath:                   true,
 	importJobsEndpointPath:             true,
+	localEmbeddingsEndpointPath:        true,
 	meetingImportEndpointPath:          true,
+	muesliImportEndpointPath:           true,
+	muesliRecordingEndpointPath:        true,
 	"/api/v1/cli/add-calendar/plan":    true,
 	"/api/v1/cli/delete-staged/plan":   true,
 	"/api/v1/cli/embeddings/plan":      true,
 	"/api/v1/cli/deduplicate/plan":     true,
 	backupFreezeBeginPath:              true,
 	backupFreezeEndPath:                true,
+	// Telemetry changes no archive state; gating it would make opening the app yield a running sync.
+	telemetryEventsPath: true,
 }
 
 // readOnlyPostRoutePatterns lists the analytical POST routes whose handlers
@@ -401,22 +425,29 @@ var operationGateExemptPaths = map[string]bool{
 // registerSearchCoverageRoute (the OpenAPI "Exploration" tag), so a new
 // analytical route forces a conscious classification decision here.
 //
-// The remote-image proxy and CardDAV account test are the non-Exploration
+// The remote-image proxy and CardDAV account test are non-Exploration
 // entries. Both perform SSRF-validated outbound reads without changing
 // archive or persistent configuration state, so they must stay available
-// while a long archive operation holds the gate.
+// while a long archive operation holds the gate. Meeting actions, context,
+// and metrics are also non-Exploration read routes. Kata evidence preparation
+// only reads message bodies and extracted document text. Message tag reads and
+// previews bypass the gate here; their handler takes it for actual writes.
 const cardDAVAccountTestPath = "/api/v1/carddav/account/test"
 
 var readOnlyPostRoutePatterns = []string{
 	"/api/v1/saved-views/{id}/run",
 	remoteImagePath,
 	cardDAVAccountTestPath,
+	kataEvidencePreparePath,
+	"/api/v1/messages/{id}/tags",
 	"/api/v1/explore",
 	"/api/v1/explore/groups",
 	"/api/v1/explore/preflight",
 	"/api/v1/explore/match-counts",
 	"/api/v1/explore/files",
 	"/api/v1/files/search",
+	"/api/v1/files/suggest",
+	"/api/v1/people/{id}/files/suggest",
 	// Visual attachment search reads the committed vector index and calls
 	// the embedding provider; it mutates nothing, and gating it would hold
 	// pure reads (and the mutation gate) hostage to provider latency.
@@ -435,6 +466,10 @@ var readOnlyPostRoutePatterns = []string{
 	"/api/v1/relationships",
 	"/api/v1/relationships/{id}/calendar",
 	"/api/v1/relationships/{id}/timeline",
+	// Meeting actions, context, and metrics read archived meeting rows in a read snapshot.
+	"/api/v1/meetings/actions",
+	"/api/v1/meetings/context",
+	"/api/v1/meetings/metrics",
 	"/api/v1/search/coverage",
 }
 
@@ -443,8 +478,8 @@ var (
 	readOnlyPostRouteMux  *http.ServeMux
 )
 
-// readOnlyPostRouteRequest reports whether r targets one of the read-only
-// analytical POST routes. Matching goes through a net/http ServeMux built
+// readOnlyPostRouteRequest reports whether r targets a POST route that bypasses
+// the middleware gate. Matching goes through a net/http ServeMux built
 // from readOnlyPostRoutePatterns so the path-parameter routes ({id},
 // {domain}) match with the same semantics as the API router itself.
 func readOnlyPostRouteRequest(r *http.Request) bool {
@@ -458,6 +493,54 @@ func readOnlyPostRouteRequest(r *http.Request) bool {
 	return pattern != ""
 }
 
+// syncTriggerRoutePattern is the route handleTriggerSync serves.
+const syncTriggerRoutePattern = "/api/v1/sync/{account}"
+
+var (
+	syncTriggerRouteOnce sync.Once
+	syncTriggerRouteMux  *http.ServeMux
+)
+
+// genericSyncTriggerRequest reports whether r triggers a generic
+// (non-account) scheduled job, such as the Apple WhatsApp or iMessage import.
+// handleTriggerSync only reserves or queues such a job in the scheduler and
+// returns; the run itself takes the gate later, in the scheduler. The request
+// therefore must not wait on the gate: while a long import holds it, a
+// gated trigger would be turned away with operation_in_progress before it
+// could coalesce into a follow-up run or return its disposition. It must not
+// count as a request waiter either, or the running job would yield to it.
+//
+// Account-sync triggers stay gated: they answer 409 on a running sync and
+// their gate behaviour is unchanged.
+//
+// The account is matched through a ServeMux built from the route pattern so
+// an escaped identifier (a calendar source is "<email>/<calendar>") resolves
+// exactly as the API router resolves it.
+func genericSyncTriggerRequest(r *http.Request) bool {
+	if r.Method != http.MethodPost {
+		return false
+	}
+	syncTriggerRouteOnce.Do(func() {
+		syncTriggerRouteMux = http.NewServeMux()
+		syncTriggerRouteMux.HandleFunc("POST "+syncTriggerRoutePattern, func(http.ResponseWriter, *http.Request) {})
+	})
+	// ServeMux.Handler does not expose path values, so serve a shallow copy
+	// and read them from it; r itself is left for the real router.
+	probe := r.WithContext(r.Context())
+	syncTriggerRouteMux.ServeHTTP(discardResponseWriter{}, probe)
+	account := probe.PathValue("account")
+	if account == "" {
+		return false
+	}
+	return classifySourceScheduling(r.URL.Query().Get("source_type"), account).kind == sourceScheduleGeneric
+}
+
+type discardResponseWriter struct{}
+
+func (discardResponseWriter) Header() http.Header         { return http.Header{} }
+func (discardResponseWriter) Write(p []byte) (int, error) { return len(p), nil }
+func (discardResponseWriter) WriteHeader(int)             {}
+
 func operationGateRequest(r *http.Request, auth requestAuthentication) (bool, string, error) {
 	if r.URL.Path == DaemonShutdownPath {
 		return false, "", nil
@@ -470,6 +553,9 @@ func operationGateRequest(r *http.Request, auth requestAuthentication) (bool, st
 		return false, "", nil
 	}
 	if readOnlyPostRouteRequest(r) {
+		return false, "", nil
+	}
+	if genericSyncTriggerRequest(r) {
 		return false, "", nil
 	}
 	// Provider handlers take the gate only for their local mutations. Device
@@ -529,14 +615,21 @@ func cliRepairMessageGateDecision(r *http.Request) (label string, skip bool, err
 // cliRunReadOnlyCommands are proxied CLI commands that only read. Keys are
 // the leading command-path words of CLIRunRequest args (flags follow them).
 var cliRunReadOnlyCommands = map[string]bool{
-	"draft-get":        true,
-	"draft-send-as":    true,
-	"logs":             true,
-	"list-deletions":   true,
-	"show-deletion":    true,
-	"embeddings list":  true,
-	"documents search": true,
-	"documents status": true,
+	"export-messages":   true,
+	"export-discord":    true,
+	"list-folders":      true,
+	"policy list":       true,
+	"draft-get":         true,
+	"draft-send-as":     true,
+	"logs":              true,
+	"list-deletions":    true,
+	"show-deletion":     true,
+	"embeddings list":   true,
+	"embeddings status": true,
+	"documents search":  true,
+	// Tier previews only read.
+	"person tiers preview": true,
+	"person tiers explain": true,
 }
 
 // cliRunSelfGatedCommands are proxied CLI commands that acquire the
@@ -544,8 +637,17 @@ var cliRunReadOnlyCommands = map[string]bool{
 // create" brackets its own work with the backup freeze begin/end endpoints
 // (see handleBackupFreezeBegin), so the middleware must skip it exactly like
 // a read-only command or the two acquisitions would deadlock each other.
+// Embeddings optimize coordinates its own gate leases between copy batches.
 var cliRunSelfGatedCommands = map[string]bool{
 	"backup create": true,
+}
+
+// IsCLIRunEmbeddingsOptimize identifies the optimize command path using the
+// same flag handling as gate inspection. The daemon must handle every matched
+// invocation locally, including invalid arguments, rather than launching an
+// ungated generic CLI subprocess.
+func IsCLIRunEmbeddingsOptimize(args []string) bool {
+	return len(args) > 0 && cliRunCommandWords(args) == "embeddings optimize"
 }
 
 func cliRunGateDecision(r *http.Request, auth requestAuthentication) (label string, skip bool, err error) {
@@ -573,7 +675,7 @@ func cliRunGateDecision(r *http.Request, auth requestAuthentication) (label stri
 			return "", true, nil
 		}
 		command := cliRunCommandWords(req.Args)
-		if cliRunReadOnlyCommands[command] || cliRunSelfGatedCommands[command] {
+		if cliRunReadOnlyCommands[command] || cliRunSelfGatedCommands[command] || IsCLIRunEmbeddingsOptimize(req.Args) {
 			return "", true, nil
 		}
 		if command != "" {
@@ -590,21 +692,44 @@ func cliRunGateDecision(r *http.Request, auth requestAuthentication) (label stri
 // cliRunCommandGroups are proxied parent commands whose second arg is a
 // subcommand name rather than a positional value.
 var cliRunCommandGroups = map[string]bool{
+	"policy":     true,
 	"embeddings": true,
 	"backup":     true,
 	"documents":  true,
 }
 
-// cliRunCommandWords extracts the command path from proxied args. Positional
-// values and flags follow the command path, so only a known group consumes a
-// second word.
+// cliRunCommandWords extracts the command path while consuming supported flags and their values.
 func cliRunCommandWords(args []string) string {
 	first := args[0]
 	if strings.HasPrefix(first, "-") {
 		return ""
 	}
-	if cliRunCommandGroups[first] && len(args) > 1 && !strings.HasPrefix(args[1], "-") {
-		return first + " " + args[1]
+	if first == cliRunPersonCommand && len(args) > 2 && args[1] == "tiers" {
+		return first + " tiers " + args[2]
+	}
+	if !cliRunCommandGroups[first] {
+		return first
+	}
+	for i := 1; i < len(args); i++ {
+		arg := args[i]
+		if !strings.HasPrefix(arg, "-") {
+			return first + " " + arg
+		}
+		name, _, hasValue := strings.Cut(arg, "=")
+		switch name {
+		case "--json", "--watch", "--verbose", "-v", "--local", "--no-log-file", "--log-sql", "--help", "-h":
+		case "--source", "--interval", "--config", "--home", "--log-file", "--log-level", "--log-sql-slow-ms":
+			if !hasValue {
+				i++
+			}
+		default:
+			// Cobra accepts repeated boolean shorthand, such as -vv.
+			if strings.HasPrefix(name, "-v") && strings.Trim(name[1:], "v") == "" {
+				continue
+			}
+			// Unknown flags stay gated because their next argument may be a value.
+			return first
+		}
 	}
 	return first
 }

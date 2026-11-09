@@ -47,12 +47,19 @@ export interface ArchiveMessageSummary {
 }
 
 export interface ArchiveAttachment {
+  id: number;
+  /** The bytes are stored and downloadable. */
+  stored?: boolean;
   filename: string;
   mimeType: string;
   sizeBytes: number;
 }
 
 export interface ArchiveMessageDetail extends ArchiveMessageSummary {
+  senderParticipantID?: number;
+  recipientParticipants?: { display: string; participantID: number }[];
+  messageType?: string;
+  relatedMessageId?: number;
   body: string;
   bodyHtml?: string;
   attachments: ArchiveAttachment[];

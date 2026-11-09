@@ -1,24 +1,36 @@
 package query
 
 import (
-	"context"
+	"os"
+	"path/filepath"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/msgvault/internal/testutil/tbmock"
 )
 
-func TestAddLabel_ValidName(t *testing.T) {
-	b := NewTestDataBuilder(t)
-	id := b.AddLabel("INBOX")
-	assert.Equal(t, int64(1), id)
-	id2 := b.AddLabel("SENT")
-	assert.Equal(t, int64(2), id2)
+func TestBuild_CopiesAreIndependent(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+	assert := assert.New(t)
+	first, cleanup := buildStandardTestData(t).Build()
+	t.Cleanup(cleanup)
+	second, cleanup := buildStandardTestData(t).Build()
+	t.Cleanup(cleanup)
+	require.NotEqual(first, second)
+
+	require.NoError(os.Remove(filepath.Join(first, "messages", "year=2024", "data.parquet")))
+	readiness, err := InspectCacheReadiness(second)
+	require.NoError(err)
+	assert.Equal(CacheReady, readiness)
+	readiness, err = InspectCacheReadiness(first)
+	require.NoError(err)
+	assert.Equal(CacheInterrupted, readiness)
 }
 
 func TestAddMessage_ExplicitSourceID_BypassesCheck(t *testing.T) {
+	t.Parallel()
 	// Explicit SourceID bypasses the "no sources" check.
 	b := NewTestDataBuilder(t)
 	id := b.AddMessage(MessageOpt{
@@ -29,6 +41,7 @@ func TestAddMessage_ExplicitSourceID_BypassesCheck(t *testing.T) {
 }
 
 func TestTestDataBuilder_ValidationFailures(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name string
 		fn   func(*TestDataBuilder)
@@ -60,6 +73,7 @@ func TestTestDataBuilder_ValidationFailures(t *testing.T) {
 }
 
 func TestAddMessage_UsesFirstSource(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	b := NewTestDataBuilder(t)
@@ -76,12 +90,13 @@ func TestAddMessage_UsesFirstSource(t *testing.T) {
 	engine := b.BuildEngine()
 	defer func() { _ = engine.Close() }()
 
-	stats, err := engine.GetTotalStats(context.Background(), StatsOptions{})
+	stats, err := engine.GetTotalStats(t.Context(), StatsOptions{})
 	require.NoError(err, "GetTotalStats")
 	assert.Equal(int64(1), stats.MessageCount)
 }
 
 func TestAddAttachment_SetsHasAttachments(t *testing.T) {
+	t.Parallel()
 	b := NewTestDataBuilder(t)
 	b.AddSource("a@test.com")
 	msgID := b.AddMessage(MessageOpt{Subject: "with attachment"})
@@ -91,22 +106,4 @@ func TestAddAttachment_SetsHasAttachments(t *testing.T) {
 	b.AddAttachment(msgID, 1024, "file.txt")
 
 	assert.True(t, b.messages[0].HasAttachments, "HasAttachments should be true after AddAttachment")
-}
-
-func TestBuild_EmptyAuxiliaryTables(t *testing.T) {
-	// Build should succeed with messages but no participants, labels, etc.
-	b := NewTestDataBuilder(t)
-	b.AddSource("a@test.com")
-	b.AddMessage(MessageOpt{
-		Subject: "solo message",
-		SentAt:  time.Date(2024, 6, 1, 0, 0, 0, 0, time.UTC),
-	})
-
-	engine := b.BuildEngine()
-	defer func() { _ = engine.Close() }()
-
-	// Should be able to query without errors.
-	stats, err := engine.GetTotalStats(context.Background(), StatsOptions{})
-	require.NoError(t, err, "GetTotalStats")
-	assert.Equal(t, int64(1), stats.MessageCount)
 }

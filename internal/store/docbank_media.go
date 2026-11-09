@@ -11,6 +11,9 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"go.kenn.io/msgvault/internal/attachmentpolicy"
+	"go.kenn.io/msgvault/internal/personscope"
 )
 
 // beeperMediaLocalGapCodes are source gaps that a daemon restart cannot fix.
@@ -53,12 +56,36 @@ const (
 	beeperMediaPollDelay         = time.Minute
 )
 
-// beeperMediaEligible is the shared provider, capture and role predicate. It
-// assumes a (attachments), m (messages), c (conversations) and src (sources).
-// Archives older than attachment_state leave it NULL on stored Beeper audio.
-const beeperMediaEligible = `length(COALESCE(a.content_hash, '')) = 64
-	  AND COALESCE(a.size, 0) > 0
+const attachmentHashedBytes = `(length(COALESCE(a.content_hash, '')) = 64
+	  AND COALESCE(a.storage_path, '') <> '')`
+
+// Audio processing needs a positive size; the attachment mirror also accepts empty files.
+const attachmentBytesArchived = `(` + attachmentHashedBytes + ` AND COALESCE(a.size, 0) > 0)`
+
+var docbankAliasProviders = []string{sourceTypeSlack, sourceTypeDiscord}
+
+var docbankAliasProvider = func() string {
+	var aliases []string
+	for _, provider := range docbankAliasProviders {
+		aliases = append(aliases, fmt.Sprintf("SUBSTR(a.source_attachment_id,1,%d)='%s:'", len(provider)+1, provider))
+	}
+	return "(" + strings.Join(aliases, " OR ") + ")"
+}()
+
+var hashlessProviderAliasBytes = `(COALESCE(a.content_hash, '') = ''
 	  AND COALESCE(a.storage_path, '') <> ''
+	  AND ` + docbankAliasProvider + `)`
+
+// hashlessProviderAlias needs casPathHash to verify its storage path.
+var hashlessProviderAlias = `(` + hashlessProviderAliasBytes + ` AND COALESCE(a.size, 0) > 0)`
+
+// beeperMediaEligible is the shared provider, capture and role predicate. It
+// assumes a (attachments), m (messages), cv (conversations) and src (sources).
+// Merge-preserved copies retain old provider attachment references and are
+// archive evidence rather than current media occurrences. Archives older than
+// attachment_state leave it NULL on stored Beeper audio.
+const beeperMediaEligible = attachmentBytesArchived + `
+	  AND NOT EXISTS (SELECT 1 FROM source_merge_preserved_attachments spa WHERE spa.attachment_id = a.id)
 	  AND COALESCE(src.source_type, '') <> ''
 	  AND COALESCE(src.identifier, '') <> ''
 	  AND COALESCE(m.source_message_id, '') <> ''
@@ -69,21 +96,22 @@ const beeperMediaEligible = `length(COALESCE(a.content_hash, '')) = 64
 		  AND COALESCE(a.attachment_role, 'unknown') = 'standalone')
 		OR (src.source_type <> 'beeper'
 		  AND COALESCE(NULLIF(a.source_part_key, ''), a.source_attachment_id, '') <> ''
-		  AND COALESCE(c.source_conversation_id, '') <> ''
+		  AND COALESCE(cv.source_conversation_id, '') <> ''
 		  AND COALESCE(a.attachment_state, '') IN ('', 'stored')
 		  AND COALESCE(a.attachment_role, 'unknown') IN ('standalone', 'unknown'))
 	  )`
 
-// beeperMediaCurrentJoin follows occurrence row o to its live source
-// attachment by stable source tuple, never by attachment row ID.
-var beeperMediaCurrentJoin = `
+// beeperMediaTupleJoin follows occurrence row o by stable source tuple, including historical deliveries.
+var beeperMediaTupleJoin = `
 	JOIN sources src ON src.source_type = o.source_type AND src.identifier = o.source_identifier
 	JOIN messages m ON m.source_id = src.id AND m.source_message_id = o.source_message_id
-	JOIN conversations c ON c.id = m.conversation_id
+	JOIN conversations cv ON cv.id = m.conversation_id
 	JOIN attachments a ON a.message_id = m.id
-	WHERE COALESCE(c.source_conversation_id, '') = o.source_conversation_id
+	WHERE COALESCE(cv.source_conversation_id, '') = o.source_conversation_id
 	  AND COALESCE(a.source_attachment_id, '') = o.source_attachment_id
-	  AND COALESCE(NULLIF(a.source_part_key, ''), NULLIF(a.source_attachment_id, ''), src.source_type || ':unknown') = o.source_part_key
+	  AND COALESCE(NULLIF(a.source_part_key, ''), NULLIF(a.source_attachment_id, ''), src.source_type || ':unknown') = o.source_part_key`
+
+var beeperMediaCurrentJoin = beeperMediaTupleJoin + `
 	  AND a.content_hash = o.source_sha256
 	  AND ` + beeperMediaEligible + `
 	  AND ` + LiveMessagesWhere("m", true)
@@ -91,25 +119,26 @@ var beeperMediaCurrentJoin = `
 // BeeperMediaCandidate is the current archive evidence for a stored attachment
 // to inspect for audio. The source tuple, rather than AttachmentID, is stable.
 type BeeperMediaCandidate struct {
-	AttachmentID         int64
-	MessageID            int64
-	SentAt               sql.NullTime
-	ConversationID       int64
-	SourceID             int64
-	SourceType           string
-	SourceIdentifier     string
-	SourceConversationID string
-	SourceMessageID      string
-	SourceAttachmentID   string
-	SourcePartKey        string
-	Filename             string
-	MIMEType             string
-	MediaType            string
-	Role                 string
-	ContentHash          string
-	ByteLength           int64
-	AttachmentState      string
-	AttachmentMetadata   string
+	AttachmentID            int64
+	MessageID               int64
+	SentAt                  sql.NullTime
+	ConversationID          int64
+	SourceID                int64
+	SourceType              string
+	SourceIdentifier        string
+	SourceConversationID    string
+	SourceMessageID         string
+	OriginalSourceMessageID string
+	SourceAttachmentID      string
+	SourcePartKey           string
+	Filename                string
+	MIMEType                string
+	MediaType               string
+	Role                    string
+	ContentHash             string
+	ByteLength              int64
+	AttachmentState         string
+	AttachmentMetadata      string
 }
 
 // BeeperMediaMapping is one occurrence row together with the optional shared
@@ -213,6 +242,7 @@ type BeeperMediaResult struct {
 // ties a pass to the journal registration it can complete.
 type BeeperMediaScan struct {
 	DestinationKey    string    `json:"destination_key"`
+	Generation        string    `json:"generation,omitempty"`
 	AfterAttachmentID int64     `json:"after_attachment_id"`
 	PassHighWater     int64     `json:"pass_high_water"`
 	BaselineSequence  int64     `json:"baseline_sequence"`
@@ -220,8 +250,13 @@ type BeeperMediaScan struct {
 }
 
 const beeperMediaCandidateColumns = `
-	SELECT a.id, m.id, c.id, src.id, src.source_type, src.identifier,
-	       COALESCE(c.source_conversation_id, ''), COALESCE(m.source_message_id, ''),
+	SELECT a.id, m.id, cv.id, src.id, src.source_type, src.identifier,
+	       COALESCE(cv.source_conversation_id, ''), COALESCE(m.source_message_id, ''),
+	       COALESCE(NULLIF((SELECT marker.original_source_message_id
+	                        FROM source_merge_archive_only_messages marker
+	                        WHERE marker.message_id = m.id), ''),
+	                (SELECT smm.original_message_id FROM source_merge_messages smm
+	                 WHERE smm.message_id = m.id AND smm.archive_only = TRUE), ''),
 	       COALESCE(a.source_attachment_id, ''),
 	       COALESCE(NULLIF(a.source_part_key, ''), a.source_attachment_id, ''),
 	       COALESCE(a.filename, ''), COALESCE(a.mime_type, ''),
@@ -231,7 +266,7 @@ const beeperMediaCandidateColumns = `
 	       COALESCE(CAST(a.attachment_metadata AS TEXT), ''), m.sent_at
 	FROM attachments a
 	JOIN messages m ON m.id = a.message_id
-	JOIN conversations c ON c.id = m.conversation_id
+	JOIN conversations cv ON cv.id = m.conversation_id
 	JOIN sources src ON src.id = m.source_id`
 
 // ListBeeperMediaCandidates returns a bounded page of captured attachments on
@@ -261,10 +296,27 @@ func (s *Store) GetBeeperMediaCandidate(ctx context.Context, attachmentID int64)
 func (s *Store) queryBeeperMediaCandidates(
 	ctx context.Context, idFilter string, id int64, limit int,
 ) ([]BeeperMediaCandidate, error) {
+	return s.readBeeperMediaCandidates(ctx, idFilter, limit, id, limit)
+}
+
+// GetBeeperMediaCandidates resolves a caller-bounded selection of attachments.
+func (s *Store) GetBeeperMediaCandidates(ctx context.Context, ids []int64) ([]BeeperMediaCandidate, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	args := make([]any, len(ids), len(ids)+1)
+	for i, id := range ids {
+		args[i] = id
+	}
+	args = append(args, len(ids))
+	return s.readBeeperMediaCandidates(ctx, `a.id IN (?`+strings.Repeat(", ?", len(ids)-1)+`)`, len(ids), args...)
+}
+
+func (s *Store) readBeeperMediaCandidates(ctx context.Context, idFilter string, limit int, args ...any) ([]BeeperMediaCandidate, error) {
 	rows, err := s.db.QueryContext(ctx, s.Rebind(beeperMediaCandidateColumns+`
 		WHERE `+idFilter+` AND `+beeperMediaEligible+` AND `+LiveMessagesWhere("m", true)+`
 		ORDER BY a.id
-		LIMIT ?`), id, limit)
+		LIMIT ?`), args...)
 	if err != nil {
 		return nil, fmt.Errorf("list beeper media candidates: %w", err)
 	}
@@ -276,6 +328,7 @@ func (s *Store) queryBeeperMediaCandidates(
 			&candidate.AttachmentID, &candidate.MessageID, &candidate.ConversationID,
 			&candidate.SourceID, &candidate.SourceType, &candidate.SourceIdentifier,
 			&candidate.SourceConversationID, &candidate.SourceMessageID,
+			&candidate.OriginalSourceMessageID,
 			&candidate.SourceAttachmentID, &candidate.SourcePartKey,
 			&candidate.Filename, &candidate.MIMEType, &candidate.MediaType,
 			&candidate.Role, &candidate.ContentHash, &candidate.ByteLength,
@@ -573,6 +626,200 @@ func (s *Store) currentBeeperMediaMessage(ctx context.Context, mapping BeeperMed
 		return false, fmt.Errorf("resolve beeper media occurrence: %w", err)
 	}
 	return true, nil
+}
+
+// MessageMediaOccurrence joins visible local audio with its optional Docbank mapping.
+type MessageMediaOccurrence struct {
+	MessageID        int64
+	ConversationID   int64
+	AttachmentID     int64
+	Filename         string
+	ContainingTitle  string
+	OccurredAt       *time.Time
+	Size             int64
+	OccurrenceRef    string
+	Revision         string
+	RetentionState   string
+	ErrorCode        string
+	VaultUID         string
+	DocbankSourceID  string
+	SourceVersionID  string
+	ContentVersionID string
+	// The delivery of the occurrence's current processing key, which for a
+	// provider transcript is keyed by that transcript's text.
+	DeliveryProfile        string
+	DeliveryPhase          string
+	DeliveryOperationState string
+	SuppliedInputID        string
+	BytesArchived          bool
+	AttachmentState        attachmentpolicy.DownloadState
+}
+
+// messageAudioHint matches attachment a when its metadata says audio.
+const messageAudioHint = `(COALESCE(a.media_type, '') IN ('audio', 'voice_note')
+	OR LOWER(COALESCE(a.mime_type, '')) LIKE 'audio/%'
+	OR LOWER(COALESCE(a.filename, '')) LIKE '%.wav'
+	OR LOWER(COALESCE(a.filename, '')) LIKE '%.mp3'
+	OR LOWER(COALESCE(a.filename, '')) LIKE '%.m4a'
+	OR LOWER(COALESCE(a.filename, '')) LIKE '%.aac'
+	OR LOWER(COALESCE(a.filename, '')) LIKE '%.ogg'
+	OR LOWER(COALESCE(a.filename, '')) LIKE '%.oga'
+	OR LOWER(COALESCE(a.filename, '')) LIKE '%.opus')`
+
+const messageRecordingMapping = `o.retention_state <> 'revoked'
+	  AND NOT (o.retention_state = 'blocked' AND o.retention_operation_id = ''
+	    AND o.error_code = 'unsupported_media' AND NOT ` + messageAudioHint + `)`
+
+// Current mappings recognize inspected audio with generic file metadata.
+func messageRecordingAudio(where string) string {
+	return `(` + messageAudioHint + ` OR a.id IN (
+	SELECT a.id FROM beeper_media_occurrences o` + beeperMediaCurrentJoin + where + `
+	  AND ` + messageRecordingMapping + `))`
+}
+
+// ListMessageMediaOccurrences lists visible archived audio and missing bytes.
+// A destination adds current remote mappings; empty means a local-only read.
+// The media worker owns stale mapping revocation.
+func (s *Store) ListMessageMediaOccurrences(
+	ctx context.Context, destination string, messageID int64,
+) ([]MessageMediaOccurrence, error) {
+	if messageID < 1 {
+		return nil, errors.New("message media occurrence query is invalid")
+	}
+	var occurrences []MessageMediaOccurrence
+	if destination != "" {
+		var err error
+		occurrences, err = s.listMessageOccurrenceRows(ctx, destination, messageID, nil)
+		if err != nil {
+			return nil, err
+		}
+	}
+	archived, err := s.listMessageAudio(ctx, "list archived message audio", true, `
+		SELECT a.id, COALESCE(a.filename, ''), COALESCE(a.size, 0), COALESCE(a.attachment_state, ''),
+		       CASE WHEN `+hashlessProviderAlias+` THEN COALESCE(a.storage_path, '') ELSE '' END
+		FROM attachments a
+		JOIN messages m ON m.id = a.message_id
+		WHERE m.id = ? AND `+LiveMessagesWhere("m", true)+`
+		  AND `+messageRecordingAudio(" AND m.id = ?")+`
+		  AND (`+attachmentBytesArchived+` OR `+hashlessProviderAlias+`)
+		  AND COALESCE(a.attachment_state, '') IN ('', 'stored')
+		ORDER BY a.id`, messageID, messageID)
+	if err != nil {
+		return nil, err
+	}
+	mapped := make(map[int64]bool, len(occurrences))
+	for _, o := range occurrences {
+		mapped[o.AttachmentID] = true
+	}
+	archived = slices.DeleteFunc(archived, func(o MessageMediaOccurrence) bool { return mapped[o.AttachmentID] })
+	for i := range archived {
+		archived[i].BytesArchived = true
+	}
+	uncaptured, err := s.listMessageAudio(ctx, "list uncaptured message audio", false, `
+		SELECT a.id, COALESCE(a.filename, ''), COALESCE(a.size, 0), COALESCE(a.attachment_state, ''),
+		       CASE WHEN COALESCE(a.attachment_state, '') = '' AND `+hashlessProviderAlias+`
+		         THEN COALESCE(a.storage_path, '') ELSE '' END
+		FROM attachments a
+		JOIN messages m ON m.id = a.message_id
+		WHERE m.id = ? AND `+LiveMessagesWhere("m", true)+`
+		  AND `+messageAudioHint+`
+		  AND (COALESCE(a.attachment_state, '') IN ('pending', 'skipped', 'failed', 'unavailable')
+		    OR (COALESCE(a.attachment_state, '') = '' AND NOT `+attachmentBytesArchived+`))
+		ORDER BY a.id`, messageID)
+	if err != nil {
+		return nil, err
+	}
+	return slices.Concat(occurrences, archived, uncaptured), nil
+}
+
+func (s *Store) listMessageOccurrenceRows(
+	ctx context.Context, destination string, messageID int64, scope *personscope.Scope,
+) ([]MessageMediaOccurrence, error) {
+	where := ""
+	args := []any{destination}
+	if messageID > 0 {
+		where += " AND m.id = ?"
+		args = append(args, messageID)
+	}
+	if scope != nil {
+		predicate, values := personscope.MessagePredicate(*scope, "m", "cv")
+		where += " AND (" + predicate + ")"
+		args = append(args, values...)
+	}
+	rows, err := s.db.QueryContext(ctx, s.Rebind(`
+		SELECT m.id, cv.id, a.id, COALESCE(a.filename, ''), COALESCE(a.size, 0), COALESCE(a.attachment_state, ''), o.occurrence_ref, o.revision,
+		       o.retention_state, o.error_code, o.vault_uid, o.source_id, o.source_version_id,
+		       o.content_version_id, COALESCE(d.profile, ''), COALESCE(d.phase, ''),
+		       COALESCE(d.operation_state, ''), COALESCE(d.supplied_input_id, ''),
+		       `+containingTitleMCVSQL+`,
+		       COALESCE(m.sent_at, m.received_at, m.internal_date)
+		FROM beeper_media_occurrences o
+		LEFT JOIN beeper_media_deliveries d
+		  ON d.destination_key = o.destination_key AND d.processing_key = o.processing_key`+
+		beeperMediaCurrentJoin+`
+		  AND o.destination_key = ? AND `+messageRecordingMapping+where+`
+		ORDER BY a.id, o.occurrence_ref, o.revision`), args...)
+	if err != nil {
+		return nil, fmt.Errorf("list message media occurrences: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var occurrences []MessageMediaOccurrence
+	for rows.Next() {
+		var o MessageMediaOccurrence
+		var occurredAt nullableTimestamp
+		if err := rows.Scan(&o.MessageID, &o.ConversationID, &o.AttachmentID, &o.Filename, &o.Size, &o.AttachmentState, &o.OccurrenceRef, &o.Revision,
+			&o.RetentionState, &o.ErrorCode, &o.VaultUID, &o.DocbankSourceID, &o.SourceVersionID,
+			&o.ContentVersionID, &o.DeliveryProfile, &o.DeliveryPhase, &o.DeliveryOperationState,
+			&o.SuppliedInputID, &o.ContainingTitle, &occurredAt); err != nil {
+			return nil, fmt.Errorf("scan message media occurrence: %w", err)
+		}
+		o.BytesArchived = true
+		o.OccurredAt = optionalTimestamp(occurredAt)
+		occurrences = append(occurrences, o)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate message media occurrences: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("close message media occurrences: %w", err)
+	}
+	return occurrences, nil
+}
+
+// listMessageAudio reads attachment rows that have no occurrence identity.
+// listMessageAudio reads attachment rows without occurrence identity. Each row
+// ends with a hashless provider alias's storage path, or "" for other rows.
+// The archived list keeps an alias only when that path is trusted CAS storage,
+// and the uncaptured list only when it is not.
+func (s *Store) listMessageAudio(
+	ctx context.Context, operation string, archived bool, query string, args ...any,
+) ([]MessageMediaOccurrence, error) {
+	rows, err := s.db.QueryContext(ctx, s.Rebind(query), args...)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", operation, err)
+	}
+	defer func() { _ = rows.Close() }()
+	var audio []MessageMediaOccurrence
+	for rows.Next() {
+		var o MessageMediaOccurrence
+		var aliasPath string
+		if err := rows.Scan(&o.AttachmentID, &o.Filename, &o.Size, &o.AttachmentState, &aliasPath); err != nil {
+			return nil, fmt.Errorf("scan %s: %w", operation, err)
+		}
+		if aliasPath != "" {
+			if _, trusted := casPathHash(aliasPath); trusted != archived {
+				continue
+			}
+		}
+		audio = append(audio, o)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate %s: %w", operation, err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("close %s: %w", operation, err)
+	}
+	return audio, nil
 }
 
 // RevokeStaleBeeperMediaMappings moves non-revoked mappings without a current
@@ -1052,6 +1299,10 @@ func (s *Store) ReconsiderBlockedBeeperMediaOperations(ctx context.Context, dest
 
 // LoadBeeperMediaScan loads the destination-namespaced rolling checkpoint.
 func (s *Store) LoadBeeperMediaScan(ctx context.Context, destination string) (BeeperMediaScan, error) {
+	return s.loadBeeperMediaScan(ctx, destination, false)
+}
+
+func (s *Store) loadBeeperMediaScan(ctx context.Context, destination string, create bool) (BeeperMediaScan, error) {
 	if destination == "" {
 		return BeeperMediaScan{}, errors.New("beeper media destination is required")
 	}
@@ -1059,7 +1310,18 @@ func (s *Store) LoadBeeperMediaScan(ctx context.Context, destination string) (Be
 	err := s.db.QueryRowContext(ctx, s.Rebind(`SELECT value FROM archive_metadata WHERE key = ?`),
 		beeperMediaScanKey(destination)).Scan(&encoded)
 	if errors.Is(err, sql.ErrNoRows) {
-		return BeeperMediaScan{DestinationKey: destination}, nil
+		if !create {
+			return BeeperMediaScan{DestinationKey: destination}, nil
+		}
+		// Persist a unique checkpoint before reading a page so resets reject stale commits.
+		initialValue, marshalErr := json.Marshal(BeeperMediaScan{DestinationKey: destination, Generation: uuid.NewString()})
+		if marshalErr != nil {
+			return BeeperMediaScan{}, marshalErr
+		}
+		err = s.db.QueryRowContext(ctx, s.Rebind(`
+			INSERT INTO archive_metadata (key, value) VALUES (?, ?)
+			ON CONFLICT (key) DO UPDATE SET value = archive_metadata.value
+			RETURNING value`), beeperMediaScanKey(destination), string(initialValue)).Scan(&encoded)
 	}
 	if err != nil {
 		return BeeperMediaScan{}, fmt.Errorf("read beeper media scan: %w", err)
@@ -1078,6 +1340,10 @@ func (s *Store) LoadBeeperMediaScan(ctx context.Context, destination string) (Be
 func (s *Store) AdvanceBeeperMediaScan(
 	ctx context.Context, destination string, before, after BeeperMediaScan,
 ) (bool, error) {
+	return s.advanceBeeperMediaScan(ctx, destination, before, after, true)
+}
+
+func (s *Store) advanceBeeperMediaScan(ctx context.Context, destination string, before, after BeeperMediaScan, initialize bool) (bool, error) {
 	if err := errors.Join(validateBeeperMediaScan(destination, before),
 		validateBeeperMediaScan(destination, after)); err != nil {
 		return false, err
@@ -1093,13 +1359,12 @@ func (s *Store) AdvanceBeeperMediaScan(
 	var swapped bool
 	err = s.withTxContext(ctx, func(tx *loggedTx) error {
 		q := boundQuerier{ctx: ctx, q: tx}
-		if _, err := q.Exec(`
-			INSERT INTO archive_metadata (key, value) VALUES (?, ?)
-			ON CONFLICT (key) DO NOTHING`, beeperMediaScanKey(destination), string(oldValue)); err != nil {
-			return fmt.Errorf("initialize beeper media scan: %w", err)
+		if initialize {
+			if _, err := q.Exec(`INSERT INTO archive_metadata (key, value) VALUES (?, ?) ON CONFLICT (key) DO NOTHING`, beeperMediaScanKey(destination), string(oldValue)); err != nil {
+				return fmt.Errorf("initialize beeper media scan: %w", err)
+			}
 		}
-		result, err := q.Exec(`UPDATE archive_metadata SET value = ? WHERE key = ? AND value = ?`,
-			string(newValue), beeperMediaScanKey(destination), string(oldValue))
+		result, err := q.Exec(`UPDATE archive_metadata SET value = ? WHERE key = ? AND value = ?`, string(newValue), beeperMediaScanKey(destination), string(oldValue))
 		if err != nil {
 			return fmt.Errorf("advance beeper media scan: %w", err)
 		}

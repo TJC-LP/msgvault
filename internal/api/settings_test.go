@@ -127,9 +127,11 @@ func TestGetSettingsIsSelfDescribingAndIncludesSafeCatalog(t *testing.T) {
 		"beeper.media", "beeper.media_scope", "beeper.media_max_participants", "beeper.max_media_mb",
 		"slack.enabled", "slack.schedule", "slack.channels", "slack.exclude_channels",
 		"slack.dms", "slack.group_dms",
+		"inline.enabled", "inline.schedule", "inline.media", "inline.media_scope", "inline.media_max_participants", "inline.max_media_mb",
 		"slack.media", "slack.media_scope", "slack.media_max_participants", "slack.max_media_mb",
 		"discord.media", "discord.media_scope", "discord.media_max_participants", "discord.max_media_mb",
 		"teams.media", "teams.media_scope", "teams.media_max_participants", "teams.max_media_mb",
+		"imessage.media_max_participants", "imessage.max_media_mb",
 		"vector.embeddings.timeout", "vector.preprocess.strip_quotes", "vector.preprocess.strip_signatures",
 		"vector.preprocess.strip_html", "vector.preprocess.strip_base64",
 		"vector.preprocess.strip_url_tracking", "vector.preprocess.collapse_whitespace",
@@ -380,6 +382,12 @@ func TestPatchSettingsPersistsSafeScalarAndAttachmentPolicies(t *testing.T) {
 		{"key": "slack.media_scope", "value": map[string]any{"string": "none"}},
 		{"key": "slack.media_max_participants", "value": map[string]any{"integer": 0}},
 		{"key": "slack.max_media_mb", "value": map[string]any{"integer": 90}},
+		{"key": "inline.enabled", "value": map[string]any{"boolean": true}},
+		{"key": "inline.schedule", "value": map[string]any{"string": "*/15 * * * *"}},
+		{"key": "inline.media", "value": map[string]any{"boolean": false}},
+		{"key": "inline.media_scope", "value": map[string]any{"string": "direct"}},
+		{"key": "inline.media_max_participants", "value": map[string]any{"integer": 0}},
+		{"key": "inline.max_media_mb", "value": map[string]any{"integer": 40}},
 		{"key": "discord.media", "value": map[string]any{"boolean": true}},
 		{"key": "discord.media_scope", "value": map[string]any{"string": "all"}},
 		{"key": "discord.media_max_participants", "value": map[string]any{"integer": 10}},
@@ -388,6 +396,8 @@ func TestPatchSettingsPersistsSafeScalarAndAttachmentPolicies(t *testing.T) {
 		{"key": "teams.media_scope", "value": map[string]any{"string": "direct"}},
 		{"key": "teams.media_max_participants", "value": map[string]any{"integer": 6}},
 		{"key": "teams.max_media_mb", "value": map[string]any{"integer": 60}},
+		{"key": "imessage.media_max_participants", "value": map[string]any{"integer": 7}},
+		{"key": "imessage.max_media_mb", "value": map[string]any{"integer": 65}},
 		{"key": "vector.embeddings.timeout", "value": map[string]any{"string": "45s"}},
 		{"key": "vector.preprocess.strip_quotes", "value": map[string]any{"boolean": false}},
 		{"key": "vector.search.max_page_size_hybrid", "value": map[string]any{"integer": 0}},
@@ -418,8 +428,17 @@ func TestPatchSettingsPersistsSafeScalarAndAttachmentPolicies(t *testing.T) {
 	assertions.Equal(80, loaded.Beeper.MaxMediaMB)
 	assertions.Equal("none", loaded.Slack.MediaScope)
 	assertions.Equal(90, loaded.Slack.MaxMediaMB)
+	assertions.True(loaded.Inline.Enabled)
+	assertions.Equal("*/15 * * * *", loaded.Inline.Schedule)
+	requirements.NotNil(loaded.Inline.Media)
+	assertions.False(*loaded.Inline.Media)
+	assertions.Equal("direct", loaded.Inline.MediaScope)
+	assertions.Zero(loaded.Inline.MediaMaxParticipants)
+	assertions.Equal(40, loaded.Inline.MaxMediaMB)
 	assertions.Equal(10, loaded.Discord.MediaMaxParticipants)
 	assertions.Equal(60, loaded.Teams.MaxMediaMB)
+	assertions.Equal(7, loaded.IMessage.MediaMaxParticipants)
+	assertions.Equal(65, loaded.IMessage.MaxMediaMB)
 	assertions.False(loaded.Vector.Preprocess.StripQuotesEnabled())
 	assertions.Equal(0, loaded.Vector.Search.MaxPageSizeHybridClamp())
 }
@@ -427,10 +446,14 @@ func TestPatchSettingsPersistsSafeScalarAndAttachmentPolicies(t *testing.T) {
 func TestPatchSettingsRejectsInvalidAttachmentPolicy(t *testing.T) {
 	t.Parallel()
 	srv, _ := newSettingsTestServer(t, "")
-	resp := patchSettings(t, srv,
-		`{"updates":[{"key":"teams.media_max_participants","value":{"integer":-1}}]}`)
-	assert.Equal(t, http.StatusUnprocessableEntity, resp.Code, resp.Body.String())
-	assert.NotContains(t, resp.Body.String(), "provider-credentials")
+	for _, body := range []string{
+		`{"updates":[{"key":"teams.media_max_participants","value":{"integer":-1}}]}`,
+		`{"updates":[{"key":"imessage.max_media_mb","value":{"integer":-1}}]}`,
+	} {
+		resp := patchSettings(t, srv, body)
+		assert.Equal(t, http.StatusUnprocessableEntity, resp.Code, resp.Body.String())
+		assert.NotContains(t, resp.Body.String(), "provider-credentials")
+	}
 }
 
 func TestPatchSettingsRejectsHostAndAuthSettings(t *testing.T) {
@@ -1498,7 +1521,7 @@ func performSettingsRequest(
 	apiKey string,
 ) *httptest.ResponseRecorder {
 	t.Helper()
-	req := httptest.NewRequest(method, path, bytes.NewReader(body))
+	req := httptest.NewRequestWithContext(t.Context(), method, path, bytes.NewReader(body))
 	req.RemoteAddr = "127.0.0.1:12345"
 	if len(body) > 0 {
 		req.Header.Set("Content-Type", "application/json")
@@ -1783,6 +1806,41 @@ func TestPatchSettingsRemovesStaleStoredCredentialOnLaterWrite(t *testing.T) {
 	assertions.Equal(severed.ETag, unrelated.Header().Get("Credential-Etag"))
 }
 
+func TestPatchSettingsCredentialConflictCanFollowCommittedSlackPolicy(t *testing.T) {
+	t.Parallel()
+	requirements, assertions := require.New(t), assert.New(t)
+	initial := settingsStoredVectorConfig + "\n[slack]\ndms = true\n"
+	srv, path := newSettingsTestServer(t, initial)
+	credentialETag := storeVectorEmbeddingsCredential(t, srv, "stale-origin-secret")
+	moved := strings.Replace(initial, "https://first.example.test/v1", "https://second.example.test/v1", 1)
+	requirements.NoError(os.WriteFile(path, []byte(moved), 0o600))
+	srv.settingsConfigEditor = func(configPath, ifMatch string, edits []config.Edit) (config.ConfigFile, error) {
+		snapshot, err := config.EditConfigFile(configPath, ifMatch, edits)
+		if err != nil {
+			return snapshot, err
+		}
+		// Interleave a real credential write between config commit and cleanup.
+		_, err = providercredentials.Put(srv.cfg.TokensDir(), credentialETag,
+			providercredentials.VectorEmbeddingsID, "https://first.example.test/v1", "rotated-secret")
+		requirements.NoError(err)
+		return snapshot, nil
+	}
+
+	response := patchSettings(t, srv, `{"updates":[{"key":"slack.dms","value":{"boolean":false}}]}`)
+	requirements.Equal(http.StatusPreconditionFailed, response.Code, response.Body.String())
+	var failure map[string]any
+	requirements.NoError(json.Unmarshal(response.Body.Bytes(), &failure))
+	assertions.Equal("credential_conflict", failure["error"])
+	loaded, err := config.Load(path, "")
+	requirements.NoError(err)
+	assertions.False(loaded.Slack.DMsEnabled())
+	credentials, err := providercredentials.Read(srv.cfg.TokensDir())
+	requirements.NoError(err)
+	value, _, err := credentials.Resolve(providercredentials.VectorEmbeddingsID, "https://first.example.test/v1", "", nil)
+	requirements.NoError(err)
+	assertions.Equal("rotated-secret", value)
+}
+
 func TestPatchSettingsRemovesStaleNamedProviderCredentialsAfterHostEdit(t *testing.T) {
 	t.Parallel()
 	requirements := require.New(t)
@@ -1880,6 +1938,7 @@ func TestPutPersonEnrichmentProviderRequiresValidKindEvenWhenDisabled(t *testing
 			"/api/v1/settings/person-enrichment/providers/new-provider", body, get.Header().Get("ETag"), "")
 		assertions.Equal(http.StatusUnprocessableEntity, rejected.Code, rejected.Body.String())
 		assertions.Contains(rejected.Body.String(), "validation_failed")
+		assertions.Equal("application/json", rejected.Header().Get("Content-Type"))
 	}
 	written, err := os.ReadFile(path)
 	requirements.NoError(err)
@@ -2139,4 +2198,25 @@ func TestSecretHint(t *testing.T) {
 			assert.Equal(t, tc.want, secretHint(tc.value))
 		})
 	}
+}
+
+func TestSettingsLocalEmbeddingsRejectsProviderCredentials(t *testing.T) {
+	t.Parallel()
+	assert, require := assert.New(t), require.New(t)
+	server, path := newSettingsTestServer(t, "[vector.embeddings]\nlocal_only = true\n")
+	get := performSettingsRequest(t, server, http.MethodGet, settingsPath, nil, "", "")
+	require.Equal(http.StatusOK, get.Code, get.Body.String())
+	var settings SettingsResponse
+	require.NoError(json.Unmarshal(get.Body.Bytes(), &settings))
+	key := settingsByKey(settings.Settings)["vector.embeddings.api_key"]
+	assert.True(key.ReadOnly)
+	put := performSettingsRequest(t, server, http.MethodPut, "/api/v1/settings/provider-credentials/vector.embeddings", []byte(`{"value":"replacement-key"}`), get.Header().Get("Credential-Etag"), "")
+	assert.Equal(http.StatusBadRequest, put.Code, put.Body.String())
+	assert.Contains(put.Body.String(), "Local embeddings don't use provider credentials")
+	response := patchSettings(t, server, `{"updates":[{"key":"vector.embeddings.endpoint","value":{"string":"http://127.0.0.1:11434/v1"}}]}`)
+	require.Equal(http.StatusOK, response.Code, response.Body.String())
+	loaded, err := config.Load(path, "")
+	require.NoError(err)
+	assert.False(loaded.Vector.Embeddings.LocalOnly)
+	assert.Equal("http://127.0.0.1:11434/v1", loaded.Vector.Embeddings.Endpoint)
 }

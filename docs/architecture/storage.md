@@ -1,5 +1,5 @@
 ---
-last_edited: "2026-09-25"
+last_edited: "2026-11-08"
 title: Data Storage
 description: Database schema, Parquet analytics cache, content-addressed attachments, and token storage.
 ---
@@ -33,7 +33,7 @@ separately. SQLite is the default and stores the archive at `~/.msgvault/msgvaul
 | Column | Type | Description |
 |---|---|---|
 | `id` | INTEGER PK | Auto-increment |
-| `source_type` | TEXT | Provider/import type, for example `gmail`, `imap`, `gcal`, `teams`, `discord`, `beeper`, `mbox`, `whatsapp`, `granola`, `plaud`, `circleback`, `notion_meetings`, or `muesli` |
+| `source_type` | TEXT | Provider/import type, for example `gmail`, `imap`, `gcal`, `teams`, `discord`, `beeper`, `chatwoot`, `mbox`, `whatsapp`, `omi`, `granola`, `plaud`, `circleback`, `notion_meetings`, `muesli`, `twilio`, or `twenty` |
 | `identifier` | TEXT | Provider-stable identifier such as an email address, phone number, or Discord guild ID |
 | `display_name` | TEXT | Account display name |
 | `sync_cursor` | TEXT | Sync cursor (Gmail history ID for Gmail accounts) |
@@ -58,9 +58,12 @@ separately. SQLite is the default and stores the archive at `~/.msgvault/msgvaul
 | `conversation_id` | INTEGER FK | References `conversations` |
 | `source_id` | INTEGER FK | References `sources` |
 | `source_message_id` | TEXT | Source-specific message ID |
-| `message_type` | TEXT | `email`, `calendar_event`, `meeting_transcript`, `beeper`, `teams`, `discord`, `sms`, `mms`, `whatsapp`, `imessage`, `fbmessenger`, `synctech_sms_call`, `google_voice_text`, `google_voice_call`, `google_voice_voicemail` |
+| `message_type` | TEXT | `email`, `calendar_event`, `meeting_transcript`, `beeper`, `chatwoot`, `teams`, `discord`, `sms`, `mms`, `whatsapp`, `imessage`, `fbmessenger`, `telegram`, `synctech_sms_call`, `google_voice_text`, `google_voice_call`, `google_voice_voicemail` |
 | `sent_at` | DATETIME | Send timestamp |
 | `sender_id` | INTEGER FK | References `participants` |
+| `account_address` | TEXT, nullable | The one confirmed address an email or calendar event belongs to; NULL when evidence conflicts or is missing |
+| `account_path` | TEXT, nullable | `inbound`, `sent` or `calendar`; NULL on email and calendar rows means attribution is still pending |
+| `email_linkage_outcome` | TEXT, nullable | `complete`, or why the identifiers in `email_link_keys` may be incomplete (`missing_raw`, `invalid_headers`, `size_limit` and others); NULL on an email means the keys are still pending |
 | `subject` | TEXT | Message subject |
 | `snippet` | TEXT | Preview excerpt |
 | `size_estimate` | INTEGER | Approximate size in bytes |
@@ -68,12 +71,60 @@ separately. SQLite is the default and stores the archive at `~/.msgvault/msgvaul
 | `deleted_at` | DATETIME | Soft-delete timestamp |
 | `deleted_from_source_at` | DATETIME | Records removal from the source; content may remain archived |
 
+The Store derives `account_address` and `account_path` in the same transaction
+as every message write that changes their inputs: raw MIME, recipients, and
+Sent or Drafts labels. A change to confirmed identities or the source
+identifier returns the affected rows to pending in its own transaction, then
+derives them in pages after it commits. Every sync or import first derives the
+source's pending rows, which a partial index on pending rows keeps cheap when
+there are none. Attribution never changes `source_id`.
+Email linkage follows the same pattern: a write that stores MIME also fills
+`email_link_keys` and `email_linkage_outcome` in its transaction, and the
+same sync step derives any email still pending, through its own partial index.
+Archives from before the column start with every email pending.
+Rows other than email and calendar events keep both columns NULL. The
+[received-account design](https://github.com/kenn-io/msgvault/blob/main/docs/internal/received-as-identity-design.md) records
+the rules; [Searching](../usage/searching.md#find-mail-by-the-address-that-received-it)
+covers `received:` and `account:`.
+
+**message_delivery_addresses** -- Delivery-header addresses read from each
+email's stored MIME (`kind` is `original` or `delivered`, `address` is
+lowercased). The address-leading index lets an identity change re-derive only
+the messages that mention it. A derived row's addresses always match its stored
+MIME; messages without MIME have none.
+
+**email_link_keys** -- Identifiers each email names in its headers, read from
+its stored MIME: `reply` (In-Reply-To), `reference` (References) and `attached`
+(the Message-ID of each attached `message/rfc822` original), at most 128 per
+kind, unique per email and kind. The value-leading index finds every email that names an identifier. A
+copy's own Message-ID is `messages.rfc822_message_id`, so related-copy lookups
+match these values against that column and against each other.
+
 **message_bodies** -- Parsed content stored separately from message metadata.
 
 `message_id` is both the primary key and a reference to `messages`; `body_text`
 and `body_html` hold the parsed bodies. Keeping these large values separate
 allows metadata scans without reading message content. Search uses the full-text
 index; detail readers fetch bodies by message ID.
+
+Email parsing replaces NUL (`U+0000`) with the visible replacement character
+`�` (`U+FFFD`) in display and search text, including subjects, bodies, display
+names, and attachment filenames. Provider snippets follow the same rule.
+This policy applies to SQLite and PostgreSQL; PostgreSQL cannot store NUL in
+text columns. It keeps the surrounding text searchable without silently joining
+words across a removed character. These projections are not lossless originals.
+
+MIME identity values containing NUL are unusable: message, reply, reference,
+list, and content IDs are omitted from new projections, and invalid address
+tokens are skipped. Historical SQLite identity keys retain their exact comparison
+form, including NUL, so existing duplicate groups can still be processed.
+Replacing characters in these keys could falsely match a different identity.
+The original MIME and decoded attachment bytes remain unchanged, as do raw-part
+fingerprints. Ingestion, replay, message repair, and text re-derivation use this
+same parser policy. Existing email bodies and body-derived snippets are rebuilt
+from retained MIME on the next sync or with `repair-derived`; that pass does not
+rewrite subjects, participants, or attachment metadata. Those fields require
+message repair or re-import when their old projections contain NUL.
 
 **message_raw** -- Raw provider payload storage, compressed with zlib.
 
@@ -89,6 +140,40 @@ envelope keeps provider discovery, structured blocks, page Markdown, minimized
 resolved users, canonical text used for safe transcript preservation, and
 hydration warnings. Integration tokens and authorization headers are never
 part of the envelope.
+
+**source_import_items** -- Durable import receipts.
+
+Apple Mail imports keep two kinds of rows here:
+
+- `emlx-target` rows track one archived message, which several `.emlx` files
+  can share. The importer marks the row `pending` before it writes the message,
+  its attachments or its search entry, and `imported` once all of that work
+  succeeds. The completion records the attachment and search settings it used;
+  a later import with different settings finishes the message again from its
+  archived raw. A `pending` row also names the file being written, the
+  attachments it contributes, and a digest of the new raw. If the import stops
+  before that file's row is updated, the next import that finishes the message
+  credits those attachments to the file when the archived raw matches. The
+  file's own row names that message before the write starts, so a row that
+  names a different message is always the newer one.
+  A message archived before receipts existed is marked legacy. For it, a file
+  without its own attachment record only fills empty placeholders and records
+  what it holds; it can replace stored attachment content only after its own
+  cache changes.
+- `emlx-occurrence` rows track one `.emlx` file, keyed by a digest of the
+  import root plus the file's relative path. An `imported` row stores a
+  filesystem fingerprint of the file and its cached attachments, and a hash of
+  each attachment the file contributed. A `pending` row means the file still
+  has work to finish.
+
+A repeat import skips reading a file when its fingerprint matches and its
+message is complete. The attachment hashes stop a file from replacing an
+attachment that another file has since updated. Platforms without a supported
+fingerprint still record completed rows but always read the file.
+
+The rows reuse the existing table and the sync run's ownership check, without a
+schema migration. They are cache hints rather than integrity checks; see
+[repeat imports](../usage/importing.md#repeat-apple-mail-imports).
 
 **participants** -- Observed addresses and handles from source data. These are
 separate from the curated `persons` table.
@@ -198,11 +283,15 @@ results instantly as you group and drill down. On the default SQLite backend, ms
 Parquet so DuckDB can group and filter it without repeatedly joining the
 normalized archive tables.
 
-Ungrouped Everything and Files listings page a scalar message or attachment
+Ungrouped Messages and Files listings page a scalar message or attachment
 population before resolving participant lists for the returned rows. Exact
 totals use separate narrow scans. This page-before-enrichment boundary keeps
 multi-million-message listings inside the daemon's interactive DuckDB memory
-budget without changing cache format or query semantics.
+budget without changing cache format or query semantics. Domain-filtered
+Messages listings share the filtered message population between page
+selection, participant enrichment, and total counting. This avoids repeating
+recipient and conversation-roster membership joins under the interactive
+memory limit. Listings without domain filters retain separate scalar scans.
 
 The Parquet cache is disposable and can be rebuilt at any time. The daemon
 starts HTTP health and API routing before analytics cache maintenance, and
@@ -212,11 +301,10 @@ the background after HTTP is ready. In `engine = "auto"`, aggregate views use
 live SQL while that work runs and switch to DuckDB after the cache is ready and
 opens successfully; a failed build or open keeps live SQL. In
 `engine = "duckdb"`, analytics remain unavailable until the required cache is
-ready, with no SQL fallback. While that automatic initialization is active,
-cache-dependent Web UI views report that preparation is in progress and retry
+ready, with no SQL fallback. In auto mode, Messages serves live archive rows during a full rebuild and switches to the published cache when it opens. If no usable cache is produced, the live rows stay available with recovery steps. Other cache-dependent Web UI views report that preparation is in progress and retry
 until the cache becomes ready; terminal unavailable states retain the explicit
 rebuild action. Set `auto_build_cache = false` to skip automatic startup
-maintenance; scheduled syncs, ingest commands, and
+maintenance and its live Messages path; scheduled syncs, ingest commands, and
 `msgvault build-cache` can refresh or build the cache explicitly.
 
 Each build writes and verifies a same-filesystem staging tree before publishing
@@ -310,7 +398,7 @@ not convert existing packs automatically. Stop the daemon and run
 
 ## Token Storage
 
-OAuth tokens are stored as JSON files per account:
+By default, OAuth tokens are stored as JSON files per account:
 
 ```
 tokens/
@@ -323,6 +411,11 @@ Token files are owner-only. Protect this directory: its credentials grant the
 configured provider access. Discord bot records may be shared by several guild
 sources through an optional binding label and are removed only after the last
 referencing source is deleted.
+
+Google credentials and tokens can use
+[configured commands](/docs/configuration/#command-backed-google-credentials-and-tokens).
+The external store owns the token JSON; the token directory holds coordination
+locks. Other providers retain their file storage.
 
 ## Compression
 

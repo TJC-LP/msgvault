@@ -1,8 +1,8 @@
 package store_test
 
 import (
-	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"testing"
 
@@ -55,7 +55,7 @@ func seedEmbedScopeFixture(t *testing.T, st *store.Store) embedScopeFixture {
 
 	// One soft-deleted message in source A: live predicates must exclude it.
 	fx.deletedA = seed(fx.srcA, "alice-deleted", 1)[0]
-	_, err = st.DB().Exec(st.Rebind(
+	_, err = st.DB().ExecContext(t.Context(), st.Rebind(
 		`UPDATE messages SET deleted_at = CURRENT_TIMESTAMP WHERE id = ?`), fx.deletedA)
 	require.NoError(t, err, "soft-delete message")
 	return fx
@@ -66,7 +66,7 @@ func TestScanForEmbeddingScopedFiltersBySource(t *testing.T) {
 	assert := assert.New(t)
 	st := testutil.NewTestStore(t)
 	fx := seedEmbedScopeFixture(t, st)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	scoped, err := st.ScanForEmbeddingScoped(ctx, 1, 0, 100, nil, []int64{fx.srcA.ID})
 	require.NoError(err, "ScanForEmbeddingScoped")
@@ -86,12 +86,12 @@ func TestScanForEmbeddingScopedFiltersBySource(t *testing.T) {
 	assert.Empty(none, "a source with no messages scans empty")
 }
 
-func TestCoverageCountsScopedFiltersBySource(t *testing.T) {
+func TestCoverageCountsScopedVariantsFilterBySource(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
 	st := testutil.NewTestStore(t)
 	fx := seedEmbedScopeFixture(t, st)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	require.NoError(st.SetEmbedGen(ctx, fx.msgsA[:2], 7), "stamp two of A's messages")
 
@@ -101,6 +101,11 @@ func TestCoverageCountsScopedFiltersBySource(t *testing.T) {
 	assert.Equal(int64(2), stamped, "stamped within source A")
 	assert.Equal(int64(1), missing, "missing within source A")
 
+	// The unbounded count, used off the request path, reports the same scope.
+	live, stamped, _, missing, err = st.CoverageCountsScopedUnbounded(ctx, 7, nil, []int64{fx.srcA.ID})
+	require.NoError(err, "CoverageCountsScopedUnbounded")
+	assert.Equal([3]int64{3, 2, 1}, [3]int64{live, stamped, missing})
+
 	missingB, err := st.MissingCountScoped(ctx, 7, nil, []int64{fx.srcB.ID})
 	require.NoError(err, "MissingCountScoped")
 	assert.Equal(int64(3), missingB, "all of source B's messages are missing for gen 7")
@@ -109,10 +114,10 @@ func TestCoverageCountsScopedFiltersBySource(t *testing.T) {
 func TestScopedFiltersComposeMessageTypesAndSources(t *testing.T) {
 	st := testutil.NewTestStore(t)
 	fx := seedEmbedScopeFixture(t, st)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Reclassify one of A's messages as a different type.
-	_, err := st.DB().Exec(st.Rebind(
+	_, err := st.DB().ExecContext(t.Context(), st.Rebind(
 		`UPDATE messages SET message_type = 'sms' WHERE id = ?`), fx.msgsA[0])
 	require.NoError(t, err, "reclassify message type")
 
@@ -120,4 +125,81 @@ func TestScopedFiltersComposeMessageTypesAndSources(t *testing.T) {
 	require.NoError(t, err, "ScanForEmbeddingScoped type+source")
 	assert.Equal(t, fx.msgsA[1:], emailA,
 		"the sms-typed message drops out of the email×A intersection")
+}
+
+func TestScanEmbeddingCoverageStreamsStampedLiveIDsInBatches(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	st := testutil.NewTestStore(t)
+	fx := seedEmbedScopeFixture(t, st)
+	ctx := t.Context()
+	require.NoError(st.SetEmbedGen(ctx, append([]int64{fx.deletedA}, fx.msgsA...), 7), "stamp A, including its deleted row")
+	require.NoError(st.SetEmbedGen(ctx, fx.msgsB, 7), "stamp B outside the scope")
+
+	var batches [][]int64
+	live, stamped, err := st.ScanEmbeddingCoverage(ctx, 7, store.EmbeddingCoverageScan{
+		SourceIDs: []int64{fx.srcA.ID},
+		BatchSize: 2,
+		VisitStamped: func(messageIDs []int64) error {
+			batches = append(batches, append([]int64(nil), messageIDs...))
+			return nil
+		},
+	})
+	require.NoError(err)
+	assert.Equal(int64(3), live)
+	assert.Equal(int64(3), stamped)
+	assert.Equal([][]int64{fx.msgsA[:2], fx.msgsA[2:]}, batches,
+		"only live in-scope IDs arrive, at most BatchSize at a time")
+}
+
+func TestScanEmbeddingCoverageStopsOnVisitError(t *testing.T) {
+	st := testutil.NewTestStore(t)
+	fx := seedEmbedScopeFixture(t, st)
+	ctx := t.Context()
+	require.NoError(t, st.SetEmbedGen(ctx, fx.msgsA, 7))
+	visitErr := errors.New("vector database unavailable")
+
+	_, _, err := st.ScanEmbeddingCoverage(ctx, 7, store.EmbeddingCoverageScan{
+		BatchSize:    10,
+		VisitStamped: func([]int64) error { return visitErr },
+	})
+	require.ErrorIs(t, err, visitErr)
+}
+
+func TestScanEmbeddingCoverageRejectsNonPositiveBatchSize(t *testing.T) {
+	st := testutil.NewTestStore(t)
+	_, _, err := st.ScanEmbeddingCoverage(t.Context(), 7, store.EmbeddingCoverageScan{
+		VisitStamped: func([]int64) error { return nil },
+	})
+	require.ErrorContains(t, err, "batch size must be positive")
+}
+
+func TestSetEmbedGenIfUnchanged(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	st := testutil.NewTestStore(t)
+	id := seedMessageForLM(t, st)
+	tokenAtRead := baselineLM(t, st, id)
+
+	_, err := st.DB().ExecContext(t.Context(), st.Rebind(`UPDATE message_bodies SET body_text = ? WHERE message_id = ?`), "corrected body", id)
+	require.NoError(err)
+	missed, covered, err := st.SetEmbedGenIfUnchanged(t.Context(), []store.EmbedGenStamp{{ID: id, LastModified: tokenAtRead}}, 7)
+	require.NoError(err)
+	assert.Equal([]int64{id}, missed)
+	assert.Zero(covered)
+	assert.False(readEmbedGen(t, st, id).Valid, "a stale token must not stamp the row")
+	tokenAtRead = baselineLM(t, st, id)
+
+	missed, covered, err = st.SetEmbedGenIfUnchanged(
+		t.Context(),
+		[]store.EmbedGenStamp{{ID: id, LastModified: tokenAtRead}}, 7)
+	require.NoError(err)
+	assert.Empty(missed)
+	assert.Equal(1, covered)
+	assert.Equal(sql.NullInt64{Int64: 7, Valid: true}, readEmbedGen(t, st, id))
+	coveredToken := readLM(t, st, id)
+	missed, covered, err = st.SetEmbedGenIfUnchanged(t.Context(), []store.EmbedGenStamp{{ID: id, LastModified: coveredToken}}, 7)
+	require.NoError(err)
+	assert.Empty(missed, "an already covered row is not a CAS miss")
+	assert.Zero(covered, "an already covered row is not newly covered")
 }

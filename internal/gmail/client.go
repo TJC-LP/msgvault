@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"go.kenn.io/msgvault/internal/httpretry"
+	"go.kenn.io/msgvault/internal/store"
 
 	"golang.org/x/oauth2"
 	"golang.org/x/sync/errgroup"
@@ -70,8 +71,28 @@ func WithRateLimiter(rl *RateLimiter) ClientOption {
 	}
 }
 
+// tokenSourceFailureError marks a failure to obtain a token, which happens
+// before oauth2's transport sends any request to Gmail.
+type tokenSourceFailureError struct{ err error }
+
+func (e *tokenSourceFailureError) Error() string { return e.err.Error() }
+func (e *tokenSourceFailureError) Unwrap() error { return e.err }
+
+type classifiedTokenSource struct{ source oauth2.TokenSource }
+
+func (s classifiedTokenSource) Token() (*oauth2.Token, error) {
+	token, err := s.source.Token()
+	if err != nil {
+		return nil, &tokenSourceFailureError{err: err}
+	}
+	return token, nil
+}
+
 // NewClient creates a new Gmail API client.
 func NewClient(tokenSource oauth2.TokenSource, opts ...ClientOption) *Client {
+	if tokenSource != nil {
+		tokenSource = classifiedTokenSource{source: tokenSource}
+	}
 	c := &Client{
 		httpClient:  oauth2.NewClient(context.Background(), tokenSource),
 		userID:      "me",
@@ -191,6 +212,11 @@ func (c *Client) requestWithRetryBudget(ctx context.Context, op Operation, metho
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
 			if remoteMutation {
+				// A token failure, such as a refresh that could not be saved,
+				// happens before any Gmail request is sent.
+				if _, ok := errors.AsType[*tokenSourceFailureError](err); ok {
+					return nil, fmt.Errorf("oauth token for gmail mutation: %w", err)
+				}
 				if _, ok := errors.AsType[*oauth2.RetrieveError](err); ok {
 					return nil, fmt.Errorf("http request: %w", err)
 				}
@@ -599,6 +625,9 @@ func classifyDraftWrite(err error) error {
 	if _, ok := errors.AsType[*oauth2.RetrieveError](err); ok {
 		return &DraftWriteError{State: DraftStateRejected, Code: "auth_failed", Err: err}
 	}
+	if _, ok := errors.AsType[*tokenSourceFailureError](err); ok {
+		return &DraftWriteError{State: DraftStateRejected, Code: "auth_failed", Err: err}
+	}
 	if _, ok := errors.AsType[*NotFoundError](err); ok {
 		return &DraftWriteError{State: DraftStateRejected, Code: "draft_absent", Err: err}
 	}
@@ -689,7 +718,7 @@ func (c *Client) ListLabels(ctx context.Context) ([]*Label, error) {
 			ID:                    l.ID,
 			Name:                  l.Name,
 			Type:                  l.Type,
-			SystemRole:            SystemRoleForLabelID(l.ID),
+			SystemRole:            store.GmailSystemRoleForLabelID(l.ID),
 			MessagesTotal:         l.MessagesTotal,
 			MessagesUnread:        l.MessagesUnread,
 			MessageListVisibility: l.MessageListVisibility,
@@ -699,23 +728,22 @@ func (c *Client) ListLabels(ctx context.Context) ([]*Label, error) {
 	return labels, nil
 }
 
-// ListMessages returns message IDs matching the query.
+// ListMessages returns message IDs matching the query, including Spam and Trash.
+// Callers can explicitly exclude those labels with the Gmail query.
 func (c *Client) ListMessages(ctx context.Context, query string, pageToken string) (*MessageListResponse, error) {
-	return c.listMessages(ctx, query, pageToken, false)
+	return c.listMessages(ctx, query, pageToken)
 }
 
 // ListCompleteMessageSnapshot returns every message still present in Gmail,
 // including Spam and Trash, for source-presence reconciliation.
 func (c *Client) ListCompleteMessageSnapshot(ctx context.Context, pageToken string) (*MessageListResponse, error) {
-	return c.listMessages(ctx, "", pageToken, true)
+	return c.listMessages(ctx, "", pageToken)
 }
 
-func (c *Client) listMessages(ctx context.Context, query, pageToken string, includeSpamTrash bool) (*MessageListResponse, error) {
+func (c *Client) listMessages(ctx context.Context, query, pageToken string) (*MessageListResponse, error) {
 	params := url.Values{}
 	params.Set("maxResults", "500")
-	if includeSpamTrash {
-		params.Set("includeSpamTrash", "true")
-	}
+	params.Set("includeSpamTrash", "true")
 	if query != "" {
 		params.Set("q", query)
 	}

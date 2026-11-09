@@ -10,11 +10,20 @@ import (
 
 // ---- Beeper Desktop API objects (see /v1/spec, "Beeper Client API") ----
 
+// AccountBridge carries the provider's authoritative service identity.
+type AccountBridge struct {
+	ID       string `json:"id"`
+	Provider string `json:"provider"`
+	Type     string `json:"type"`
+}
+
 // Account is a chat account connected to Beeper Desktop (one per network login).
 type Account struct {
-	AccountID string `json:"accountID"`
-	Network   string `json:"network"` // human-friendly name; may be empty
-	User      User   `json:"user"`
+	Bridge    *AccountBridge `json:"bridge"`
+	Status    string         `json:"status"`
+	AccountID string         `json:"accountID"`
+	Network   string         `json:"network"` // human-friendly name; may be empty
+	User      User           `json:"user"`
 	// Discovered marks an account assembled from chat data because the
 	// accounts endpoint did not report it (see DiscoverAccounts). It is never
 	// decoded from the API.
@@ -84,15 +93,23 @@ type ChatParticipants struct {
 	Total   int           `json:"total"`
 }
 
+// ChatMerge lists a merged container's underlying network chats.
+type ChatMerge struct {
+	ChatIDs       []string `json:"chatIDs"`
+	DefaultChatID string   `json:"defaultChatID"`
+}
+
 // Chat is a conversation on one account.
 type Chat struct {
-	ID           string           `json:"id"` // Matrix room ID, globally unique
-	AccountID    string           `json:"accountID"`
-	Network      string           `json:"network"`
-	Title        string           `json:"title"`
-	Type         string           `json:"type"` // "single" | "group"
-	Participants ChatParticipants `json:"participants"`
-	LastActivity time.Time        `json:"lastActivity"`
+	Merge            *ChatMerge       `json:"merge"`
+	MergedIntoChatID string           `json:"mergedIntoChatID"`
+	ID               string           `json:"id"` // Matrix room ID, globally unique
+	AccountID        string           `json:"accountID"`
+	Network          string           `json:"network"`
+	Title            string           `json:"title"`
+	Type             string           `json:"type"` // "single" | "group"
+	Participants     ChatParticipants `json:"participants"`
+	LastActivity     time.Time        `json:"lastActivity"`
 	// Draft is the composer draft as sent: absent, null, or an object.
 	Draft jsontext.Value `json:"draft"`
 }
@@ -192,6 +209,9 @@ type SearchChatsOutput struct {
 // ImportOptions configures one Import run for a single Beeper account
 // (= one msgvault source).
 type ImportOptions struct {
+	// Route proof is obtained from the exact account endpoint during this run.
+	// Neither a display label nor a user/account identifier can replace it.
+	routeAccount *Account
 	// AccountID is the Beeper account to sync (e.g. "whatsapp", "signal").
 	// It doubles as the msgvault source identifier.
 	AccountID string
@@ -273,14 +293,19 @@ type ImportSummary struct {
 	// re-applied because the participant-link store was unavailable. Contested
 	// pairs are recorded as conflicts by the store and are not counted here.
 	IdentityReplayErrors int64
+	// RosterRepairErrors counts quiet-room membership repairs that failed with
+	// a store error. They appear in the run's error count but, unlike Errors,
+	// do not withhold source freshness, because message sync already finished.
+	RosterRepairErrors int64
 	// AttachmentsDownloaded counts media stored this run;
 	// AttachmentsPending counts failed/deferred downloads that left a
 	// retry marker (see backfill-beeper-media).
 	AttachmentsDownloaded int64
 	AttachmentsPending    int64
 	AttachmentsSkipped    int64
-	// AttachmentsUnavailable counts media the source reported as permanently
-	// gone (e.g. expired WhatsApp media). Their markers are terminal.
+	// AttachmentsUnavailable counts newly terminal media: definitive source
+	// loss, or a not-found response that repeated on a separate, later run
+	// for a message at least 30 days old.
 	AttachmentsUnavailable int64
 	// AttachmentsOverCap is the size-specific subset of AttachmentsSkipped.
 	// AttachmentsOverCapBytes saturates while summing declared sizes or the
@@ -294,4 +319,28 @@ type ImportSummary struct {
 	// affected chats are re-visited next run.
 	FetchErrors int64
 	Errors      int64
+	FailedChats map[string]*ChatFailure
+}
+
+// ChatFailure counts a chat's fetch and attachment errors during one run.
+type ChatFailure struct {
+	FetchErrors, MediaErrors int64
+	LastError                string
+}
+
+func (sum *ImportSummary) failChat(chatID string, media bool, err error) {
+	if sum.FailedChats == nil {
+		sum.FailedChats = make(map[string]*ChatFailure)
+	}
+	cf := sum.FailedChats[chatID]
+	if cf == nil {
+		cf = &ChatFailure{}
+		sum.FailedChats[chatID] = cf
+	}
+	if media {
+		cf.MediaErrors++
+	} else {
+		cf.FetchErrors++
+	}
+	cf.LastError = err.Error()
 }

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -18,6 +19,7 @@ import (
 	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/scheduler"
 	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/testutil"
 	"go.kenn.io/msgvault/internal/testutil/storetest"
 )
 
@@ -37,14 +39,13 @@ func TestRunActivityBuildLocalUsesConfigAndBackstop(t *testing.T) {
 	cfg.Activity.BatchSize = 1
 	cfg.Activity.MaxDirectCounterparts = 1
 
-	st, err := store.OpenForTest(cfg.DatabaseDSN())
-	require.NoError(err)
-	require.NoError(st.InitSchema())
+	st := testutil.NewSQLiteTestStoreAt(t, cfg.DatabaseDSN())
 	source, err := st.GetOrCreateSource("gmail", "activity-cli@example.com")
 	require.NoError(err)
 	require.NoError(st.AddAccountIdentity(
 		source.ID, "activity-cli@example.com", "manual"))
 	conversationID, err := st.EnsureConversation(
+		t.Context(),
 		source.ID, "activity-cli-thread", "Activity CLI")
 	require.NoError(err)
 	ownerID, err := st.EnsureParticipant(
@@ -101,7 +102,7 @@ func TestRunActivityBuildLocalUsesConfigAndBackstop(t *testing.T) {
 	require.NoError(command.Execute())
 	assert.Contains(output.String(), "Projected 2 event(s) in 2 batch(es)")
 
-	st, err = store.OpenForTest(cfg.DatabaseDSN())
+	st, err = store.OpenForTest(t.Context(), cfg.DatabaseDSN())
 	require.NoError(err)
 	var timezone, localDate string
 	require.NoError(st.DB().QueryRowContext(testCtx, st.Rebind(`
@@ -143,7 +144,7 @@ func TestRunActivityBuildLocalUsesConfigAndBackstop(t *testing.T) {
 	command.SetOut(&output)
 	command.SetArgs([]string{"build"})
 	require.NoError(command.Execute())
-	st, err = store.OpenForTest(cfg.DatabaseDSN())
+	st, err = store.OpenForTest(t.Context(), cfg.DatabaseDSN())
 	require.NoError(err)
 	var count int
 	require.NoError(st.DB().QueryRowContext(testCtx, st.Rebind(
@@ -160,7 +161,7 @@ func TestRunActivityBuildLocalUsesConfigAndBackstop(t *testing.T) {
 	command.SetArgs([]string{"build", "--backstop"})
 	require.NoError(command.Execute())
 	assert.Contains(output.String(), "Projected 1 event(s)")
-	st, err = store.OpenForTest(cfg.DatabaseDSN())
+	st, err = store.OpenForTest(t.Context(), cfg.DatabaseDSN())
 	require.NoError(err)
 	t.Cleanup(func() { _ = st.Close() })
 	require.NoError(st.DB().QueryRowContext(testCtx, st.Rebind(
@@ -247,13 +248,21 @@ func TestRegisterActivityProjectionJobHonorsDisabledSchedule(t *testing.T) {
 }
 
 func TestScheduledProjectionYieldsToSyncBetweenPasses(t *testing.T) {
-	assert := assert.New(t)
-	require := require.New(t)
+	// The process-wide PostgreSQL pool must outlive the synctest bubble.
 	f := storetest.New(t)
 	for i := range 23 {
 		f.NewMessage().WithSourceMessageID(fmt.Sprintf("scheduled-projection-%d", i)).
 			WithSentAt(time.Date(2026, 10, 1, 12, i, 0, 0, time.UTC)).Create(t, f.Store)
 	}
+	synctest.Test(t, func(t *testing.T) {
+		testScheduledProjectionYieldsToSyncBetweenPasses(t, f)
+	})
+}
+
+func testScheduledProjectionYieldsToSyncBetweenPasses(t *testing.T, f *storetest.Fixture) {
+	t.Helper()
+	assert := assert.New(t)
+	require := require.New(t)
 	gate := &projectionAdmissionTracker{SerialOperationGate: api.NewSerialOperationGate(), acquired: make(chan struct{}), release: make(chan struct{})}
 	syncObserved := make(chan int, 1)
 	sched := scheduler.New(func(ctx context.Context, _ string) error {
@@ -269,14 +278,17 @@ func TestScheduledProjectionYieldsToSyncBetweenPasses(t *testing.T) {
 	require.NoError(registerActivityProjectionJob(sched, f.Store, config.ActivityConfig{
 		Timezone: "UTC", BatchSize: 1, MaxDirectCounterparts: 25, Schedule: "0 0 1 1 *",
 	}, testDiscardLogger()))
-	require.NoError(sched.StartJob(activityProjectionJob))
+	_, startErr := sched.StartJob(activityProjectionJob, false)
+	require.NoError(startErr)
 	select {
 	case <-gate.acquired:
 	case <-time.After(10 * time.Second):
 		require.FailNow("projection did not acquire the gate")
 	}
-	require.NoError(sched.TriggerSync("short@example.com"))
-	require.Eventually(func() bool { return sched.Status()[0].Queued }, 10*time.Second, 10*time.Millisecond)
+	require.NoError(sched.TriggerSync("short@example.com", false))
+	// Queued is set before the sync goroutine reaches the gate.
+	synctest.Wait()
+	require.True(sched.Status()[0].Queued)
 	release()
 	select {
 	case count := <-syncObserved:

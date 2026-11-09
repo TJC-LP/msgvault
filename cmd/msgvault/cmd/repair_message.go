@@ -43,7 +43,9 @@ func defaultRepairMessageCommandDeps(contexts ...context.Context) repairMessageC
 	return repairMessageCommandDeps{
 		bind:               defaultRepairMessageCommandDepsForContext,
 		isDaemonSubprocess: isDaemonCLISubprocess,
-		openHTTPStore:      OpenHTTPStore,
+		openHTTPStore: func(ctx context.Context) (*daemonclient.Client, HTTPStoreInfo, error) {
+			return OpenHTTPStore(ctx)
+		},
 		preflightReauth: func(
 			ctx context.Context, client *daemonclient.Client, info HTTPStoreInfo, sourceID int64,
 		) error {
@@ -71,20 +73,22 @@ func defaultRepairMessageCommandDepsForContext(ctx context.Context) repairMessag
 	return repairMessageCommandDeps{
 		bind:               defaultRepairMessageCommandDepsForContext,
 		isDaemonSubprocess: isDaemonCLISubprocess,
-		openHTTPStore:      OpenHTTPStore,
+		openHTTPStore: func(ctx context.Context) (*daemonclient.Client, HTTPStoreInfo, error) {
+			return OpenHTTPStore(ctx)
+		},
 		preflightReauth: func(
 			ctx context.Context, client *daemonclient.Client, info HTTPStoreInfo, sourceID int64,
 		) error {
 			return preflightReauth(ctx, buildSyncPreflight(client, info, state), "", sourceID)
 		},
 		openWritableStore: func() (*store.Store, func(), error) {
-			return openWritableStoreAndInitForInvocation(state)
+			return openWritableStoreAndInitForInvocation(ctx, state)
 		},
 		openReadOnlyStore: func() (*store.Store, func(), error) {
 			if currentCfg == nil {
 				return nil, nil, errors.New("configuration is unavailable")
 			}
-			st, err := store.OpenReadOnly(currentCfg.DatabaseDSN())
+			st, err := store.OpenReadOnlyContext(ctx, currentCfg.DatabaseDSN())
 			if err != nil {
 				return nil, nil, fmt.Errorf("open database read-only: %w", err)
 			}
@@ -97,7 +101,7 @@ func defaultRepairMessageCommandDepsForContext(ctx context.Context) repairMessag
 			if currentCfg == nil {
 				return errors.New("configuration is unavailable")
 			}
-			return rebuildCacheAfterWrite(currentCfg.DatabaseDSN(), state)
+			return rebuildCacheAfterWrite(ctx, currentCfg.DatabaseDSN(), state)
 		},
 		attachmentsDir: func() string {
 			if currentCfg == nil {

@@ -10,9 +10,11 @@ export const ExploreFilterDimension = {
   participant: "participant",
   domain: "domain",
   message_type: "message_type",
+  kind: "kind",
   mailing_list: "mailing_list",
   after: "after",
   before: "before",
   deletion: "deletion",
   identity: "identity",
+  account: "account",
 } as const;

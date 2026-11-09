@@ -34,6 +34,7 @@ export const EXPLORE_COLUMNS: ReadonlyArray<{ id: ExploreColumn; label: string }
 // Where the grouping label reads wrongly as a filter chip (plural, or a different word),
 // name it here.
 const FILTER_DIMENSIONS: Partial<Record<string, string>> = {
+  account: 'Account',
   participant: 'Person',
   identity: 'Identity',
   domain: 'Domain',
@@ -85,8 +86,6 @@ const KNOWN_MIME: Record<string, string> = {
 
 // Keys are `${action}:${reason}`, matching the unavailable_actions the preflight endpoint returns.
 const REASONS: Record<string, string> = {
-  'open_in_source:trusted_source_link_unavailable':
-    'Your sources don’t provide links to open these items.',
   'export:browser_export_requires_single_message': 'Export works for one message at a time.',
   'export:selection_has_no_exportable_raw_message':
     'The selection has no original message to export.',
@@ -116,6 +115,23 @@ export function filterDimensionLabel(
   if (explicit) return explicit;
   if (isGroupingDimension(dimension)) return groupingDimensionLabel(dimension);
   return sentenceCase(dimension);
+}
+
+// filterValueLabel shows a filter value as people read it. An account key
+// names a confirmed address (identity:<source>:<base64url address>) or a
+// source's unattributed mail; other values show as stored.
+export function filterValueLabel(dimension: string, value: string): string {
+  if (dimension !== 'account') return value;
+  if (/^unattributed:\d+$/.test(value)) return 'Unattributed';
+  const identity = /^identity:\d+:([A-Za-z0-9_-]+)$/.exec(value);
+  if (!identity?.[1]) return value;
+  try {
+    const base64 = identity[1].replaceAll('-', '+').replaceAll('_', '/');
+    const bytes = Uint8Array.from(atob(base64), (char) => char.charCodeAt(0));
+    return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+  } catch {
+    return value;
+  }
 }
 
 // One wording for grouping in chips and saved-view summaries ("Grouped by Person, then Year").
@@ -160,9 +176,9 @@ function kindPresentation(icon: string, label: string): EntryKindPresentation {
 
 // Mirrors identityindex.TextMessageTypes plus its chat/text fallbacks
 // (internal/identityindex/schema.go).
-const CHAT_MESSAGE_TYPES = new Set([
+export const CHAT_MESSAGE_TYPES = new Set([
   'chat', 'text', 'google_chat', 'whatsapp', 'imessage', 'sms', 'mms', 'rcs',
-  'google_voice_text', 'teams', 'discord', 'beeper', 'slack', 'fbmessenger'
+  'google_voice_text', 'teams', 'discord', 'beeper', 'slack', 'inline', 'fbmessenger', 'matrix', 'chatwoot', 'telegram'
 ]);
 
 // The server-assigned kind wins; the message type covers rows and archive messages without one.
@@ -179,7 +195,7 @@ export function entryKindPresentation(kind: string, messageType = ''): EntryKind
   if (normalized === 'calendar' || normalized === 'calendar_event') {
     return kindPresentation('□', 'Calendar event');
   }
-  if (normalized === 'meeting' || normalized === 'meeting_transcript') {
+  if (normalized === 'meeting' || normalized === 'meeting_transcript' || normalized === 'meeting_note' || normalized === 'meeting_minutes') {
     return kindPresentation('◫', 'Meeting item');
   }
   return kindPresentation('◇', 'Archive item');

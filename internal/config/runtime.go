@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"go.kenn.io/msgvault/internal/providercredentials"
 )
@@ -24,7 +25,19 @@ func Load(path, home string) (*Config, error) {
 }
 
 // LoadWithOverrides applies flags before validating lower-priority env values.
+// It rejects invalid settings in every section, including those only the daemon reads.
 func LoadWithOverrides(path, home string, overrides RuntimeOverrides) (*Config, error) {
+	cfg, err := LoadClientWithOverrides(path, home, overrides)
+	if err != nil {
+		return nil, err
+	}
+	return cfg.requireDaemonValid()
+}
+
+// LoadClientWithOverrides loads like LoadWithOverrides, but records invalid
+// settings that only the daemon reads in DaemonConfigError instead of
+// failing, so client commands can still reach a running daemon.
+func LoadClientWithOverrides(path, home string, overrides RuntimeOverrides) (*Config, error) {
 	return loadWithOverrides(path, home, overrides)
 }
 
@@ -163,12 +176,12 @@ func (c *Config) applyRuntimeOverrides(o RuntimeOverrides) error {
 		c.runtimeConfigState.apiPort.capture(c.Server.APIPort, *o.APIPort)
 		c.Server.APIPort = *o.APIPort
 	} else if v, ok := os.LookupEnv("MSGVAULT_API_PORT"); ok {
-		port, err := strconv.Atoi(v)
-		if err != nil {
-			return errors.New("MSGVAULT_API_PORT must be an integer between 0 and 65535")
+		if port, err := strconv.Atoi(v); err != nil {
+			c.deferDaemonError(errors.New("MSGVAULT_API_PORT must be an integer between 0 and 65535"))
+		} else {
+			c.runtimeConfigState.apiPort.capture(c.Server.APIPort, port)
+			c.Server.APIPort = port
 		}
-		c.runtimeConfigState.apiPort.capture(c.Server.APIPort, port)
-		c.Server.APIPort = port
 	}
 	if v, ok := os.LookupEnv("MSGVAULT_BACKUP_REPO"); ok {
 		value := expandPath(v)
@@ -193,7 +206,13 @@ func (c *Config) applyRuntimeOverrides(o RuntimeOverrides) error {
 		if v, ok := os.LookupEnv(entry.name); ok {
 			value, err := strconv.ParseBool(v)
 			if err != nil {
-				return fmt.Errorf("%s must be a boolean", entry.name)
+				err = fmt.Errorf("%s must be a boolean", entry.name)
+				// Only the daemon reads CORS credentials; clients read the others.
+				if entry.destination != &c.Server.CORSCredentials {
+					return err
+				}
+				c.deferDaemonError(err)
+				continue
 			}
 			entry.record.capture(*entry.destination, value)
 			*entry.destination = value
@@ -323,6 +342,35 @@ func (c *Config) PrepareServerKey() error {
 			return fmt.Errorf("persist server API key: %w", err)
 		}
 		c.Server.credential.value = key
+	}
+	return c.loadRemoteClientKeys()
+}
+
+// loadRemoteClientKeys reads remote client keys once the owner key is final,
+// so a missing reader key file only stops the server.
+func (c *Config) loadRemoteClientKeys() error {
+	if len(c.Server.RemoteClients) > 0 && c.Server.AuthenticationKey() == "" {
+		return errors.New("server remote_clients requires an effective API key")
+	}
+	seen := map[string]string{c.Server.AuthenticationKey(): "the server API key"}
+	for i := range c.Server.RemoteClients {
+		client := &c.Server.RemoteClients[i]
+		if client.APIKeyFile == "" {
+			return fmt.Errorf("invalid [server] remote_clients %q: api_key_file is required", client.ClientID)
+		}
+		key, err := providercredentials.ReadSecretFile(c.credentialPath(client.APIKeyFile))
+		if err != nil {
+			return fmt.Errorf("invalid [server] remote_clients %q: %w", client.ClientID, err)
+		}
+		// Authentication strips a "Bearer " prefix, so a key with spaces could alias another key.
+		if strings.ContainsFunc(key, unicode.IsSpace) {
+			return fmt.Errorf("invalid [server] remote_clients %q: key must not contain whitespace", client.ClientID)
+		}
+		if other, ok := seen[key]; ok {
+			return fmt.Errorf("invalid [server] remote_clients %q: key duplicates %s", client.ClientID, other)
+		}
+		seen[key] = "remote client " + client.ClientID
+		client.APIKey = key
 	}
 	return nil
 }

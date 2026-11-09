@@ -57,17 +57,13 @@ func readAccountIdentityRevision(q rowQuerier) (int64, error) {
 	return revision, nil
 }
 
-// bumpAccountIdentityRevision increments the account-identity revision
+// bumpAccountIdentityRevisionContext increments the account-identity revision
 // inside tx, seeding the row with 0 first if it does not exist yet. Follows
 // bumpIdentityRevision's approach in participant_links.go. Callers are the
 // identity mutations that invalidate baked message data: AddAccountIdentity,
 // RemoveAccountIdentity, and the participant-merge paths (MergeParticipants,
 // mergeParticipant); none of them expose the new value, so unlike
 // bumpIdentityRevision this returns only an error.
-func (s *Store) bumpAccountIdentityRevision(tx *loggedTx) error {
-	return s.bumpAccountIdentityRevisionContext(context.Background(), tx)
-}
-
 func (s *Store) bumpAccountIdentityRevisionContext(ctx context.Context, tx *loggedTx) error {
 	if _, err := tx.ExecContext(ctx, s.dialect.InsertOrIgnore(
 		`INSERT OR IGNORE INTO archive_metadata (key, value) VALUES (?, '0')`),
@@ -158,8 +154,8 @@ func (s *Store) AddAccountIdentityContext(
 		sourceID,
 		address,
 		signal,
-		func(ctx context.Context, tx *loggedTx) error {
-			return refreshSourceMessageAttributionContext(ctx, tx, sourceID, "")
+		func(ctx context.Context, tx *loggedTx, address string) error {
+			return refreshIdentityMessageAttributionContext(ctx, tx, sourceID, []string{address}, "")
 		},
 	)
 }
@@ -179,15 +175,15 @@ func (s *Store) AddAccountIdentityAndRefreshMessageAttributionContext(
 		sourceID,
 		address,
 		signal,
-		func(ctx context.Context, tx *loggedTx) error {
-			return refreshSourceMessageAttributionContext(
-				ctx, tx, sourceID, excludeSourceMessageID,
+		func(ctx context.Context, tx *loggedTx, address string) error {
+			return refreshIdentityMessageAttributionContext(
+				ctx, tx, sourceID, []string{address}, excludeSourceMessageID,
 			)
 		},
 	)
 }
 
-type accountIdentityInsertHook func(context.Context, *loggedTx) error
+type accountIdentityInsertHook func(context.Context, *loggedTx, string) error
 
 func (s *Store) addAccountIdentityContext(
 	ctx context.Context,
@@ -230,10 +226,9 @@ func (s *Store) addAccountIdentityOnce(
 	match identifierMatch,
 	onInsert accountIdentityInsertHook,
 ) error {
-	return s.withTxContext(ctx, func(tx *loggedTx) error {
-		if err := s.lockIdentityMutationTxContext(ctx, tx); err != nil {
-			return err
-		}
+	var pending []int64
+	err := s.withAttributionTxContext(ctx, attributionLock{Exclusive: true}, func(tx *loggedTx) error {
+		pending = nil
 		added, err := s.mergeAccountIdentitySignalsTx(ctx, tx, sourceID, addr, []string{signal}, match)
 		if err != nil {
 			return err
@@ -246,13 +241,20 @@ func (s *Store) addAccountIdentityOnce(
 				return err
 			}
 			if onInsert != nil {
-				if err := onInsert(ctx, tx); err != nil {
+				if err := onInsert(ctx, tx, addr); err != nil {
 					return err
 				}
 			}
+			pending, err = s.markAccountAttributionPendingForAddressesTx(ctx, tx, sourceID, []string{addr})
+			return err
 		}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	s.deriveAccountAttributionAfterCommit(ctx, sourceID, pending)
+	return nil
 }
 
 // mergeAccountIdentitySignalsTx applies the row-level insert/signal-merge
@@ -402,10 +404,7 @@ func (s *Store) mergeConfirmedAccountIdentityChunkOnce(
 	confirmations []normalizedIdentityConfirmation,
 ) ([]IdentityConfirmationOutcome, error) {
 	outcomes := make([]IdentityConfirmationOutcome, 0, len(confirmations))
-	err := s.withTxContext(ctx, func(tx *loggedTx) error {
-		if err := s.lockIdentityMutationTxContext(ctx, tx); err != nil {
-			return err
-		}
+	err := s.withAttributionTxContext(ctx, attributionLock{Exclusive: true}, func(tx *loggedTx) error {
 		for _, confirmation := range confirmations {
 			_, present, err := s.mergeAccountIdentitySignalsTxWith(
 				ctx,
@@ -529,10 +528,29 @@ func (s *Store) RemoveAccountIdentityContext(
 ) (int64, error) {
 	match := newIdentifierMatch(address)
 	var removed int64
-	err := s.withTxContext(ctx, func(tx *loggedTx) error {
-		if err := s.lockIdentityMutationTxContext(ctx, tx); err != nil {
-			return err
+	var pending []int64
+	err := s.withAttributionTxContext(ctx, attributionLock{Exclusive: true}, func(tx *loggedTx) error {
+		pending = nil
+		var removedAddresses []string
+		rows, err := tx.QueryContext(ctx,
+			`SELECT address FROM account_identities WHERE source_id = ? AND `+match.WhereClause("address"),
+			sourceID, match.BindValue())
+		if err != nil {
+			return fmt.Errorf("read account identity to remove: %w", err)
 		}
+		for rows.Next() {
+			var addr string
+			if err := rows.Scan(&addr); err != nil {
+				_ = rows.Close()
+				return fmt.Errorf("scan account identity to remove: %w", err)
+			}
+			removedAddresses = append(removedAddresses, addr)
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("read account identity to remove: %w", err)
+		}
+		_ = rows.Close()
 		res, err := tx.ExecContext(ctx,
 			`DELETE FROM account_identities WHERE source_id = ? AND `+match.WhereClause("address"),
 			sourceID, match.BindValue(),
@@ -565,11 +583,16 @@ func (s *Store) RemoveAccountIdentityContext(
 		if err := s.bumpAccountIdentityRevisionContext(ctx, tx); err != nil {
 			return err
 		}
-		return refreshSourceMessageAttributionContext(ctx, tx, sourceID, "")
+		if err := refreshIdentityMessageAttributionContext(ctx, tx, sourceID, removedAddresses, ""); err != nil {
+			return err
+		}
+		pending, err = s.markAccountAttributionPendingForAddressesTx(ctx, tx, sourceID, removedAddresses)
+		return err
 	})
 	if err != nil {
 		return 0, err
 	}
+	s.deriveAccountAttributionAfterCommit(ctx, sourceID, pending)
 	return removed, nil
 }
 
@@ -622,7 +645,7 @@ func (s *Store) persistDefaultIdentityOptOutAfterLastRemovalContext(
 //
 // Identifiers are returned with the case the user stored. Callers comparing
 // against email-shaped strings should lowercase both sides at compare time.
-func (s *Store) GetIdentitiesForScope(sourceIDs []int64) (map[string]struct{}, error) {
+func (s *Store) GetIdentitiesForScope(ctx context.Context, sourceIDs []int64) (map[string]struct{}, error) {
 	out := make(map[string]struct{})
 	if len(sourceIDs) == 0 {
 		return out, nil
@@ -637,7 +660,7 @@ func (s *Store) GetIdentitiesForScope(sourceIDs []int64) (map[string]struct{}, e
 	query := `SELECT address FROM account_identities WHERE source_id IN (` +
 		strings.Join(placeholders, ",") + `)`
 
-	rows, err := s.db.Query(query, args...)
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("get identities for scope: %w", err)
 	}

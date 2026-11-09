@@ -21,6 +21,8 @@ const (
 	maxMetadataBytes   = 64 << 10
 	maxTranscriptBytes = 16 << 20
 	maxMediaBytes      = 2 << 30
+	// A transcript read returns supplied text in JSON units, which can roughly double it.
+	maxTranscriptResponseBytes = 2*maxTranscriptBytes + maxResponseBytes
 )
 
 var (
@@ -31,11 +33,28 @@ var (
 	ErrInvalidRequest        = errors.New("docbank request is invalid")
 )
 
-// HTTPError preserves only the response status class and a stable local code.
-// Response bodies are deliberately discarded because Docbank may echo input.
+// HTTPError preserves only the response status class, a stable local code, and
+// Docbank's own error code when it is a plain token. The rest of the body is
+// discarded because Docbank may echo input.
 type HTTPError struct {
 	Status int
 	Code   string
+	// Reason is Docbank's error code, such as content_missing.
+	Reason string
+}
+
+func newHTTPError(status int, body []byte) *HTTPError {
+	var problem struct {
+		Code string `json:"code"`
+	}
+	code := statusCode(status)
+	if json.Unmarshal(body, &problem) == nil && problem.Code == "capability_unavailable" {
+		code = problem.Code
+	}
+	if len(problem.Code) > 64 || strings.Trim(problem.Code, "abcdefghijklmnopqrstuvwxyz_") != "" {
+		problem.Code = ""
+	}
+	return &HTTPError{Status: status, Code: code, Reason: problem.Code}
 }
 
 func (e *HTTPError) Error() string {
@@ -148,11 +167,83 @@ type Receipt struct {
 	SuppliedInputID  string `json:"supplied_input_id,omitempty"`
 }
 
+// ReferenceRequest URLs are access material; never log or store them.
+type ReferenceRequest struct {
+	OperationID  string     `json:"operation_id"`
+	ReferenceURL string     `json:"reference_url"`
+	CanonicalURL string     `json:"canonical_url,omitempty"`
+	Acquire      bool       `json:"acquire"`
+	Occurrence   Occurrence `json:"occurrence"`
+}
+
+func (c *Client) SubmitReference(ctx context.Context, request ReferenceRequest) (Receipt, error) {
+	var receipt Receipt
+	err := c.jsonRequest(ctx, http.MethodPost, "/api/v1/media/sources", request, &receipt)
+	if err = validateReceipt(receipt, request.OperationID, err); err != nil {
+		return Receipt{}, err
+	}
+	if receipt.OccurrenceID == "" {
+		return Receipt{}, ErrInvalidReceipt
+	}
+	return receipt, nil
+}
+
+func (c *Client) OperationReceipt(ctx context.Context, operationID string) (Receipt, error) {
+	var receipt Receipt
+	err := c.jsonRequest(ctx, http.MethodGet, "/api/v1/media/operations/"+url.PathEscape(operationID), nil, &receipt)
+	if err = validateReceipt(receipt, operationID, err); err != nil {
+		return Receipt{}, err
+	}
+	if receipt.OccurrenceID == "" {
+		return Receipt{}, ErrInvalidReceipt
+	}
+	return receipt, nil
+}
+
+func IsNotFound(err error) bool {
+	httpErr, ok := errors.AsType[*HTTPError](err)
+	return ok && httpErr.Status == http.StatusNotFound
+}
+
 type JobStatus struct {
 	JobID       string `json:"job_id"`
 	State       string `json:"state"`
 	Phase       string `json:"phase"`
 	FailureCode string `json:"failure_code,omitzero"`
+}
+
+// MediaTimeSpan is one half-open interval in retained media, in milliseconds.
+type MediaTimeSpan struct {
+	StartMS int64 `json:"start_ms"`
+	EndMS   int64 `json:"end_ms"`
+}
+
+type MediaTranscriptUnit struct {
+	Text     string         `json:"text"`
+	TimeSpan *MediaTimeSpan `json:"time_span,omitempty"`
+	Speaker  string         `json:"speaker,omitempty"`
+}
+
+type MediaTranscriptEvidence struct {
+	BuildID         string                `json:"build_id"`
+	SuppliedInputID string                `json:"supplied_input_id,omitempty"`
+	Origin          string                `json:"origin"`
+	Completeness    string                `json:"completeness"`
+	Truncated       bool                  `json:"truncated"`
+	HasOmissions    bool                  `json:"has_omissions"`
+	Units           []MediaTranscriptUnit `json:"units"`
+}
+
+// MediaTranscript is Docbank's transcript evidence for one exact media version.
+type MediaTranscript struct {
+	VaultUID         string                   `json:"vault_uid"`
+	SourceID         string                   `json:"source_id"`
+	SourceVersionID  string                   `json:"source_version_id"`
+	ContentVersionID string                   `json:"content_version_id"`
+	EvidenceState    string                   `json:"evidence_state"`
+	CoverageState    string                   `json:"coverage_state"`
+	OperationState   string                   `json:"operation_state"`
+	Transcript       *MediaTranscriptEvidence `json:"transcript,omitempty"`
 }
 
 // NewClient validates the destination without making a network request.
@@ -192,7 +283,7 @@ func isLoopbackHost(host string) bool {
 }
 
 func (c *Client) Submit(ctx context.Context, metadata SuppliedMetadata, content io.Reader) (Receipt, error) {
-	receipt, err := c.multipart(ctx, "/api/v1/media/sources", metadata, metadata.Filename, metadata.MediaType, content)
+	receipt, err := c.mediaMultipart(ctx, "/api/v1/media/sources", metadata, metadata.Filename, metadata.MediaType, content)
 	if err = validateReceipt(receipt, metadata.OperationID, err); err != nil {
 		return Receipt{}, err
 	}
@@ -204,7 +295,7 @@ func (c *Client) Submit(ctx context.Context, metadata SuppliedMetadata, content 
 
 func (c *Client) ImportTranscript(ctx context.Context, sourceID string, metadata ArtifactMetadata, content io.Reader) (Receipt, error) {
 	endpoint := "/api/v1/media/sources/" + url.PathEscape(sourceID) + "/artifacts"
-	receipt, err := c.multipart(ctx, endpoint, metadata, metadata.Filename, metadata.MediaType, content)
+	receipt, err := c.mediaMultipart(ctx, endpoint, metadata, metadata.Filename, metadata.MediaType, content)
 	if err = validateReceipt(receipt, metadata.OperationID, err); err != nil {
 		return Receipt{}, err
 	}
@@ -255,7 +346,32 @@ func (c *Client) JobStatus(ctx context.Context, jobID string) (JobStatus, error)
 	return status, nil
 }
 
-func (c *Client) multipart(
+// Transcript reads one exact retained version's transcript evidence.
+func (c *Client) Transcript(
+	ctx context.Context, sourceID, sourceVersionID, contentVersionID string,
+) (MediaTranscript, error) {
+	if sourceID == "" || sourceVersionID == "" || contentVersionID == "" {
+		return MediaTranscript{}, fmt.Errorf("%w: transcript requires an exact media version", ErrInvalidRequest)
+	}
+	endpoint := "/api/v1/media/sources/" + url.PathEscape(sourceID) + "/versions/" +
+		url.PathEscape(sourceVersionID) + "/transcript?" +
+		url.Values{"content_version_id": {contentVersionID}}.Encode()
+	var transcript MediaTranscript
+	if err := c.jsonRequestLimit(ctx, http.MethodGet, endpoint, nil, &transcript, maxTranscriptResponseBytes); err != nil {
+		return MediaTranscript{}, err
+	}
+	// Docbank echoes the requested tuple, and only ready evidence carries text.
+	evidence := transcript.Transcript
+	if transcript.VaultUID == "" || transcript.SourceID != sourceID ||
+		transcript.SourceVersionID != sourceVersionID || transcript.ContentVersionID != contentVersionID ||
+		(transcript.EvidenceState == "ready") != (evidence != nil) ||
+		(evidence != nil && evidence.Origin != "supplied" && evidence.Origin != "generated") {
+		return MediaTranscript{}, ErrInvalidReceipt
+	}
+	return transcript, nil
+}
+
+func (c *Client) mediaMultipart(
 	ctx context.Context, endpoint string, metadata any, filename, mediaType string, content io.Reader,
 ) (Receipt, error) {
 	if content == nil || filename == "" || mediaType == "" {
@@ -269,11 +385,25 @@ func (c *Client) multipart(
 		return Receipt{}, fmt.Errorf("%w: metadata exceeds the size limit", ErrInvalidRequest)
 	}
 
+	body, err := c.multipart(ctx, endpoint, nil, func(writer *multipart.Writer) error {
+		return writeMultipart(metadataBytes, filename, mediaType, content, writer)
+	})
+	if err != nil {
+		return Receipt{}, err
+	}
+	var receipt Receipt
+	if err := json.Unmarshal(body, &receipt); err != nil {
+		return Receipt{}, fmt.Errorf("%w: undecodable response", ErrInvalidReceipt)
+	}
+	return receipt, validateReceipt(receipt, "", nil)
+}
+
+func (c *Client) multipart(ctx context.Context, endpoint string, headers http.Header, write func(*multipart.Writer) error) ([]byte, error) {
 	reader, writer := io.Pipe()
 	multipartWriter := multipart.NewWriter(writer)
 	writeResult := make(chan error, 1)
 	go func() {
-		err := writeMultipart(metadataBytes, filename, mediaType, content, multipartWriter)
+		err := write(multipartWriter)
 		_ = writer.CloseWithError(err)
 		writeResult <- err
 	}()
@@ -282,40 +412,41 @@ func (c *Client) multipart(
 	if err != nil {
 		_ = reader.CloseWithError(err)
 		<-writeResult
-		return Receipt{}, err
+		return nil, err
+	}
+	req.Header = headers.Clone()
+	if req.Header == nil {
+		req.Header = make(http.Header)
 	}
 	req.Header.Set("Content-Type", multipartWriter.FormDataContentType())
 	if err := c.setAPIKey(req); err != nil {
 		_ = reader.CloseWithError(err)
 		<-writeResult
-		return Receipt{}, err
+		return nil, err
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
 		_ = reader.CloseWithError(err)
 		<-writeResult
-		return Receipt{}, transportError(err)
+		return nil, transportError(err)
 	}
-	body, readErr := readResponse(resp)
+	body, readErr := readResponse(resp, maxResponseBytes)
 	_ = resp.Body.Close()
 	if readErr != nil {
 		_ = reader.CloseWithError(readErr)
 		<-writeResult
-		return Receipt{}, readErr
+		return nil, readErr
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		_ = reader.Close()
 		<-writeResult
-		return Receipt{}, &HTTPError{Status: resp.StatusCode, Code: statusCode(resp.StatusCode)}
+		return nil, &HTTPError{Status: resp.StatusCode, Code: statusCode(resp.StatusCode)}
 	}
+	_ = reader.Close()
 	if err := <-writeResult; err != nil {
-		return Receipt{}, fmt.Errorf("write Docbank upload: %w", err)
+		return nil, fmt.Errorf("write Docbank upload: %w", err)
 	}
-	var receipt Receipt
-	if err := json.Unmarshal(body, &receipt); err != nil {
-		return Receipt{}, fmt.Errorf("%w: undecodable response", ErrInvalidReceipt)
-	}
-	return receipt, validateReceipt(receipt, "", nil)
+	return body, nil
 }
 
 func writeMultipart(
@@ -329,10 +460,7 @@ func writeMultipart(
 		_, err = part.Write(metadata)
 	}
 	if err == nil {
-		header = make(textproto.MIMEHeader)
-		header.Set("Content-Disposition", multipart.FileContentDisposition("file", filename))
-		header.Set("Content-Type", mediaType)
-		part, err = writer.CreatePart(header)
+		part, err = filePart(writer, filename, mediaType)
 	}
 	if err == nil {
 		limit := int64(maxMediaBytes)
@@ -352,26 +480,42 @@ func writeMultipart(
 	return err
 }
 
-func (c *Client) jsonRequest(ctx context.Context, method, endpoint string, body any, out any) error {
+func (c *Client) newJSONRequest(ctx context.Context, method, endpoint string, body any, requestLimit int64) (*http.Request, error) {
 	var reader io.Reader
 	if body != nil {
 		encoded, err := json.Marshal(body)
 		if err != nil {
-			return fmt.Errorf("%w: encode request", ErrInvalidRequest)
+			return nil, fmt.Errorf("%w: encode request", ErrInvalidRequest)
 		}
-		if len(encoded) > maxMetadataBytes {
-			return fmt.Errorf("%w: request exceeds the size limit", ErrInvalidRequest)
+		if int64(len(encoded)) > requestLimit {
+			return nil, fmt.Errorf("%w: request exceeds the size limit", ErrInvalidRequest)
 		}
 		reader = strings.NewReader(string(encoded))
 	}
 	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+endpoint, reader)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
 	if err := c.setAPIKey(req); err != nil {
+		return nil, err
+	}
+	return req, nil
+}
+
+func (c *Client) jsonRequest(ctx context.Context, method, endpoint string, body any, out any) error {
+	return c.jsonRequestLimit(ctx, method, endpoint, body, out, maxResponseBytes)
+}
+
+func (c *Client) jsonRequestLimit(ctx context.Context, method, endpoint string, body any, out any, limit int64) error {
+	return c.jsonRequestLimits(ctx, method, endpoint, body, out, maxMetadataBytes, limit)
+}
+
+func (c *Client) jsonRequestLimits(ctx context.Context, method, endpoint string, body any, out any, requestLimit, limit int64) error {
+	req, err := c.newJSONRequest(ctx, method, endpoint, body, requestLimit)
+	if err != nil {
 		return err
 	}
 	resp, err := c.http.Do(req)
@@ -379,12 +523,12 @@ func (c *Client) jsonRequest(ctx context.Context, method, endpoint string, body 
 		return transportError(err)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	data, err := readResponse(resp)
+	data, err := readResponse(resp, limit)
 	if err != nil {
 		return err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return &HTTPError{Status: resp.StatusCode, Code: statusCode(resp.StatusCode)}
+		return newHTTPError(resp.StatusCode, data)
 	}
 	if out == nil {
 		return nil
@@ -417,12 +561,12 @@ func (c *Client) setAPIKey(req *http.Request) error {
 	return nil
 }
 
-func readResponse(resp *http.Response) ([]byte, error) {
-	data, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
+func readResponse(resp *http.Response, limit int64) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
 	if err != nil {
 		return nil, fmt.Errorf("read Docbank response: %w", err)
 	}
-	if len(data) > maxResponseBytes {
+	if int64(len(data)) > limit {
 		return nil, ErrResponseTooLarge
 	}
 	return data, nil
@@ -468,4 +612,15 @@ func statusCode(status int) string {
 		}
 		return "http_error"
 	}
+}
+
+func filePart(writer *multipart.Writer, filename, mediaType string) (io.Writer, error) {
+	header := make(textproto.MIMEHeader)
+	header.Set("Content-Disposition", multipart.FileContentDisposition("file", filename))
+	header.Set("Content-Type", mediaType)
+	part, err := writer.CreatePart(header)
+	if err != nil {
+		return nil, fmt.Errorf("create upload part: %w", err)
+	}
+	return part, nil
 }

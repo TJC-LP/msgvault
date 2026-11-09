@@ -177,6 +177,18 @@ func (c *Client) BaseURL() string {
 	return c.baseURL
 }
 
+func (c *Client) currentDaemonURL() string {
+	if c == nil {
+		return ""
+	}
+	if c.httpClient != nil {
+		if recovery, ok := c.httpClient.Transport.(*localDaemonRecovery); ok {
+			return recovery.connection().endpoint.URL
+		}
+	}
+	return c.baseURL
+}
+
 // Timeout returns the HTTP timeout configured for non-streaming requests.
 func (c *Client) Timeout() time.Duration {
 	if c == nil || c.httpClient == nil {
@@ -220,7 +232,7 @@ func (c *Client) DoGeneratedRequestWithContext(
 	path string,
 	options runtime.RequestOptions,
 ) (*http.Response, error) {
-	return c.doGeneratedRequestWithHTTPClient(ctx, method, path, options, c.httpClient)
+	return c.doGeneratedRequestWithHTTPClient(ctx, method, path, options, c.httpClient, maxErrorBodyBytes)
 }
 
 // DoGeneratedStreamingRequestWithContext is like DoGeneratedRequestWithContext
@@ -232,7 +244,7 @@ func (c *Client) DoGeneratedStreamingRequestWithContext(
 	path string,
 	options runtime.RequestOptions,
 ) (*http.Response, error) {
-	return c.doGeneratedRequestWithHTTPClient(ctx, method, path, options, httpClientWithoutTimeout(c.httpClient))
+	return c.doGeneratedRequestWithHTTPClient(ctx, method, path, options, httpClientWithoutTimeout(c.httpClient), maxErrorBodyBytes)
 }
 
 func (c *Client) doGeneratedRequestWithHTTPClient(
@@ -241,6 +253,7 @@ func (c *Client) doGeneratedRequestWithHTTPClient(
 	path string,
 	options runtime.RequestOptions,
 	httpClient *http.Client,
+	errorBodyLimit int64,
 ) (*http.Response, error) {
 	client, err := c.GeneratedClient()
 	if err != nil {
@@ -263,7 +276,7 @@ func (c *Client) doGeneratedRequestWithHTTPClient(
 	if httpClient == nil {
 		httpClient = http.DefaultClient
 	}
-	resp, err := doRequestWithRootContext(c.requestContext(), httpClient, req)
+	resp, err := doRequestWithRootContext(c.requestContext(), httpClient, req, errorBodyLimit)
 	if err != nil {
 		return nil, fmt.Errorf("request failed: %w", err)
 	}
@@ -292,13 +305,14 @@ func (d httpDoer) Do(ctx context.Context, req *http.Request) (*http.Response, er
 	if ctx != nil {
 		req = req.WithContext(ctx)
 	}
-	return doRequestWithRootContext(d.rootContext, client, req)
+	return doRequestWithRootContext(d.rootContext, client, req, maxErrorBodyBytes)
 }
 
 func doRequestWithRootContext(
 	rootContext context.Context,
 	client *http.Client,
 	req *http.Request,
+	errorBodyLimit int64,
 ) (*http.Response, error) {
 	requestContext := req.Context()
 	switch {
@@ -326,12 +340,48 @@ func doRequestWithRootContext(
 			stopRootCancellation: stopRootCancellation,
 			cancel:               cancel,
 		}
-		return resp, nil
+		return boundErrorBody(resp, errorBodyLimit), nil
 	}
 
 	// #nosec G704 -- daemonclient intentionally sends requests to the
 	// caller-resolved msgvault daemon URL after New validates the scheme.
-	return client.Do(req)
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	return boundErrorBody(resp, errorBodyLimit), nil
+}
+
+const maxErrorBodyBytes = 64 << 10
+
+// boundErrorBody caps how much of an error response any caller can buffer.
+func boundErrorBody(resp *http.Response, limit int64) *http.Response {
+	if resp.StatusCode >= http.StatusBadRequest {
+		resp.Body = &boundedErrorBody{ReadCloser: resp.Body, remaining: limit + 1, limit: limit}
+	}
+	return resp
+}
+
+type boundedErrorBody struct {
+	io.ReadCloser
+
+	remaining int64
+	limit     int64
+}
+
+func (b *boundedErrorBody) Read(p []byte) (int, error) {
+	if b.remaining <= 0 {
+		return 0, fmt.Errorf("error response exceeds %d KiB", b.limit>>10)
+	}
+	if int64(len(p)) > b.remaining {
+		p = p[:b.remaining]
+	}
+	n, err := b.ReadCloser.Read(p)
+	b.remaining -= int64(n)
+	if b.remaining <= 0 {
+		return n, fmt.Errorf("error response exceeds %d KiB", b.limit>>10)
+	}
+	return n, err
 }
 
 type cancelOnCloseBody struct {

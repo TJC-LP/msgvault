@@ -31,6 +31,9 @@ import (
 )
 
 type workerCatalog struct {
+	loadRangesErr     error
+	saveRangeErr      error
+	ranges            []store.DocumentExtractionRange
 	claimInput        store.DocumentExtractionClaimInput
 	publication       *store.DocumentExtractionPublication
 	failure           *store.DocumentExtractionFailure
@@ -196,7 +199,7 @@ func TestMistralWorkerConvertsCSVAndPublishesThroughStore(t *testing.T) {
 	profile := store.DocumentExtractionProfile{
 		ID: "profile-test", Fingerprint: strings.Repeat("a", 64),
 		Provider: "mistral", Endpoint: "https://api.mistral.ai/v1/ocr",
-		Region: "eu", Model: "mistral-ocr-4-0", RetentionPosture: "standard",
+		Region: "eu", Model: ModelMistralOCR, RetentionPosture: "standard",
 		TrainingPosture: "opted-out", AllowedMediaTypes: []string{"text/csv", "application/pdf"},
 		PolicyJSON: []byte(`{"policy":1}`),
 	}
@@ -397,6 +400,7 @@ func TestMistralWorkerPublishesOnlyNormalizedDerivatives(t *testing.T) {
 	assert.NotContains(catalog.publication.Units[0].Text, "private")
 	assert.Equal([]string{"Invoice"}, catalog.publication.Chunks[0].HeadingPath)
 	assert.Equal(1, catalog.publication.RequestCount)
+	assert.Equal(1, catalog.publication.UploadCount)
 	assert.Zero(catalog.publication.RetryCount)
 	assert.Positive(catalog.publication.ProviderLatencyMS)
 	assert.Equal(1, result.Units)
@@ -752,7 +756,7 @@ func (s *syntheticMistralTransport) RoundTrip(request *http.Request) (*http.Resp
 		pages[i] = map[string]any{"index": i, "markdown": fmt.Sprintf("%s slide %d", s.sentinel, i)}
 	}
 	body, err := json.Marshal(map[string]any{
-		"model": "mistral-ocr-4-0", "pages": pages,
+		"model": ModelMistralOCR, "pages": pages,
 		"usage_info": map[string]any{"pages_processed": s.processed, "doc_size_bytes": s.sourceLen},
 	})
 	if err != nil {
@@ -1013,10 +1017,10 @@ func TestMistralWorkerReportsMalformedPDFCauseWithoutUpload(t *testing.T) {
 		AttachmentID: 1, CanonicalBlobHash: hex.EncodeToString(digest[:]),
 		MIMEType: "application/pdf", Size: int64(len(content)), MessageType: "email",
 	})
-	require.ErrorContains(err, "PDF structure is malformed")
+	require.ErrorContains(err, "PDF structure could not be validated")
 	require.NotNil(catalog.failure)
 	assert.Equal("invalid_local_source", catalog.failure.ReasonCode)
-	assert.Contains(catalog.failure.Detail, "PDF structure is malformed")
+	assert.Contains(catalog.failure.Detail, "PDF structure could not be validated")
 	assert.Equal(catalog.failure.Detail, result.FailureDetail)
 	assert.Zero(processor.calls)
 }
@@ -1075,4 +1079,15 @@ func TestMistralWorkerSizeDiagnosticsReachStatus(t *testing.T) {
 			assert.Equal(tc.want, status.Failures[0].Detail)
 		})
 	}
+}
+
+func (c *workerCatalog) LoadDocumentExtractionRanges(context.Context, store.DocumentExtractionClaim, int64) ([]store.DocumentExtractionRange, error) {
+	return c.ranges, c.loadRangesErr
+}
+func (c *workerCatalog) SaveDocumentExtractionRange(_ context.Context, _ store.DocumentExtractionClaim, r store.DocumentExtractionRange, _ int64, _ int) error {
+	if c.saveRangeErr != nil {
+		return c.saveRangeErr
+	}
+	c.ranges = append(c.ranges, r)
+	return nil
 }

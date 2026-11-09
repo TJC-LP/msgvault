@@ -16,6 +16,7 @@ import (
 
 	pstlib "github.com/mooijtech/go-pst/v6/pkg"
 	pstreader "go.kenn.io/msgvault/internal/pst"
+	"go.kenn.io/msgvault/internal/rederive"
 	"go.kenn.io/msgvault/internal/remoteimage"
 	"go.kenn.io/msgvault/internal/store"
 )
@@ -174,11 +175,12 @@ func importPstWithBatchSize(
 	defer func() {
 		retErr = errors.Join(retErr, execution.Release())
 	}()
+	rederive.Heal(ctx, slog.Default(), st, src)
 
 	// Set display name to the PST filename so it appears in list-accounts / get_stats.
 	pstBase := filepath.Base(absPath)
 	if !src.DisplayName.Valid || src.DisplayName.String == "" {
-		if err := st.UpdateSourceDisplayName(src.ID, pstBase); err != nil {
+		if err := st.UpdateSourceDisplayNameContext(ctx, src.ID, pstBase); err != nil {
 			log.Warn("failed to set source display name", "error", err)
 		} else {
 			src.DisplayName.Valid = true
@@ -194,7 +196,7 @@ func importPstWithBatchSize(
 	)
 
 	if !opts.NoResume {
-		active, err := st.GetLatestCheckpointedSyncByType(src.ID, "import-pst")
+		active, err := st.GetLatestCheckpointedSyncByType(ctx, src.ID, "import-pst")
 		if err != nil && !errors.Is(err, store.ErrSyncRunNotFound) {
 			return nil, fmt.Errorf("check resumable sync: %w", err)
 		}
@@ -364,14 +366,14 @@ func importPstWithBatchSize(
 			ids[i] = p.SourceMsgID
 		}
 
-		existingWithRaw, errWithRaw := st.MessageExistsWithRawBatch(src.ID, ids)
+		existingWithRaw, errWithRaw := st.MessageExistsWithRawBatchContext(ctx, src.ID, ids)
 		if errWithRaw != nil {
 			cp.ErrorsCount++
 			summary.Errors++
 			log.Warn("existence check failed", "error", errWithRaw)
 		}
 
-		existingAny, errAny := st.MessageExistsBatch(src.ID, ids)
+		existingAny, errAny := st.MessageExistsBatchContext(ctx, src.ID, ids)
 		if errAny != nil {
 			cp.ErrorsCount++
 			summary.Errors++
@@ -394,7 +396,7 @@ func importPstWithBatchSize(
 			// Re-import repairs header facts while preserving archived content.
 			existingID, exists := existingWithRaw[p.SourceMsgID]
 			if errWithRaw != nil {
-				one, err := st.MessageExistsWithRawBatch(src.ID, []string{p.SourceMsgID})
+				one, err := st.MessageExistsWithRawBatchContext(ctx, src.ID, []string{p.SourceMsgID})
 				if err == nil {
 					existingID, exists = one[p.SourceMsgID]
 				}
@@ -410,7 +412,10 @@ func importPstWithBatchSize(
 				}
 				summary.MessagesSkipped++
 				if p.LabelID != 0 {
-					if err := st.AddMessageLabels(existingID, []int64{p.LabelID}); err != nil {
+					// The header repair above has committed and a cancel will
+					// checkpoint at this message, so a resume never revisits it.
+					// Restore its folder label even after a cancel.
+					if err := st.AddMessageLabels(context.WithoutCancel(ctx), existingID, []int64{p.LabelID}); err != nil {
 						log.Warn("add labels to existing message", "error", err)
 					}
 				}
@@ -484,7 +489,7 @@ func importPstWithBatchSize(
 		// Ensure label for this folder.
 		labelID, ok := labelCache[entry.Path]
 		if !ok {
-			lid, err := st.EnsureLabel(src.ID, entry.Path, entry.Name, "user")
+			lid, err := st.EnsureLabel(ctx, src.ID, entry.Path, entry.Name, "user")
 			if err != nil {
 				cp.ErrorsCount++
 				summary.Errors++

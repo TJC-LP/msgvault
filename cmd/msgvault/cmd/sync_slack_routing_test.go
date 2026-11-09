@@ -13,6 +13,7 @@ import (
 	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/slack"
 	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/telemetry"
 	"go.kenn.io/msgvault/internal/testutil"
 )
 
@@ -45,7 +46,7 @@ func TestResolveSlackSyncSourcesFiltersByTeam(t *testing.T) {
 	assert := assert.New(t)
 	st := testutil.NewTestStore(t)
 
-	_, err := resolveSlackSyncSources(st, "")
+	_, err := resolveSlackSyncSources(t.Context(), st, "")
 	require.ErrorContains(err, "no Slack workspaces registered")
 
 	_, err = st.GetOrCreateSource(sourceTypeSlack, "T01:UME")
@@ -53,17 +54,68 @@ func TestResolveSlackSyncSourcesFiltersByTeam(t *testing.T) {
 	_, err = st.GetOrCreateSource(sourceTypeSlack, "T02:UOTHER")
 	require.NoError(err)
 
-	all, err := resolveSlackSyncSources(st, "")
+	all, err := resolveSlackSyncSources(t.Context(), st, "")
 	require.NoError(err)
 	assert.Len(all, 2)
 
-	one, err := resolveSlackSyncSources(st, "T02")
+	one, err := resolveSlackSyncSources(t.Context(), st, "T02")
 	require.NoError(err)
 	require.Len(one, 1)
 	assert.Equal("T02:UOTHER", one[0].Identifier)
 
-	_, err = resolveSlackSyncSources(st, "TYPO")
+	_, err = resolveSlackSyncSources(t.Context(), st, "TYPO")
 	require.ErrorContains(err, `slack workspace "TYPO" is not registered`)
+}
+
+func TestResolveSlackSyncSourcesSkipsRetiredWorkspaces(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	st := testutil.NewTestStore(t)
+	retired, err := st.GetOrCreateSource(sourceTypeSlack, "T01:UOLD")
+	require.NoError(err)
+	active, err := st.GetOrCreateSource(sourceTypeSlack, "T02:UNEW")
+	require.NoError(err)
+	_, err = st.MergeSourcesContext(t.Context(), store.MergeSourcesRequest{
+		FromSourceID: retired.ID,
+		IntoSourceID: active.ID,
+	})
+	require.NoError(err)
+
+	all, err := resolveSlackSyncSources(t.Context(), st, "")
+	require.NoError(err)
+	require.Len(all, 1)
+	assert.Equal(active.ID, all[0].ID)
+
+	_, err = resolveSlackSyncSources(t.Context(), st, "T01")
+	require.ErrorIs(err, store.ErrSourceRetired)
+}
+
+func TestScheduledSlackSyncSkipsRetiredMalformedWorkspace(t *testing.T) {
+	cfg := testConfigValue()
+	require := require.New(t)
+	st := testutil.NewTestStore(t)
+	retired, err := st.GetOrCreateSource(sourceTypeSlack, "malformed-no-colon")
+	require.NoError(err)
+	active, err := st.GetOrCreateSource(sourceTypeSlack, "T09:UME")
+	require.NoError(err)
+	_, err = st.MergeSourcesContext(t.Context(), store.MergeSourcesRequest{
+		FromSourceID: retired.ID,
+		IntoSourceID: active.ID,
+	})
+	require.NoError(err)
+
+	tmpDir := t.TempDir()
+	savedCfg := cfg
+	t.Cleanup(func() { cfg = savedCfg })
+	cfg = &config.Config{
+		HomeDir: tmpDir,
+		Data:    config.DataConfig{DataDir: tmpDir},
+	}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+
+	err = runConfiguredSlackSync(testCtx, st)
+	require.ErrorContains(err, "no Slack token for UME in workspace T09")
+	require.NotContains(err.Error(), "malformed identifier")
 }
 
 func TestRunConfiguredSlackSyncIsolatesBrokenWorkspaces(t *testing.T) {
@@ -88,11 +140,18 @@ func TestRunConfiguredSlackSyncIsolatesBrokenWorkspaces(t *testing.T) {
 		Data:    config.DataConfig{DataDir: tmpDir},
 	}
 	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
-	_ = testCtx
+	events := 0
+	invocationFromContext(testCtx).syncFailures = &telemetry.SyncFailures{Capture: func(event string, props map[string]any) error {
+		assert.Equal(t, "sync_failed", event)
+		assert.Equal(t, "slack", props["sync_source"])
+		events++
+		return nil
+	}}
 
 	err = runConfiguredSlackSync(testCtx, st)
 	require.ErrorContains(err, "malformed identifier")
 	require.ErrorContains(err, "no Slack token for UME in workspace T09")
+	assert.Equal(t, 2, events)
 }
 
 func TestScheduledSlackAttemptsResumeAfterInterruptedWorkspace(t *testing.T) {
@@ -103,10 +162,10 @@ func TestScheduledSlackAttemptsResumeAfterInterruptedWorkspace(t *testing.T) {
 		_, err := st.GetOrCreateSource(sourceTypeSlack, identifier)
 		require.NoError(err)
 	}
-	sources, err := resolveSlackSyncSources(st, "")
+	sources, err := resolveSlackSyncSources(t.Context(), st, "")
 	require.NoError(err)
 	rotation := &slackWorkspaceRotation{}
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	var first []string
 	err = runScheduledSlackAttempts(ctx, sources, rotation, func(src *store.Source) (bool, error) {
 		first = append(first, src.Identifier)
@@ -117,7 +176,7 @@ func TestScheduledSlackAttemptsResumeAfterInterruptedWorkspace(t *testing.T) {
 	assert.Equal([]string{sources[0].Identifier}, first)
 
 	var resumed []string
-	err = runScheduledSlackAttempts(context.Background(), sources, rotation,
+	err = runScheduledSlackAttempts(t.Context(), sources, rotation,
 		func(src *store.Source) (bool, error) {
 			resumed = append(resumed, src.Identifier)
 			return true, nil

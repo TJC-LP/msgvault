@@ -26,6 +26,8 @@ oauth_client*.json
 .beads/
 .mcp.json
 .worktrees/
+/tmp/
+/web/tmp/
 
 # Python
 __pycache__/
@@ -41,6 +43,9 @@ __pycache__/
 # Go caches
 .gocache/
 .gopath/
+
+# Test events gotestsum records for CI artifacts
+/gotestsum/
 
 # IDE
 .idea/

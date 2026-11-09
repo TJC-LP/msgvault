@@ -3,7 +3,12 @@ package jobctx
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 )
+
+// ScheduledEmbeddingLabel identifies automatic message indexing on the work gate.
+const ScheduledEmbeddingLabel = "scheduled embedding"
 
 // ErrYieldedToWaiter is the cancellation cause used when a resumable job
 // steps aside so a waiting operation can acquire the work gate.
@@ -13,4 +18,81 @@ var ErrYieldedToWaiter = errors.New("yielded to a waiting operation")
 // a waiting operation.
 func YieldedToWaiter(ctx context.Context) bool {
 	return errors.Is(context.Cause(ctx), ErrYieldedToWaiter)
+}
+
+// ErrorAfterYield removes scheduler cancellation from err while preserving
+// independent failures, including failures joined with the cancellation. It
+// also removes an explicit yield signal returned before the context is
+// cancelled. Explicitly supplied scheduler signals are always removed.
+func ErrorAfterYield(ctx context.Context, err error, schedulerSignals ...error) error {
+	if err == nil {
+		return nil
+	}
+	filterContextCancellation := YieldedToWaiter(ctx) || errors.Is(context.Cause(ctx), ErrRunBudgetExceeded)
+	if filterContextCancellation || errors.Is(err, ErrYieldedToWaiter) || len(schedulerSignals) > 0 {
+		_, filtered := filterYieldCancellation(
+			err, errors.Is(ctx.Err(), context.DeadlineExceeded), filterContextCancellation, schedulerSignals...,
+		)
+		return filtered
+	}
+	return err
+}
+
+type yieldFilteredError struct {
+	message string
+	cause   error
+}
+
+func (e yieldFilteredError) Error() string { return e.message }
+
+func (e yieldFilteredError) Unwrap() error { return e.cause }
+
+func filterYieldCancellation(err error, deadlineExpired, filterContextCancellation bool, schedulerSignals ...error) (bool, error) {
+	if err == nil {
+		return false, nil
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		causes := joined.Unwrap()
+		kept := make([]error, 0, len(causes))
+		changed := false
+		for _, cause := range causes {
+			filteredOut, filtered := filterYieldCancellation(cause, deadlineExpired, filterContextCancellation, schedulerSignals...)
+			changed = changed || filteredOut
+			if filtered != nil {
+				kept = append(kept, filtered)
+			}
+		}
+		if !changed {
+			return false, err
+		}
+		return true, errors.Join(kept...)
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		cause := wrapped.Unwrap()
+		changed, filtered := filterYieldCancellation(cause, deadlineExpired, filterContextCancellation, schedulerSignals...)
+		if !changed {
+			return false, err
+		}
+		if filtered == nil {
+			return true, nil
+		}
+		message := err.Error()
+		if causeMessage := cause.Error(); causeMessage != "" {
+			message = strings.Replace(message, causeMessage, filtered.Error(), 1)
+		}
+		if message == err.Error() {
+			message = fmt.Sprintf("%s: %s", message, filtered.Error())
+		}
+		return true, yieldFilteredError{message: message, cause: filtered}
+	}
+	for _, signal := range schedulerSignals {
+		if errors.Is(err, signal) {
+			return true, nil
+		}
+	}
+	if errors.Is(err, ErrYieldedToWaiter) || (filterContextCancellation && (errors.Is(err, context.Canceled) ||
+		(deadlineExpired && (errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrRunBudgetExceeded))))) {
+		return true, nil
+	}
+	return false, err
 }

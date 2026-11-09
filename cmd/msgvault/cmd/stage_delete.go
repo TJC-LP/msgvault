@@ -24,7 +24,7 @@ const (
 func newStageDeleteCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "stage-delete [query]",
-		Short: "Stage active messages matching search criteria or explicit IDs for deletion",
+		Short: "Stage messages matching a query or IDs for deletion",
 		Long: `Stage the deletable messages matching a search query for deletion.
 
 The search runs with the same semantics as msgvault search. Matches that no
@@ -57,7 +57,7 @@ func runStageDelete(cmd *cobra.Command, args []string) error {
 }
 
 func runStageDeleteFromQuery(cmd *cobra.Command, queryText string) error {
-	parsed := search.Parse(queryText)
+	parsed := search.ParseOR(queryText)
 	if err := parsed.Err(); err != nil {
 		return usageErr(cmd, err)
 	}

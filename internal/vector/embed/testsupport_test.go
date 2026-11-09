@@ -142,27 +142,38 @@ func (s *testWorkStore) SetEmbedGen(ctx context.Context, ids []int64, target int
 	return err
 }
 
-// SetEmbedGenIfUnchanged mirrors store.Store.SetEmbedGenIfUnchanged: a
-// per-row optimistic-CAS stamp gated on last_modified, used by the worker's
-// content read→stamp path. Returns the ids whose UPDATE matched 0 rows (CAS
-// misses) so the worker can log them and exclude them from success accounting.
-func (s *testWorkStore) SetEmbedGenIfUnchanged(ctx context.Context, items []store.EmbedGenStamp, target int64) (missed []int64, err error) {
+// SetEmbedGenIfUnchanged mirrors store.Store.SetEmbedGenIfUnchanged: one
+// transaction of per-row optimistic-CAS stamps gated on last_modified, used by
+// the worker's content read→stamp path. Returns the ids whose UPDATE matched 0
+// rows (CAS misses) so the worker can log them and exclude them from success
+// accounting.
+func (s *testWorkStore) SetEmbedGenIfUnchanged(ctx context.Context, items []store.EmbedGenStamp, target int64) (missed []int64, covered int, err error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
 	for _, it := range items {
-		res, err := s.db.ExecContext(ctx,
+		res, err := tx.ExecContext(ctx,
 			`UPDATE messages SET embed_gen = ? WHERE id = ? AND last_modified = ?`,
 			target, it.ID, it.LastModified)
 		if err != nil {
-			return missed, err
+			return nil, 0, err
 		}
 		n, err := res.RowsAffected()
 		if err != nil {
-			return missed, err
+			return nil, 0, err
 		}
 		if n == 0 {
 			missed = append(missed, it.ID)
+		} else {
+			covered++
 		}
 	}
-	return missed, nil
+	if err := tx.Commit(); err != nil {
+		return nil, 0, err
+	}
+	return missed, covered, nil
 }
 
 // countMissing returns how many live messages still need embedding for
@@ -170,7 +181,8 @@ func (s *testWorkStore) SetEmbedGenIfUnchanged(ctx context.Context, items []stor
 func countMissing(t *testing.T, db *sql.DB, gen int64) int {
 	t.Helper()
 	var n int
-	err := db.QueryRow(
+	err := db.QueryRowContext(
+		t.Context(),
 		`SELECT COUNT(*) FROM messages
 		  WHERE (embed_gen IS NULL OR embed_gen <> ?)
 		    AND deleted_at IS NULL AND deleted_from_source_at IS NULL`, gen).Scan(&n)
@@ -182,7 +194,7 @@ func countMissing(t *testing.T, db *sql.DB, gen int64) int {
 func readWatermark(t *testing.T, db *sql.DB, gen int64) int64 {
 	t.Helper()
 	var id int64
-	err := db.QueryRow(`SELECT watermark_id FROM embed_watermark WHERE generation_id = ?`, gen).Scan(&id)
+	err := db.QueryRowContext(t.Context(), `SELECT watermark_id FROM embed_watermark WHERE generation_id = ?`, gen).Scan(&id)
 	if err == sql.ErrNoRows {
 		return 0
 	}
@@ -207,7 +219,7 @@ type workerFixture struct {
 // deterministic vector per input.
 func newWorkerFixture(t *testing.T, n int) *workerFixture {
 	t.Helper()
-	ctx := context.Background()
+	ctx := t.Context()
 
 	dir := t.TempDir()
 	mainPath := filepath.Join(dir, "main.db")
@@ -216,13 +228,15 @@ func newWorkerFixture(t *testing.T, n int) *workerFixture {
 	require.NoError(t, err, "open main")
 	t.Cleanup(func() { _ = mainDB.Close() })
 
-	_, err = mainDB.Exec(testMainSchema)
+	_, err = mainDB.ExecContext(t.Context(), testMainSchema)
 	require.NoError(t, err, "schema")
 	for i := 1; i <= n; i++ {
-		_, err := mainDB.Exec(
+		_, err := mainDB.ExecContext(
+			t.Context(),
 			`INSERT INTO messages (id, subject) VALUES (?, ?)`, i, fmt.Sprintf("msg %d", i))
 		require.NoError(t, err, "insert message")
-		_, err = mainDB.Exec(
+		_, err = mainDB.ExecContext(
+			t.Context(),
 			`INSERT INTO message_bodies (message_id, body_text) VALUES (?, ?)`, i, fmt.Sprintf("body %d", i))
 		require.NoError(t, err, "insert body")
 	}

@@ -26,8 +26,9 @@ is not a promise that the assistant cannot access private archive content.
 MCP can stage a deletion manifest but cannot execute remote deletion, send mail,
 or sync new messages. Optional profile writes require `--allow-profile-writes`;
 calendar event mutations require `--allow-calendar-writes` and explicit
-per-operation approval through an MCP client that supports elicitation. HTTP
-writes also need `--http-allow-writes`. Execution of a staged mail deletion
+per-operation approval through an MCP client that supports elicitation; Kata
+issues that quote archive text require `--allow-kata-writes`. HTTP writes also
+need `--http-allow-writes`. Execution of a staged mail deletion
 remains a separate CLI step. See the [MCP tool and access reference](usage/chat.md).
 
 Treat imported messages, attachments, and generated briefs as untrusted input to
@@ -43,12 +44,14 @@ profile automation, and external enrichment can send selected data to your
 configured providers. A supported local embedding endpoint keeps that embedding
 work local; it does not automatically change the providers used by other
 features. See [recommended configuration](usage/recommended-configuration.md).
+The daemon also sends anonymous usage telemetry without archive content; see
+[Telemetry](configuration.md#telemetry).
 
 <p class="faq-question">Why is a documented feature missing from my binary?</p>
 
 The documentation follows current `main`; your installed binary may be older.
 Check `msgvault version` and the installed command's `--help`, then consult the
-[0.20.0 changelog](changelog.md#0200). Upgrade the CLI and a configured remote
+[latest release notes](https://github.com/kenn-io/msgvault/releases/latest). Upgrade the CLI and a configured remote
 daemon together.
 
 <p class="faq-question">What is the web server for?</p>

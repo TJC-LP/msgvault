@@ -4,10 +4,12 @@
 import type { MessageSummary } from "./messageSummary";
 
 export interface SearchResult {
+  index_state?: string;
   messages: MessageSummary[];
   page: number;
   page_size: number;
   query: string;
   total: number;
+  warnings?: string[];
   [key: string]: unknown;
 }

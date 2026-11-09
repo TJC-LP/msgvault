@@ -28,7 +28,8 @@ import (
 func countEmbeddingRowsPG(t *testing.T, db *sql.DB, gen vector.GenerationID) int {
 	t.Helper()
 	var n int
-	require.NoError(t, db.QueryRowContext(context.Background(),
+	require.NoError(t, db.QueryRowContext(
+		t.Context(),
 		`SELECT COUNT(*) FROM embeddings WHERE generation_id = $1`, int64(gen)).Scan(&n),
 		"count embedding rows for generation %d", gen)
 	return n
@@ -41,7 +42,7 @@ func countEmbeddingRowsPG(t *testing.T, db *sql.DB, gen vector.GenerationID) int
 // generation id.
 func seedGenWithEmbeddingsPG(t *testing.T, pgb *pgvector.Backend, ids ...int64) vector.GenerationID {
 	t.Helper()
-	ctx := context.Background()
+	ctx := t.Context()
 	// No messages rows are inserted: embeddings.message_id has no FK to
 	// messages, and the consuming tests force-activate/retire (force=true),
 	// bypassing the coverage gate, so no live messages are needed. (The full
@@ -74,7 +75,7 @@ func TestRunEmbeddingsRetire_PG_DeletesEmbeddings(t *testing.T) {
 	require := require.New(t)
 
 	pgb, rebind, dsn := openEmbedManagePGDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	db := pgb.DB()
 
 	gen := seedGenWithEmbeddingsPG(t, pgb, 1, 2, 3)
@@ -120,7 +121,7 @@ func TestRunEmbeddingsActivate_PG_AutoRetireDeletesPrevious(t *testing.T) {
 	require := require.New(t)
 
 	pgb, rebind, dsn := openEmbedManagePGDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	db := pgb.DB()
 
 	genA := seedGenWithEmbeddingsPG(t, pgb, 1, 2)
@@ -172,7 +173,7 @@ func TestRunEmbeddingsActivate_PG_AutoRetireDeletesPrevious(t *testing.T) {
 func openEmbedManagePGDB(t *testing.T) (*pgvector.Backend, func(string) string, string) {
 	t.Helper()
 	_, dsn := openServePGSchema(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	st, err := store.Open(dsn)
 	require.NoError(t, err, "store.Open")
@@ -198,6 +199,57 @@ func openEmbedManagePGDB(t *testing.T) (*pgvector.Backend, func(string) string, 
 	return pgb, (&store.PostgreSQLDialect{}).Rebind, dsn
 }
 
+func TestFillFullCoveragePartitionsScopedLiveMessagesPG(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	pgb, _, dsn := openEmbedManagePGDB(t)
+	ctx := t.Context()
+	gen, err := pgb.CreateGeneration(ctx, "example-model", 4, "example-fingerprint")
+	require.NoError(err)
+
+	main, err := store.Open(dsn)
+	require.NoError(err)
+	t.Cleanup(func() { _ = main.Close() })
+	inScope, err := main.GetOrCreateSource("gmail", "coverage@example.test")
+	require.NoError(err)
+	outOfScope, err := main.GetOrCreateSource("gmail", "other@example.test")
+	require.NoError(err)
+	addMessage := func(sourceID int64, sourceMessageID string, stamped, embedded bool) int64 {
+		conversationID, err := main.EnsureConversation(t.Context(), sourceID, "thread-"+sourceMessageID, "Coverage")
+		require.NoError(err)
+		id, err := main.UpsertMessageContext(t.Context(), &store.Message{
+			SourceID: sourceID, ConversationID: conversationID,
+			SourceMessageID: sourceMessageID, MessageType: "email",
+		})
+		require.NoError(err)
+		if stamped {
+			_, err = main.DB().ExecContext(ctx, `UPDATE messages SET embed_gen = $1 WHERE id = $2`, int64(gen), id)
+			require.NoError(err)
+		}
+		if embedded {
+			require.NoError(pgb.Upsert(ctx, gen, []vector.Chunk{{MessageID: id, Vector: []float32{1, 0, 0, 0}}}))
+		}
+		return id
+	}
+	addMessage(inScope.ID, "embedded", true, true)
+	addMessage(inScope.ID, "blank", true, false)
+	addMessage(inScope.ID, "vector-before-stamp", false, true)
+	addMessage(inScope.ID, "missing", false, false)
+	deleted := addMessage(inScope.ID, "deleted-from-source", true, true)
+	_, err = main.DB().ExecContext(ctx, `UPDATE messages SET deleted_from_source_at = NOW() WHERE id = $1`, deleted)
+	require.NoError(err)
+	addMessage(outOfScope.ID, "out-of-scope", true, true)
+
+	row := embeddingGenerationRow{ID: gen}
+	scope := vector.BuildScope{SourceIDs: []int64{inScope.ID}}
+	require.NoError(fillFullCoverage(ctx, pgb, scope, &row))
+	assert.Equal(int64(4), row.LiveCount)
+	assert.Equal(int64(1), row.EmbeddedCount, "a vector without a stamp is not embedded coverage")
+	assert.Equal(int64(1), row.BlankCount)
+	assert.Equal(int64(2), row.MissingCount)
+	assert.Equal(row.LiveCount, row.EmbeddedCount+row.BlankCount+row.MissingCount)
+}
+
 // TestListEmbeddingGenerations_PG exercises listEmbeddingGenerations through
 // the PG rebind path against a live PostgreSQL database. Validates that the
 // PG placeholder rebind and boolean-placeholder behaviour work correctly.
@@ -206,7 +258,7 @@ func TestListEmbeddingGenerations_PG(t *testing.T) {
 	require := require.New(t)
 
 	pgb, rebind, _ := openEmbedManagePGDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	db := pgb.DB()
 
 	// Start with an empty database — list must return an empty slice, not error.
@@ -246,7 +298,7 @@ func TestOpenEmbeddingsMetadataDB_PG(t *testing.T) {
 	// Stand up an isolated schema and migrate the pgvector metadata tables
 	// into it so the helper's existence pre-check passes.
 	db, dsn := openServePGSchema(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	require.NoError(
 		pgvector.Migrate(ctx, db, 4, false), "pgvector.Migrate")
 
@@ -324,15 +376,16 @@ func openEmptyPGSchemaSolo(t *testing.T) string {
 	setup, err := sql.Open("pgx", url)
 	require.NoError(t, err, "open setup")
 	defer func() { _ = setup.Close() }()
-	_, err = setup.Exec("CREATE SCHEMA " + schemaName)
+	_, err = setup.ExecContext(t.Context(), "CREATE SCHEMA "+schemaName)
 	require.NoError(t, err, "create schema")
+	// Cleanup runs after t.Context() is canceled.
 	t.Cleanup(func() {
 		cleanup, err := sql.Open("pgx", url)
 		if err != nil {
 			return
 		}
 		defer func() { _ = cleanup.Close() }()
-		_, _ = cleanup.Exec("DROP SCHEMA " + schemaName + " CASCADE")
+		_, _ = cleanup.ExecContext(context.WithoutCancel(t.Context()), "DROP SCHEMA "+schemaName+" CASCADE")
 	})
 
 	sep := "?"
@@ -340,4 +393,38 @@ func openEmptyPGSchemaSolo(t *testing.T) string {
 		sep = "&"
 	}
 	return url + sep + "search_path=" + schemaName
+}
+
+func TestEmbeddingsListUsesQueryOnlyPostgresHandles(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	pgb, _, dsn := openEmbedManagePGDB(t)
+	ctx := t.Context()
+	_, err := pgb.CreateGeneration(ctx, "example-model", 4, "example-fingerprint")
+	require.NoError(err)
+	cfg := config.NewDefaultConfig()
+	cfg.Data.DatabaseURL = dsn
+	cfg.Vector.Embeddings.Dimension = 4
+	ctx = testInvocationContext(ctx, cfg, invocationOptions{})
+	metadata, _, closeMetadata, err := openEmbeddingsMetadataDBWithMode(ctx, true)
+	require.NoError(err)
+	defer closeMetadata()
+	var readOnly string
+	require.NoError(metadata.QueryRowContext(ctx, "SHOW transaction_read_only").Scan(&readOnly))
+	assert.Equal("on", readOnly)
+	_, err = metadata.ExecContext(ctx, "UPDATE index_generations SET message_count=99")
+	require.Error(err)
+	backend, closeBackend, err := openEmbeddingsBackendWithMode(ctx, true)
+	require.NoError(err)
+	defer closeBackend()
+	pgBackend, ok := backend.(*pgvector.Backend)
+	require.True(ok)
+	_, err = pgBackend.DB().ExecContext(ctx, "UPDATE index_generations SET message_count=99")
+	require.Error(err)
+	cmd := &cobra.Command{Use: "list"}
+	cmd.SetContext(ctx)
+	var output bytes.Buffer
+	cmd.SetOut(&output)
+	require.NoError(runEmbeddingsList(cmd, nil))
+	assert.Contains(output.String(), "example-model")
 }

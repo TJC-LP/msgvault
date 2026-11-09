@@ -1,7 +1,10 @@
 // Package attachmentpolicy evaluates provider-neutral media download policy.
 package attachmentpolicy
 
-import "fmt"
+import (
+	"fmt"
+	"time"
+)
 
 // DefaultChatMaxBytes is the per-attachment size cap chat providers (Beeper,
 // Slack, Teams) apply when max_media_mb is unset. It is sized for the media
@@ -28,8 +31,11 @@ const (
 	SkipAccountPolicy        SkipReason = "account_policy"
 	SkipSizeCap              SkipReason = "size_cap"
 	SkipFetchFailure         SkipReason = "fetch_failure"
-	// SkipSourceUnavailable marks media the source network has permanently
-	// deleted, such as WhatsApp media past its server retention.
+	// SkipSourceUnavailable marks media the source reported missing, paired
+	// with StateUnavailable once confirmed permanently gone (such as
+	// WhatsApp media past its server retention) or with StateFailed while a
+	// provider still treats the loss as provisional and retries it. The
+	// state, not the reason alone, says which it is.
 	SkipSourceUnavailable SkipReason = "source_unavailable"
 )
 
@@ -127,4 +133,16 @@ func OversizeMarkerSize(maxBytes, observed int64) int {
 		return 0
 	}
 	return int(observed)
+}
+
+// DownloadTimeout bounds one media download. A 60s API deadline starves large
+// files on slow links, so the bound scales with the size cap at a ~128 KiB/s
+// floor rate above a generous minimum, while staying finite so an unattended
+// scheduled sync never hangs forever on a stalled read.
+func DownloadTimeout(maxBytes int64) time.Duration {
+	scaled := time.Duration(maxBytes/(128<<10)) * time.Second
+	if scaled < 10*time.Minute {
+		return 10 * time.Minute
+	}
+	return scaled
 }

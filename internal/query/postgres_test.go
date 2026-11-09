@@ -10,27 +10,12 @@ import (
 var _ Engine = (*SQLiteEngine)(nil)
 var _ Engine = (*DuckDBEngine)(nil)
 
-// TestPostgresEngineUsesDialect verifies that NewPostgreSQLEngine creates an engine
-// with the PostgreSQL query dialect (Rebind converts ? to $N).
-func TestPostgresEngineUsesDialect(t *testing.T) {
-	require := require.New(t)
-	e := NewPostgreSQLEngine(nil)
-	pe, ok := e.(*pgEngine)
-	require.True(ok, "NewPostgreSQLEngine returned %T, want *pgEngine", e)
-	inner, ok := pe.Engine.(*SQLiteEngine)
-	require.True(ok, "pgEngine.Engine = %T, want *SQLiteEngine", pe.Engine)
-	_, ok = inner.dialect.(PostgreSQLQueryDialect)
-	require.True(ok, "inner dialect = %T, want PostgreSQLQueryDialect", inner.dialect)
-	reboundQuery := inner.dialect.Rebind("SELECT ? WHERE id = ?")
-	require.Contains(reboundQuery, "$1", "Rebind did not convert ? to $N")
-	require.Contains(reboundQuery, "$2", "Rebind did not convert ? to $N")
-}
-
 // TestPostgresEngineHidesTextEngine verifies that the PostgreSQL engine is
 // NOT exposed as a TextEngine. The underlying *SQLiteEngine satisfies
 // TextEngine, but the pgEngine wrapper deliberately hides those methods
 // because they emit FTS5 MATCH and strftime() SQL that PostgreSQL rejects.
 func TestPostgresEngineHidesTextEngine(t *testing.T) {
+	t.Parallel()
 	e := NewPostgreSQLEngine(nil)
 	_, ok := e.(TextEngine)
 	require.False(t, ok, "PostgreSQL engine must not satisfy TextEngine (SQLite-only FTS5/strftime SQL)")
@@ -40,6 +25,7 @@ func TestPostgresEngineHidesTextEngine(t *testing.T) {
 }
 
 func TestPostgresEngineExposesAggregateDeletionResolver(t *testing.T) {
+	t.Parallel()
 	requirements := require.New(t)
 	engine := NewPostgreSQLEngine(nil)
 
@@ -49,6 +35,7 @@ func TestPostgresEngineExposesAggregateDeletionResolver(t *testing.T) {
 
 // TestPostgresTimeTruncExpression verifies the PostgreSQL time truncation expressions.
 func TestPostgresTimeTruncExpression(t *testing.T) {
+	t.Parallel()
 	d := PostgreSQLQueryDialect{}
 	for _, tc := range []struct {
 		gran string

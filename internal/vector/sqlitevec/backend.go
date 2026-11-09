@@ -10,24 +10,19 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"os"
 	"sort"
 	"strings"
 	"time"
 
 	sqlite3 "github.com/mattn/go-sqlite3"
+	"go.kenn.io/msgvault/internal/search"
 	"go.kenn.io/msgvault/internal/sqliteutil"
 	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/vector"
 )
 
-// sqliteDatetimeFormat is the text DATETIME layout used everywhere
-// else in the repository (see internal/query/sqlite.go). Bind date
-// bounds with this format so boundary comparisons are consistent
-// with the existing query paths.
-const (
-	sqliteDatetimeFormat          = "2006-01-02 15:04:05"
-	listIDSchemaRequiredErrorText = "List-Id filter requires messages.list_id; open the archive with a writable msgvault version first"
-)
+const listIDSchemaRequiredErrorText = "List-Id filter requires messages.list_id; open the archive with a writable msgvault version first"
 
 // Compile-time check that *Backend satisfies the vector.Backend interface.
 var _ vector.Backend = (*Backend)(nil)
@@ -48,9 +43,11 @@ type Options struct {
 	// set, Open SKIPS BackfillEmbedGenForUpgrade, which would otherwise
 	// WRITE messages.embed_gen + applied_migrations through the read-only
 	// main handle and fail. This mirrors pgvector.Options.SkipMigrate's
-	// read-only guard. Migrate still runs because it only writes vectors.db,
-	// which is opened read-write regardless.
+	// read-only guard. Migrate still runs unless MetadataReadOnly also requests
+	// a query-only vectors.db handle.
 	ReadOnly bool
+	// MetadataReadOnly opens existing vectors.db with query-only SQL and skips all writes.
+	MetadataReadOnly bool
 	// ANNWorkCeiling bounds rows considered by one accelerated search. Zero
 	// selects the production default. Requests above the ceiling use exact
 	// search so it does not cap the number of requested results.
@@ -94,13 +91,31 @@ func Open(ctx context.Context, opts Options) (*Backend, error) {
 	if err := RegisterExtension(); err != nil {
 		return nil, err
 	}
-	db, err := sql.Open(DriverName(), opts.Path)
+	dsn := opts.Path
+	if opts.MetadataReadOnly {
+		var path string
+		var err error
+		dsn, path, err = sqliteutil.QueryOnlyDSN(opts.Path)
+		if err != nil {
+			return nil, fmt.Errorf("resolve vectors.db: %w", err)
+		}
+		if _, err := os.Stat(path); err != nil {
+			return nil, fmt.Errorf("existing vectors.db required: %w", err)
+		}
+		opts.ReadOnly = true
+	}
+	db, err := sql.Open(DriverName(), dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open vectors.db: %w", err)
 	}
-	if err := Migrate(ctx, db, opts.Dimension); err != nil {
+	if !opts.MetadataReadOnly {
+		if err := Migrate(ctx, db, opts.Dimension); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("migrate vectors.db: %w", err)
+		}
+	} else if err := db.PingContext(ctx); err != nil {
 		_ = db.Close()
-		return nil, fmt.Errorf("migrate vectors.db: %w", err)
+		return nil, fmt.Errorf("read vectors.db: %w", err)
 	}
 	vec1Version, err := installedVec1Version(ctx, db)
 	if err != nil {
@@ -180,9 +195,20 @@ func Open(ctx context.Context, opts Options) (*Backend, error) {
 // Close releases the vectors.db handle.
 func (b *Backend) Close() error { return b.db.Close() }
 
+// WithBuildScope pins message coverage without reopening or closing shared storage.
+func (b *Backend) WithBuildScope(scope vector.BuildScope) vector.Backend {
+	next := *b
+	next.scope = vector.NewBuildScope(scope.MessageTypes, scope.SourceIDs)
+	return &next
+}
+
 // DB returns the underlying *sql.DB for vectors.db. Exposed for callers
 // that need to share the pool (e.g. the embed worker's VectorsDB field).
 func (b *Backend) DB() *sql.DB { return b.db }
+
+func (b *Backend) EmbeddingCheckpoints() vector.EmbeddingCheckpoints {
+	return vector.EmbeddingCheckpoints{DB: b.db, Rebind: func(query string) string { return query }}
+}
 
 // Path returns the filesystem path of vectors.db.
 func (b *Backend) Path() string { return b.path }
@@ -915,10 +941,12 @@ func distinctMessageIDs(chunks []vector.Chunk) []int64 {
 	return out
 }
 
+const deleteVectorSQL = `DELETE FROM %s WHERE generation_id = ? AND embedding_id = ?`
+
 // deleteForMessageIDs removes every chunk (in both vec0 and embeddings)
-// belonging to the given message_ids under gen. The vec0 delete runs
-// first so its rowids (which equal embeddings.embedding_id) still exist
-// for the subquery to resolve. Used by Upsert for idempotent replace.
+// belonging to the given message_ids under gen. Resolve embedding IDs before
+// deleting metadata, then delete vec0 rows by primary key to avoid a full scan.
+// Used by Upsert for idempotent replace.
 func deleteForMessageIDs(ctx context.Context, tx *sql.Tx, vecTable, acceleratorTable string, gen vector.GenerationID, ids []int64) error {
 	if len(ids) == 0 {
 		return nil
@@ -936,15 +964,32 @@ func deleteForMessageIDs(ctx context.Context, tx *sql.Tx, vecTable, acceleratorT
 			return fmt.Errorf("delete accelerator vectors: %w", err)
 		}
 	}
-	// vec0 partition-aware filter (generation_id) so the engine can
-	// prune by partition before scanning, then embedding_id IN (...).
-	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`
-		DELETE FROM %s WHERE generation_id = ? AND embedding_id IN (
-			SELECT embedding_id FROM embeddings
-			WHERE generation_id = ?
-			  AND message_id IN (SELECT value FROM json_each(?))
-		)`, vecTable), int64(gen), int64(gen), string(blob)); err != nil {
-		return fmt.Errorf("delete vectors: %w", err)
+	rows, err := tx.QueryContext(ctx, `SELECT embedding_id FROM embeddings
+		WHERE generation_id = ? AND message_id IN (SELECT value FROM json_each(?))`, int64(gen), string(blob))
+	if err != nil {
+		return fmt.Errorf("query embedding ids: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var embeddingIDs []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return fmt.Errorf("scan embedding id: %w", err)
+		}
+		embeddingIDs = append(embeddingIDs, id)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("read embedding ids: %w", err)
+	}
+	stmt, err := tx.PrepareContext(ctx, fmt.Sprintf(deleteVectorSQL, vecTable))
+	if err != nil {
+		return fmt.Errorf("prepare vector delete: %w", err)
+	}
+	defer func() { _ = stmt.Close() }()
+	for _, id := range embeddingIDs {
+		if _, err := stmt.ExecContext(ctx, int64(gen), id); err != nil {
+			return fmt.Errorf("delete vector %d: %w", id, err)
+		}
 	}
 	if _, err := tx.ExecContext(ctx, `
 		DELETE FROM embeddings
@@ -1424,7 +1469,8 @@ func (b *Backend) filteredMessageIDsLimit(ctx context.Context, f vector.Filter, 
 		}
 	}
 	clauses := []string{store.LiveMessagesWhere("m", true)}
-	var args []any
+	accountClauses, args := search.AccountScopeConditions(f.AccountScopes, "m")
+	clauses = append(clauses, accountClauses...)
 	if len(f.MessageIDs) > 0 {
 		clauses = append(clauses, inClause("m.id", f.MessageIDs))
 		for _, id := range f.MessageIDs {
@@ -1558,12 +1604,12 @@ func (b *Backend) filteredMessageIDsLimit(ctx context.Context, f vector.Filter, 
 		args = append(args, *f.HasAttachment)
 	}
 	if f.After != nil {
-		clauses = append(clauses, "m.sent_at >= ?")
-		args = append(args, f.After.Format(sqliteDatetimeFormat))
+		clauses = append(clauses, "julianday(m.sent_at) >= julianday(?)")
+		args = append(args, f.After.UTC().Format(time.RFC3339Nano))
 	}
 	if f.Before != nil {
-		clauses = append(clauses, "m.sent_at < ?")
-		args = append(args, f.Before.Format(sqliteDatetimeFormat))
+		clauses = append(clauses, "julianday(m.sent_at) < julianday(?)")
+		args = append(args, f.Before.UTC().Format(time.RFC3339Nano))
 	}
 	if f.LargerThan != nil {
 		clauses = append(clauses, "m.size_estimate > ?")
@@ -1576,6 +1622,10 @@ func (b *Backend) filteredMessageIDsLimit(ctx context.Context, f vector.Filter, 
 	for _, term := range f.SubjectSubstrings {
 		clauses = append(clauses, `m.subject LIKE ? ESCAPE '\'`)
 		args = append(args, "%"+escapeLikeSubject(term)+"%")
+	}
+	for _, filename := range f.FilenameSubstrings {
+		clauses = append(clauses, `EXISTS (SELECT 1 FROM attachments fa WHERE fa.message_id = m.id AND `+sqliteutil.UnicodeLowerFunction+`(fa.filename) LIKE `+sqliteutil.UnicodeLowerFunction+`(?) ESCAPE '\')`)
+		args = append(args, "%"+escapeLikeSubject(filename)+"%")
 	}
 	for _, term := range f.ListIDSubstrings {
 		clauses = append(clauses, sqliteutil.UnicodeLowerFunction+`(m.list_id) LIKE `+sqliteutil.UnicodeLowerFunction+`(?) ESCAPE '\'`)
@@ -1701,10 +1751,7 @@ func (b *Backend) Delete(ctx context.Context, gen vector.GenerationID, messageID
 		return err
 	}
 
-	// deleteForMessageIDs handles vec0 (via the embedding_id subquery)
-	// and embeddings together. Both the vec0 and embeddings deletes
-	// take a single JSON-each batch rather than per-id statements, so
-	// the call count stays at 2 even for a large messageIDs list.
+	// deleteForMessageIDs removes vec0 rows by embedding ID before metadata.
 	accelerator, err := b.readyAcceleratorForWrite(ctx, tx, gen, dim)
 	if err != nil {
 		return err
@@ -2100,6 +2147,34 @@ func (b *Backend) EmbeddedMessageCountForIDs(ctx context.Context, gen vector.Gen
 		  AND message_id IN (SELECT value FROM json_each(?))`,
 		int64(gen), string(encoded)).Scan(&count); err != nil {
 		return 0, fmt.Errorf("count filtered embedded messages: %w", err)
+	}
+	return count, nil
+}
+
+// EmbeddedMessageCountForSnapshot counts generation vectors among the
+// live, stamped message IDs captured by a main-database read snapshot.
+func (b *Backend) EmbeddedMessageCountForSnapshot(
+	ctx context.Context, gen vector.GenerationID, stampedMessageIDs []int64,
+) (int64, error) {
+	if len(stampedMessageIDs) == 0 {
+		return 0, nil
+	}
+	if len(stampedMessageIDs) > vector.FilteredCoverageBatchSize {
+		return 0, fmt.Errorf("%w: got %d, maximum %d",
+			vector.ErrCoverageBatchTooLarge, len(stampedMessageIDs), vector.FilteredCoverageBatchSize)
+	}
+	encoded, err := json.Marshal(stampedMessageIDs, json.Deterministic(true))
+	if err != nil {
+		return 0, fmt.Errorf("encode coverage snapshot message ids: %w", err)
+	}
+	var count int64
+	if err := b.db.QueryRowContext(ctx, `
+		SELECT COUNT(DISTINCT message_id)
+		FROM embeddings
+		WHERE generation_id = ?
+		  AND message_id IN (SELECT value FROM json_each(?))`,
+		int64(gen), string(encoded)).Scan(&count); err != nil {
+		return 0, fmt.Errorf("count snapshot embedded messages: %w", err)
 	}
 	return count, nil
 }

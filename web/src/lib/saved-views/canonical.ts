@@ -1,6 +1,7 @@
 import type { SavedViewStateEnvelope } from '../api/generated/models';
 import {
   filterDimensionLabel,
+  filterValueLabel,
   groupedByLabel,
   presentationLabel,
   searchModeLabel
@@ -11,8 +12,14 @@ import {
   type ExploreURLState
 } from '../explore/models';
 
+import { trimAttributeText } from '../directory/attribute-text';
+
 export type CanonicalState = SavedViewStateEnvelope;
-export const CURRENT_SCHEMA_VERSION = 1;
+export const CURRENT_SCHEMA_VERSION = 2;
+
+export function supportsSavedViewSchema(version: number): boolean {
+  return version >= 1 && version <= CURRENT_SCHEMA_VERSION;
+}
 
 // Saved views written before the v2 filter names still use these fields.
 const LEGACY_FILTER_FIELDS: Record<string, ExploreFilterDimension> = {
@@ -21,7 +28,7 @@ const LEGACY_FILTER_FIELDS: Record<string, ExploreFilterDimension> = {
 };
 
 export function canonicalSavedViewState(state: ExploreURLState): CanonicalState {
-  const query = state.query.trim();
+  const query = trimAttributeText(state.query);
   return {
     ...(query ? { query, search_mode: state.searchMode } : {}),
     filters: state.filters.map((filter) => ({
@@ -46,12 +53,37 @@ function searchMode(saved: CanonicalState): ExploreURLState['searchMode'] {
     : 'full_text';
 }
 
-export function exploreStateFromSavedView(saved: CanonicalState): Partial<ExploreURLState> {
+// Keep trimming and pipe boundaries in step with internal/savedview/service.go and search.IsStandalonePipe.
+function quoteLegacyPipes(query: string): string {
+  query = trimAttributeText(query);
+  let result = '';
+  let quote = '';
+  let escaped = false;
+  for (let i = 0; i < query.length; i++) {
+    const char = query[i]!;
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (char === '\\') escaped = true;
+      else if (char === quote) quote = '';
+    } else if (char === '"' || char === "'") {
+      quote = char;
+    } else if (char === '|' && (i === 0 || query[i - 1] === ' ') && (i + 1 === query.length || query[i + 1] === ' ')) {
+      result += '"|"';
+      continue;
+    }
+    result += char;
+  }
+  return result;
+}
+
+export function exploreStateFromSavedView(saved: CanonicalState, schemaVersion = CURRENT_SCHEMA_VERSION): Partial<ExploreURLState> {
   const presentation = saved.presentation ?? 'table';
+  const mode = searchMode(saved);
+  const query = saved.query ?? '';
   return {
     workspace: presentation === 'files' ? 'files' : 'everything',
-    query: saved.query ?? '',
-    searchMode: searchMode(saved),
+    query: schemaVersion === 1 && mode === 'full_text' ? quoteLegacyPipes(query) : query,
+    searchMode: mode,
     filters: (saved.filters ?? []).map((filter) => ({
       dimension: filterDimension(filter.field),
       values: [...filter.values]
@@ -75,8 +107,9 @@ export function savedViewSummary(saved: CanonicalState): string[] {
   const parts: string[] = [];
   if (saved.query) parts.push(`${searchModeLabel(searchMode(saved))}: “${saved.query}”`);
   for (const filter of saved.filters ?? []) {
-    const label = filterDimensionLabel(filterDimension(filter.field));
-    parts.push(`${label}: ${filter.values.join(', ')}`);
+    const dimension = filterDimension(filter.field);
+    const values = filter.values.map((value) => filterValueLabel(dimension, value));
+    parts.push(`${filterDimensionLabel(dimension)}: ${values.join(', ')}`);
   }
   if (saved.grouping?.length) parts.push(groupedByLabel(saved.grouping));
   parts.push(presentationLabel(saved.presentation ?? 'table'));

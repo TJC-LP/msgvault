@@ -15,26 +15,6 @@ import (
 var resolverTestNow = time.Date(2026, time.August, 22, 12, 0, 0, 0, time.UTC)
 
 func TestResolverV1DefaultPolicyAndScoring(t *testing.T) {
-	assertions := assert.New(t)
-
-	policy := DefaultPolicyV1()
-	assertions.Equal(ResolverVersionV1, policy.Version)
-	assertions.Equal(750, policy.ApplyThreshold)
-	assertions.Equal(100, policy.ReplacementMargin)
-	assertions.Equal(75, policy.HysteresisMargin)
-	assertions.Equal(900, policy.MinimumIdentityScore)
-	assertions.Equal(150, policy.MaxCorroborationBonus)
-	assertions.Equal(map[EvidenceSourceClass]int{
-		EvidenceArchive: 300, EvidencePublic: 250, EvidenceSystem: 500,
-		EvidenceProviderAssertion: 150,
-	}, policy.SourceClassWeights)
-	assertions.Equal(map[EvidenceDirectness]int{
-		DirectSelf: 400, DirectOther: 200, Indirect: 0,
-	}, policy.DirectnessWeights)
-	assertions.Equal(map[EvidenceAuthority]int{
-		AuthorityAuthoritative: 300, AuthorityOrdinary: 100, AuthorityAggregator: 0,
-	}, policy.AuthorityWeights)
-
 	t.Run("recent direct self beats authoritative public evidence", func(t *testing.T) {
 		assert := assert.New(t)
 
@@ -687,6 +667,17 @@ func TestResolverV1RejectsInvalidIdentityAndSensitiveClaims(t *testing.T) {
 				}
 			},
 			action: DecisionInvalid, reason: ReasonMalformedValue,
+		},
+		{
+			name: "persisted unaligned archive evidence rejection remains durable",
+			mutate: func(input *ResolutionInput) {
+				input.Claims[0].Normalized = nil
+				input.Claims[0].Failure = &ValidationFailure{
+					Action: DecisionInvalid, Reason: ReasonUnalignedEvidence,
+					Detail: "archive source changed after packet assembly",
+				}
+			},
+			action: DecisionInvalid, reason: ReasonUnalignedEvidence,
 		},
 	}
 

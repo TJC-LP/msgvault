@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -20,7 +21,7 @@ var (
 
 var importMessengerCmd = &cobra.Command{
 	Use:   "import-messenger <dyi-export-dir>",
-	Short: "Import Facebook Messenger from a Download Your Information export",
+	Short: "Import Facebook Messenger from a Meta data export",
 	Long: `Import Facebook Messenger conversations from a DYI export (JSON or HTML).
 
 Both JSON and HTML DYI formats are supported. When a thread contains both, the
@@ -45,7 +46,7 @@ Examples:
   msgvault import-messenger --me test.user@facebook.messenger ~/downloads/facebook-export
   msgvault import-messenger --me test.user@facebook.messenger --format both ./dyi
   msgvault import-messenger --me test.user@facebook.messenger --limit 100 ./dyi
-	`,
+  `,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if !isDaemonCLISubprocess() {
@@ -69,7 +70,7 @@ func runImportMessenger(cmd *cobra.Command, rootDir string) error {
 	}
 
 	dbPath := cfg.DatabaseDSN()
-	s, cleanup, err := openWritableStoreAndInitForIngestInvocation(state)
+	s, cleanup, err := openWritableStoreAndInitForIngestInvocation(cmd.Context(), state)
 	if err != nil {
 		return err
 	}
@@ -97,12 +98,14 @@ func runImportMessenger(cmd *cobra.Command, rootDir string) error {
 	if err != nil {
 		if ctx.Err() != nil {
 			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "\nImport interrupted. Re-run to continue.")
-			return rebuildCacheAfterWrite(dbPath, state)
+			return rebuildCacheAfterWrite(ctx, dbPath, state)
 		}
 		return fmt.Errorf("import failed: %w", err)
 	}
 
-	if err := runPostSourceCreateMigrationsForInvocation(s, state); err != nil {
+	// The import committed. A stop request that lands now must not skip the
+	// migration that follows.
+	if err := runPostSourceCreateMigrationsForInvocation(context.WithoutCancel(ctx), s, state); err != nil {
 		return fmt.Errorf("post-source-create migrations: %w", err)
 	}
 
@@ -130,7 +133,7 @@ func runImportMessenger(cmd *cobra.Command, rootDir string) error {
 			importMessengerMe, fbmessenger.Slug(fbmessenger.StripDomain(importMessengerMe)))
 	}
 
-	return rebuildCacheAfterWrite(dbPath, state)
+	return rebuildCacheAfterWrite(ctx, dbPath, state)
 }
 
 func init() {

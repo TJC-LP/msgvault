@@ -10,8 +10,8 @@ import (
 // content_changed_at triggers on both backends.
 //
 // The invariant tying this list to the change feed is one-directional: every
-// field ChangedMessage carries must appear here, EXCEPT id, source_id, and
-// content_changed_at (immutable identity and the watermark itself). Any other
+// field ChangedMessage carries must appear here, EXCEPT id and
+// content_changed_at (the immutable row ID and the watermark itself). Any other
 // field the feed reports but the trigger ignores would be cached stale by a
 // consumer forever. The converse does not hold. This list also covers columns
 // the feed does not return — sender_id and metadata are tracked because
@@ -35,6 +35,7 @@ import (
 // Adding a column to `messages` without classifying it here or in
 // MessagesNonContentColumns fails TestMessagesColumnClassificationIsExhaustive.
 var MessagesContentColumns = []string{
+	sourceIDColumnName, // ownership changes during archive consolidation
 	// source_message_id is NOT immutable, despite reading like a natural key:
 	// UpdateMessageOnDedup (messages.go) rewrites it on a cross-mailbox
 	// RFC822 dedup match and MigrateSourceMessageID rewrites
@@ -63,7 +64,6 @@ var MessagesContentColumns = []string{
 // wrong call here is a consumer that silently misses updates.
 var MessagesNonContentColumns = []string{
 	"id",                // immutable identity
-	sourceIDColumnName,  // immutable: which account this came from
 	"rfc822_message_id", // not reported by the feed (dedup.go rewrites it)
 	"read_at",           // local read state, not archive content
 	"delivered_at",      // platform delivery receipt
@@ -76,6 +76,14 @@ var MessagesNonContentColumns = []string{
 	// attribution provenance migration for no reader-visible difference.
 	"source_is_from_me",
 	"identity_is_from_me",
+	"hidden_text_present", // derived HTML detector result; the body write tracks content
+	// Account attribution is a derived routing projection, absent from
+	// ChangedMessage. The cache journal invalidates account filters.
+	"account_address",
+	"account_path",
+	// The pending marker of the derived email_link_keys; absent from the feed.
+	"email_linkage_outcome",
+	"draft_authored",      // attribution input: the row was once filed as a draft
 	"reply_to_message_id", // threading pointer; conversation_id is the routing key
 	"thread_position",     // ordering within a thread, derived
 	"is_read",             // local read state

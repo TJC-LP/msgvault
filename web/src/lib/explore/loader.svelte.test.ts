@@ -1,5 +1,5 @@
 import { flushSync } from 'svelte';
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, onTestFinished, vi } from 'vitest';
 
 import { createAPIClient } from '../api/client';
 import { ExploreLoader, type ExploreLoaderCallbacks } from './loader.svelte';
@@ -74,6 +74,76 @@ function setup(
 }
 
 describe('ExploreLoader', () => {
+  it('closes Past runs over loaded Messages without another archive request', async ({ onTestFinished }) => {
+    window.history.replaceState(null, '', '/');
+    const state = new ExploreState(window);
+    const fetchFn = vi.fn<typeof fetch>(async () => Response.json(exploreResponse({ rows: [entry(1)], total_count: 1 })));
+    const { loader, cleanup } = setup(fetchFn, state);
+    onTestFinished(() => { cleanup(); state.destroy(); });
+    await vi.waitFor(() => expect(loader.rows).toHaveLength(1));
+    expect(fetchFn).toHaveBeenCalledOnce();
+    state.openOperationHistory({});
+    state.openOperationHistory({ operationRunID: `op2.${'a'.repeat(32)}.exampleRun` });
+    flushSync();
+    const popped = new Promise(resolve => window.addEventListener('popstate', resolve, { once: true }));
+    state.closeOperationHistory();
+    await popped;
+    flushSync();
+    await vi.waitFor(() => expect(loader.loading).toBe(false));
+    expect(state.current.operationHistory).toBe(false);
+    expect(fetchFn).toHaveBeenCalledOnce();
+    expect(loader.rows.map(row => row.key)).toEqual(['message:1']);
+  });
+
+  it('consumes an empty search submission once and excludes grouping changes and retries', async ({ onTestFinished }) => {
+    window.history.replaceState(null, '', `/?explore=${encodeURIComponent(JSON.stringify({ workspace: 'everything' }))}`);
+    const state = new ExploreState(window), onSearchAccepted = vi.fn();
+    const fetchFn = vi.fn<typeof fetch>(async () => Response.json(exploreResponse()));
+    const { loader, cleanup } = setup(fetchFn, state, { onSearchAccepted });
+    onTestFinished(() => { cleanup(); state.destroy(); });
+    await vi.waitFor(() => expect(loader.loading).toBe(false));
+    fetchFn.mockResolvedValueOnce(Response.json({
+      error: 'analytical_cache_unavailable', message: 'The analytical cache is being prepared',
+      readiness: 'building', recovery_action: ''
+    }, { status: 503 }));
+    loader.submitted = true;
+    state.commitSearch('missing', 'full_text'); flushSync();
+    await vi.waitFor(() => expect(loader.unavailable?.readiness).toBe('building'));
+    await vi.waitFor(() => expect(onSearchAccepted).toHaveBeenLastCalledWith('missing', 'full_text', expect.any(AbortSignal), 0), { timeout: 5000 });
+    onSearchAccepted.mockClear();
+    loader.retry(); flushSync();
+    await vi.waitFor(() => expect(onSearchAccepted).toHaveBeenCalledOnce());
+    expect(onSearchAccepted).toHaveBeenLastCalledWith('missing', 'full_text', expect.any(AbortSignal), undefined);
+    onSearchAccepted.mockClear();
+    state.commitGrouping('source'); flushSync();
+    await vi.waitFor(() => expect(onSearchAccepted).toHaveBeenCalledOnce());
+    expect(onSearchAccepted).toHaveBeenLastCalledWith('missing', 'full_text', expect.any(AbortSignal), undefined);
+  });
+
+  it('reports current successful results across retries', async ({ onTestFinished }) => {
+    window.history.replaceState(null, '', `/?explore=${encodeURIComponent(JSON.stringify({ workspace: 'everything', query: 'needle' }))}`);
+    const onSearchAccepted = vi.fn(), state = new ExploreState(window);
+    let resolveStale!: (response: Response) => void;
+    const fetchFn = vi.fn<typeof fetch>(async () => Response.json(exploreResponse({ rows: [entry(1)] }))).mockResolvedValueOnce(Response.json(exploreResponse())).mockImplementationOnce(() => new Promise<Response>((resolve) => { resolveStale = resolve; })).mockResolvedValueOnce(Response.json({ error: 'archive unavailable' }, { status: 500 }));
+    const { loader, cleanup } = setup(fetchFn, state, { onSearchAccepted });
+    onTestFinished(() => { cleanup(); state.destroy(); });
+    await vi.waitFor(() => expect(onSearchAccepted.mock.calls).toEqual([['needle', 'full_text', expect.any(AbortSignal), undefined]]), { timeout: 5000 });
+    state.commitSearch('other', 'semantic'); flushSync();
+    await vi.waitFor(() => expect(fetchFn).toHaveBeenCalledTimes(2));
+    state.commitSearch('replacement', 'full_text'); flushSync();
+    await vi.waitFor(() => expect(loader.error).toBe('Exploration request failed (500)'));
+    expect(onSearchAccepted).toHaveBeenCalledTimes(1);
+    resolveStale(Response.json(exploreResponse({ rows: [entry(99)] })));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(loader.rows).toEqual([]);
+    expect(onSearchAccepted.mock.calls).toEqual([['needle', 'full_text', expect.any(AbortSignal), undefined]]);
+    expect(onSearchAccepted.mock.calls[0]![2].aborted).toBe(true);
+    loader.retry();
+    await vi.waitFor(() => expect(loader.rows).toHaveLength(1));
+    expect(onSearchAccepted.mock.calls).toEqual([['needle', 'full_text', expect.any(AbortSignal), undefined], ['replacement', 'full_text', expect.any(AbortSignal), undefined]]);
+    loader.retry();
+    await vi.waitFor(() => expect(onSearchAccepted.mock.calls).toEqual([['needle', 'full_text', expect.any(AbortSignal), undefined], ['replacement', 'full_text', expect.any(AbortSignal), undefined], ['replacement', 'full_text', expect.any(AbortSignal), undefined]]));
+  });
   it('issues exactly one fetch for one filter commit', async () => {
     window.history.replaceState(null, '', `/?explore=${encodeURIComponent(JSON.stringify({ workspace: 'everything' }))}`);
     let exploreCount = 0;
@@ -347,6 +417,52 @@ describe('ExploreLoader', () => {
 
     cleanup();
     state.destroy();
+  });
+
+  it.each([
+    { workspace: 'everything', grouped: false, endpoint: '/api/v1/explore' },
+    { workspace: 'everything', grouped: true, endpoint: '/api/v1/explore/groups' },
+    { workspace: 'files', grouped: true, endpoint: '/api/v1/files/groups' }
+  ])('restarts $workspace pagination after a 409 on $endpoint', async ({ workspace, grouped, endpoint }) => {
+    window.history.replaceState(null, '', `/?explore=${encodeURIComponent(JSON.stringify({ workspace }))}`);
+    const cursors: (string | undefined)[] = [];
+    const row = (index: number) => grouped ? {
+      key: String(index), label: `Group ${index}`, count: index,
+      estimated_bytes: 10, latest_at: '2026-07-18T12:00:00Z'
+    } : entry(index);
+    const fetchFn = vi.fn<typeof fetch>(async input => {
+      const request = input as Request;
+      expect(new URL(request.url).pathname).toBe(endpoint);
+      const body = await request.clone().json() as { cursor?: string };
+      cursors.push(body.cursor);
+      if (body.cursor === 'old-cursor') return Response.json({
+        error: 'archive_revision_changed', message: 'The committed analytical cache changed; restart pagination'
+      }, { status: 409 });
+      return Response.json(exploreResponse({
+        rows: [row(cursors.length === 1 ? 1 : 2)], total_count: 2,
+        cache_revision: cursors.length === 1 ? 'cache-1' : 'cache-2',
+        next_cursor: cursors.length === 1 ? 'old-cursor' : 'new-cursor'
+      }));
+    });
+    const state = new ExploreState(window);
+    if (grouped) state.commitGrouping('source');
+    const { loader, cleanup } = setup(fetchFn, state);
+    onTestFinished(() => { cleanup(); state.destroy(); });
+    const rows = () => grouped ? loader.groupRows : loader.rows;
+    await vi.waitFor(() => expect(rows()).toHaveLength(1));
+
+    expect((await loader.loadMore()).status).toBe('failed');
+    expect(rows().map(row => row.key)).toEqual([grouped ? '1' : 'message:1']);
+    expect(loader.pageError).toContain('Reload this view.');
+    expect(loader.error).toBe('');
+    expect(loader.nextCursor).toBeUndefined();
+
+    loader.retry();
+    flushSync();
+    await vi.waitFor(() => expect(rows().map(row => row.key)).toEqual([grouped ? '2' : 'message:2']));
+    expect(cursors).toEqual([undefined, 'old-cursor', undefined]);
+    expect(loader.nextCursor).toBe('new-cursor');
+    expect(loader.pageError).toBe('');
   });
 
   it('keeps a terminal authority-change failure inline while dropping the cursor', async () => {

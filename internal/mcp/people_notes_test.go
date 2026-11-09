@@ -41,6 +41,93 @@ type recordingPeopleBackend struct {
 	calendarErr          error
 }
 
+type namedPromotionTestBackend struct {
+	*recordingPeopleBackend
+
+	namedParticipantID int64
+	displayName        *string
+}
+
+type perIDPeopleBackend struct {
+	*recordingPeopleBackend
+
+	contacts map[int64]*query.PersonSummary
+}
+
+func (b *perIDPeopleBackend) GetContact(_ context.Context, participantID int64) (*query.PersonSummary, error) {
+	return b.contacts[participantID], nil
+}
+
+func (b *namedPromotionTestBackend) PromoteWithDisplayName(_ context.Context, participantID int64, displayName *string) (*OperationResult, error) {
+	b.namedParticipantID = participantID
+	b.displayName = displayName
+	return &OperationResult{Output: b.promotedPerson}, b.promoteErr
+}
+
+func TestNamedPromotionSchemaIsLimitedToSupportingBackends(t *testing.T) {
+	legacy := &recordingPeopleBackend{}
+	legacyTools := toolsByName(t, rawListTools(t, peopleToolOptions(legacy), true))
+	assert.Equal(t, []string{"participant_id"}, toolPropertyNames(t, legacyTools[ToolPromotePerson]))
+	named := &namedPromotionTestBackend{recordingPeopleBackend: legacy}
+	namedTools := toolsByName(t, rawListTools(t, peopleToolOptions(named), true))
+	assert.Equal(t, []string{"display_name", "participant_id"}, toolPropertyNames(t, namedTools[ToolPromotePerson]))
+}
+
+func TestNamedPromotionWithoutDisplayNameNeedsNoConfirmation(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		args map[string]any
+	}{
+		{name: "omitted", args: map[string]any{"participant_id": 11}},
+		{name: "null", args: map[string]any{"participant_id": 11, "display_name": nil}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			assertions := assert.New(t)
+			now := time.Date(2026, 8, 20, 12, 30, 0, 0, time.UTC)
+			backend := &namedPromotionTestBackend{recordingPeopleBackend: &recordingPeopleBackend{
+				promotedPerson: &store.Person{ID: 7, VCardUID: "person-7", DisplayName: new("Observed Example"), Revision: 1, ParticipantIDs: []int64{11}, CreatedAt: now, UpdatedAt: now},
+			}}
+			result := rawCallTool(t, peopleToolOptions(backend), ToolPromotePerson, test.args)
+			require.NotEqual(t, true, result["isError"], "result: %#v", result)
+			assertions.Empty(result["inputRequests"])
+			assertions.Equal(int64(11), backend.promoteParticipantID)
+			assertions.Zero(backend.namedParticipantID)
+			structured := toolStructuredContent(t, result)
+			assertions.InDelta(7, structured["id"], 0)
+			assertions.Equal("Observed Example", structured["display_name"])
+		})
+	}
+}
+
+func TestNamedPromotionStringRequiresConfirmation(t *testing.T) {
+	for _, displayName := range []string{"Chosen Example", ""} {
+		t.Run(displayName, func(t *testing.T) {
+			assertions := assert.New(t)
+			now := time.Date(2026, 8, 20, 12, 30, 0, 0, time.UTC)
+			backend := &namedPromotionTestBackend{recordingPeopleBackend: &recordingPeopleBackend{
+				promotedPerson: &store.Person{ID: 7, VCardUID: "person-7", Revision: 1, ParticipantIDs: []int64{11}, CreatedAt: now, UpdatedAt: now},
+			}}
+			args := map[string]any{"participant_id": 11, "display_name": displayName}
+			rejected := confirmedCallTool(t, peopleToolOptions(backend), ToolPromotePerson, args, false)
+			assertions.Equal(true, rejected["isError"])
+			assertions.Zero(backend.namedParticipantID)
+			assertions.Zero(backend.promoteParticipantID)
+
+			prompted := false
+			result := confirmedCallTool(t, peopleToolOptions(backend), ToolPromotePerson, args, true, func(message string) {
+				prompted = true
+				assertions.Contains(message, `"participant_id":11`)
+			})
+			assertions.True(prompted)
+			assertions.Equal(false, result["isError"])
+			assertions.Equal(int64(11), backend.namedParticipantID)
+			require.NotNil(t, backend.displayName)
+			assertions.Equal(displayName, *backend.displayName)
+			assertions.Zero(backend.promoteParticipantID)
+		})
+	}
+}
+
 func (b *recordingPeopleBackend) GetContact(_ context.Context, participantID int64) (*query.PersonSummary, error) {
 	b.contactParticipantID = participantID
 	return b.contact, b.contactErr
@@ -147,7 +234,7 @@ func TestMCPPeopleCapabilityAndWritePolicy(t *testing.T) {
 		assert.Contains(writable, name)
 	}
 	assert.Equal([]string{"cursor", "limit", "query"}, toolPropertyNames(t, writable[ToolSearchPeople]))
-	assert.Equal([]string{"category", "contact_state", "cursor", "last_contact_after", "last_contact_before", "limit", "organization", "primary_channel", "query", "sort"}, toolPropertyNames(t, writable[ToolListDirectoryPeople]))
+	assert.Equal([]string{"address", "category", "contact_state", "cursor", "last_contact_after", "last_contact_before", "limit", "organization", "primary_channel", "query", "sort"}, toolPropertyNames(t, writable[ToolListDirectoryPeople]))
 	assert.Equal([]any{"name", "last_contact_desc", "last_contact_asc"}, toolInputProperty(t, writable[ToolListDirectoryPeople], "sort")["enum"])
 	assert.Equal([]any{"active", "inactive"}, toolInputProperty(t, writable[ToolListDirectoryPeople], "contact_state")["enum"])
 	assert.InDelta(float64(store.DefaultDirectoryPeopleLimit), toolInputProperty(t, writable[ToolListDirectoryPeople], "limit")["default"], 0)
@@ -176,7 +263,7 @@ func toolReadOnlyHint(t *testing.T, tool map[string]any) any {
 func TestMCPGetPersonRelationshipReturnsSummaryAndOptionalCalendar(t *testing.T) {
 	assert := assert.New(t)
 	contact := query.PersonSummary{
-		ID: 7, DisplayLabel: "Test Person", CurrentRelationshipTemperature: 62,
+		ID: 7, DisplayLabel: "Test Person", ActivityCount: 4, CurrentRelationshipTemperature: 62,
 		PeakRelationshipTemperature: 87, PeakRelationshipYear: 2018,
 	}
 	calendar := &query.RelationshipCalendarResponse{
@@ -202,6 +289,8 @@ func TestMCPGetPersonRelationshipReturnsSummaryAndOptionalCalendar(t *testing.T)
 	require.True(t, ok)
 	assert.InDelta(float64(62), current["temperature"], 0)
 	assert.InDelta(float64(87), structured["peak_temperature"], 0)
+	assert.Equal("UTC", structured["scoring_timezone"])
+	assert.InDelta(float64(12), structured["identity_revision"], 0)
 	assert.InDelta(float64(2025), structured["year"], 0)
 	assert.Len(structured["days"], 1)
 
@@ -213,6 +302,48 @@ func TestMCPGetPersonRelationshipReturnsSummaryAndOptionalCalendar(t *testing.T)
 	assert.Equal("UTC", backend.calendarRequest.Timezone)
 	assert.NotZero(backend.calendarRequest.Year)
 	assert.NotContains(toolStructuredContent(t, result), "days")
+}
+
+func TestMCPGetPersonRelationshipDraftOnlyOmitsCalendar(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	backend := &recordingPeopleBackend{
+		contact: &query.PersonSummary{
+			ID: 9, DisplayLabel: "Draft recipient", CacheRevision: "cache-8",
+			Cluster: &query.PersonCluster{CanonicalID: 7, MemberIDs: []int64{7, 9}},
+		},
+		calendarErr: query.ErrRelationshipPersonNotFound,
+	}
+	result := rawCallTool(t, peopleToolOptions(backend), ToolGetPersonRelationship, map[string]any{
+		"participant_id": 9,
+	})
+	require.NotEqual(true, result["isError"], "result: %#v", result)
+	structured := toolStructuredContent(t, result)
+	assert.Equal("Draft recipient", structured["display_label"])
+	assert.InDelta(9, structured["participant_id"], 0)
+	assert.InDelta(7, structured["canonical_id"], 0)
+	assert.Equal("cache-8", structured["cache_revision"])
+	assert.Equal([]any{}, structured["annual"])
+	current, ok := structured["current"].(map[string]any)
+	require.True(ok)
+	assert.InDelta(0, current["temperature"], 0)
+	for _, field := range []string{"scoring_timezone", "score_version", "effective_date", "identity_revision"} {
+		assert.NotContains(structured, field)
+	}
+	assert.NotContains(structured, "year")
+	assert.NotContains(structured, "timezone")
+	assert.NotContains(structured, "days")
+	assert.Equal(peoplebrowser.CalendarRequest{}, backend.calendarRequest)
+
+	result = rawCallTool(t, peopleToolOptions(backend), ToolGetPersonRelationship, map[string]any{
+		"participant_id": 9, "year": 2025, "timezone": "America/New_York",
+	})
+	require.NotEqual(true, result["isError"], "result: %#v", result)
+	structured = toolStructuredContent(t, result)
+	assert.InDelta(2025, structured["year"], 0)
+	assert.Equal("America/New_York", structured["timezone"])
+	assert.NotContains(structured, "days")
+	assert.Equal(peoplebrowser.CalendarRequest{}, backend.calendarRequest)
 }
 
 func TestMCPGetPersonRelationshipValidationDoesNotCallBackend(t *testing.T) {
@@ -258,6 +389,10 @@ func TestMCPSearchPeopleIncludesCuratedOnlyDisplayNameAndProfileID(t *testing.T)
 		profiles: []store.Person{{
 			ID: 7, VCardUID: "person-7", DisplayName: &displayName, Revision: 3,
 			ParticipantIDs: []int64{11}, CreatedAt: now, UpdatedAt: now,
+			CardDAVBindings: []store.CardDAVBinding{{
+				Connection: "personal", Book: "Personal", Href: "https://contacts.example.test/book/person.vcf",
+				RemoteUID: "urn:uuid:remote-7", MappingStatus: store.CardDAVMappingMapped,
+			}},
 		}},
 		contact: &query.PersonSummary{
 			ID: 11, DisplayLabel: "Observed Name", Identifiers: []query.PersonIdentifier{},
@@ -280,9 +415,47 @@ func TestMCPSearchPeopleIncludesCuratedOnlyDisplayNameAndProfileID(t *testing.T)
 	assert.Equal("Curated Alias", row["display_label"])
 	assert.InDelta(float64(11), row["id"], 0)
 	assert.InDelta(float64(7), row["person_id"], 0)
+	assert.Equal("person-7", row["vcard_uid"])
+	bindings, ok := row["carddav_bindings"].([]any)
+	require.True(ok)
+	require.Len(bindings, 1)
+	binding, ok := bindings[0].(map[string]any)
+	require.True(ok)
+	assert.Equal("urn:uuid:remote-7", binding["remote_uid"])
 	profile, ok := row["profile"].(map[string]any)
 	require.True(ok)
 	assert.InDelta(float64(7), profile["id"], 0)
+}
+
+func TestMCPSearchPeoplePrefersActiveParticipantSummary(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	now := time.Date(2026, 8, 20, 12, 30, 0, 0, time.UTC)
+	backend := &perIDPeopleBackend{
+		recordingPeopleBackend: &recordingPeopleBackend{
+			searchPage: &peoplebrowser.SearchPage{Rows: []query.PersonSummary{}},
+			profiles: []store.Person{{
+				ID: 7, VCardUID: "person-7", DisplayName: new("Example Contact"),
+				ParticipantIDs: []int64{11, 12},
+			}},
+		},
+		contacts: map[int64]*query.PersonSummary{
+			11: {ID: 11, ActivityCount: 0},
+			12: {ID: 12, ActivityCount: 3, FirstAt: now, LastAt: now},
+		},
+	}
+
+	result := rawCallTool(t, peopleToolOptions(backend), ToolSearchPeople, map[string]any{"query": "", "limit": 20})
+	require.NotEqual(true, result["isError"], "result: %#v", result)
+	rows, ok := toolStructuredContent(t, result)["rows"].([]any)
+	require.True(ok)
+	require.Len(rows, 1)
+	row, ok := rows[0].(map[string]any)
+	require.True(ok)
+	assert.InDelta(12, row["id"], 0)
+	assert.InDelta(3, row["activity_count"], 0)
+	assert.Equal("2026-08-20T12:30:00Z", row["first_at"])
+	assert.Equal("2026-08-20T12:30:00Z", row["last_at"])
 }
 
 func TestMCPSearchPeopleKeepsObservedPageWhenProfileQuerySpansContactFields(t *testing.T) {
@@ -313,6 +486,54 @@ func TestMCPSearchPeopleKeepsObservedPageWhenProfileQuerySpansContactFields(t *t
 
 	assert.NotEqual(true, result["isError"], "result: %#v", result)
 	assert.NotEmpty(toolStructuredContent(t, result)["next_cursor"])
+}
+
+func TestMCPSearchPeopleDraftOnlyProfilePreservesObservedContinuation(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	backend := &recordingPeopleBackend{
+		searchPage: &peoplebrowser.SearchPage{
+			Rows: []query.PersonSummary{{
+				ID: 22, DisplayLabel: "Active Contact", ActivityCount: 1,
+				Identifiers: []query.PersonIdentifier{}, SourceCounts: []query.SourceCount{},
+			}},
+			TotalCount: 1, CacheRevision: "cache-7",
+		},
+		profiles: []store.Person{{
+			ID: 7, VCardUID: "person-7", DisplayName: new("Draft Contact"), Revision: 1,
+			ParticipantIDs: []int64{11},
+		}},
+		contact: &query.PersonSummary{
+			ID: 11, DisplayLabel: "Draft Contact", ActivityCount: 0,
+			Identifiers: []query.PersonIdentifier{}, SourceCounts: []query.SourceCount{},
+		},
+	}
+	opts := peopleToolOptions(backend)
+	first := rawCallTool(t, opts, ToolSearchPeople, map[string]any{"query": "", "limit": 1})
+	require.NotEqual(true, first["isError"], "result: %#v", first)
+	firstPage := toolStructuredContent(t, first)
+	assert.InDelta(2, firstPage["total_count"], 0)
+	rows, ok := firstPage["rows"].([]any)
+	require.True(ok)
+	require.Len(rows, 1)
+	row, ok := rows[0].(map[string]any)
+	require.True(ok)
+	assert.InDelta(11, row["id"], 0)
+	cursor, ok := firstPage["next_cursor"].(string)
+	require.True(ok)
+	require.NotEmpty(cursor)
+
+	second := rawCallTool(t, opts, ToolSearchPeople, map[string]any{"query": "", "limit": 1, "cursor": cursor})
+	require.NotEqual(true, second["isError"], "result: %#v", second)
+	secondPage := toolStructuredContent(t, second)
+	assert.InDelta(2, secondPage["total_count"], 0)
+	rows, ok = secondPage["rows"].([]any)
+	require.True(ok)
+	require.Len(rows, 1)
+	row, ok = rows[0].(map[string]any)
+	require.True(ok)
+	assert.InDelta(22, row["id"], 0)
+	assert.Empty(secondPage["next_cursor"])
 }
 
 func TestMCPGetPersonNotesReturnsOnlyNotesFields(t *testing.T) {

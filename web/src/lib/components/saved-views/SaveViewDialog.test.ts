@@ -5,6 +5,7 @@ import { createAPIClient } from '../../api/client';
 import { defaultExploreURLState } from '../../explore/state.svelte';
 import type { ExploreURLState } from '../../explore/models';
 import SaveViewDialog from './SaveViewDialog.svelte';
+import { view } from '../shell/fixtures.test-support';
 
 const state: ExploreURLState = {
   ...defaultExploreURLState,
@@ -18,14 +19,6 @@ const state: ExploreURLState = {
   columns: ['kind', 'title'],
   inspectorPinned: true
 };
-
-function savedView() {
-  return {
-    id: 7, name: 'Invoices', description: 'Quarterly review', canonical_state: {},
-    schema_version: 1, revision: 1,
-    created_at: '2026-07-19T10:00:00Z', updated_at: '2026-07-19T10:00:00Z'
-  };
-}
 
 function renderDialog(fetchFn: typeof fetch, overrides: Partial<ExploreURLState> = {}) {
   const onSaved = vi.fn();
@@ -43,7 +36,7 @@ describe('SaveViewDialog', () => {
   });
 
   it('submits once when Enter is pressed in a named Name field', async () => {
-    const fetchFn = vi.fn<typeof fetch>(async () => Response.json(savedView(), { status: 201 }));
+    const fetchFn = vi.fn<typeof fetch>(async () => Response.json({ ...view(7, 'Invoices'), description: 'Quarterly review' }, { status: 201 }));
     const { onSaved } = renderDialog(fetchFn);
     const name = screen.getByLabelText('Name') as HTMLInputElement;
     await fireEvent.input(name, { target: { value: 'Invoices' } });
@@ -70,7 +63,7 @@ describe('SaveViewDialog', () => {
       const requests: Request[] = [];
       const fetchFn = vi.fn<typeof fetch>(async (input) => {
         requests.push(input instanceof Request ? input : new Request(input));
-        return Response.json(savedView(), { status: 201 });
+        return Response.json({ ...view(7, 'Invoices'), description: 'Quarterly review' }, { status: 201 });
       });
       const { onSaved } = renderDialog(fetchFn, { searchMode, activeRow: 'message:9' });
 
@@ -86,7 +79,7 @@ describe('SaveViewDialog', () => {
       expect(requests[0]!.method).toBe('POST');
       const body = await requests[0]!.clone().json();
       expect(body).toEqual({
-        name: 'Invoices', description: 'Quarterly review', schema_version: 1,
+        name: 'Invoices', description: 'Quarterly review', schema_version: 2,
         canonical_state: {
           query: 'invoice', search_mode: searchMode,
           filters: [{ field: 'source', operator: 'in', values: ['1'] }],
@@ -108,7 +101,7 @@ describe('SaveViewDialog', () => {
       const requests: Request[] = [];
       const fetchFn = vi.fn<typeof fetch>(async (input) => {
         requests.push(input instanceof Request ? input : new Request(input));
-        return Response.json(savedView(), { status: 201 });
+        return Response.json({ ...view(7, 'Invoices'), description: 'Quarterly review' }, { status: 201 });
       });
       const { onSaved } = renderDialog(fetchFn, { query, searchMode });
       await fireEvent.input(screen.getByLabelText('Name'), { target: { value: 'Invoices' } });

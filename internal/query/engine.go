@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"go.kenn.io/msgvault/internal/search"
+	"go.kenn.io/msgvault/internal/store"
 )
 
 var (
@@ -38,7 +39,7 @@ type Engine interface {
 	// Message queries
 	ListMessages(ctx context.Context, filter MessageFilter) ([]MessageSummary, error)
 	GetMessage(ctx context.Context, id int64) (*MessageDetail, error)
-	GetMessageBySourceID(ctx context.Context, sourceMessageID string) (*MessageDetail, error)
+	GetMessageBySourceID(ctx context.Context, sourceMessageID string, sourceIDs []int64) (*MessageDetail, error)
 	GetAttachment(ctx context.Context, id int64) (*AttachmentInfo, error)
 
 	// GetAttachmentsByHash returns every attachment matching the given content
@@ -88,6 +89,7 @@ type Engine interface {
 	//
 	// queryStr is the raw search string (needed for stats; search.Query doesn't store it).
 	// statsGroupBy controls which view's key columns are used for stats search filtering.
+	// ViewNoStats omits aggregates; limit=0 returns the count without a page.
 	SearchFastWithStats(ctx context.Context, query *search.Query, queryStr string,
 		filter MessageFilter, statsGroupBy ViewType, limit, offset int) (*SearchFastResult, error)
 
@@ -96,8 +98,9 @@ type Engine interface {
 	GetDeletionTargetsByFilter(ctx context.Context, filter MessageFilter) ([]DeletionTarget, error)
 
 	// SearchByDomains returns messages where any participant (from, to, cc, or bcc)
-	// belongs to one of the given domains.
-	SearchByDomains(ctx context.Context, domains []string, after, before *time.Time, limit, offset int) ([]MessageSummary, error)
+	// belongs to one of the given domains. Non-empty sourceIDs limit results to those accounts.
+	// HasMore reports whether another page follows the returned messages.
+	SearchByDomains(ctx context.Context, domains []string, after, before *time.Time, limit, offset int, sourceIDs []int64) (DomainSearchResult, error)
 
 	// Account queries
 	ListAccounts(ctx context.Context) ([]AccountInfo, error)
@@ -107,6 +110,12 @@ type Engine interface {
 
 	// Close releases any resources held by the engine.
 	Close() error
+}
+
+// VirtualAccountLister reads the virtual account catalog: per source, its
+// confirmed identities and its unattributed rows, with live counts.
+type VirtualAccountLister interface {
+	ListVirtualAccounts(ctx context.Context) (map[int64][]store.VirtualAccount, error)
 }
 
 // DeletionSearchMode selects the search predicate used while resolving an
@@ -119,6 +128,11 @@ const (
 	DeletionSearchAggregate DeletionSearchMode = "aggregate"
 )
 
+// MaxDeletionTargetSearchResults is the largest permitted bounded search
+// result set. Callers use the extra row as an overflow sentinel for the
+// 100,000-match staging limit.
+const MaxDeletionTargetSearchResults = 100_001
+
 // DeletionTargetSearchResolver resolves a filtered search and source deletion
 // eligibility in one backend query. Keeping this capability separate from
 // Engine lets callers fail closed when a backend cannot provide a stable
@@ -130,6 +144,20 @@ type DeletionTargetSearchResolver interface {
 		filter MessageFilter,
 		mode DeletionSearchMode,
 	) ([]DeletionTarget, error)
+}
+
+// BoundedDeletionTargetSearchResolver resolves at most maxResults exact
+// search matches for one-shot staging and reports the count before eligibility
+// filtering. The existing unbounded resolver stays
+// available to callers such as the TUI that intentionally stage every match.
+type BoundedDeletionTargetSearchResolver interface {
+	GetDeletionTargetsBySearchBounded(
+		ctx context.Context,
+		searchQuery *search.Query,
+		filter MessageFilter,
+		mode DeletionSearchMode,
+		maxResults int,
+	) ([]DeletionTarget, int, error)
 }
 
 // DeletionTargetAggregateSearchResolver resolves the exact message population
@@ -178,11 +206,15 @@ type SemanticMessageSearchResult struct {
 	HasMore  bool
 }
 
-// Explorer is intentionally separate from Engine: only the committed
-// DuckDB/Parquet analytical read model implements it. Transactional engines
-// must never become a modality-specific fallback for exploration.
-type Explorer interface {
+// EntryExplorer lists message and conversation rows. Auto mode may serve
+// live SQLite rows during or after a full analytical cache rebuild.
+type EntryExplorer interface {
 	Explore(ctx context.Context, request ExploreRequest) (*ExploreResponse, error)
+}
+
+// Explorer adds operations that require the committed analytical cache.
+type Explorer interface {
+	EntryExplorer
 	ExploreCoverage(ctx context.Context, request ExploreCoverageRequest, visit func(messageIDs []int64) error) (*ExploreCoverageResult, error)
 	ExploreGroups(ctx context.Context, request ExploreGroupRequest) (*ExploreGroupResponse, error)
 	ExploreSelectionStats(ctx context.Context, request ExploreSelectionRequest) (*ExploreSelectionStats, error)
@@ -224,16 +256,32 @@ type PeopleInboxAnalyzer interface {
 // message bodies. It is deliberately separate from Engine so generic Search
 // retains its composite subject/body/participant semantics.
 type MessageBodySearcher interface {
-	SearchMessageBodies(ctx context.Context, query *search.Query, limit, offset int) ([]MessageSummary, error)
+	SearchMessageBodies(ctx context.Context, query *search.Query, limit, offset int) (*SearchFastResult, error)
 }
 
-// SearchFastResult holds the combined results of a fast search:
-// paginated messages, total count, and aggregate stats — all from a single
-// materialized scan of the matching message IDs.
+// DomainSearchResult is one page of SearchByDomains matches. HasMore reports
+// whether a match remains beyond the page.
+type DomainSearchResult struct {
+	Messages []MessageSummary
+	HasMore  bool
+}
+
+// SearchHint suggests a retry when a search returns no matches.
+type SearchHint struct {
+	Code      string `json:"code"`
+	Message   string `json:"message"`
+	RetryWith struct {
+		Query string `json:"query"`
+	} `json:"retry_with"`
+}
+
+// SearchFastResult carries messages and index status, with optional totals and aggregate stats.
 type SearchFastResult struct {
+	IndexState string
 	Messages   []MessageSummary
 	TotalCount int64
 	Stats      *TotalStats
+	Hints      []SearchHint
 }
 
 // TotalStats provides overall database statistics.

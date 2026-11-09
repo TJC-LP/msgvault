@@ -19,13 +19,15 @@ const (
 	ModeFull Mode = iota
 	ModeIncremental
 	ModeIndexOnly
-	// ModeAppendRepair rebuilds activity after recipients or canonical links
-	// change while reading committed and staged message shards together.
+	// ModeAppendRepair rebuilds activity after recipients, canonical links, or
+	// unsent status change, reading committed and staged message shards together.
 	ModeAppendRepair
 )
 
 // BuildOptions identifies committed, staged, and output cache roots.
 type BuildOptions struct {
+	// UnsentMessages names a message_id relation; empty means no unsent messages.
+	UnsentMessages string
 	Mode           Mode
 	CommittedRoot  string
 	StagedBaseRoot string
@@ -41,12 +43,18 @@ type BuildOptions struct {
 
 // ActivityStats records the rows built in this run. Incremental builds
 // report only their staged delta, so reporting does not rescan old activity.
+// These construction metrics include unsent rows retained for Explore.
 type ActivityStats struct {
 	DirectRows               int64
 	ConversationExpandedRows int64
 	FinalRows                int64
 	ExpansionRatio           float64
 }
+
+const (
+	activityBuildRelation      = "relationship_build_activity"
+	deltaActivityBuildRelation = "relationship_build_activity_delta"
+)
 
 // BuildResult contains marker data derived alongside the index.
 type BuildResult struct {
@@ -81,7 +89,8 @@ func Build(
 
 	b := builder{db: db, opts: opts}
 	defer func() {
-		resultErr = errors.Join(resultErr, b.dropBuildTables())
+		// Drop the build tables even when ctx was canceled mid-build.
+		resultErr = errors.Join(resultErr, b.dropBuildTables(context.WithoutCancel(ctx)))
 	}()
 
 	for _, dataset := range baseIdentityDatasets {
@@ -109,6 +118,18 @@ func Build(
 		return BuildResult{}, err
 	}
 	activity := b.activityRelation()
+	if opts.Mode == ModeIncremental {
+		if err := b.materializeBuildTable(ctx, deltaActivityBuildRelation,
+			b.deltaActivityRelation(), "relationship_activity_delta"); err != nil {
+			return BuildResult{}, err
+		}
+	} else {
+		if err := b.materializeBuildTable(ctx, activityBuildRelation,
+			activity, "relationship_activity_edges"); err != nil {
+			return BuildResult{}, err
+		}
+		activity = "(SELECT * FROM " + activityBuildRelation + ")"
+	}
 	effectiveAt, err := b.relationshipEffectiveAt(ctx, activity)
 	if err != nil {
 		return BuildResult{}, err
@@ -145,7 +166,7 @@ func Build(
 	if opts.Mode == ModeIncremental {
 		// The committed generation was validated before publication. Appends
 		// use new message IDs, so only the staged edges need row validation.
-		validationActivity = b.deltaActivityRelation()
+		validationActivity = deltaActivityBuildRelation
 	}
 	if err := Validate(ctx, db, ValidationOptions{
 		OutputRoot:             opts.OutputRoot,
@@ -165,7 +186,7 @@ func Build(
 	}
 	statsActivity := activity
 	if opts.Mode == ModeIncremental {
-		statsActivity = b.deltaActivityRelation()
+		statsActivity = deltaActivityBuildRelation
 	}
 	activityStats, err := collectActivityStats(ctx, db, statsActivity)
 	if err != nil {
@@ -233,7 +254,7 @@ func (b builder) deltaActivityRelation() string {
 }
 
 func (b builder) expandedActivity(paths []string) string {
-	return ExpandedActivityRelation(
+	return buildActivityRelation(
 		readParquetRelation(paths, true),
 		readParquetRelation([]string{b.base("conversation_participants")}, false),
 		readParquetRelation([]string{b.base("participants")}, false),
@@ -248,6 +269,14 @@ func (b builder) messageRelation() string {
 		paths = append([]string{b.committed("messages")}, paths...)
 	}
 	return readParquetRelation(paths, true)
+}
+
+func (b builder) recipientRelation() string {
+	paths := []string{b.base("message_recipients")}
+	if b.opts.Mode == ModeAppendRepair && !b.opts.ReplacedBaseDatasets["message_recipients"] {
+		paths = append([]string{b.committed("message_recipients")}, paths...)
+	}
+	return readParquetRelation(paths, false)
 }
 
 func (b builder) statsRelations() cacheStatsRelations {
@@ -293,7 +322,7 @@ func (b builder) copyRelationshipActivity(ctx context.Context) error {
 	options := "FORMAT PARQUET, COMPRESSION 'zstd', PARTITION_BY (occurred_year), " +
 		"WRITE_PARTITION_COLUMNS true, OVERWRITE_OR_IGNORE"
 	for _, year := range years {
-		query := buildSparseRelationshipActivitySQL(b.base, b.messageRelation(), year)
+		query := buildSparseRelationshipActivitySQL(b.base, b.messageRelation(), b.recipientRelation(), year, b.opts.UnsentMessages)
 		statement := "COPY (" + query + ") TO '" + quoteSQLString(output) +
 			"' (" + options + ")"
 		if _, err := b.db.ExecContext(ctx, statement); err != nil {
@@ -347,7 +376,7 @@ func (b builder) copyEmptyRelationshipActivity(ctx context.Context) error {
 	if err := os.MkdirAll(filepath.Dir(emptyOutput), 0o755); err != nil {
 		return fmt.Errorf("create empty %s partition: %w", DatasetActivity, err)
 	}
-	query := buildSparseRelationshipActivitySQL(b.base, b.messageRelation(), 0)
+	query := buildSparseRelationshipActivitySQL(b.base, b.messageRelation(), b.recipientRelation(), 0, b.opts.UnsentMessages)
 	statement := "COPY (SELECT * FROM (" + query + ") WHERE false) TO '" +
 		quoteSQLString(emptyOutput) + "' (FORMAT PARQUET, COMPRESSION 'zstd')"
 	if _, err := b.db.ExecContext(ctx, statement); err != nil {
@@ -370,11 +399,14 @@ func (b builder) materializeBuildTable(
 	return nil
 }
 
-func (b builder) dropBuildTables() error {
+func (b builder) dropBuildTables(ctx context.Context) error {
 	var result error
-	for _, table := range []string{logicalBuildRelation, temperatureBuildRelation, directoryBuildRelation} {
+	for _, table := range []string{
+		logicalBuildRelation, temperatureBuildRelation, directoryBuildRelation,
+		activityBuildRelation, deltaActivityBuildRelation,
+	} {
 		if _, err := b.db.ExecContext(
-			context.Background(),
+			ctx,
 			"DROP TABLE IF EXISTS "+table,
 		); err != nil {
 			result = errors.Join(result, fmt.Errorf("drop %s: %w", table, err))

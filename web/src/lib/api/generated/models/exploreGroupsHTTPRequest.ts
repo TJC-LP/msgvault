@@ -12,6 +12,7 @@ export interface ExploreGroupsHTTPRequest {
   filters?: ExploreFilter[];
   group_key?: string;
   /**
+   * Day counts individual messages; other dimensions count entries, with chats collapsed into conversations
    * @minItems 1
    * @maxItems 1
    */
@@ -22,8 +23,14 @@ export interface ExploreGroupsHTTPRequest {
    */
   limit?: number;
   presentation?: ExploreGroupsHTTPRequestPresentation;
+  /** Search query; full_text accepts standalone pipe-separated OR alternatives; other modes read pipes as text */
   query?: string;
+  /** Search mode; pipe OR is full_text only */
   search_mode?: ExploreGroupsHTTPRequestSearchMode;
+  /** Count sent messages only, excluding drafts and unsent items */
+  sent_only?: boolean;
   /** @maxItems 1 */
   sort?: ExploreGroupSort[];
+  /** IANA timezone for day grouping; defaults to UTC */
+  timezone?: string;
 }

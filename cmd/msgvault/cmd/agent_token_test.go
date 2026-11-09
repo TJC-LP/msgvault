@@ -144,7 +144,7 @@ func TestDelegatedDraftSourceScopeThroughHTTP(t *testing.T) {
 			"source_ids":  []int64{sourceID},
 		})
 		require.NoError(err)
-		req, err := http.NewRequest(http.MethodPost, server.URL+"/api/v1/agent-tokens", bytes.NewReader(body))
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, server.URL+"/api/v1/agent-tokens", bytes.NewReader(body))
 		require.NoError(err)
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("X-Api-Key", "owner-test-key")
@@ -164,7 +164,7 @@ func TestDelegatedDraftSourceScopeThroughHTTP(t *testing.T) {
 		}
 		body, err := json.Marshal(map[string]any{"args": args})
 		require.NoError(err)
-		req, err := http.NewRequest(http.MethodPost, server.URL+"/api/v1/cli/run", bytes.NewReader(body))
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, server.URL+"/api/v1/cli/run", bytes.NewReader(body))
 		require.NoError(err)
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("X-Msgvault-Agent-Token", secret)
@@ -233,7 +233,7 @@ func TestDelegatedGmailDraftLifecycleThroughHTTP(t *testing.T) {
 		}
 		body, err := json.Marshal(request)
 		require.NoError(err)
-		req, err := http.NewRequest(http.MethodPost, server.URL+"/api/v1/agent-tokens", bytes.NewReader(body))
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, server.URL+"/api/v1/agent-tokens", bytes.NewReader(body))
 		require.NoError(err)
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("X-Api-Key", "owner-test-key")
@@ -248,7 +248,7 @@ func TestDelegatedGmailDraftLifecycleThroughHTTP(t *testing.T) {
 	run := func(secret string, args []string) (int, []api.CLIRunEvent) {
 		body, err := json.Marshal(map[string]any{"args": args})
 		require.NoError(err)
-		req, err := http.NewRequest(http.MethodPost, server.URL+"/api/v1/cli/run", bytes.NewReader(body))
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, server.URL+"/api/v1/cli/run", bytes.NewReader(body))
 		require.NoError(err)
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("X-Msgvault-Agent-Token", secret)
@@ -386,7 +386,7 @@ func TestDelegatedGmailDraftGetThroughAgentCLI(t *testing.T) {
 	owner, err := daemonclient.New(daemonclient.Config{URL: server.URL, APIKey: "owner-test-key", AllowInsecure: true})
 	require.NoError(err)
 	t.Cleanup(func() { _ = owner.Close() })
-	grant, err := owner.IssueAgentToken(t.Context(), "test agent", []string{"draft.create"}, []int64{fixture.source.ID}, nil)
+	grant, err := owner.IssueAgentToken(t.Context(), "test agent", []string{"draft.create"}, []int64{fixture.source.ID}, nil, time.Time{})
 	require.NoError(err)
 	tokenFile := filepath.Join(t.TempDir(), "agent.token")
 	require.NoError(os.WriteFile(tokenFile, []byte(grant.Secret+"\n"), 0o600))
@@ -538,7 +538,7 @@ func TestOpenAgentDelegatedStore(t *testing.T) {
 	})
 	require.NoError(err)
 	t.Cleanup(func() { _ = owner.Close() })
-	grant, err := owner.IssueAgentToken(t.Context(), "test agent", []string{"draft.create"}, []int64{source.ID}, nil)
+	grant, err := owner.IssueAgentToken(t.Context(), "test agent", []string{"draft.create"}, []int64{source.ID}, nil, time.Time{})
 	require.NoError(err)
 
 	// Write the token to a temp file.

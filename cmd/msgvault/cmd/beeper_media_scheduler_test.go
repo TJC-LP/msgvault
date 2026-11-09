@@ -26,6 +26,7 @@ import (
 	"go.kenn.io/msgvault/internal/attachmentpolicy"
 	"go.kenn.io/msgvault/internal/attachmentstore"
 	"go.kenn.io/msgvault/internal/config"
+	"go.kenn.io/msgvault/internal/docbankmedia"
 	"go.kenn.io/msgvault/internal/scheduler"
 	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/testutil/storetest"
@@ -38,7 +39,7 @@ const beeperMediaTestKeyEnv = "MSGVAULT_TEST_BEEPER_MEDIA_KEY"
 func storedBeeperVoiceNote(t *testing.T) (*store.Store, *attachmentstore.Store) {
 	t.Helper()
 	f := storetest.New(t)
-	_, err := f.Store.DB().Exec(f.Store.Rebind(
+	_, err := f.Store.DB().ExecContext(t.Context(), f.Store.Rebind(
 		`UPDATE sources SET source_type = 'beeper', identifier = ? WHERE id = ?`), "signal", f.Source.ID)
 	require.NoError(t, err)
 	messageID := f.CreateMessage("voice1")
@@ -140,7 +141,7 @@ func (s *retentionServer) requestCount() int {
 
 func retentionRows(t *testing.T, st *store.Store) map[string]string {
 	t.Helper()
-	rows, err := st.DB().Query(`SELECT destination_key, retention_state || ':' || error_code || ':' || source_id
+	rows, err := st.DB().QueryContext(t.Context(), `SELECT destination_key, retention_state || ':' || error_code || ':' || source_id
 		FROM beeper_media_occurrences`)
 	require.NoError(t, err)
 	defer func() { require.NoError(t, rows.Close()) }()
@@ -167,23 +168,23 @@ func TestBeeperMediaConfig(t *testing.T) {
 	server, httpServer := newRetentionServer(t)
 	archiveUID, err := st.ArchiveUIDContext(t.Context())
 	require.NoError(err)
-	destination := beeperMediaDestinationKey(httpServer.URL, archiveUID)
+	destination := docbankmedia.DestinationKey(httpServer.URL, archiveUID)
 	sched := scheduler.New(nil)
 	defer func() { <-sched.Stop().Done() }()
 
 	// Absent configuration registers nothing.
-	require.NoError(configureBeeperMediaJob(t.Context(), sched, nil, st, blobs, t.TempDir(), config.DocbankIntegrationConfig{}, nil))
+	require.NoError(configureBeeperMediaJob(t.Context(), sched, nil, st, blobs, t.TempDir(), t.TempDir(), config.DocbankIntegrationConfig{}, nil))
 	assert.False(sched.IsJobScheduled(beeperMediaSubmitJob))
 	assert.False(consumerRegistered(t, st))
 
 	// Remote plaintext is refused before any job exists.
-	require.Error(configureBeeperMediaJob(t.Context(), sched, nil, st, blobs, t.TempDir(), config.DocbankIntegrationConfig{
+	require.Error(configureBeeperMediaJob(t.Context(), sched, nil, st, blobs, t.TempDir(), t.TempDir(), config.DocbankIntegrationConfig{
 		Enabled: true, URL: "http://docbank.example.com", APIKeyEnv: beeperMediaTestKeyEnv, AllSourcesUploadConsent: true}, nil))
 	assert.False(sched.IsJobScheduled(beeperMediaSubmitJob))
 
 	// Without upload consent the job records local discovery only.
 	t.Setenv(beeperMediaTestKeyEnv, "synthetic-key")
-	require.NoError(configureBeeperMediaJob(t.Context(), sched, nil, st, blobs, t.TempDir(), config.DocbankIntegrationConfig{
+	require.NoError(configureBeeperMediaJob(t.Context(), sched, nil, st, blobs, t.TempDir(), t.TempDir(), config.DocbankIntegrationConfig{
 		Enabled: true, URL: httpServer.URL, APIKeyEnv: beeperMediaTestKeyEnv}, nil))
 	require.NoError(sched.TriggerJob(beeperMediaSubmitJob))
 	assert.Equal(map[string]string{destination: "pending::"}, retentionRows(t, st))
@@ -192,12 +193,12 @@ func TestBeeperMediaConfig(t *testing.T) {
 
 	// A missing credential blocks the operation without scheduling a retry.
 	t.Setenv(beeperMediaTestKeyEnv, "")
-	require.NoError(configureBeeperMediaJob(t.Context(), sched, nil, st, blobs, t.TempDir(), config.DocbankIntegrationConfig{
+	require.NoError(configureBeeperMediaJob(t.Context(), sched, nil, st, blobs, t.TempDir(), t.TempDir(), config.DocbankIntegrationConfig{
 		Enabled: true, URL: httpServer.URL, APIKeyEnv: beeperMediaTestKeyEnv, AllSourcesUploadConsent: true}, nil))
 	require.NoError(sched.TriggerJob(beeperMediaSubmitJob))
 	var state, code, operationID string
 	var scheduled bool
-	require.NoError(st.DB().QueryRow(st.Rebind(`
+	require.NoError(st.DB().QueryRowContext(t.Context(), st.Rebind(`
 		SELECT retention_state, error_code, retention_operation_id, next_action_at IS NOT NULL
 		FROM beeper_media_occurrences WHERE destination_key = ?`), destination).
 		Scan(&state, &code, &operationID, &scheduled))
@@ -209,9 +210,9 @@ func TestBeeperMediaConfig(t *testing.T) {
 
 	// Startup reconsideration reopens the same operation. A failing peer still retries.
 	t.Setenv(beeperMediaTestKeyEnv, "synthetic-key")
-	require.NoError(configureBeeperMediaJob(t.Context(), sched, nil, st, blobs, t.TempDir(), config.DocbankIntegrationConfig{
+	require.NoError(configureBeeperMediaJob(t.Context(), sched, nil, st, blobs, t.TempDir(), t.TempDir(), config.DocbankIntegrationConfig{
 		Enabled: true, URL: httpServer.URL, APIKeyEnv: beeperMediaTestKeyEnv, AllSourcesUploadConsent: true}, nil))
-	require.NoError(st.DB().QueryRow(st.Rebind(`
+	require.NoError(st.DB().QueryRowContext(t.Context(), st.Rebind(`
 		SELECT retention_state, error_code, retention_operation_id, next_action_at IS NOT NULL
 		FROM beeper_media_occurrences WHERE destination_key = ?`), destination).
 		Scan(&state, &code, &operationID, &scheduled))
@@ -221,19 +222,19 @@ func TestBeeperMediaConfig(t *testing.T) {
 	assert.True(scheduled)
 
 	server.failStatus.Store(http.StatusServiceUnavailable)
-	_, err = st.DB().Exec(`UPDATE beeper_media_occurrences SET next_action_at = '2000-01-01 00:00:00.000'`)
+	_, err = st.DB().ExecContext(t.Context(), `UPDATE beeper_media_occurrences SET next_action_at = '2000-01-01 00:00:00.000'`)
 	require.NoError(err)
 	require.NoError(sched.TriggerJob(beeperMediaSubmitJob))
 	assert.Equal(map[string]string{destination: "pending:server_error:"}, retentionRows(t, st))
 	var retryScheduled bool
-	require.NoError(st.DB().QueryRow(st.Rebind(`
+	require.NoError(st.DB().QueryRowContext(t.Context(), st.Rebind(`
 		SELECT next_action_at IS NOT NULL FROM beeper_media_occurrences WHERE destination_key = ?`), destination).
 		Scan(&retryScheduled))
 	assert.True(retryScheduled)
 	assert.Equal(1, server.requestCount())
 
 	// Disabling removes the job and its journal consumer but keeps receipts.
-	require.NoError(configureBeeperMediaJob(t.Context(), sched, nil, st, blobs, t.TempDir(), config.DocbankIntegrationConfig{}, nil))
+	require.NoError(configureBeeperMediaJob(t.Context(), sched, nil, st, blobs, t.TempDir(), t.TempDir(), config.DocbankIntegrationConfig{}, nil))
 	assert.False(sched.IsJobScheduled(beeperMediaSubmitJob))
 	assert.False(consumerRegistered(t, st))
 	assert.Len(retentionRows(t, st), 1)
@@ -251,7 +252,7 @@ func TestBeeperMediaInvalidConfigUnregisters(t *testing.T) {
 	defer func() { <-sched.Stop().Done() }()
 	cfg := config.DocbankIntegrationConfig{Enabled: true, URL: httpServer.URL,
 		APIKeyEnv: beeperMediaTestKeyEnv, AllSourcesUploadConsent: true}
-	require.NoError(configureBeeperMediaJob(t.Context(), sched, nil, st, blobs, t.TempDir(), cfg, nil))
+	require.NoError(configureBeeperMediaJob(t.Context(), sched, nil, st, blobs, t.TempDir(), t.TempDir(), cfg, nil))
 	require.NoError(sched.TriggerJob(beeperMediaSubmitJob))
 	require.True(consumerRegistered(t, st))
 	require.Len(retentionRows(t, st), 1)
@@ -259,13 +260,13 @@ func TestBeeperMediaInvalidConfigUnregisters(t *testing.T) {
 	// An invalid endpoint removes the job and consumer but keeps receipts.
 	invalid := cfg
 	invalid.URL = "http://docbank.example.com"
-	require.Error(configureBeeperMediaJob(t.Context(), sched, nil, st, blobs, t.TempDir(), invalid, nil))
+	require.Error(configureBeeperMediaJob(t.Context(), sched, nil, st, blobs, t.TempDir(), t.TempDir(), invalid, nil))
 	assert.False(sched.IsJobScheduled(beeperMediaSubmitJob))
 	assert.False(consumerRegistered(t, st))
 	assert.Len(retentionRows(t, st), 1)
 
 	// A valid restart registers the consumer again.
-	require.NoError(configureBeeperMediaJob(t.Context(), sched, nil, st, blobs, t.TempDir(), cfg, nil))
+	require.NoError(configureBeeperMediaJob(t.Context(), sched, nil, st, blobs, t.TempDir(), t.TempDir(), cfg, nil))
 	require.NoError(sched.TriggerJob(beeperMediaSubmitJob))
 	assert.True(consumerRegistered(t, st))
 }
@@ -281,10 +282,10 @@ func TestBeeperMediaScheduledRoute(t *testing.T) {
 	defer func() { <-sched.Stop().Done() }()
 	cfg := config.DocbankIntegrationConfig{Enabled: true, URL: httpServer.URL,
 		APIKeyEnv: beeperMediaTestKeyEnv, AllSourcesUploadConsent: true}
-	require.NoError(configureBeeperMediaJob(t.Context(), sched, nil, st, blobs, t.TempDir(), cfg, nil))
+	require.NoError(configureBeeperMediaJob(t.Context(), sched, nil, st, blobs, t.TempDir(), t.TempDir(), cfg, nil))
 	archiveUID, err := st.ArchiveUIDContext(t.Context())
 	require.NoError(err)
-	destination := beeperMediaDestinationKey(httpServer.URL, archiveUID)
+	destination := docbankmedia.DestinationKey(httpServer.URL, archiveUID)
 
 	// A waiting operation interrupts the upload; the saved request survives.
 	server.hang.Store(true)
@@ -326,8 +327,8 @@ func TestBeeperMediaScheduledRoute(t *testing.T) {
 	// A new destination starts its own delivery scope.
 	otherServer, otherHTTP := newRetentionServer(t)
 	cfg.URL = otherHTTP.URL
-	require.NoError(configureBeeperMediaJob(t.Context(), sched, nil, st, blobs, t.TempDir(), cfg, nil))
-	otherDestination := beeperMediaDestinationKey(otherHTTP.URL, archiveUID)
+	require.NoError(configureBeeperMediaJob(t.Context(), sched, nil, st, blobs, t.TempDir(), t.TempDir(), cfg, nil))
+	otherDestination := docbankmedia.DestinationKey(otherHTTP.URL, archiveUID)
 	otherServer.hang.Store(true)
 	stopped := make(chan error, 1)
 	go func() { stopped <- sched.TriggerJob(beeperMediaSubmitJob) }()
@@ -348,12 +349,12 @@ func TestStoredMediaSchedulerUsesOtherSourceProfile(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
 	st, blobs := storedBeeperVoiceNote(t)
-	_, err := st.DB().Exec(`UPDATE attachments SET attachment_role = 'preview'
+	_, err := st.DB().ExecContext(t.Context(), `UPDATE attachments SET attachment_role = 'preview'
 		WHERE message_id = (SELECT id FROM messages WHERE source_message_id = 'voice1')`)
 	require.NoError(err)
 	source, err := st.GetOrCreateSource("gmail", "rod@example.com")
 	require.NoError(err)
-	conversation, err := st.EnsureConversation(source.ID, "mail-thread-1", "Mail")
+	conversation, err := st.EnsureConversation(t.Context(), source.ID, "mail-thread-1", "Mail")
 	require.NoError(err)
 	messageID, err := st.UpsertMessage(&store.Message{
 		ConversationID: conversation, SourceID: source.ID, SourceMessageID: "mail-audio-1",
@@ -374,13 +375,13 @@ func TestStoredMediaSchedulerUsesOtherSourceProfile(t *testing.T) {
 	sched := scheduler.New(nil)
 	cfg := config.DocbankIntegrationConfig{Enabled: true, URL: httpServer.URL,
 		APIKeyEnv: beeperMediaTestKeyEnv, AllSourcesUploadConsent: true, ASRProfile: "asr"}
-	require.NoError(configureBeeperMediaJob(t.Context(), sched, nil, st, blobs, t.TempDir(), cfg, nil))
+	require.NoError(configureBeeperMediaJob(t.Context(), sched, nil, st, blobs, t.TempDir(), t.TempDir(), cfg, nil))
 	require.NoError(sched.TriggerJob(beeperMediaSubmitJob))
 	archiveUID, err := st.ArchiveUIDContext(t.Context())
 	require.NoError(err)
-	destination := beeperMediaDestinationKey(httpServer.URL, archiveUID)
+	destination := docbankmedia.DestinationKey(httpServer.URL, archiveUID)
 	var provider, profile string
-	require.NoError(st.DB().QueryRow(st.Rebind(`SELECT provider, profile FROM beeper_media_deliveries
+	require.NoError(st.DB().QueryRowContext(t.Context(), st.Rebind(`SELECT provider, profile FROM beeper_media_deliveries
 		WHERE destination_key = ?`), destination).Scan(&provider, &profile))
 	assert.Equal("gmail", provider)
 	assert.Equal("asr", profile)
@@ -391,7 +392,7 @@ func TestStoredMediaRequiresAllSourcesConsent(t *testing.T) {
 		t.Run(provider, func(t *testing.T) {
 			require, assert := require.New(t), assert.New(t)
 			st, blobs := storedBeeperVoiceNote(t)
-			_, err := st.DB().Exec(st.Rebind(`UPDATE sources SET source_type = ?`), provider)
+			_, err := st.DB().ExecContext(t.Context(), st.Rebind(`UPDATE sources SET source_type = ?`), provider)
 			require.NoError(err)
 			t.Setenv("MSGVAULT_HOME", t.TempDir())
 			t.Setenv(beeperMediaTestKeyEnv, "synthetic-key")
@@ -408,7 +409,7 @@ upload_consent = true
 			require.NoError(os.WriteFile(path, []byte(content), 0o600))
 			cfg, err := config.Load(path, "")
 			require.NoError(err)
-			require.NoError(configureBeeperMediaJob(t.Context(), sched, nil, st, blobs, t.TempDir(), cfg.Integrations.Docbank, nil))
+			require.NoError(configureBeeperMediaJob(t.Context(), sched, nil, st, blobs, t.TempDir(), t.TempDir(), cfg.Integrations.Docbank, nil))
 			require.NoError(sched.TriggerJob(beeperMediaSubmitJob))
 			assert.Zero(server.requestCount(), "existing consent must keep all audio local")
 
@@ -416,12 +417,12 @@ upload_consent = true
 			require.NoError(os.WriteFile(path, []byte(content), 0o600))
 			cfg, err = config.Load(path, "")
 			require.NoError(err)
-			require.NoError(configureBeeperMediaJob(t.Context(), sched, nil, st, blobs, t.TempDir(), cfg.Integrations.Docbank, nil))
+			require.NoError(configureBeeperMediaJob(t.Context(), sched, nil, st, blobs, t.TempDir(), t.TempDir(), cfg.Integrations.Docbank, nil))
 			require.NoError(sched.TriggerJob(beeperMediaSubmitJob))
 			assert.Equal(1, server.requestCount(), "new consent must allow the stored audio upload")
 			archiveUID, err := st.ArchiveUIDContext(t.Context())
 			require.NoError(err)
-			assert.Equal(map[string]string{beeperMediaDestinationKey(httpServer.URL, archiveUID): "retained::source"}, retentionRows(t, st))
+			assert.Equal(map[string]string{docbankmedia.DestinationKey(httpServer.URL, archiveUID): "retained::source"}, retentionRows(t, st))
 		})
 	}
 }
@@ -440,15 +441,15 @@ func TestBeeperMediaGatedStoreWrites(t *testing.T) {
 	server, httpServer := newRetentionServer(t)
 	gate := api.NewSerialOperationGate()
 	logger := slog.New(slog.DiscardHandler)
-	sched, media := newServeSchedulers(nil, logger, nil, gate)
+	sched, media := newServeSchedulers(nil, logger, nil, gate, nil)
 	require.NoError(sched.AddJob(scheduler.Job{Name: "test-gated-job", Schedule: "0 0 1 1 *",
 		Run: func(context.Context) error { return nil }}))
 	cfg := config.DocbankIntegrationConfig{Enabled: true, URL: httpServer.URL,
 		APIKeyEnv: beeperMediaTestKeyEnv, AllSourcesUploadConsent: true}
-	require.NoError(configureBeeperMediaJob(t.Context(), media, gate, st, blobs, t.TempDir(), cfg, logger))
+	require.NoError(configureBeeperMediaJob(t.Context(), media, gate, st, blobs, t.TempDir(), t.TempDir(), cfg, logger))
 	archiveUID, err := st.ArchiveUIDContext(t.Context())
 	require.NoError(err)
-	destination := beeperMediaDestinationKey(httpServer.URL, archiveUID)
+	destination := docbankmedia.DestinationKey(httpServer.URL, archiveUID)
 	waitCtx, cancel := context.WithTimeout(t.Context(), time.Minute)
 	defer cancel()
 
@@ -494,13 +495,13 @@ func TestBeeperMediaGatedStoreWrites(t *testing.T) {
 	// Daemon shutdown cancels an upload in flight and drains both schedulers.
 	otherServer, otherHTTP := newRetentionServer(t)
 	cfg.URL = otherHTTP.URL
-	require.NoError(configureBeeperMediaJob(t.Context(), media, gate, st, blobs, t.TempDir(), cfg, logger))
+	require.NoError(configureBeeperMediaJob(t.Context(), media, gate, st, blobs, t.TempDir(), t.TempDir(), cfg, logger))
 	otherServer.hang.Store(true)
 	stopped := make(chan error, 1)
 	go func() { stopped <- media.TriggerJob(beeperMediaSubmitJob) }()
 	<-otherServer.arrived
 	require.NoError(shutdownServeRuntime(waitCtx, io.Discard, nil, serveSchedulers{sched, media}, gate))
-	shutdownWait, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	shutdownWait, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 	select {
 	case err := <-stopped:
@@ -509,7 +510,7 @@ func TestBeeperMediaGatedStoreWrites(t *testing.T) {
 		require.FailNow("shutdown returned before the upload stopped")
 	}
 	assert.Equal(map[string]string{
-		destination: "retained::source", beeperMediaDestinationKey(otherHTTP.URL, archiveUID): "pending::",
+		destination: "retained::source", docbankmedia.DestinationKey(otherHTTP.URL, archiveUID): "pending::",
 	}, retentionRows(t, st))
 	assert.True(gate.Draining())
 	require.Error(media.TriggerJob(beeperMediaSubmitJob))
@@ -526,11 +527,11 @@ func TestBeeperMediaJobStatus(t *testing.T) {
 	_, httpServer := newRetentionServer(t)
 	gate := api.NewSerialOperationGate()
 	logger := slog.New(slog.DiscardHandler)
-	sched, media := newServeSchedulers(nil, logger, nil, gate)
+	sched, media := newServeSchedulers(nil, logger, nil, gate, nil)
 	defer func() { <-serveSchedulers{sched, media}.Stop().Done() }()
 	require.NoError(sched.AddJob(scheduler.Job{Name: "test-gated-job", Schedule: "0 0 1 1 *",
 		Run: func(context.Context) error { return nil }}))
-	require.NoError(configureBeeperMediaJob(t.Context(), media, gate, st, blobs, t.TempDir(), config.DocbankIntegrationConfig{
+	require.NoError(configureBeeperMediaJob(t.Context(), media, gate, st, blobs, t.TempDir(), t.TempDir(), config.DocbankIntegrationConfig{
 		Enabled: true, URL: httpServer.URL, APIKeyEnv: beeperMediaTestKeyEnv}, logger))
 	var adapter api.SyncScheduler = &schedulerAdapter{scheduler: sched, media: media}
 
@@ -548,27 +549,34 @@ func TestBeeperMediaJobStatus(t *testing.T) {
 	assert.Empty(jobs[beeperMediaSubmitJob].LastError)
 	archiveUID, err := st.ArchiveUIDContext(t.Context())
 	require.NoError(err)
-	assert.Equal(map[string]string{beeperMediaDestinationKey(httpServer.URL, archiveUID): "pending::"},
+	assert.Equal(map[string]string{docbankmedia.DestinationKey(httpServer.URL, archiveUID): "pending::"},
 		retentionRows(t, st))
 }
 
 func TestBeeperMediaDoesNotPreventIdleShutdown(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		st, blobs := storedBeeperVoiceNote(t)
 		idleShutdown := make(chan struct{})
 		idle := api.NewIdleTracker(3*time.Minute, func() { close(idleShutdown) })
 		logger := slog.New(slog.DiscardHandler)
 		gate := api.NewSerialOperationGate()
-		sched, media := newServeSchedulers(nil, logger, idle, gate)
+		sched, media := newServeSchedulers(nil, logger, idle, gate, nil)
 		defer func() { <-serveSchedulers{sched, media}.Stop().Done() }()
-		require.NoError(t, configureBeeperMediaJob(t.Context(), media, gate, st, blobs, t.TempDir(),
-			config.DocbankIntegrationConfig{Enabled: true, URL: "http://127.0.0.1"}, logger))
+		// Exercise scheduler activity without bringing PostgreSQL's shared pool
+		// and background readers into the synctest bubble.
+		var passes atomic.Int32
+		require.NoError(t, media.AddJob(scheduler.Job{
+			Name: beeperMediaSubmitJob, Schedule: beeperMediaSubmitCron,
+			Run: func(context.Context) error {
+				passes.Add(1)
+				return nil
+			},
+		}))
 		go idle.Run(t.Context())
 		media.Start()
 
-		// Repeated discovery passes must leave an unused daemon free to stop.
+		// Repeated media passes must leave an unused daemon free to stop.
 		synctest.Sleep(3*time.Minute + time.Second)
-		require.Len(t, retentionRows(t, st), 1, "scheduled discovery must have run")
+		require.GreaterOrEqual(t, passes.Load(), int32(2), "scheduled media passes must have run repeatedly")
 		select {
 		case <-idleShutdown:
 		default:
@@ -593,4 +601,37 @@ func testWAV() []byte {
 	copy(data[36:40], "data")
 	binary.LittleEndian.PutUint32(data[40:44], uint32(len(audio)))
 	return data
+}
+
+func TestNewMessageRecordingReader(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	st := storetest.New(t).Store
+
+	reader, err := newMessageRecordingReader(t.Context(), st, config.DocbankIntegrationConfig{URL: "https://docbank.example.com"})
+	require.NoError(err)
+	require.NotNil(reader)
+	assert.Same(st, reader.Store)
+	assert.Nil(reader.Client)
+
+	reader, err = newMessageRecordingReader(t.Context(), st, config.DocbankIntegrationConfig{Enabled: true, URL: "ftp://x"})
+	require.Error(err)
+	require.NotNil(reader)
+	assert.Nil(reader.Client)
+	assert.False(reader.UploadConsent)
+
+	archiveUID, err := st.ArchiveUIDContext(t.Context())
+	require.NoError(err)
+	for _, consent := range []bool{false, true} {
+		reader, err = newMessageRecordingReader(t.Context(), st, config.DocbankIntegrationConfig{
+			Enabled: true, URL: "https://docbank.example.com/", APIKeyEnv: beeperMediaTestKeyEnv,
+			AllSourcesUploadConsent: consent,
+		})
+		require.NoError(err)
+		require.NotNil(reader)
+		assert.Equal(docbankmedia.DestinationKey("https://docbank.example.com", archiveUID), reader.Destination)
+		assert.Equal(consent, reader.UploadConsent)
+		assert.NotNil(reader.Client)
+		assert.Same(st, reader.Store)
+	}
 }

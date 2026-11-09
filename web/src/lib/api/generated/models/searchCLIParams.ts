@@ -4,7 +4,11 @@
 
 export type SearchCLIParams = {
   /**
-   * Search query
+   * Include attachment names and bounded FTS match context
+   */
+  include_snippet?: boolean;
+  /**
+   * Search query; full text accepts standalone pipe-separated OR alternatives
    */
   q: string;
   /**

@@ -125,7 +125,7 @@ func gatedMeetingProjectionStore(t *testing.T, base *Store, gate *meetingProject
 	return st
 }
 
-func TestMeetingProjectionUpgradeCancellationResumesCommittedRows(t *testing.T) {
+func TestMeetingProjectionUpgradeCancellationResumesCommittedPages(t *testing.T) {
 	assertions := assert.New(t)
 	requirements := require.New(t)
 	base := newRFC822IDBackfillBackendStore(t)
@@ -139,7 +139,7 @@ func TestMeetingProjectionUpgradeCancellationResumesCommittedRows(t *testing.T) 
 	gate := &meetingProjectionGate{committed: func(projected bool) {
 		if projected {
 			committed++
-			if committed == 3 {
+			if committed == 1 {
 				cancel()
 			}
 		}
@@ -148,7 +148,7 @@ func TestMeetingProjectionUpgradeCancellationResumesCommittedRows(t *testing.T) 
 	requirements.ErrorIs(st.InitSchemaContext(ctx), context.Canceled)
 	var count int
 	requirements.NoError(base.db.QueryRow(`SELECT COUNT(*) FROM meeting_details`).Scan(&count))
-	assertions.Equal(3, count, "commits before cancellation survive")
+	assertions.Equal(100, count, "the committed page survives cancellation")
 	applied, err := base.IsMigrationAppliedContext(t.Context(), projectionMigrationName, 1)
 	requirements.NoError(err)
 	assertions.False(applied)
@@ -220,6 +220,14 @@ func TestMeetingProjectionPublicRawWritesLockMessageBeforeRaw(t *testing.T) {
 			statement := make(chan string, 1)
 			var once sync.Once
 			gate := &meetingProjectionGate{before: func(_ context.Context, query string, _ []driver.NamedValue) error {
+				// A MIME write first opens the account-attribution entry: the
+				// pre-transaction source read, the identity share and, on
+				// PostgreSQL, the source row lock all precede the message lock.
+				if strings.Contains(query, "SELECT source_id FROM messages WHERE id") ||
+					strings.Contains(query, "FROM archive_metadata") ||
+					(base.IsPostgreSQL() && strings.Contains(query, "UPDATE sources SET updated_at")) {
+					return nil
+				}
 				once.Do(func() { statement <- query })
 				return nil
 			}}
@@ -243,6 +251,9 @@ func TestMeetingProjectionPublicRawWritesLockMessageBeforeRaw(t *testing.T) {
 				if base.IsPostgreSQL() {
 					assertions.Contains(first, "FROM messages WHERE id =")
 					assertions.Contains(first, "FOR UPDATE")
+				} else if mime {
+					// The source row lock reserves SQLite's writer first.
+					assertions.Contains(first, "UPDATE sources SET updated_at")
 				} else {
 					assertions.Contains(first, "UPDATE embedding_change_clock")
 				}

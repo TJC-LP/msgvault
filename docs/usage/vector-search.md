@@ -1,5 +1,5 @@
 ---
-last_edited: "2026-09-25"
+last_edited: "2026-10-08"
 title: Vector Search
 description: Find messages by meaning and set up separate people, visual, and document search indexes.
 ---
@@ -26,6 +26,12 @@ by a third party, message text and semantic query text are sent there;
 use a local or self-hosted endpoint when you need the workflow to stay
 on your own machine or network.
 
+Use `msgvault embeddings status --watch` to see message coverage and diagnose
+slow embedding work. Its recent batch timings separate provider calls and retry
+waits from database writes. See [embedding status](../cli-reference.md#embeddings-status)
+for rate, ETA, and source-filter semantics. The same snapshot is available at
+`GET /api/v1/embeddings/status` and through MCP `get_embeddings_status`.
+
 Choose the index for the thing you want to find:
 
 | Content | Search command | Setup |
@@ -40,11 +46,26 @@ text. Those indexes have separate builds and consent. For a guided setup using
 the provider keys you have, start with
 [Recommended Configuration](/docs/usage/recommended-configuration/).
 
+## Turn on search by meaning
+
+In the Web UI, open Settings, then Overview, and click **Turn on** beside
+**Search by meaning**. MsgVault downloads the shared local server if needed,
+builds the message index, and enables semantic search in the running daemon.
+The row shows download and indexing progress. You can close the page while it
+runs and keep using keyword search.
+
+If Ollama already serves `nomic-embed-text`, Turn on uses it. An existing
+Ollama configuration stays on Ollama.
+When the browser uses a remote address, the download line names the daemon host.
+The **Turn on** hint below full-text search results opens Settings.
+
 ## Prerequisites
 
-1. **A running embedding endpoint.** msgvault does
-   not host a model. Point it at a local, self-hosted, or hosted
-   endpoint that you trust. Common local options include [Ollama](https://ollama.com),
+1. **An embedding provider.** Run `msgvault setup providers --local-embeddings`
+   to install and start the shared local server after confirming any missing
+   downloads. This works without a running endpoint. You can also point msgvault
+   at a running local, self-hosted, or hosted endpoint that you trust.
+   Common local options include [Ollama](https://ollama.com),
    [llama.cpp's `server`](https://github.com/ggerganov/llama.cpp/tree/master/examples/server),
    and [LM Studio](https://lmstudio.ai). On an Apple Silicon Mac,
    [`afm`](https://github.com/scouzi1966/maclocal-api) is another option
@@ -103,7 +124,13 @@ go build -tags "fts5 sqlite_vec" -o msgvault.exe ./cmd/msgvault
 
 ## Enable
 
-Use `msgvault setup providers` to select defaults, or add a `[vector]` block
+Use `msgvault setup providers` to select defaults. Without a hosted key, setup uses Ollama with `nomic-embed-text` or offers the shared local server. It asks once before downloading missing model and runtime files.
+
+Run `msgvault setup providers --local-embeddings` to switch to the shared local server while Ollama is running. Switching an Ollama-built Nomic message index with the same recipe keeps its generation; the next build embeds only new messages. Switching from another model requires `msgvault embeddings build --full-rebuild --yes`. This CLI switch changes document-vector and semantic-person consent identities once, so renew those consents. Later local server port changes preserve the local generation and consent identities. Configured providers remain tied to their endpoints.
+
+The CLI switch also changes the separate document-vector generation: renew its consents, restart the daemon, and build the matching generation to restore document semantic search.
+
+For manual configuration, add a `[vector]` block
 to `~/.msgvault/config.toml`.
 
 Guided Ollama setup uses a conservative `max_input_chars = 2000`, leaving
@@ -232,6 +259,67 @@ reduce the `max_input_chars` content budget. Changing either prefix marks
 the existing vector generation stale so prefixed queries cannot be mixed
 with an index built from unprefixed documents.
 
+### Optional EmbeddingGemma 2 text endpoint
+
+EmbeddingGemma 2 can use the existing OpenAI-compatible text path with
+768-dimensional output and literal retrieval prefixes. Msgvault does not load
+or serve the model. First configure a trusted endpoint to accept the fully
+formatted text below, with automatic prompt insertion disabled.
+
+```toml
+[vector]
+enabled = true
+backend = "sqlite-vec"
+
+[vector.embeddings]
+api_format = "openai"
+endpoint = "http://127.0.0.1:8080/v1"
+# Example serving alias; the operator must bind it to this revision and recipe.
+model = "embeddinggemma-2-914f7f89142e33e77833254d9c9b90c3cef7303b-text-fp32-768-v1"
+dimension = 768
+document_prefix = "title: none | text: "
+query_prefix = "task: search result | query: "
+batch_size = 4
+timeout = "120s"
+max_input_chars = 6000
+```
+
+Preserve the trailing spaces inside both prefix strings. Msgvault adds each
+prefix once, after preparing the content. `title: none` is a literal fallback;
+it does not interpolate the message subject into the prompt.
+Batch size 4 and a 120-second timeout are initial settings for local CPU
+serving, not a tested performance guarantee. They do not change the defaults.
+
+The endpoint operator must bind that example alias to
+[`google/embeddinggemma-2` revision
+`914f7f89142e33e77833254d9c9b90c3cef7303b`](https://huggingface.co/google/embeddinggemma-2/tree/914f7f89142e33e77833254d9c9b90c3cef7303b)
+and a fixed tokenizer, pooling, precision and output recipe. An alias is an
+operator convention; msgvault does not verify the loaded checkpoint through
+HTTP. Give a changed serving recipe a new alias. Changing `model`, `dimension`
+or either prefix separates message generations and requires a full rebuild.
+Extracted document vectors have their own generation and consent policy;
+those settings change that identity too. Follow the separate
+[document setup](document-indexing.md#semantic-and-hybrid-document-search).
+
+The [model card](https://ai.google.dev/gemma/docs/embeddinggemma/model_card_2)
+specifies mean pooling including prompts, L2-normalized output, and
+`bfloat16` or `float32` activations rather than `float16`. Require the server
+to enforce the shared **8192-token input limit including formatting**.
+`max_input_chars = 6000` is a conservative starting point, not a token count
+or admission check. Check the server's tokenizer and oversized-input policy
+before embedding an archive.
+
+Msgvault rejects wrong-width, nonfinite and zero-norm vectors. It preserves
+valid provider values, so the server must return unit-length vectors for this
+recipe. `dimension` checks response width; msgvault neither sends an OpenAI
+`dimensions` request nor slices vectors. Reduced 512/256/128-dimensional
+output needs an explicitly configured serving recipe that truncates and
+L2-normalizes again, with a separate alias and matching query/document width.
+The example above covers native 768 only.
+
+Msgvault has not been tested against a live EmbeddingGemma 2 server. This
+setup covers text only; it adds no image, video or audio transport.
+
 ### Matching `max_input_chars` to your embedder's context window
 
 `max_input_chars` is an upper bound in characters per embedding
@@ -293,10 +381,11 @@ representative content before starting a full rebuild.
     `num_ctx` does not help. Check both with `ollama show <model>`
     before raising `max_input_chars`.
 
-If `msgvault embeddings build` logs `HTTP 400`, msgvault includes the
-response body from the embedder when available. Check both the CLI log
-and the embedder's own logs. A body such as `the input length exceeds
-the context length` confirms you need to lower `max_input_chars`.
+If `msgvault embeddings build` reports `HTTP 400`, check the embedder's own
+logs for the reason. The OpenAI-compatible client reports the HTTP status
+without echoing the provider's response body. A server log such as
+`the input length exceeds the context length` confirms you need to lower
+`max_input_chars`.
 Do not rely on this error to detect oversized inputs through Ollama's
 OpenAI-compatible endpoint; see the warning above.
 
@@ -350,8 +439,12 @@ msgvault embeddings optimize
 The optimizer reads stored vectors only. It does not call the embedding
 provider. Copy progress is committed in batches, native training runs in a
 disposable child process, and publication happens only after integrity checks.
-The daemon pauses scheduled embedding and other gated writes for the whole
-operation; searches remain available. If the command is interrupted, run it
+The daemon lets imports and other archive writes run between committed copy
+batches, then resumes preparation. If stored vectors changed during the pause,
+it restarts the copy against the new revision. Native training and publication
+remain exclusive and pause other archive writes; searches remain available.
+Configure SQL tracing on the daemon rather than passing `--log-sql` or
+`--log-sql-slow-ms` to optimize. If the command is interrupted, run it
 again. Search stays exact until the accelerator is ready, then `sqlite_accelerator = "auto"` switches semantic and
 hybrid retrieval to bounded ANN candidates with exact reranking. New embedding
 writes update a ready accelerator in the same transaction.
@@ -429,9 +522,9 @@ trigger).
 |---|---|
 | Manual `sync-full` / `sync` (Gmail, IMAP) | No. Run `msgvault embeddings build` afterward |
 | Manual `sync-calendar` / `sync-teams` / `sync-discord` | No. Run `msgvault embeddings build` afterward |
-| Manual `sync-slack` / `sync-beeper` / `sync-granola` / `sync-plaud` / `sync-circleback` / `sync-notion-meetings` / `sync-muesli` | No. Run `msgvault embeddings build` afterward |
+| Manual `sync-slack` / `sync-beeper` / `sync-omi` / `sync-granola` / `sync-plaud` / `sync-circleback` / `sync-pocket` / `sync-notion-meetings` / `sync-muesli` / `sync-twilio` / `sync-twenty` / `sync-chatwoot` | No. Run `msgvault embeddings build` afterward |
 | Scheduled account syncs in `msgvault serve` (Gmail, IMAP, Teams, Discord) | Yes, when `[vector.embed.schedule].run_after_sync = true` |
-| Scheduled calendar, Slack, Beeper, Granola, Plaud, Circleback, Notion, and Muesli syncs in `msgvault serve` | No immediate post-sync run. Picked up by the embed worker's `[vector.embed.schedule].cron` schedule |
+| Scheduled calendar, Slack, Beeper, Omi, Granola, Plaud, Circleback, Pocket, Notion, Muesli, Twilio, Twenty, and Chatwoot syncs in `msgvault serve` | No immediate post-sync run. Picked up by the embed worker's `[vector.embed.schedule].cron` schedule |
 | Local email imports (`import-pst`, `import-emlx`, `import-eml`, `import-mbox`) | No. Run `msgvault embeddings build` afterward |
 | Local chat/text imports | No. Run `msgvault embeddings build` afterward |
 
@@ -524,6 +617,8 @@ If the active generation's fingerprint no longer matches the current embedding
 policy or configuration, including a policy change shipped in an upgrade, vector
 and hybrid search report `index_stale`; run
 `msgvault embeddings build --full-rebuild --yes` to build a matching generation.
+If the daemon started before you changed the settings, run
+`msgvault daemon restart` after the rebuild.
 See [Model Rotation](#model-rotation) for fingerprint inputs and search behavior
 while the rebuild runs.
 
@@ -682,7 +777,9 @@ fingerprint, so search refuses to serve potentially-mismatched
 results). On the CLI or HTTP API, use `mode=fts` until the new generation
 activates; it does not depend on the vector index. In MCP, omit `mode` for
 metadata search or use `search_message_bodies`. Once `msgvault embeddings
-build` reports the new generation activated, vector and hybrid modes resume.
+build` reports the new generation activated, run `msgvault daemon restart`
+if the daemon started before you changed the settings. Vector and hybrid modes
+then resume.
 
 ## Troubleshooting
 
@@ -696,7 +793,7 @@ body keywords.
 | Error | Meaning | Recovery |
 |---|---|---|
 | `vector_not_enabled` | The server or MCP process did not wire a vector backend, usually because `[vector] enabled = false`. | Set `enabled = true`, configure `[vector.embeddings]`, and start with a build that includes the needed backend (`sqlite_vec` or `pgvector`). |
-| `index_stale` | Active generation's fingerprint does not match the current embedding settings: model, dimension, task prefixes, preprocessing policy, `max_input_chars`, output policy, or scope. | For an existing account-scoped index built with CLI flags, set matching `[vector.embed.scope].accounts` and restart the daemon. Otherwise run `msgvault embeddings build --full-rebuild --yes`. |
+| `index_stale` | Fingerprint mismatch: model, dimension, task prefixes, preprocessing policy, `max_input_chars`, output policy, or scope. | If a rebuild activated settings changed since startup, run `msgvault daemon restart`. For a CLI account-scoped index, set matching `[vector.embed.scope].accounts` and restart. Otherwise run `msgvault embeddings build --full-rebuild --yes`. If the daemon can't finish checking restart versus rebuild, it says to retry in a moment and checks again a few seconds later. |
 | `index_building` | No active generation yet; one is being built. | Finish running `msgvault embeddings build`, wait for the scheduler, or use the appropriate non-vector fallback. |
 | `missing_free_text` | `mode=vector` or `mode=hybrid` used with a filter-only query (no free text to embed). | Add free-text terms to `q`, or use the appropriate non-vector fallback. |
 | `index_scope_mismatch` | The active vector generation was built for selected message types and the query is unscoped or asks for a type outside that scope. | Add a compatible `message_type` filter, use the appropriate non-vector fallback, or rebuild an unscoped generation. |
@@ -705,12 +802,16 @@ body keywords.
 | `invalid_mode` | The requested mode is not supported by that surface. | Use `fts`, `vector`, or `hybrid` on the CLI or HTTP; use `vector`, `hybrid`, or omitted `mode` in MCP. |
 | `embedding_timeout` | The embedding endpoint did not respond before the request deadline (transient: slow/cold model, network blip). | Retry; if persistent, raise `[vector.embeddings].timeout` or use a faster endpoint. |
 
-For non-429 HTTP 4xx errors, msgvault treats the response as
-permanent and includes up to the first few KiB of the response body in
-the error. If a batch contains both good and bad rows, the worker
+The OpenAI-compatible client retries HTTP 408 and 429; its other HTTP 4xx
+errors are permanent. The Voyage contextual client retries HTTP 429; its
+other HTTP 4xx errors are permanent.
+The OpenAI-compatible client reports the HTTP status and a classified
+reason; check the embedder's own logs for the response body. The Voyage
+contextual client includes up to the first few KiB of the response body
+in the error. If a batch contains both good and bad rows, the worker
 downshifts to smaller batches and then single-message requests so
 valid messages can still be embedded while the failing row is dropped
-or reported. If the body says `the input length exceeds the context
+or reported. If the server log or error body says `the input length exceeds the context
 length` (Ollama) or an equivalent token-limit error, lower
 `max_input_chars` to match the model's context window. See the sizing
 guidance above.
@@ -759,8 +860,10 @@ vector tied back to the same message.
 - Chunking at `max_input_chars` with overlap for long messages.
 
 Messages deleted at the source (`deleted_from_source_at IS NOT NULL`)
-are skipped entirely. Messages that become empty after preprocessing
-are marked complete and not sent to the embedding endpoint.
+are skipped entirely. Messages that are empty or contain only whitespace
+and invisible characters after preprocessing are marked complete and never
+sent to the embedding endpoint.
+Chunks containing only such characters are dropped.
 
 The [contextual API format](#contextual-chat-and-meeting-embeddings) uses
 conversation windows for Beeper and meeting-aware chunks for transcripts.
@@ -840,7 +943,7 @@ Original attachments remain in the archive.
 MCP clients use `search_visual_attachments` for visual queries,
 `search_document_attachments` for document text, and `search_person_files` for
 attachment metadata. The CLI `person files --lane all` combines those search
-paths for one person. The Web UI's [Operations workspace](/docs/web-ui/#operations) shows
+paths for one person. The Web UI's [Past runs](/docs/web-ui/#background-jobs-and-past-runs) shows
 visual coverage and the build or resume actions the daemon currently allows.
 
 ## See Also

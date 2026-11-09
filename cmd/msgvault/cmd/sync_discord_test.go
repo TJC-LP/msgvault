@@ -49,6 +49,105 @@ func TestSyncDiscordNoArgumentContinuesAfterFailureInSourceIDOrder(t *testing.T)
 	assert.Equal([]string{"/guilds/" + testDiscordGuildA, "/guilds/" + testDiscordGuildB}, guildRequests)
 }
 
+func TestSyncDiscordNoArgumentSkipsRetiredGuilds(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	st := newDiscordCLIStore(t)
+	tokensDir := t.TempDir()
+	require.NoError(discord.NewTokenManager(tokensDir).Save(discord.NewTokenRecord(testDiscordBotID, "archive-bot", testDiscordBotToken, "")))
+	retired, err := st.GetOrCreateSource("discord", testDiscordGuildA)
+	require.NoError(err)
+	active, err := st.GetOrCreateSource("discord", testDiscordGuildB)
+	require.NoError(err)
+	_, err = st.MergeSourcesContext(t.Context(), store.MergeSourcesRequest{
+		FromSourceID: retired.ID,
+		IntoSourceID: active.ID,
+	})
+	require.NoError(err)
+	historical, err := resolveDiscordSources(st, "")
+	require.NoError(err)
+	assert.Len(historical, 2, "history-oriented selection retains both source records")
+	api := newDiscordCLIServer(t)
+
+	cmd := newSyncDiscordLocalCmd(testDiscordCommandDeps(t, st, tokensDir, api.server.URL))
+	cmd.SetOut(&bytes.Buffer{})
+	cmd.SetErr(&bytes.Buffer{})
+	require.NoError(cmd.Execute())
+
+	var guildRequests []string
+	for _, request := range api.requestURIs() {
+		if request == "/guilds/"+testDiscordGuildA || request == "/guilds/"+testDiscordGuildB {
+			guildRequests = append(guildRequests, request)
+		}
+	}
+	assert.Equal([]string{"/guilds/" + testDiscordGuildB}, guildRequests)
+}
+
+func TestSyncDiscordExplicitRetiredGuildFailsBeforeCredentialLookup(t *testing.T) {
+	require := require.New(t)
+	st := newDiscordCLIStore(t)
+	retired, err := st.GetOrCreateSource("discord", testDiscordGuildA)
+	require.NoError(err)
+	active, err := st.GetOrCreateSource("discord", testDiscordGuildB)
+	require.NoError(err)
+	_, err = st.MergeSourcesContext(t.Context(), store.MergeSourcesRequest{
+		FromSourceID: retired.ID,
+		IntoSourceID: active.ID,
+	})
+	require.NoError(err)
+	api := newDiscordCLIServer(t)
+
+	cmd := newSyncDiscordLocalCmd(testDiscordCommandDeps(t, st, t.TempDir(), api.server.URL))
+	cmd.SetArgs([]string{testDiscordGuildA})
+	err = cmd.Execute()
+	require.ErrorIs(err, store.ErrSourceRetired)
+	require.NotContains(err.Error(), "credential")
+}
+
+func TestSyncDiscordResolvesAliasSelector(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	st := newDiscordCLIStore(t)
+	tokensDir := t.TempDir()
+	require.NoError(discord.NewTokenManager(tokensDir).Save(discord.NewTokenRecord(testDiscordBotID, "archive-bot", testDiscordBotToken, "")))
+	source, err := st.GetOrCreateSource("discord", testDiscordGuildA)
+	require.NoError(err)
+	alias := "Archive Guild"
+	_, err = st.UpdateSourceSettingsContext(t.Context(), source.ID, store.SourceSettingsUpdate{Alias: &alias})
+	require.NoError(err)
+	api := newDiscordCLIServer(t)
+
+	cmd := newSyncDiscordLocalCmd(testDiscordCommandDeps(t, st, tokensDir, api.server.URL))
+	cmd.SetArgs([]string{"archive guild"})
+	cmd.SetOut(&bytes.Buffer{})
+	cmd.SetErr(&bytes.Buffer{})
+	require.NoError(cmd.Execute())
+
+	var guildRequests []string
+	for _, request := range api.requestURIs() {
+		if request == "/guilds/"+testDiscordGuildA {
+			guildRequests = append(guildRequests, request)
+		}
+	}
+	assert.Equal([]string{"/guilds/" + testDiscordGuildA}, guildRequests)
+}
+
+func TestResolveDiscordSourcesResolvesAliasSelector(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	st := newDiscordCLIStore(t)
+	source, err := st.GetOrCreateSource("discord", testDiscordGuildA)
+	require.NoError(err)
+	alias := "Archive Guild"
+	_, err = st.UpdateSourceSettingsContext(t.Context(), source.ID, store.SourceSettingsUpdate{Alias: &alias})
+	require.NoError(err)
+
+	sources, err := resolveDiscordSources(st, "archive guild")
+	require.NoError(err)
+	require.Len(sources, 1)
+	assert.Equal(source.ID, sources[0].ID)
+}
+
 func TestSyncDiscordResolvesUnambiguousDisplayNameAndForwardsBounds(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
@@ -58,7 +157,7 @@ func TestSyncDiscordResolvesUnambiguousDisplayNameAndForwardsBounds(t *testing.T
 	source, err := st.GetOrCreateSource("discord", testDiscordGuildA)
 	require.NoError(err)
 	require.NoError(st.UpdateSourceDisplayName(source.ID, "Alpha Guild"))
-	require.NoError(st.UpdateSourceOAuthApp(source.ID, sql.NullString{}))
+	require.NoError(st.UpdateSourceOAuthApp(t.Context(), source.ID, sql.NullString{}))
 	runID, err := st.StartSync(source.ID, "discord")
 	require.NoError(err)
 	require.NoError(st.CompleteSync(runID, "not-json"), "--full must ignore malformed stored state")
@@ -78,7 +177,7 @@ func TestSyncDiscordResolvesUnambiguousDisplayNameAndForwardsBounds(t *testing.T
 	assert.Contains(output.String(), "Alpha Guild")
 	assert.NotContains(output.String(), testDiscordBotToken)
 	var messageCount int
-	require.NoError(st.DB().QueryRow(st.Rebind("SELECT COUNT(*) FROM messages WHERE source_id = ?"), source.ID).Scan(&messageCount))
+	require.NoError(st.DB().QueryRowContext(t.Context(), st.Rebind("SELECT COUNT(*) FROM messages WHERE source_id = ?"), source.ID).Scan(&messageCount))
 	assert.Zero(messageCount, "--after must exclude earlier Discord messages")
 }
 
@@ -143,7 +242,7 @@ func TestSyncDiscordRebuildsCacheAfterPartialDurableImportFailure(t *testing.T) 
 	source, err := st.GetOrCreateSource("discord", testDiscordGuildA)
 	require.NoError(err)
 	require.NoError(st.UpdateSourceDisplayName(source.ID, "Alpha Guild"))
-	require.NoError(st.UpdateSourceOAuthApp(source.ID, sql.NullString{}))
+	require.NoError(st.UpdateSourceOAuthApp(t.Context(), source.ID, sql.NullString{}))
 	installFailingDiscordParticipantTrigger(t, st)
 	api := newDiscordCLIServer(t)
 	api.messages[testDiscordChannel] = []discord.Message{{
@@ -164,7 +263,8 @@ func TestSyncDiscordRebuildsCacheAfterPartialDurableImportFailure(t *testing.T) 
 	err = cmd.Execute()
 	require.ErrorContains(err, "synthetic participant persistence failure")
 	var messageCount int
-	require.NoError(st.DB().QueryRow(
+	require.NoError(st.DB().QueryRowContext(
+		t.Context(),
 		st.Rebind("SELECT COUNT(*) FROM messages WHERE source_id = ?"), source.ID,
 	).Scan(&messageCount))
 	assert.Equal(1, messageCount, "core message persistence must precede the injected failure")
@@ -176,9 +276,12 @@ func TestSyncDiscordRebuildsCacheAfterRepairBeforeSyncSetupFailure(t *testing.T)
 		name         string
 		invalidState bool
 		wantError    string
+		wantRepaired bool
 	}{
-		{"invalid saved state", true, "load last successful Discord sync state"},
-		{"active sync", false, "start Discord sync"},
+		{"invalid saved state", true, "load last successful Discord sync state", true},
+		// Another sync owns the source, so the import stops before rewriting
+		// its messages.
+		{"active sync", false, "acquire Discord sync execution", false},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			require := require.New(t)
@@ -222,6 +325,11 @@ func TestSyncDiscordRebuildsCacheAfterRepairBeforeSyncSetupFailure(t *testing.T)
 			}
 			metadata, err := st.GetMessageMetadata(messageID)
 			require.NoError(err)
+			if !tt.wantRepaired {
+				assert.False(metadata.Valid, "an import without source ownership must not repair messages")
+				assert.Zero(rebuilds, "an import that repaired nothing must not rebuild analytics")
+				return
+			}
 			assert.JSONEq(`{"discord_message_type":0,"discord_message_flags":8192}`, metadata.String)
 			assert.Equal(1, rebuilds, "repair writes must refresh analytics even if sync setup fails")
 		})
@@ -232,7 +340,7 @@ func installFailingDiscordParticipantTrigger(t *testing.T, st *store.Store) {
 	t.Helper()
 	var err error
 	if st.IsPostgreSQL() {
-		_, err = st.DB().Exec(`
+		_, err = st.DB().ExecContext(t.Context(), `
 			CREATE OR REPLACE FUNCTION fail_discord_conversation_participant()
 			RETURNS trigger AS $$
 			BEGIN
@@ -247,7 +355,7 @@ func installFailingDiscordParticipantTrigger(t *testing.T, st *store.Store) {
 			EXECUTE FUNCTION fail_discord_conversation_participant();
 		`)
 	} else {
-		_, err = st.DB().Exec(`
+		_, err = st.DB().ExecContext(t.Context(), `
 			CREATE TRIGGER fail_discord_conversation_participant
 			BEFORE INSERT ON conversation_participants
 			BEGIN

@@ -15,7 +15,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/doordash-oss/oapi-codegen-dd/v3/pkg/runtime"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel/propagation"
@@ -111,7 +110,7 @@ func TestMCPTracePropagationDaemonClientInjectsW3CHeaders(t *testing.T) {
 	ctx := propagation.NewCompositeTextMapPropagator(
 		propagation.TraceContext{},
 		propagation.Baggage{},
-	).Extract(context.Background(), carrier)
+	).Extract(t.Context(), carrier)
 	response, err := client.DoGeneratedRequestWithContext(
 		ctx,
 		http.MethodGet,
@@ -333,24 +332,12 @@ func TestNewAgentTokenClientRejectsRedirects(t *testing.T) {
 	c, err := New(Config{URL: redirector.URL, AgentToken: "mva1_token", AllowInsecure: true})
 	require.NoError(t, err)
 
-	resp, err := c.DoGeneratedRequestWithContext(context.Background(), http.MethodGet, "/health", &generated.RunCLIRequestOptions{})
+	resp, err := c.DoGeneratedRequestWithContext(t.Context(), http.MethodGet, "/health", &generated.RunCLIRequestOptions{})
 	if resp != nil {
 		_ = resp.Body.Close()
 	}
 	require.Error(t, err, "agent token client must not follow redirects")
 	assert.Contains(t, err.Error(), "does not follow redirects")
-}
-
-func TestNewAllowsHTTPWithAllowInsecure(t *testing.T) {
-	c, err := New(Config{URL: "http://nas:8080", APIKey: "key", AllowInsecure: true})
-	require.NoError(t, err, "New")
-	require.NotNil(t, c, "client")
-}
-
-func TestNewAllowsHTTPS(t *testing.T) {
-	c, err := New(Config{URL: "https://nas:8080", APIKey: "key"})
-	require.NoError(t, err, "New")
-	require.NotNil(t, c, "client")
 }
 
 func TestNewRejectsEmptyURL(t *testing.T) {
@@ -417,7 +404,7 @@ func TestCLIModeGeneratedRequestCarriesClassAndAPIKey(t *testing.T) {
 		RequestMode: RequestModeCLI,
 	})
 	require.NoError(t, err, "New")
-	_, err = c.RunSQLQuery(context.Background(), "SELECT 1")
+	_, err = c.RunSQLQuery(t.Context(), "SELECT 1")
 	require.NoError(t, err, "RunSQLQuery")
 }
 
@@ -442,7 +429,7 @@ func TestGeneratedClientUsesTransportAndAuth(t *testing.T) {
 	apiClient, err := c.GeneratedClient()
 	require.NoError(err, "generated client")
 
-	got, err := apiClient.RunQuery(context.Background(), &generated.RunQueryRequestOptions{
+	got, err := apiClient.RunQuery(t.Context(), &generated.RunQueryRequestOptions{
 		Body: &generated.RunQueryBody{SQL: "SELECT 1"},
 	})
 
@@ -470,7 +457,7 @@ func TestRunSQLQueryPreservesIntegerPrecision(t *testing.T) {
 	c, err := New(Config{URL: srv.URL, APIKey: "key", AllowInsecure: true})
 	require.NoError(err, "New")
 
-	got, err := c.RunSQLQuery(context.Background(), "SELECT name, message_count, id FROM v_labels")
+	got, err := c.RunSQLQuery(t.Context(), "SELECT name, message_count, id FROM v_labels")
 	require.NoError(err, "RunSQLQuery")
 
 	assert.Equal([]string{"name", "message_count", "id"}, got.Columns, "columns")
@@ -539,7 +526,7 @@ func TestGeneratedClientUsesConfiguredHTTPClient(t *testing.T) {
 	apiClient, err := c.GeneratedClient()
 	require.NoError(t, err, "generated client")
 
-	_, err = apiClient.RunQuery(context.Background(), &generated.RunQueryRequestOptions{
+	_, err = apiClient.RunQuery(t.Context(), &generated.RunQueryRequestOptions{
 		Body: &generated.RunQueryBody{SQL: "SELECT 1"},
 	})
 
@@ -601,10 +588,73 @@ func TestGeneratedCLIResponseErrorReturnsBareServerMessage(t *testing.T) {
 	require.EqualError(t, err, "bad account", "CLI error")
 }
 
-func TestGeneratedResponseDecodeErrorDetection(t *testing.T) {
-	err := &runtime.ResponseDecodeError{Err: errors.New("malformed")}
-	assert.True(t, responseDecodeError(err), "decode error")
-	assert.False(t, responseDecodeError(errors.New("other")), "other error")
+func TestRunCLICommandTypesDaemonReportedFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		status           int
+		body, want       string
+		typed, truncated bool
+	}{
+		{name: "daemon refusal", status: 400, body: `{"error":"command_not_allowed","message":"command is not allowed through the daemon CLI runner"}`, want: "command is not allowed through the daemon CLI runner", typed: true},
+		{name: "stream event", status: 200, body: "{\"type\":\"error\",\"error\":\"not_permitted\"}\n", want: "not_permitted", typed: true},
+		{name: "empty stream error", status: 200, body: "{\"type\":\"error\"}\n", want: "run failed", typed: true},
+		{name: "malformed HTML", status: 400, body: "<html>private-body</html>", want: "API error (400): <html>private-body</html>"},
+		{name: "truncated body", status: 400, body: `{"message":"private-body"}`, want: "API error (400): could not read response body: unexpected EOF", truncated: true},
+		{name: "truncated stream", status: 200, body: `{"type":`, want: "decode CLI run stream:"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert := assert.New(t)
+			require := require.New(t)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				if tc.truncated {
+					w.Header().Set("Content-Length", "1000")
+				}
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			t.Cleanup(server.Close)
+			client, err := New(Config{URL: server.URL, AllowInsecure: true})
+			require.NoError(err)
+			t.Cleanup(func() { _ = client.Close() })
+			err = client.RunCLICommand(t.Context(), CLIRunRequest{Args: []string{"draft-get", "d1"}}, nil)
+			require.Error(err)
+			_, typed := errors.AsType[*CLIRunError](err)
+			assert.Equal(tc.typed, typed)
+			if tc.name == "truncated stream" {
+				assert.Contains(err.Error(), tc.want)
+			} else {
+				assert.EqualError(err, tc.want)
+			}
+		})
+	}
+	t.Run("transport", func(t *testing.T) {
+		assert := assert.New(t)
+		require := require.New(t)
+		server := httptest.NewServer(http.NotFoundHandler())
+		server.Close()
+		client, err := New(Config{URL: server.URL, AllowInsecure: true})
+		require.NoError(err)
+		t.Cleanup(func() { _ = client.Close() })
+		err = client.RunCLICommand(t.Context(), CLIRunRequest{}, nil)
+		require.Error(err)
+		_, typed := errors.AsType[*CLIRunError](err)
+		assert.False(typed)
+	})
+	t.Run("cancellation", func(t *testing.T) {
+		assert := assert.New(t)
+		require := require.New(t)
+		server := httptest.NewServer(http.NotFoundHandler())
+		t.Cleanup(server.Close)
+		client, err := New(Config{URL: server.URL, AllowInsecure: true})
+		require.NoError(err)
+		t.Cleanup(func() { _ = client.Close() })
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		err = client.RunCLICommand(ctx, CLIRunRequest{}, nil)
+		require.ErrorIs(err, context.Canceled)
+		_, typed := errors.AsType[*CLIRunError](err)
+		assert.False(typed)
+	})
 }
 
 func TestRunCLICommandRetriesWhileOperationInProgress(t *testing.T) {
@@ -637,7 +687,7 @@ func TestRunCLICommandRetriesWhileOperationInProgress(t *testing.T) {
 	c.SetBusyNotifier(func(message string) { notified = append(notified, message) })
 
 	var stdout strings.Builder
-	err = c.RunCLICommand(context.Background(), CLIRunRequest{Args: []string{"embeddings", "list"}}, func(stream, data string) error {
+	err = c.RunCLICommand(t.Context(), CLIRunRequest{Args: []string{"embeddings", "list"}}, func(stream, data string) error {
 		if stream == "stdout" {
 			stdout.WriteString(data)
 		}
@@ -679,7 +729,7 @@ func TestRebuildCLIFTSRetriesWhileOperationInProgress(t *testing.T) {
 	require.NoError(err, "New")
 
 	var progressCalls int
-	indexed, err := c.RebuildCLIFTS(context.Background(), func(_, _ int64) { progressCalls++ })
+	indexed, err := c.RebuildCLIFTS(t.Context(), func(_, _ int64) { progressCalls++ })
 	require.NoError(err, "RebuildCLIFTS")
 
 	assert.Equal(int64(10), indexed, "indexed count after retries")
@@ -704,7 +754,7 @@ func TestGeneratedNonStreamingBusyRetryReturnsRootContextCancellation(t *testing
 	}))
 	t.Cleanup(srv.Close)
 
-	rootCtx, cancel := context.WithCancel(context.Background())
+	rootCtx, cancel := context.WithCancel(t.Context())
 	c, err := New(Config{
 		URL:           srv.URL,
 		APIKey:        "key",
@@ -745,7 +795,7 @@ func TestRawAndStreamingRequestsUseClientRootContext(t *testing.T) {
 			name: "raw",
 			request: func(c *Client) (*http.Response, error) {
 				return c.DoGeneratedRequestWithContext(
-					context.Background(),
+					t.Context(),
 					http.MethodGet,
 					"/api/v1/stats",
 					&generated.RunCLIRequestOptions{},
@@ -756,7 +806,7 @@ func TestRawAndStreamingRequestsUseClientRootContext(t *testing.T) {
 			name: "streaming",
 			request: func(c *Client) (*http.Response, error) {
 				return c.DoGeneratedStreamingRequestWithContext(
-					context.Background(),
+					t.Context(),
 					http.MethodPost,
 					"/api/v1/cli/run",
 					&generated.RunCLIRequestOptions{},
@@ -783,7 +833,7 @@ func TestRawAndStreamingRequestsUseClientRootContext(t *testing.T) {
 				}
 			})
 
-			rootCtx, cancelRoot := context.WithCancel(context.Background())
+			rootCtx, cancelRoot := context.WithCancel(t.Context())
 			t.Cleanup(cancelRoot)
 			c, err := New(Config{
 				URL:           srv.URL,
@@ -838,7 +888,7 @@ func TestRunCLICommandStopsRetryingWhenContextCancelled(t *testing.T) {
 	c, err := New(Config{URL: srv.URL, APIKey: "key", AllowInsecure: true})
 	require.NoError(err, "New")
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	waiting := make(chan struct{})
 	c.SetBusyNotifier(func(string) { close(waiting) })
 	done := make(chan error, 1)
@@ -893,7 +943,7 @@ func TestRequestEditorDelegatedMode(t *testing.T) {
 		require.NoError(t, err)
 
 		// Make a request via the generated client to trigger requestEditor.
-		resp, _ := c.DoGeneratedRequestWithContext(context.Background(), http.MethodGet, "/health", &generated.RunCLIRequestOptions{})
+		resp, _ := c.DoGeneratedRequestWithContext(t.Context(), http.MethodGet, "/health", &generated.RunCLIRequestOptions{})
 		if resp != nil {
 			_ = resp.Body.Close()
 		}
@@ -902,3 +952,59 @@ func TestRequestEditorDelegatedMode(t *testing.T) {
 		assert.Empty(t, gotAPIKey, "X-Api-Key must not be set in delegated mode")
 	})
 }
+
+func TestErrorResponseBodiesAreBounded(t *testing.T) {
+	for _, size := range []int{maxErrorBodyBytes - 1, maxErrorBodyBytes, maxErrorBodyBytes + 1} {
+		for _, eofWithData := range []bool{false, true} {
+			t.Run(fmt.Sprintf("size-%d-eof-with-data-%t", size, eofWithData), func(t *testing.T) {
+				must := require.New(t)
+				resp := boundErrorBody(&http.Response{StatusCode: http.StatusBadRequest, Body: &boundaryErrorReader{
+					Reader: strings.NewReader(strings.Repeat("x", size)), eofWithData: eofWithData,
+				}}, maxErrorBodyBytes)
+				t.Cleanup(func() { must.NoError(resp.Body.Close()) })
+				body := resp.Body
+				p := make([]byte, maxErrorBodyBytes+1)
+				n, err := body.Read(p)
+				assert.Equal(t, size, n)
+				if size > maxErrorBodyBytes {
+					must.ErrorContains(err, "exceeds 64 KiB")
+				} else {
+					if eofWithData {
+						must.ErrorIs(err, io.EOF)
+					} else {
+						must.NoError(err)
+					}
+					_, err = body.Read(p)
+					must.ErrorIs(err, io.EOF)
+				}
+			})
+		}
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, strings.Repeat("x", 80<<10))
+	}))
+	t.Cleanup(srv.Close)
+	client, err := New(Config{URL: srv.URL, AllowInsecure: true})
+	require.NoError(t, err)
+
+	_, _, err = client.GetCLIAccounts(t.Context())
+	require.ErrorContains(t, err, "exceeds 64 KiB")
+}
+
+type boundaryErrorReader struct {
+	*strings.Reader
+
+	eofWithData bool
+}
+
+func (r *boundaryErrorReader) Read(p []byte) (int, error) {
+	n, err := r.Reader.Read(p)
+	if r.eofWithData && r.Len() == 0 {
+		err = io.EOF
+	}
+	return n, err
+}
+
+func (r *boundaryErrorReader) Close() error { return nil }

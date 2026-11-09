@@ -5,6 +5,7 @@ import type { Address } from "./address";
 
 export interface CLIQueryMessageSummary {
   attachment_count: number;
+  attachment_names?: string[];
   bcc?: Address[];
   body_text?: string;
   cc?: Address[];
@@ -15,8 +16,10 @@ export interface CLIQueryMessageSummary {
   from_name: string;
   from_phone?: string;
   has_attachments: boolean;
+  hidden_text_present: boolean;
   id: number;
   labels: string[];
+  match_snippet?: string;
   message_type?: string;
   sent_at: string;
   size_estimate: number;

@@ -292,7 +292,7 @@ func (s *Store) PublishIMAPDraftReplacementContext(
 		return IMAPDraft{}, errors.New("invalid IMAP draft publication")
 	}
 	var published IMAPDraft
-	err := imapDrafts.inTx(ctx, s, draftID, func(tx *loggedTx, draft IMAPDraft) error {
+	err := imapDrafts.inAttributionTx(ctx, s, draftID, func(tx *loggedTx, draft IMAPDraft) error {
 		if draft.Revision != revision {
 			return ErrIMAPDraftRevision
 		}
@@ -346,7 +346,9 @@ func (s *Store) PublishIMAPDraftReplacementContext(
 			if err != nil {
 				return err
 			}
-			if err := replaceMessageLabelsTx(boundQuerier{ctx: ctx, q: tx}, messageID, []int64{labelID}); err != nil {
+			if err := s.refreshAccountAttributionIfOutboundChangedTx(ctx, tx, messageID, func() error {
+				return replaceMessageLabelsTx(boundQuerier{ctx: ctx, q: tx}, messageID, []int64{labelID})
+			}); err != nil {
 				return fmt.Errorf("persist replacement IMAP label: %w", err)
 			}
 			result, err := tx.ExecContext(ctx, fmt.Sprintf(`
@@ -395,7 +397,7 @@ func (s *Store) FinishIMAPDraftRemovalContext(ctx context.Context, draftID strin
 		return IMAPDraft{}, err
 	}
 	var finished IMAPDraft
-	err := imapDrafts.inTx(ctx, s, draftID, func(tx *loggedTx, draft IMAPDraft) error {
+	err := imapDrafts.inAttributionTx(ctx, s, draftID, func(tx *loggedTx, draft IMAPDraft) error {
 		if draft.Revision != revision {
 			return ErrIMAPDraftRevision
 		}
@@ -457,7 +459,7 @@ func (s *Store) retireIMAPDraftMembershipTx(
 	`, receipt.SourceID, receipt.Mailbox, receipt.UIDValidity, receipt.UID, messageID); err != nil {
 		return fmt.Errorf("retire IMAP draft membership: %w", err)
 	}
-	mailboxes, err := imapMembershipMailboxes(ctx, tx, receipt.SourceID, messageID)
+	mailboxes, err := s.imapMembershipMailboxes(ctx, tx, receipt.SourceID, messageID)
 	if err != nil {
 		return err
 	}
@@ -469,7 +471,9 @@ func (s *Store) retireIMAPDraftMembershipTx(
 		}
 		labelIDs = append(labelIDs, labelID)
 	}
-	if err := replaceMessageLabelsTx(boundQuerier{ctx: ctx, q: tx}, messageID, labelIDs); err != nil {
+	if err := s.refreshAccountAttributionIfOutboundChangedTx(ctx, tx, messageID, func() error {
+		return replaceMessageLabelsTx(boundQuerier{ctx: ctx, q: tx}, messageID, labelIDs)
+	}); err != nil {
 		return fmt.Errorf("rebuild IMAP draft labels: %w", err)
 	}
 	if len(mailboxes) == 0 {
@@ -480,7 +484,7 @@ func (s *Store) retireIMAPDraftMembershipTx(
 			return fmt.Errorf("tombstone retired IMAP draft: %w", err)
 		}
 	}
-	if err := s.bumpDerivedDataRevision(tx); err != nil {
+	if err := s.bumpDerivedDataRevisionContext(ctx, tx); err != nil {
 		return fmt.Errorf("bump derived-data revision for retired IMAP draft: %w", err)
 	}
 	return nil

@@ -1,0 +1,88 @@
+package api
+
+import (
+	"encoding/json/v2"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"go.kenn.io/msgvault/internal/agentgrant"
+	"go.kenn.io/msgvault/internal/apiprotocol"
+	"go.kenn.io/msgvault/internal/config"
+)
+
+func TestMCPCapabilitiesRequiresOwner(t *testing.T) {
+	requirements := require.New(t)
+	assertions := assert.New(t)
+	srv, registry := newAgentTokenTestServer(t)
+	_, secret, _, err := registry.Issue("synthetic-mcp-client",
+		[]agentgrant.Permission{agentgrant.PermissionDraftCreate},
+		[]agentgrant.SourceRef{{ID: 1, Type: "imap", Identifier: "sender@example.com"}}, time.Time{})
+	requirements.NoError(err)
+	router := srv.Router()
+	read := func(owner, delegated bool) *httptest.ResponseRecorder {
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/mcp/capabilities", nil)
+		if owner {
+			req.Header.Set("X-Api-Key", agentTokenTestAPIKey)
+		}
+		if delegated {
+			req.Header.Set(apiprotocol.AgentTokenHeader, secret)
+		}
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, req)
+		return response
+	}
+	unauthenticated := read(false, false)
+	assertions.Equal(http.StatusUnauthorized, unauthenticated.Code)
+	owner := read(true, false)
+	requirements.Equal(http.StatusOK, owner.Code, owner.Body.String())
+	var ownerBody MCPCapabilitiesResponse
+	requirements.NoError(json.Unmarshal(owner.Body.Bytes(), &ownerBody))
+	routes := make(map[string]apiprotocol.MCPRouteDescriptor)
+	for _, route := range ownerBody.Routes {
+		routes[route.OperationID] = route
+	}
+	requirements.Contains(routes, "listSourceStatus")
+	assertions.Equal("/api/v1/sources/status", routes["listSourceStatus"].Path)
+	assertions.Equal(http.MethodGet, routes["listSourceStatus"].Method)
+	assertions.Contains(routes["listSourceStatus"].QueryParameters, "source_type")
+	assertions.NotContains(routes, "issueAgentToken")
+	assertions.NotContains(routes, "savePeopleProviderAPIKey")
+	delegated := read(false, true)
+	assertions.Equal(http.StatusUnauthorized, delegated.Code)
+	assertions.NotContains(delegated.Body.String(), "sender@example.com")
+	assertions.NotContains(delegated.Body.String(), agentTokenTestAPIKey)
+}
+
+func TestMCPCapabilitiesDescribeRealLoopRoutes(t *testing.T) {
+	requirements := require.New(t)
+	assertions := assert.New(t)
+	server := NewServerWithOptions(ServerOptions{Config: config.NewDefaultConfig(), Logger: testLogger()})
+	response := httptest.NewRecorder()
+	server.Router().ServeHTTP(response, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/mcp/capabilities", nil))
+	requirements.Equal(http.StatusOK, response.Code, response.Body.String())
+	var capabilities MCPCapabilitiesResponse
+	requirements.NoError(json.Unmarshal(response.Body.Bytes(), &capabilities))
+	routes := map[string]apiprotocol.MCPRouteDescriptor{}
+	for _, route := range capabilities.Routes {
+		routes[route.OperationID] = route
+	}
+	for _, tc := range []struct{ id, method, path string }{
+		{"listLoops", http.MethodGet, "/api/v1/loops"},
+		{"markLoopDone", http.MethodPost, "/api/v1/loops/{message_id}/done"},
+		{"snoozeLoop", http.MethodPost, "/api/v1/loops/{message_id}/snooze"},
+		{"reopenLoop", http.MethodPost, "/api/v1/loops/{message_id}/reopen"},
+	} {
+		requirements.Contains(routes, tc.id)
+		assertions.Equal(tc.method, routes[tc.id].Method)
+		assertions.Equal(tc.path, routes[tc.id].Path)
+	}
+	assertions.ElementsMatch([]string{"limit", "person_id"}, routes["listLoops"].QueryParameters)
+	assertions.Contains(routes["snoozeLoop"].RequestProperties, "until")
+	assertions.Contains(routes["markLoopDone"].QueryParameters, "question_message_ids")
+	assertions.Contains(routes["snoozeLoop"].QueryParameters, "question_message_ids")
+}

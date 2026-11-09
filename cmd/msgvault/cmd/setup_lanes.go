@@ -15,8 +15,10 @@ import (
 	"strings"
 	"text/tabwriter"
 
+	"go.kenn.io/docbank/document/mistral"
 	"go.kenn.io/msgvault/internal/attachmentpolicy"
 	"go.kenn.io/msgvault/internal/config"
+	"go.kenn.io/msgvault/internal/documentindex"
 	"go.kenn.io/msgvault/internal/peoplesweep"
 	"go.kenn.io/msgvault/internal/providercredentials"
 	"go.kenn.io/msgvault/internal/store"
@@ -219,7 +221,7 @@ func readSetupConsentState(ctx context.Context, cfg *config.Config) *setupConsen
 	if cfg == nil {
 		return nil
 	}
-	st, err := store.OpenReadOnly(cfg.DatabaseDSN())
+	st, err := store.OpenReadOnlyContext(ctx, cfg.DatabaseDSN())
 	if err != nil {
 		return nil
 	}
@@ -267,9 +269,13 @@ func setupDocumentConsent(ctx context.Context, cfg *config.Config, st *store.Sto
 	if !cfg.Attachments.Documents.Enabled {
 		return false
 	}
-	manifest, err := loadDocumentCapabilityManifest(setupMistralManifestPath(cfg))
-	if err != nil {
-		return false
+	var manifest mistral.CapabilityManifest
+	if cfg.Attachments.Documents.Provider == documentindex.ProviderMistral {
+		var err error
+		manifest, err = loadDocumentCapabilityManifest(setupMistralManifestPath(cfg))
+		if err != nil {
+			return false
+		}
 	}
 	_, profile, err := documentProfileForConfig(&cfg.Attachments.Documents, manifest)
 	if err != nil {
@@ -283,7 +289,7 @@ func setupVisualConsent(ctx context.Context, cfg *config.Config, st *store.Store
 	if !cfg.Vector.Multimodal.Enabled {
 		return false
 	}
-	vecCfg, err := resolvedVectorConfig(st, cfg.Vector)
+	vecCfg, err := resolvedVectorConfig(ctx, st, cfg.Vector)
 	if err != nil {
 		return false
 	}
@@ -335,6 +341,13 @@ func embeddingProviderName(endpoint string) string {
 	return "custom"
 }
 
+func textEmbeddingProviderName(embeddings vector.EmbeddingsConfig) string {
+	if embeddings.LocalOnly {
+		return "local"
+	}
+	return embeddingProviderName(embeddings.Endpoint)
+}
+
 func embedScheduleSummary(schedule vector.EmbedScheduleConfig) string {
 	parts := []string{}
 	if schedule.Cron != "" {
@@ -368,11 +381,11 @@ func buildLaneReport(cfg *config.Config, env setupEnvironment) laneReport {
 }
 
 func textSearchLane(cfg *config.Config, env setupEnvironment) laneStatus {
-	lane := laneStatus{Lane: laneTextSearch, Label: "Text search (messages, chats, meetings)"}
+	lane := laneStatus{Lane: laneTextSearch, Label: "Search by meaning (messages, chats, meetings)"}
 	embeddings := cfg.Vector.Embeddings
 	if cfg.Vector.Enabled {
 		lane.State = laneStateOn
-		lane.Provider = embeddingProviderName(embeddings.Endpoint)
+		lane.Provider = textEmbeddingProviderName(embeddings)
 		lane.Model = embeddings.Model
 		lane.Schedule = embedScheduleSummary(cfg.Vector.Embed.Schedule)
 		if embeddings.EffectiveAPIFormat() == vector.APIFormatVoyageContextual {
@@ -384,7 +397,9 @@ func textSearchLane(cfg *config.Config, env setupEnvironment) laneStatus {
 			lane.State = laneStatePending
 			lane.Reason += "; " + unavailable
 		}
-		env.reportVectorCredential(&lane, providercredentials.VectorEmbeddingsID, embeddings.Endpoint, embeddings.APIKeyEnv)
+		if !embeddings.LocalOnly {
+			env.reportVectorCredential(&lane, providercredentials.VectorEmbeddingsID, embeddings.Endpoint, embeddings.APIKeyEnv)
+		}
 		return lane
 	}
 	lane.State = laneStateOff
@@ -396,8 +411,8 @@ func textSearchLane(cfg *config.Config, env setupEnvironment) laneStatus {
 		lane.Reason = "an embedding key is present but the lane is not configured"
 		lane.Next = []string{"msgvault setup providers"}
 	default:
-		lane.Reason = "no embedding provider; set " + setupVoyageKeyEnv + " (recommended) or " +
-			setupOpenAIKeyEnv + ", or run Ollama with " + setupOllamaTextModel + ", then run `msgvault setup providers`"
+		lane.Reason = "keyword search works; set up search by meaning for semantic matches"
+		lane.Next = []string{"msgvault setup providers --local-embeddings"}
 	}
 	return lane
 }
@@ -407,13 +422,13 @@ func personSearchLane(cfg *config.Config, env setupEnvironment) laneStatus {
 	switch {
 	case cfg.Vector.Enabled && cfg.Vector.People.Enabled:
 		lane.State = laneStateOn
-		lane.Provider = embeddingProviderName(cfg.Vector.Embeddings.Endpoint)
+		lane.Provider = textEmbeddingProviderName(cfg.Vector.Embeddings)
 		lane.Model = cfg.Vector.Embeddings.Model
 		lane.Consent = env.consentState(func(s setupConsentState) bool { return s.PersonSemantic })
-		lane.Reason = "one curated document per person rides the text-search generation"
+		lane.Reason = "one curated document per person is embedded for search by meaning"
 		if text := textSearchLane(cfg, env); text.State != laneStateOn {
 			lane.State = laneStatePending
-			lane.Reason += "; text search is not ready: " + text.Reason
+			lane.Reason += "; search by meaning is not ready: " + text.Reason
 		}
 		if lane.Consent != consentActive {
 			lane.State = laneStatePending
@@ -424,7 +439,7 @@ func personSearchLane(cfg *config.Config, env setupEnvironment) laneStatus {
 		lane.Reason = "set [vector.people] enabled = true with explicit retention and training postures"
 	default:
 		lane.State = laneStateOff
-		lane.Reason = "requires the text-search lane"
+		lane.Reason = "requires search by meaning"
 	}
 	return lane
 }
@@ -497,6 +512,25 @@ func visualProbeCommand(cfg *config.Config) string {
 func documentsLane(cfg *config.Config, env setupEnvironment) laneStatus {
 	lane := laneStatus{Lane: laneDocuments, Label: "Document attachments (extraction and lexical search)"}
 	documents := cfg.Attachments.Documents
+	if documents.Provider == documentindex.ProviderDocling {
+		lane.Provider, lane.Model = documents.Provider, documents.Model
+		lane.Reason = fmt.Sprintf("operator-controlled endpoint %s; retention=%s, training=%s; uploads are manual-only", documents.Endpoint, documents.RetentionPosture, documents.TrainingPosture)
+		if !documents.Enabled {
+			lane.State = laneStateOff
+			lane.Reason += "; set [attachments.documents] enabled = true"
+			return lane
+		}
+		lane.State = laneStateOn
+		lane.Consent = env.consentState(func(s setupConsentState) bool { return s.Documents })
+		if lane.Consent != consentActive {
+			lane.State = laneStatePending
+			lane.Next = []string{"msgvault documents consent-docling --yes", "msgvault documents build --yes"}
+		}
+		if documents.APIKeyEnv != "" {
+			env.reportMissingCredential(&lane, documents.APIKeyEnv)
+		}
+		return lane
+	}
 	manifest := setupMistralManifestPath(cfg)
 	if documents.Enabled {
 		lane.State = laneStateOn
@@ -529,7 +563,7 @@ func documentsLane(cfg *config.Config, env setupEnvironment) laneStatus {
 		lane.Next = []string{"msgvault setup providers"}
 		return lane
 	}
-	lane.Reason = "needs " + documents.APIKeyEnv + " (Mistral is the only document provider)"
+	lane.Reason = "needs " + documents.APIKeyEnv + "; or configure a self-hosted Docling endpoint"
 	return lane
 }
 
@@ -539,13 +573,13 @@ func documentVectorsLane(cfg *config.Config, env setupEnvironment) laneStatus {
 	switch {
 	case documents.Enabled && documents.Index.Embeddings.Enabled:
 		lane.State = laneStateOn
-		lane.Provider = embeddingProviderName(cfg.Vector.Embeddings.Endpoint)
+		lane.Provider = textEmbeddingProviderName(cfg.Vector.Embeddings)
 		lane.Model = cfg.Vector.Embeddings.Model
 		lane.Schedule = embedScheduleSummary(cfg.Vector.Embed.Schedule)
-		lane.Reason = "document chunks and search query text are sent to the text-search provider under separate consents"
+		lane.Reason = "document chunks and search query text are sent to the provider for search by meaning under separate consents"
 		if text := textSearchLane(cfg, env); text.State != laneStateOn {
 			lane.State = laneStatePending
-			lane.Reason += "; text search is not ready: " + text.Reason
+			lane.Reason += "; search by meaning is not ready: " + text.Reason
 		}
 		lane.ConsentPurposes = map[string]string{
 			"document_embedding": env.consentState(func(s setupConsentState) bool { return s.DocumentEmbedding }),
@@ -563,7 +597,7 @@ func documentVectorsLane(cfg *config.Config, env setupEnvironment) laneStatus {
 		}
 	case documents.Enabled && !cfg.Vector.Enabled:
 		lane.State = laneStateOff
-		lane.Reason = "requires the text-search lane"
+		lane.Reason = "requires search by meaning"
 	case documents.Enabled:
 		lane.State = laneStateOff
 		lane.Reason = "set [attachments.documents.index.embeddings] enabled = true"
@@ -600,7 +634,7 @@ func peopleInferenceLane(cfg *config.Config, env setupEnvironment) laneStatus {
 		if err == nil && provider.Credential == peoplesweep.CredentialStored {
 			profile, credentialErr := sweep.Profile()
 			if credentialErr == nil {
-				resolver := peoplesweep.NewCredentialResolver(peoplesweep.NewFileCredentialStore(cfg.TokensDir()), env.lookupEnv)
+				resolver := peoplesweep.NewCredentialResolver(peoplesweep.NewStoredCredentials(cfg.TokensDir()), env.lookupEnv)
 				_, credentialErr = resolver.Resolve(name, profile)
 			}
 			if credentialErr != nil {
@@ -656,6 +690,7 @@ func mediaPolicyLane(cfg *config.Config) laneStatus {
 		"slack " + mediaPolicySummary(cfg.Slack.MediaPolicy("")),
 		"discord " + mediaPolicySummary(cfg.Discord.MediaPolicy("")),
 		"teams " + mediaPolicySummary(cfg.Teams.MediaPolicy("")),
+		"imessage " + mediaPolicySummary(cfg.IMessage.MediaPolicy()),
 	}
 	lane.Reason = strings.Join(summaries, "; ")
 	return lane

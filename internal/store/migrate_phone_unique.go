@@ -309,6 +309,9 @@ func (s *Store) mergeParticipant(ctx context.Context, tx *loggedTx, winner, lose
 	}
 
 	// (3) reactions UNIQUE(message_id, participant_id, reaction_type, reaction_value)
+	if err := repointReactionSourceEvents(ctx, tx, loser, winner); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `
 		DELETE FROM reactions
 		 WHERE participant_id = ?
@@ -375,7 +378,7 @@ func (s *Store) mergeParticipant(ctx context.Context, tx *loggedTx, winner, lose
 			err,
 		)
 	}
-	edges, err := s.loadLinkEdgesTxContext(ctx, tx)
+	edges, err := s.loadComponentEdgesTxContext(ctx, tx, loser, winner)
 	if err != nil {
 		return fmt.Errorf("load participant links (loser=%d, winner=%d): %w", loser, winner, err)
 	}
@@ -389,7 +392,7 @@ func (s *Store) mergeParticipant(ctx context.Context, tx *loggedTx, winner, lose
 	if err := s.rewriteLinksForMergeContext(ctx, tx, loser, winner); err != nil {
 		return fmt.Errorf("rewrite participant links (loser=%d, winner=%d): %w", loser, winner, err)
 	}
-	if err := s.reconcileCurrentObservationIdentityMatchesTxContext(ctx, tx); err != nil {
+	if err := s.reconcileObservationIdentityMatchesForParticipantTxContext(ctx, tx, winner); err != nil {
 		return fmt.Errorf(
 			"reconcile observation identity matches (loser=%d, winner=%d): %w",
 			loser,

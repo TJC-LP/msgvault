@@ -72,13 +72,14 @@ const (
 	StateRunning   State = "running"
 	StateSucceeded State = "succeeded"
 	StatePartial   State = "partial"
+	StatePaused    State = "paused"
 	StateFailed    State = "failed"
 	StateCancelled State = "cancelled"
 )
 
 func (s State) Validate() error {
 	switch s {
-	case StateQueued, StateRunning, StateSucceeded, StatePartial, StateFailed, StateCancelled:
+	case StateQueued, StateRunning, StateSucceeded, StatePartial, StatePaused, StateFailed, StateCancelled:
 		return nil
 	default:
 		return fmt.Errorf("invalid operation state %q", s)
@@ -478,6 +479,8 @@ const (
 	PublicErrorRetryAfter                     PublicErrorCode = "retry_after"
 	PublicErrorAuthenticationFailed           PublicErrorCode = "authentication_failed"
 	PublicErrorGoogleAuthorizationRequired    PublicErrorCode = "google_authorization_required"
+	PublicErrorMicrosoftAuthorizationRequired PublicErrorCode = "microsoft_authorization_required"
+	PublicErrorMicrosoftContactTooLarge       PublicErrorCode = "microsoft_contact_too_large"
 	PublicErrorUpstreamFailed                 PublicErrorCode = "upstream_failed"
 	PublicErrorSafetyLimit                    PublicErrorCode = "safety_limit"
 	PublicErrorSyncFailed                     PublicErrorCode = "sync_failed"
@@ -509,6 +512,12 @@ type PublicError struct {
 	Message string
 }
 
+// OperationPublicError is the snake_case form API responses publish for a PublicError.
+type OperationPublicError struct {
+	Code    PublicErrorCode `json:"code" enum:"archive_gap,authentication_failed,budget,cancelled,carddav_sync_failed,daemon_restarted,google_authorization_required,internal,invalid_output,invocation_archive_drift,invocation_authentication_failed,invocation_cancelled,invocation_daemon_restarted,invocation_internal,invocation_invalid_output,invocation_rate_limited,invocation_safety_limit,invocation_timeout,invocation_unsafe_error_redacted,invocation_upstream_failed,lease_lost,microsoft_authorization_required,microsoft_contact_too_large,person_sweep_failed,policy,provider_http,rate_limited,retry_after,safety_limit,source_sync_failed,sync_failed,timeout,unsafe_error_redacted,upstream_failed"`
+	Message string          `json:"message"`
+}
+
 var fixedPublicErrorMessages = map[PublicErrorCode]string{
 	PublicErrorSourceSyncFailed:               "Source sync failed.",
 	PublicErrorPersonSweepFailed:              "Person sweep failed.",
@@ -525,6 +534,8 @@ var fixedPublicErrorMessages = map[PublicErrorCode]string{
 	PublicErrorRetryAfter:                     "CardDAV sync is temporarily paused.",
 	PublicErrorAuthenticationFailed:           "CardDAV authentication failed.",
 	PublicErrorGoogleAuthorizationRequired:    "Google Contacts authorization is required. Connect Google in CardDAV account settings.",
+	PublicErrorMicrosoftAuthorizationRequired: "Microsoft contacts authorization is required. Run msgvault carddav authorize-microsoft with your account email.",
+	PublicErrorMicrosoftContactTooLarge:       "A published contact is over Outlook's 4 MB limit, and each sync reports it until it fits. The daemon log names its person ID. " + contactTooLargeRemedy,
 	PublicErrorUpstreamFailed:                 "CardDAV server request failed.",
 	PublicErrorSafetyLimit:                    "CardDAV sync exceeded its safety limits.",
 	PublicErrorSyncFailed:                     "CardDAV sync failed.",
@@ -596,6 +607,14 @@ func (e PublicError) Validate() error {
 	return nil
 }
 
+const contactTooLargeRemedy = "Removing stored photos or other media currently needs the profile API; the CLI and Web UI have no control for it."
+
+// MicrosoftContactTooLargeMessage names the person whose card a publish,
+// approval or conflict resolution could not write to Outlook.
+func MicrosoftContactTooLargeMessage(personID int64) string {
+	return fmt.Sprintf("Person %d's contact is over Outlook's 4 MB limit. %s", personID, contactTooLargeRemedy)
+}
+
 func newPublicError(code PublicErrorCode) *PublicError {
 	return &PublicError{Code: code, Message: fixedPublicErrorMessages[code]}
 }
@@ -629,6 +648,8 @@ func ProjectSourceState(
 			return StatePartial, newPublicError(PublicErrorSourceSyncFailed), nil
 		}
 		return StateFailed, newPublicError(PublicErrorSourceSyncFailed), nil
+	case "paused":
+		return StatePaused, nil, nil
 	case "cancelled":
 		return StateCancelled, nil, nil
 	default:
@@ -674,6 +695,10 @@ func ProjectCardDAVFailure(durableCode string) *PublicError {
 		code = PublicErrorAuthenticationFailed
 	case "google_authorization_required":
 		code = PublicErrorGoogleAuthorizationRequired
+	case "microsoft_authorization_required":
+		code = PublicErrorMicrosoftAuthorizationRequired
+	case "microsoft_contact_too_large":
+		code = PublicErrorMicrosoftContactTooLarge
 	case "upstream_failed":
 		code = PublicErrorUpstreamFailed
 	case "safety_limit":
@@ -826,12 +851,12 @@ func validateRunStateAndError(
 			if publicError != nil {
 				return fmt.Errorf("source sync state %q cannot carry a public error", state)
 			}
-		case StateSucceeded:
+		case StateSucceeded, StatePaused:
 			if publicError != nil {
 				return fmt.Errorf("source sync state %q cannot carry a public error", state)
 			}
 			if itemErrors != 0 {
-				return errors.New("succeeded source sync cannot have item errors")
+				return fmt.Errorf("source sync state %q cannot have item errors", state)
 			}
 		case StatePartial:
 			if publicError == nil {
@@ -967,8 +992,8 @@ func isPersonSweepError(code PublicErrorCode) bool {
 func isCardDAVError(code PublicErrorCode) bool {
 	switch code {
 	case PublicErrorCancelled, PublicErrorRetryAfter, PublicErrorAuthenticationFailed,
-		PublicErrorGoogleAuthorizationRequired,
-		PublicErrorUpstreamFailed, PublicErrorSafetyLimit, PublicErrorSyncFailed,
+		PublicErrorGoogleAuthorizationRequired, PublicErrorMicrosoftAuthorizationRequired,
+		PublicErrorMicrosoftContactTooLarge, PublicErrorUpstreamFailed, PublicErrorSafetyLimit, PublicErrorSyncFailed,
 		PublicErrorUnsafeErrorRedacted, PublicErrorDaemonRestarted,
 		PublicErrorCardDAVSyncFailed:
 		return true

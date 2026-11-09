@@ -6,6 +6,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -17,7 +18,7 @@ import (
 // runHybridSearch executes vector or hybrid search through the configured
 // remote server or local daemon. It preserves the historical CLI renderer while
 // keeping vector backend ownership inside the daemon.
-func runHybridSearch(cmd *cobra.Command, queryStr, mode string, explain bool) error {
+func runHybridSearch(cmd *cobra.Command, queryStr, mode string, explain bool) (result error) {
 	state := invocationFromCommand(cmd)
 	if state == nil || state.logger == nil {
 		return errors.New("invocation state is unavailable")
@@ -28,6 +29,13 @@ func runHybridSearch(cmd *cobra.Command, queryStr, mode string, explain bool) er
 		return fmt.Errorf("open store: %w", err)
 	}
 	defer func() { _ = s.Close() }()
+	kind := "hybrid"
+	if mode == "vector" {
+		kind = "semantic"
+	}
+	if strings.TrimSpace(queryStr) != "" {
+		defer reportSuccessfulCLIAction(cmd, s, "search_run", "search_type", kind, &result)
+	}
 
 	logger.Info("vector search start",
 		"mode", mode,
@@ -76,9 +84,21 @@ func runHybridSearch(cmd *cobra.Command, queryStr, mode string, explain bool) er
 		"duration_ms", time.Since(started).Milliseconds(),
 	)
 
+	if searchSort == "date" {
+		sortSemanticResultsByDate(resp.Results)
+	}
+
+	if strings.TrimSpace(queryStr) != "" && len(resp.Results) == 0 {
+		defer reportSuccessfulCLIAction(cmd, s, "search_empty", "search_type", kind, &result)
+	}
 	if searchJSON {
 		return outputHybridResultsJSON(resp, explain)
 	}
+	defer func() {
+		for _, hint := range semanticMoreResultsHints(resp) {
+			_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "Hint: "+hint["message"])
+		}
+	}()
 	return outputHybridResultsTable(resp, explain)
 }
 
@@ -109,6 +129,9 @@ func writeHybridResultsTableWidth(out io.Writer, results []daemonclient.CLIHybri
 	if explain {
 		headers = append(headers, "RRF", "BM25", "VEC")
 	}
+	if searchShowSnippet {
+		headers = append(headers, "SNIPPET")
+	}
 	rows := make([][]searchTableCell, 0, len(results))
 	for _, r := range results {
 		from := r.FromEmail
@@ -132,6 +155,9 @@ func writeHybridResultsTableWidth(out io.Writer, results []daemonclient.CLIHybri
 				searchTableCell{text: formatOptionalScorePtr(r.VectorScore)},
 			)
 		}
+		if searchShowSnippet {
+			row = append(row, searchTableCell{text: searchSnippetText(r.Message.Snippet)})
+		}
 		rows = append(rows, row)
 	}
 	return writeSearchTable(out, headers, rows, width)
@@ -152,11 +178,20 @@ func outputHybridResultsJSON(resp *daemonclient.CLIHybridSearch, explain bool) e
 	rows := make([]map[string]any, len(resp.Results))
 	for i, r := range resp.Results {
 		row := map[string]any{
-			"id":         r.ID,
-			"subject":    r.Subject,
-			"from_email": r.FromEmail,
-			"sent_at":    r.SentAt.Format(time.RFC3339),
-			"boosted":    r.SubjectBoosted,
+			"id":                  r.ID,
+			"subject":             r.Subject,
+			"from_email":          r.FromEmail,
+			"sent_at":             r.SentAt.Format(time.RFC3339),
+			"boosted":             r.SubjectBoosted,
+			"conversation_id":     r.Message.ConversationID,
+			"snippet":             r.Message.Snippet,
+			"hidden_text_present": r.Message.HiddenTextPresent,
+		}
+		if r.AttachmentCount != nil {
+			row["attachment_count"] = *r.AttachmentCount
+		}
+		if r.Message.AttachmentNames != nil {
+			row["attachment_names"] = r.Message.AttachmentNames
 		}
 		if r.Message.WebURL != "" {
 			row["web_url"] = r.Message.WebURL
@@ -189,6 +224,9 @@ func outputHybridResultsJSON(resp *daemonclient.CLIHybridSearch, explain bool) e
 	if resp.Accelerator != "" {
 		output["accelerator"] = resp.Accelerator
 	}
+	if hints := semanticMoreResultsHints(resp); len(hints) > 0 {
+		output["hints"] = hints
+	}
 	return printJSON(output)
 }
 
@@ -197,4 +235,40 @@ func formatOptionalScorePtr(v *float64) string {
 		return "-"
 	}
 	return fmt.Sprintf("%.4f", *v)
+}
+
+func sortSemanticResultsByDate(results []daemonclient.CLIHybridSearchResult) {
+	slices.SortStableFunc(results, func(a, b daemonclient.CLIHybridSearchResult) int {
+		if order := b.SentAt.Compare(a.SentAt); order != 0 {
+			return order
+		}
+		if a.ID < b.ID {
+			return -1
+		}
+		if a.ID > b.ID {
+			return 1
+		}
+		return 0
+	})
+}
+
+func semanticMoreResultsHints(resp *daemonclient.CLIHybridSearch) []map[string]string {
+	if resp.HasMore {
+		return []map[string]string{{"code": "more_available", "message": "more messages match; raise --limit"}}
+	}
+	if resp.RankingLimitReached > 0 {
+		message := fmt.Sprintf("semantic result limit reached; raise vector.search.max_page_size_hybrid above %d", resp.RankingLimitReached)
+		if resp.CandidateLimitReached > 0 {
+			message += fmt.Sprintf(" and vector.search.k_per_signal above %d", resp.CandidateLimitReached)
+		}
+		message += " on the server and restart it, then raise --limit"
+		return []map[string]string{{
+			"code":    "ranking_limit_reached",
+			"message": message,
+		}}
+	}
+	if resp.CandidateLimitReached > 0 {
+		return []map[string]string{{"code": "candidate_limit_reached", "message": fmt.Sprintf("more messages match; raise vector.search.k_per_signal above %d on the server and restart it, then raise --limit", resp.CandidateLimitReached)}}
+	}
+	return nil
 }

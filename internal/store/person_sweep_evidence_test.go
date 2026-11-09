@@ -373,6 +373,7 @@ func TestPersonSweepEvidenceRejectsEditBetweenPacketAndPrepare(t *testing.T) {
 	result, err := (store.PersonSweepEvidenceAligner{Store: f.store}).Align(t.Context(), input)
 	requirements.NoError(err)
 	checks.False(result.Accepted)
+	checks.Equal(personfacts.DecisionInvalid, result.Failure.Action)
 	checks.Equal(personfacts.ReasonUnalignedEvidence, result.Failure.Reason)
 }
 
@@ -411,7 +412,7 @@ func TestSearchPersonSweepMessagesPreservesNewestFirstCandidateRanking(t *testin
 }
 
 func TestPersonSweepAuthenticatedChatSenderCanBeDirectSelf(t *testing.T) {
-	for _, sourceType := range []string{"slack", "slackdump"} {
+	for _, sourceType := range []string{"matrix", "slack", "slackdump", "inline"} {
 		t.Run(sourceType, func(t *testing.T) {
 			f := newPersonSweepJournalFixture(t, true, false)
 			_, err := f.store.DB().ExecContext(t.Context(), f.store.Rebind(
@@ -451,12 +452,12 @@ func TestPersonSweepAttributesImazingCSVOutgoingMessagesToPerson(t *testing.T) {
 	_, err = imazingcsv.NewImporter(st, imazingcsv.Options{Owner: "+15550000001", Timezone: "UTC"}).
 		ImportPath(t.Context(), exportRoot)
 	requirements.NoError(err)
-	source, err := st.GetSourceByTypeAndIdentifier(imazingcsv.SourceType, "+15550000001")
+	source, err := st.GetSourceByTypeAndIdentifier(t.Context(), imazingcsv.SourceType, "+15550000001")
 	requirements.NoError(err)
 	var ownerParticipantID, messageID int64
-	requirements.NoError(st.DB().QueryRow(`
+	requirements.NoError(st.DB().QueryRowContext(t.Context(), `
 		SELECT id FROM participants WHERE phone_number = '+15550000001'`).Scan(&ownerParticipantID))
-	requirements.NoError(st.DB().QueryRow(st.Rebind(`
+	requirements.NoError(st.DB().QueryRowContext(t.Context(), st.Rebind(`
 		SELECT id FROM messages WHERE source_id = ?`), source.ID).Scan(&messageID))
 	person, _, err := st.CreatePersonFromParticipant(ownerParticipantID)
 	requirements.NoError(err)

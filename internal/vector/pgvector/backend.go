@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
+	"go.kenn.io/msgvault/internal/sqldialect"
 	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/vector"
 )
@@ -155,10 +156,21 @@ func Open(ctx context.Context, opts Options) (*Backend, error) {
 // vector.Backend interface.
 func (b *Backend) Close() error { return nil }
 
+// WithBuildScope pins message coverage without reopening or closing shared storage.
+func (b *Backend) WithBuildScope(scope vector.BuildScope) vector.Backend {
+	next := *b
+	next.scope = vector.NewBuildScope(scope.MessageTypes, scope.SourceIDs)
+	return &next
+}
+
 // DB returns the underlying *sql.DB. Exposed to mirror the sqlitevec
 // surface; callers that need the shared pool (e.g. the embed worker)
 // can retrieve it here instead of carrying the main handle separately.
 func (b *Backend) DB() *sql.DB { return b.db }
+
+func (b *Backend) EmbeddingCheckpoints() vector.EmbeddingCheckpoints {
+	return vector.EmbeddingCheckpoints{DB: b.db, Rebind: sqldialect.RebindPostgreSQL, LockGeneration: true}
+}
 
 // CreateGeneration allocates a new building generation. Under the
 // scan-and-fill design there is no pending_embeddings seed: the embed
@@ -478,6 +490,9 @@ func (b *Backend) activateGeneration(
 	if n == 0 {
 		return b.activateGateError(ctx, tx, gen, force)
 	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM embedding_checkpoints WHERE generation_id IN (SELECT id FROM index_generations WHERE state = 'retired')`); err != nil {
+		return err
+	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit activate generation %d: %w", gen, err)
 	}
@@ -600,6 +615,9 @@ func (b *Backend) RetireGeneration(ctx context.Context, gen vector.GenerationID,
 		return fmt.Errorf("delete retired generation %d person embeddings: %w", gen, err)
 	}
 	// Scan-and-fill has no per-generation queue to reap.
+	if _, err := tx.ExecContext(ctx, `DELETE FROM embedding_checkpoints WHERE generation_id = $1`, int64(gen)); err != nil {
+		return err
+	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit retire generation %d: %w", gen, err)
 	}
@@ -1483,26 +1501,9 @@ func (b *Backend) EmbeddedMessageCount(ctx context.Context, gen vector.Generatio
 	where := `e.generation_id = $1
 		    AND m.embed_gen = $1
 		    AND ` + store.LiveMessagesWhere("m", true)
-	args := []any{int64(gen)}
-	nextArg := 2
-	if len(b.scope.MessageTypes) > 0 {
-		placeholders := make([]string, len(b.scope.MessageTypes))
-		for i, typ := range b.scope.MessageTypes {
-			placeholders[i] = "$" + strconv.Itoa(nextArg)
-			nextArg++
-			args = append(args, typ)
-		}
-		where += fmt.Sprintf(" AND m.message_type IN (%s)", strings.Join(placeholders, ","))
-	}
-	if len(b.scope.SourceIDs) > 0 {
-		placeholders := make([]string, len(b.scope.SourceIDs))
-		for i, id := range b.scope.SourceIDs {
-			placeholders[i] = "$" + strconv.Itoa(nextArg)
-			nextArg++
-			args = append(args, id)
-		}
-		where += fmt.Sprintf(" AND m.source_id IN (%s)", strings.Join(placeholders, ","))
-	}
+	scopeWhere, scopeArgs := messageScopeWhere(b.scope, 2)
+	where += scopeWhere
+	args := append([]any{int64(gen)}, scopeArgs...)
 	var n int64
 	if err := b.db.QueryRowContext(ctx,
 		`SELECT COUNT(DISTINCT e.message_id)
@@ -1535,6 +1536,55 @@ func (b *Backend) EmbeddedMessageCountForIDs(ctx context.Context, gen vector.Gen
 		return 0, fmt.Errorf("count filtered embedded messages: %w", err)
 	}
 	return count, nil
+}
+
+// EmbeddingCoverage counts in-scope live, stamped, and embedded messages for
+// gen in one statement. PostgreSQL gives a statement one snapshot, so a batch
+// committed by a running embedding job cannot make Embedded exceed Stamped.
+func (b *Backend) EmbeddingCoverage(
+	ctx context.Context, gen vector.GenerationID, scope vector.BuildScope,
+) (vector.EmbeddingCoverage, error) {
+	scopeWhere, scopeArgs := messageScopeWhere(vector.NewBuildScope(scope.MessageTypes, scope.SourceIDs), 2)
+	args := append([]any{int64(gen)}, scopeArgs...)
+	var coverage vector.EmbeddingCoverage
+	if err := b.db.QueryRowContext(ctx, `
+		SELECT COUNT(*),
+		       COUNT(*) FILTER (WHERE m.embed_gen = $1),
+		       COUNT(*) FILTER (WHERE m.embed_gen = $1 AND EXISTS (
+		           SELECT 1 FROM embeddings e
+		           WHERE e.generation_id = $1 AND e.message_id = m.id))
+		FROM messages m
+		WHERE `+store.LiveMessagesWhere("m", true)+scopeWhere,
+		args...).Scan(&coverage.Live, &coverage.Stamped, &coverage.Embedded); err != nil {
+		return vector.EmbeddingCoverage{}, fmt.Errorf("count embedding coverage: %w", err)
+	}
+	return coverage, nil
+}
+
+// messageScopeWhere returns AND clauses restricting alias m to scope, numbering
+// placeholders from nextArg.
+func messageScopeWhere(scope vector.BuildScope, nextArg int) (string, []any) {
+	var where string
+	var args []any
+	if len(scope.MessageTypes) > 0 {
+		placeholders := make([]string, len(scope.MessageTypes))
+		for i, typ := range scope.MessageTypes {
+			placeholders[i] = "$" + strconv.Itoa(nextArg)
+			nextArg++
+			args = append(args, typ)
+		}
+		where += fmt.Sprintf(" AND m.message_type IN (%s)", strings.Join(placeholders, ","))
+	}
+	if len(scope.SourceIDs) > 0 {
+		placeholders := make([]string, len(scope.SourceIDs))
+		for i, id := range scope.SourceIDs {
+			placeholders[i] = "$" + strconv.Itoa(nextArg)
+			nextArg++
+			args = append(args, id)
+		}
+		where += fmt.Sprintf(" AND m.source_id IN (%s)", strings.Join(placeholders, ","))
+	}
+	return where, args
 }
 
 // ScoreMessageChunks scores every embedded chunk of messageID in gen

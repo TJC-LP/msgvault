@@ -87,6 +87,7 @@ func (f *attachmentMaintenanceFixture) addLoose(content []byte) string {
 	require.NoError(f.t, os.MkdirAll(filepath.Dir(full), 0o700), "create loose blob directory")
 	require.NoError(f.t, os.WriteFile(full, content, 0o600), "write loose blob")
 	require.NoError(f.t, f.store.UpsertAttachment(
+		f.t.Context(),
 		f.messageID,
 		fmt.Sprintf("attachment-%d.bin", f.sequence),
 		"application/octet-stream",
@@ -99,14 +100,14 @@ func (f *attachmentMaintenanceFixture) addLoose(content []byte) string {
 
 func (f *attachmentMaintenanceFixture) packedEntry(hash string) *store.PackIndexEntry {
 	f.t.Helper()
-	entry, err := f.store.GetAttachmentPackEntry(hash)
+	entry, err := f.store.GetAttachmentPackEntry(f.t.Context(), hash)
 	require.NoError(f.t, err, "GetAttachmentPackEntry(%s)", hash)
 	return entry
 }
 
 func (f *attachmentMaintenanceFixture) readBlob(hash string) []byte {
 	f.t.Helper()
-	r, _, err := f.blob.Open(hash)
+	r, _, err := f.blob.Open(f.t.Context(), hash)
 	require.NoError(f.t, err, "open blob %s", hash)
 	defer func() { require.NoError(f.t, r.Close(), "close blob reader") }()
 	data, err := io.ReadAll(r)
@@ -121,7 +122,7 @@ func (f *attachmentMaintenanceFixture) makeZeroLivePack(content []byte) string {
 	require.NoError(f.t, err, "pack zero-live fixture")
 	entry := f.packedEntry(hash)
 	require.NotNil(f.t, entry)
-	_, err = f.store.DB().Exec(f.store.Rebind(
+	_, err = f.store.DB().ExecContext(f.t.Context(), f.store.Rebind(
 		`DELETE FROM attachments WHERE content_hash = ? OR thumbnail_hash = ?`), hash, hash)
 	require.NoError(f.t, err, "logically delete packed fixture")
 	return entry.PackID
@@ -140,10 +141,10 @@ func (f *attachmentMaintenanceFixture) makeSparsePack(live []byte, createdAt tim
 	require.NoError(f.t, err, "pack sparse fixture")
 	entry := f.packedEntry(liveHash)
 	require.NotNil(f.t, entry)
-	_, err = f.store.DB().Exec(f.store.Rebind(
+	_, err = f.store.DB().ExecContext(f.t.Context(), f.store.Rebind(
 		`DELETE FROM attachments WHERE content_hash IN (?, ?)`), deadHash, deadSmallHash)
 	require.NoError(f.t, err, "delete sparse fixture entries")
-	_, err = f.store.DB().Exec(f.store.Rebind(
+	_, err = f.store.DB().ExecContext(f.t.Context(), f.store.Rebind(
 		`UPDATE attachment_packs SET created_at = ? WHERE pack_id = ?`),
 		createdAt.UTC().Format(time.RFC3339), entry.PackID)
 	require.NoError(f.t, err, "age sparse fixture pack")
@@ -158,7 +159,7 @@ func TestAutomaticAttachmentMaintenancePacksBoundedAndLogsCompleteStats(t *testi
 	content := []byte("automatic attachment maintenance payload")
 	hash := f.addLoose(content)
 
-	err := f.maintenance.runAutomaticPack(context.Background())
+	err := f.maintenance.runAutomaticPack(t.Context())
 
 	require.NoError(err, "runAutomaticPack")
 	gotAutomaticAttachmentBytes := automaticAttachmentBytes
@@ -202,16 +203,16 @@ func TestLooseAttachmentModeSkipsAutomaticPackingAndRejectsPackCreation(t *testi
 	f.maintenance.packCreationEnabled = false
 	hash := f.addLoose([]byte("remain loose when attachment packing is disabled"))
 
-	err := f.maintenance.runAutomaticPack(context.Background())
+	err := f.maintenance.runAutomaticPack(t.Context())
 	require.NoError(err)
 	assert.Nil(f.packedEntry(hash))
 	assert.Contains(f.logs.String(), "automatic attachment packing disabled")
 
-	_, err = f.maintenance.pack(context.Background(), 0)
+	_, err = f.maintenance.pack(t.Context(), 0)
 	require.Error(err)
 	assert.Contains(err.Error(), "[data].loose_attachments")
 
-	_, err = f.maintenance.repack(context.Background(), 0)
+	_, err = f.maintenance.repack(t.Context(), 0)
 	require.Error(err)
 	assert.Contains(err.Error(), "[data].loose_attachments")
 }
@@ -220,7 +221,7 @@ func TestAutomaticAttachmentMaintenanceCancellationIsInformational(t *testing.T)
 	require := require.New(t)
 	assert := assert.New(t)
 	f := newAttachmentMaintenanceFixture(t)
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 
 	err := f.maintenance.runAutomaticPack(ctx)
@@ -236,12 +237,12 @@ func TestBackgroundPackFailureLogsProgressAndStaysPending(t *testing.T) {
 	maintenance, logs := newFailingAttachmentMaintenance(t)
 
 	require.NoError(runAfterSuccessfulAttachmentIngest(
-		context.Background(), maintenance, func(context.Context) error { return nil }, nil,
+		t.Context(), maintenance, func(context.Context) error { return nil }, nil,
 	), "a later maintenance failure cannot reach the ingest result")
-	require.Error(maintenance.runPendingPack(context.Background()), "the job records the failure")
+	require.Error(maintenance.runPendingPack(t.Context()), "the job records the failure")
 	assert.True(maintenance.packPending.Load(), "a failed pass leaves its work pending")
 
-	require.Error(maintenance.runAutomaticPack(context.Background()))
+	require.Error(maintenance.runAutomaticPack(t.Context()))
 	logOutput := logs.String()
 	progressAt := strings.Index(logOutput, "level=INFO msg=\"automatic attachment maintenance progress\"")
 	warnAt := strings.Index(logOutput, "level=WARN msg=\"automatic attachment maintenance failed\"")
@@ -253,13 +254,14 @@ func TestBackgroundPackFailureLogsProgressAndStaysPending(t *testing.T) {
 	assert.Contains(logOutput, "pack-attachments", "log names the explicit retry command")
 }
 
-func (f *attachmentMaintenanceFixture) ingestLoose(content []byte) string {
+func (f *attachmentMaintenanceFixture) ingestLoose(ctx context.Context, content []byte) string {
 	f.t.Helper()
 	f.sequence++
 	rel, err := export.StoreAttachmentFile(f.dir, &mime.Attachment{Content: content})
 	require.NoError(f.t, err, "store ingested blob")
 	hash := path.Base(rel)
 	require.NoError(f.t, f.store.UpsertAttachment(
+		ctx,
 		f.messageID,
 		fmt.Sprintf("ingested-%d.bin", f.sequence),
 		"application/octet-stream",
@@ -275,13 +277,26 @@ func TestRunScheduledSourceSkipsPackWithoutNewBlobs(t *testing.T) {
 	f := newAttachmentMaintenanceFixture(t)
 	hash := f.addLoose([]byte("already loose before the sync"))
 
-	require.NoError(t, runScheduledSource(context.Background(), f.maintenance, true,
+	require.NoError(t, runScheduledSource(t.Context(), f.maintenance, true,
 		func(context.Context) error { return nil }))
 
 	assert.Nil(f.packedEntry(hash), "a run that wrote no blobs must not pack")
 	assert.NotContains(f.logs.String(), "automatic attachment maintenance")
-	require.NoError(t, f.maintenance.runPendingPack(context.Background()))
+	require.NoError(t, f.maintenance.runPendingPack(t.Context()))
 	assert.Nil(f.packedEntry(hash), "nothing was pending")
+}
+
+func TestRunScheduledSourcePreservesBareDeferralAndReleasesLease(t *testing.T) {
+	assert := assert.New(t)
+	f := newAttachmentMaintenanceFixture(t)
+
+	err := runScheduledSource(t.Context(), f.maintenance, true, func(context.Context) error {
+		return scheduler.ErrDeferUntilNextTrigger
+	})
+	assert.Same(scheduler.ErrDeferUntilNextTrigger, err, "a clean lease release preserves the bare deferral")
+	lease, err := f.maintenance.coordinator.AcquireMaintenance(t.Context())
+	require.NoError(t, err, "the deferred run released its mutation lease")
+	require.NoError(t, lease.Release())
 }
 
 func TestRunScheduledSourceDefersPackAfterNewBlobs(t *testing.T) {
@@ -289,20 +304,20 @@ func TestRunScheduledSourceDefersPackAfterNewBlobs(t *testing.T) {
 	f := newAttachmentMaintenanceFixture(t)
 	var hash string
 
-	require.NoError(t, runScheduledSource(context.Background(), f.maintenance, true,
+	require.NoError(t, runScheduledSource(t.Context(), f.maintenance, true,
 		func(context.Context) error {
-			hash = f.ingestLoose([]byte("new scheduled blob"))
+			hash = f.ingestLoose(t.Context(), []byte("new scheduled blob"))
 			return nil
 		}))
 	assert.Nil(f.packedEntry(hash), "scheduled sync must not pack inline")
 	assert.NotContains(f.logs.String(), "automatic attachment maintenance complete")
 
-	require.NoError(t, f.maintenance.runPendingPack(context.Background()))
+	require.NoError(t, f.maintenance.runPendingPack(t.Context()))
 	assert.NotNil(f.packedEntry(hash), "pending pack packs the new blob")
 	assert.Equal(1, strings.Count(f.logs.String(), "automatic attachment maintenance complete"))
 	assert.Contains(f.logs.String(), "duration=")
 
-	require.NoError(t, f.maintenance.runPendingPack(context.Background()))
+	require.NoError(t, f.maintenance.runPendingPack(t.Context()))
 	assert.Equal(1, strings.Count(f.logs.String(), "automatic attachment maintenance complete"),
 		"a second pending pass is a no-op")
 }
@@ -322,7 +337,7 @@ func TestPendingPackContinuesAfterByteBudget(t *testing.T) {
 			}
 			if daily {
 				f.maintenance.markPackPending()
-				require.ErrorIs(f.maintenance.daily(context.Background()), scheduler.ErrReschedule,
+				require.ErrorIs(f.maintenance.daily(t.Context()), scheduler.ErrReschedule,
 					"a bounded daily pass must request another pass for the remaining backlog")
 			}
 			sched := scheduler.New(nil).WithLogger(f.maintenance.logger)
@@ -367,39 +382,39 @@ func TestRunScheduledSourceMarksPendingOnFailedIngestWithBlobs(t *testing.T) {
 	ingestErr := errors.New("scheduled ingest failed")
 	var hash string
 
-	err := runScheduledSource(context.Background(), f.maintenance, true,
+	err := runScheduledSource(t.Context(), f.maintenance, true,
 		func(context.Context) error {
-			hash = f.ingestLoose([]byte("blob written before failure"))
+			hash = f.ingestLoose(t.Context(), []byte("blob written before failure"))
 			return ingestErr
 		})
 	require.ErrorIs(t, err, ingestErr)
-	require.NoError(t, f.maintenance.runPendingPack(context.Background()))
+	require.NoError(t, f.maintenance.runPendingPack(t.Context()))
 	assert.NotNil(f.packedEntry(hash), "blobs from a failed run are still packed later")
 }
 
 func TestRunScheduledSourceCalendarNeverPacks(t *testing.T) {
 	f := newAttachmentMaintenanceFixture(t)
 	var hash string
-	require.NoError(t, runScheduledSource(context.Background(), f.maintenance, false,
+	require.NoError(t, runScheduledSource(t.Context(), f.maintenance, false,
 		func(context.Context) error {
-			hash = f.ingestLoose([]byte("calendar-side blob"))
+			hash = f.ingestLoose(t.Context(), []byte("calendar-side blob"))
 			return nil
 		}))
-	require.NoError(t, f.maintenance.runPendingPack(context.Background()))
+	require.NoError(t, f.maintenance.runPendingPack(t.Context()))
 	assert.Nil(t, f.packedEntry(hash), "non-attachment sources do not request packing")
 }
 
 func TestDailyMaintenanceClearsPendingPack(t *testing.T) {
 	require := require.New(t)
 	f := newAttachmentMaintenanceFixture(t)
-	require.NoError(runScheduledSource(context.Background(), f.maintenance, true,
+	require.NoError(runScheduledSource(t.Context(), f.maintenance, true,
 		func(context.Context) error {
-			f.ingestLoose([]byte("blob packed by the daily job"))
+			f.ingestLoose(t.Context(), []byte("blob packed by the daily job"))
 			return nil
 		}))
-	require.NoError(f.maintenance.daily(context.Background()))
+	require.NoError(f.maintenance.daily(t.Context()))
 	before := strings.Count(f.logs.String(), "automatic attachment maintenance complete")
-	require.NoError(f.maintenance.runPendingPack(context.Background()))
+	require.NoError(f.maintenance.runPendingPack(t.Context()))
 	assert.Equal(t, before, strings.Count(f.logs.String(), "automatic attachment maintenance complete"),
 		"daily pack satisfied the pending request")
 }
@@ -417,7 +432,7 @@ func TestRegisterScheduledBeeperJobDefersPackToPackJob(t *testing.T) {
 
 	require.NoError(registerScheduledBeeperJob(sched, "*/30 * * * *", f.maintenance,
 		func(context.Context) error {
-			hash = f.ingestLoose([]byte("scheduled beeper payload"))
+			hash = f.ingestLoose(t.Context(), []byte("scheduled beeper payload"))
 			return nil
 		}))
 	require.NoError(registerAttachmentPackJob(sched, f.maintenance))
@@ -466,7 +481,7 @@ func TestAttachmentMaintenanceDailyPacksThenRepacks(t *testing.T) {
 	live := []byte("daily packing new loose bytes")
 	liveHash := f.addLoose(live)
 
-	require.NoError(f.maintenance.daily(context.Background()))
+	require.NoError(f.maintenance.daily(t.Context()))
 	require.NotNil(f.packedEntry(liveHash))
 	assert.Equal(live, f.readBlob(liveHash))
 	has, err := f.store.HasPackRecordContext(t.Context(), deadPackID)
@@ -486,7 +501,7 @@ func TestPostRemovalRepackFailureWarnsWithoutReplacingSuccess(t *testing.T) {
 	var warning string
 
 	err := runAfterSuccessfulAttachmentRemoval(
-		context.Background(), maintenance,
+		t.Context(), maintenance,
 		func(context.Context) error { return nil },
 		func(message string) error {
 			warning = message
@@ -531,7 +546,7 @@ func TestAutomaticRepackLogsCommittedSiblingProgressBeforeAggregateWarning(t *te
 	require.NoError(os.WriteFile(corruptPath, []byte("truncated corrupt pack"), 0o600), "corrupt oldest source")
 	var warning string
 
-	err := f.maintenance.runAutomaticRepack(context.Background(), func(message string) error {
+	err := f.maintenance.runAutomaticRepack(t.Context(), func(message string) error {
 		warning = message
 		return nil
 	})
@@ -583,12 +598,15 @@ func TestAttachmentProducingCommandExactAllowlist(t *testing.T) {
 		"import-pst",
 		"import-slackdump",
 		"import-synctech-sms",
+		"import-telegram",
 		"import-whatsapp",
 		"sync-beeper",
+		"sync-chatwoot",
 		"sync-discord",
 		"sync-slack",
 		"sync-synctech-sms",
 		"sync-teams",
+		"sync-twilio",
 	}
 	for _, command := range allowlisted {
 		t.Run("allows "+command, func(t *testing.T) {
@@ -614,13 +632,13 @@ func TestAttachmentProducingCommandExactAllowlist(t *testing.T) {
 func TestAttachmentIngestMutationLeaseWaitsForMaintenance(t *testing.T) {
 	require := require.New(t)
 	f := newAttachmentMaintenanceFixture(t)
-	maintenanceLease, err := f.maintenance.coordinator.AcquireMaintenance(context.Background())
+	maintenanceLease, err := f.maintenance.coordinator.AcquireMaintenance(t.Context())
 	require.NoError(err)
 	ingestStarted := make(chan struct{})
 	done := make(chan error, 1)
 	go func() {
 		done <- runAfterSuccessfulAttachmentIngest(
-			context.Background(), f.maintenance,
+			t.Context(), f.maintenance,
 			func(context.Context) error {
 				close(ingestStarted)
 				return nil
@@ -631,7 +649,7 @@ func TestAttachmentIngestMutationLeaseWaitsForMaintenance(t *testing.T) {
 	select {
 	case <-ingestStarted:
 		assert.Fail(t, "ingest started while maintenance held the exclusive lease")
-	case <-time.After(25 * time.Millisecond):
+	case <-time.After(25 * time.Millisecond): //nolint:kennlint // deadlinetest: absence check: the held maintenance lease keeps ingest from starting
 	}
 	require.NoError(maintenanceLease.Release())
 	select {
@@ -661,20 +679,43 @@ func TestPendingPackCheckpointsVerificationAndStillPacksNewBlobs(t *testing.T) {
 	require.NoError(err)
 	defer func() { require.NoError(resumed.close()) }()
 	ctx := jobctx.WithProgress(t.Context())
-	verifyMore, err := resumed.runScheduledPack(ctx)
-	require.NoError(err)
-	assert.False(t, verifyMore, "the second window finishes the cycle the first pass started")
+	require.NoError(resumed.runScheduledPack(ctx, true))
+	assert.False(t, resumed.verifyPending.Load(), "the second window finishes the cycle the first pass started")
 	stats, err := resumed.unpack(t.Context())
 	require.NoError(err)
 	assert.Equal(t, existing+1, stats.BlobsRestored, "manual unpack must see the full catalog")
 }
 
+func TestFinalVerificationBatchClearsBothPendingFlags(t *testing.T) {
+	for _, daily := range []bool{false, true} {
+		t.Run(fmt.Sprintf("daily=%v", daily), func(t *testing.T) {
+			require := require.New(t)
+			assert := assert.New(t)
+			f := newAttachmentMaintenanceFixture(t)
+			for i := range 140 {
+				f.addLoose([]byte(fmt.Sprintf("live packed content %d", i)))
+			}
+			_, err := f.maintenance.pack(t.Context(), 0)
+			require.NoError(err)
+			require.NoError(f.maintenance.runScheduledPack(t.Context(), true))
+			require.True(f.maintenance.verifyPending.Load(), "the first batch leaves verification pending")
+			f.maintenance.markPackPending()
+
+			if daily {
+				err = f.maintenance.daily(t.Context())
+			} else {
+				err = f.maintenance.runPendingPack(t.Context())
+			}
+			assert.NoError(err, "the final batch must finish without rescheduling")
+		})
+	}
+}
+
 func TestCompletedPackVerificationRecordsNoProgress(t *testing.T) {
 	f := newAttachmentMaintenanceFixture(t)
 	ctx := jobctx.WithProgress(t.Context())
-	verifyMore, err := f.maintenance.runScheduledPack(ctx)
-	require.NoError(t, err)
-	assert.False(t, verifyMore)
+	require.NoError(t, f.maintenance.runScheduledPack(ctx, true))
+	assert.False(t, f.maintenance.verifyPending.Load())
 	assert.False(t, jobctx.HasProgress(ctx), "an empty completed scan provides no resume point for a cancelled repack")
 }
 
@@ -745,7 +786,7 @@ func TestBackgroundPackKeepsIdleDaemonAliveUntilItFinishes(t *testing.T) {
 		const idleTimeout = 20 * time.Second
 		idleShutdown := make(chan struct{})
 		idle := api.NewIdleTracker(idleTimeout, func() { close(idleShutdown) })
-		sched, media := newServeSchedulers(nil, f.maintenance.logger, idle, api.NewSerialOperationGate())
+		sched, media := newServeSchedulers(nil, f.maintenance.logger, idle, api.NewSerialOperationGate(), nil)
 		defer func() { <-serveSchedulers{sched, media}.Stop().Done() }()
 		require.NoError(registerAttachmentPackJob(sched, f.maintenance))
 		go idle.Run(t.Context())
@@ -866,7 +907,7 @@ func TestQueuedPackJobCountsAsDaemonActivity(t *testing.T) {
 		idleShutdown := make(chan struct{})
 		idle := api.NewIdleTracker(idleTimeout, func() { close(idleShutdown) })
 		gate := api.NewSerialOperationGate()
-		sched, media := newServeSchedulers(nil, f.maintenance.logger, idle, gate)
+		sched, media := newServeSchedulers(nil, f.maintenance.logger, idle, gate, nil)
 		defer func() { <-serveSchedulers{sched, media}.Stop().Done() }()
 		require.NoError(registerAttachmentPackJob(sched, f.maintenance))
 		go idle.Run(t.Context())
@@ -923,7 +964,7 @@ func TestDailyMaintenanceChainsTheWholeVerificationCycle(t *testing.T) {
 
 	assert.Equal(1, followUps, "the second window needs one follow-up")
 	var cursor string
-	require.NoError(f.store.DB().QueryRow(f.store.Rebind(
+	require.NoError(f.store.DB().QueryRowContext(t.Context(), f.store.Rebind(
 		`SELECT value FROM archive_metadata WHERE key = ?`), "attachment_pack_verification_cursor").Scan(&cursor))
 	assert.Empty(cursor, "a finished cycle resets the verification cursor")
 	assert.Equal(2, strings.Count(f.logs.String(), "automatic attachment maintenance complete"))
@@ -938,7 +979,7 @@ func TestBackgroundPackCancelsOnShutdownAndRestartResumesIt(t *testing.T) {
 		f := newAttachmentMaintenanceFixture(t)
 		hash := f.addLoose([]byte("blob whose pass is interrupted by shutdown"))
 		gate := api.NewSerialOperationGate()
-		sched, media := newServeSchedulers(nil, f.maintenance.logger, nil, gate)
+		sched, media := newServeSchedulers(nil, f.maintenance.logger, nil, gate, nil)
 		require.NoError(registerAttachmentPackJob(sched, f.maintenance))
 		release := f.holdPackPass()
 
@@ -965,4 +1006,44 @@ func TestBackgroundPackCancelsOnShutdownAndRestartResumesIt(t *testing.T) {
 		synctest.Wait()
 		assert.NotNil(f.packedEntry(hash))
 	})
+}
+
+// TestVerificationFollowupSkipsLooseEnumeration pins the behaviour that makes
+// the follow-up loop affordable: a pass queued only to walk the next
+// verification slice must not re-enumerate loose candidates, while the next
+// pass that a sync requests still packs them. The attachment-pack job never
+// runs for verification alone; the daily job finishes verification cycles.
+func TestVerificationFollowupSkipsLooseEnumeration(t *testing.T) {
+	for _, daily := range []bool{false, true} {
+		t.Run(fmt.Sprintf("daily=%v", daily), func(t *testing.T) {
+			assert := assert.New(t)
+			require := require.New(t)
+			f := newAttachmentMaintenanceFixture(t)
+			for i := range 140 {
+				f.addLoose([]byte(fmt.Sprintf("existing packed content %d", i)))
+			}
+			_, err := f.maintenance.pack(t.Context(), 0)
+			require.NoError(err)
+			hash := f.addLoose([]byte("loose blob must wait for an enumerating pass"))
+			require.NoError(f.maintenance.runScheduledPack(t.Context(), false))
+
+			require.True(f.maintenance.verifyPending.Load())
+
+			if daily {
+				err = f.maintenance.daily(t.Context())
+			} else {
+				err = f.maintenance.runPendingPack(t.Context())
+				assert.True(f.maintenance.verifyPending.Load(), "the daily job still owes the rest of the cycle")
+			}
+			require.NoError(err)
+			assert.Nil(f.packedEntry(hash), "a verification follow-up packs no loose blob")
+
+			// A sync that wrote loose blobs requests a full pass, which packs it
+			// and advances verification by one window without chaining more.
+			f.maintenance.markPackPending()
+			require.NoError(f.maintenance.runPendingPack(t.Context()))
+			assert.NotNil(f.packedEntry(hash), "the next requested pass packs the deferred blob")
+			assert.True(f.maintenance.verifyPending.Load(), "the restarted cycle is left to the daily job")
+		})
+	}
 }

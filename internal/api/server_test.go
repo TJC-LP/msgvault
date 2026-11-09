@@ -22,12 +22,14 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/kit/daemon"
+	"go.kenn.io/msgvault/internal/agentgrant"
 	"go.kenn.io/msgvault/internal/apiprotocol"
 	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/daemonauth"
 	"go.kenn.io/msgvault/internal/deletion"
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/query/querytest"
+	"go.kenn.io/msgvault/internal/scheduler"
 	"go.kenn.io/msgvault/internal/search"
 	"go.kenn.io/msgvault/internal/store"
 )
@@ -80,7 +82,7 @@ func TestTextConversationsParticipantIDs(t *testing.T) {
 	engine := &participantFilterTextEngine{MockEngine: &querytest.MockEngine{}}
 	srv := newTestServerWithEngine(t, engine)
 
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/text/conversations?participant_id=11&participant_id=14", nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/text/conversations?participant_id=11&participant_id=14", nil)
 	response := httptest.NewRecorder()
 	srv.Router().ServeHTTP(response, req)
 	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
@@ -91,7 +93,7 @@ func TestTextConversationsParticipantIDs(t *testing.T) {
 		"/api/v1/text/conversations?participant_id=invalid",
 	} {
 		response = httptest.NewRecorder()
-		srv.Router().ServeHTTP(response, httptest.NewRequest(http.MethodGet, target, nil))
+		srv.Router().ServeHTTP(response, httptest.NewRequestWithContext(t.Context(), http.MethodGet, target, nil))
 		assert.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
 	}
 }
@@ -102,7 +104,8 @@ func TestTextConversationMessagesPassesScopedSearchQuery(t *testing.T) {
 	srv := newTestServerWithEngine(t, engine)
 
 	response := httptest.NewRecorder()
-	srv.Router().ServeHTTP(response, httptest.NewRequest(
+	srv.Router().ServeHTTP(response, httptest.NewRequestWithContext(
+		t.Context(),
 		http.MethodGet,
 		"/api/v1/text/conversations/701/messages?search_query=hiddenneedle",
 		nil,
@@ -160,12 +163,12 @@ func TestLoggerMiddlewareLogsInProgressRequest(t *testing.T) {
 		defer func() {
 			releaseRequest()
 			synctest.Wait()
-			require.NoError(srv.Shutdown(context.Background()), "shutdown")
+			require.NoError(srv.Shutdown(t.Context()), "shutdown")
 		}()
 		srv.inProgressThreshold = 20 * time.Millisecond
 		srv.inProgressInterval = 20 * time.Millisecond
 
-		req := httptest.NewRequest(http.MethodPost, queryEndpointPath,
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, queryEndpointPath,
 			bytes.NewReader([]byte(`{"sql":"SELECT 1"}`)))
 		req.Header.Set("Content-Type", "application/json")
 		resp := httptest.NewRecorder()
@@ -203,7 +206,7 @@ func TestPprofEndpointLoopbackOnly(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodGet, "/debug/pprof/", nil)
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/debug/pprof/", nil)
 			req.RemoteAddr = tc.remoteAddr
 			resp := httptest.NewRecorder()
 			srv.Router().ServeHTTP(resp, req)
@@ -237,7 +240,7 @@ func TestPprofEndpointRequiresAuthWhenKeyConfigured(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodGet, "/debug/pprof/", nil)
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/debug/pprof/", nil)
 			req.RemoteAddr = tc.remoteAddr
 			if tc.reqKey != "" {
 				req.Header.Set("X-Api-Key", tc.reqKey)
@@ -283,8 +286,8 @@ type mockScheduler struct {
 	triggeredJobs []string        // generic job names passed to TriggerJob
 	triggerJobFn  func(name string) error
 	startedJobs   []string // generic job names passed to StartJob
-	startJobFn    func(name string) error
-	triggerFn     func(email string) error
+	startJobFn    func(name string, manual bool) (scheduler.JobDisposition, error)
+	triggerFn     func(email string, manual bool) error
 	addedAccts    []string // emails added via AddAccount
 }
 
@@ -299,9 +302,9 @@ func (m *mockScheduler) IsScheduled(email string) bool {
 	return m.scheduled[email]
 }
 
-func (m *mockScheduler) TriggerSync(email string) error {
+func (m *mockScheduler) TriggerSync(email string, manual bool) error {
 	if m.triggerFn != nil {
-		return m.triggerFn(email)
+		return m.triggerFn(email, manual)
 	}
 	return nil
 }
@@ -336,12 +339,12 @@ func (m *mockScheduler) TriggerJob(name string) error {
 	return nil
 }
 
-func (m *mockScheduler) StartJob(name string) error {
+func (m *mockScheduler) StartJob(name string, manual bool) (scheduler.JobDisposition, error) {
 	m.startedJobs = append(m.startedJobs, name)
 	if m.startJobFn != nil {
-		return m.startJobFn(name)
+		return m.startJobFn(name, manual)
 	}
-	return nil
+	return scheduler.JobStarted, nil
 }
 
 // mockStore implements MessageStore for tests.
@@ -531,7 +534,7 @@ func (m *mockStore) GetStatsContext(ctx context.Context) (*StoreStats, error) {
 	return m.GetStats()
 }
 
-func (m *mockStore) ListMessagesContext(_ context.Context, offset, limit int) ([]APIMessage, int64, error) {
+func (m *mockStore) ListMessagesContext(_ context.Context, offset, limit int, _ []int64) ([]APIMessage, int64, error) {
 	return m.ListMessages(offset, limit)
 }
 
@@ -834,7 +837,7 @@ func TestHealthEndpoint(t *testing.T) {
 	sched := newMockScheduler()
 	srv := NewServer(cfg, nil, sched, testLogger())
 
-	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/health", nil)
 	w := httptest.NewRecorder()
 
 	srv.Router().ServeHTTP(w, req)
@@ -855,7 +858,7 @@ func TestHealthEndpoint_HEAD(t *testing.T) {
 	sched := newMockScheduler()
 	srv := NewServer(cfg, nil, sched, testLogger())
 
-	req := httptest.NewRequest(http.MethodHead, "/health", nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodHead, "/health", nil)
 	w := httptest.NewRecorder()
 
 	srv.Router().ServeHTTP(w, req)
@@ -878,7 +881,7 @@ func TestDaemonPingEndpoint(t *testing.T) {
 		DaemonVersion: "v-test",
 	})
 
-	req := httptest.NewRequest(http.MethodGet, daemon.DefaultPingPath, nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, daemon.DefaultPingPath, nil)
 	w := httptest.NewRecorder()
 
 	srv.Router().ServeHTTP(w, req)
@@ -908,16 +911,16 @@ func TestDaemonShutdownEndpointRequiresRuntimeToken(t *testing.T) {
 				called <- struct{}{}
 			},
 		})
-		defer func() { require.NoError(srv.Shutdown(context.Background()), "shutdown") }()
+		defer func() { require.NoError(srv.Shutdown(t.Context()), "shutdown") }()
 
-		missing := httptest.NewRequest(http.MethodPost, DaemonShutdownPath, nil)
+		missing := httptest.NewRequestWithContext(t.Context(), http.MethodPost, DaemonShutdownPath, nil)
 		missingResp := httptest.NewRecorder()
 		srv.Router().ServeHTTP(missingResp, missing)
 		assert.Equal(http.StatusUnauthorized, missingResp.Code, "missing token status")
 		synctest.Wait()
 		assert.Empty(called, "shutdown must not run without token")
 
-		req := httptest.NewRequest(http.MethodPost, DaemonShutdownPath, nil)
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, DaemonShutdownPath, nil)
 		req.Header.Set(DaemonShutdownTokenHeader, "runtime-token")
 		w := httptest.NewRecorder()
 		srv.Router().ServeHTTP(w, req)
@@ -929,6 +932,46 @@ func TestDaemonShutdownEndpointRequiresRuntimeToken(t *testing.T) {
 			require.FailNow("shutdown callback")
 		}
 	})
+}
+
+func TestLoopbackDiscoveryBypassesRateLimitWithAPIKey(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+	assert := assert.New(t)
+	challenge, err := daemonauth.NewChallenge()
+	require.NoError(err, "create challenge")
+	srv := NewServerWithOptions(ServerOptions{
+		Config:        &config.Config{Server: config.ServerConfig{APIKey: "secret-key"}},
+		Logger:        testLogger(),
+		ShutdownToken: "runtime-secret",
+	})
+	// Cleanup runs after t.Context() is canceled.
+	t.Cleanup(func() { require.NoError(srv.Shutdown(context.WithoutCancel(t.Context()))) })
+	// One request exhausts the budget; disable refills for slow runners.
+	srv.rateLimiter.rate = 0
+	srv.rateLimiter.burst = 1
+	handler := srv.Router()
+	for _, tt := range []struct {
+		path string
+		key  string
+		want int
+	}{
+		{"/api/v1/stats", "", http.StatusUnauthorized},
+		{"/api/v1/stats", "", http.StatusTooManyRequests},
+		{daemon.DefaultPingPath, "", http.StatusOK},
+		{DaemonIdentityPath, "", http.StatusNoContent},
+		{daemon.DefaultPingPath, "wrong", http.StatusTooManyRequests},
+	} {
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, tt.path, nil)
+		req.RemoteAddr = "127.0.0.1:1234"
+		req.Header.Set(DaemonIdentityChallengeHeader, challenge)
+		if tt.key != "" {
+			req.Header.Set("X-Api-Key", tt.key)
+		}
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+		assert.Equal(tt.want, w.Code, "path %s, key %q", tt.path, tt.key)
+	}
 }
 
 func TestDaemonIdentityEndpointProvesRuntimeSecretWithoutReceivingIt(t *testing.T) {
@@ -944,7 +987,7 @@ func TestDaemonIdentityEndpointProvesRuntimeSecretWithoutReceivingIt(t *testing.
 		Logger:        testLogger(),
 		ShutdownToken: "runtime-secret",
 	})
-	req := httptest.NewRequest(http.MethodGet, DaemonIdentityPath, nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, DaemonIdentityPath, nil)
 	req.Header.Set(DaemonIdentityChallengeHeader, challenge)
 	w := httptest.NewRecorder()
 
@@ -956,7 +999,7 @@ func TestDaemonIdentityEndpointProvesRuntimeSecretWithoutReceivingIt(t *testing.
 		"proof authenticates this daemon PID")
 	assert.NotContains(proof, "runtime-secret", "response does not disclose the runtime secret")
 
-	invalid := httptest.NewRequest(http.MethodGet, DaemonIdentityPath, nil)
+	invalid := httptest.NewRequestWithContext(t.Context(), http.MethodGet, DaemonIdentityPath, nil)
 	invalid.Header.Set(DaemonIdentityChallengeHeader, "invalid")
 	invalidResp := httptest.NewRecorder()
 	srv.Router().ServeHTTP(invalidResp, invalid)
@@ -988,7 +1031,7 @@ func TestAuthMiddleware(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodGet, "/api/v1/stats", nil)
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/stats", nil)
 			if tt.authHeader != "" {
 				if tt.name == "x-api-key header" {
 					req.Header.Set("X-Api-Key", tt.authHeader)
@@ -1017,7 +1060,7 @@ func TestAuthMiddlewareNoKeyConfigured(t *testing.T) {
 	srv := NewServer(cfg, nil, sched, testLogger())
 
 	// Should allow access without auth when no key is configured
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/accounts", nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/accounts", nil)
 	w := httptest.NewRecorder()
 
 	srv.Router().ServeHTTP(w, req)
@@ -1044,7 +1087,7 @@ func TestSchedulerStatusEndpoint(t *testing.T) {
 
 	srv := NewServer(cfg, nil, sched, testLogger())
 
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/scheduler/status", nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/scheduler/status", nil)
 	w := httptest.NewRecorder()
 
 	srv.Router().ServeHTTP(w, req)
@@ -1068,7 +1111,7 @@ func TestSchedulerStatusNotRunning(t *testing.T) {
 
 	srv := NewServer(cfg, nil, sched, testLogger())
 
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/scheduler/status", nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/scheduler/status", nil)
 	w := httptest.NewRecorder()
 
 	srv.Router().ServeHTTP(w, req)
@@ -1091,7 +1134,7 @@ func TestListAccountsEndpoint(t *testing.T) {
 	sched := newMockScheduler()
 	srv := NewServer(cfg, nil, sched, testLogger())
 
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/accounts", nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/accounts", nil)
 	w := httptest.NewRecorder()
 
 	srv.Router().ServeHTTP(w, req)
@@ -1123,7 +1166,7 @@ func TestNilStoreReturns503(t *testing.T) {
 
 	for _, path := range endpoints {
 		t.Run(path, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodGet, path, nil)
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, path, nil)
 			w := httptest.NewRecorder()
 			srv.Router().ServeHTTP(w, req)
 
@@ -1150,7 +1193,7 @@ func TestNilSchedulerReturns503(t *testing.T) {
 
 	for _, ep := range endpoints {
 		t.Run(ep.method+" "+ep.path, func(t *testing.T) {
-			req := httptest.NewRequest(ep.method, ep.path, nil)
+			req := httptest.NewRequestWithContext(t.Context(), ep.method, ep.path, nil)
 			w := httptest.NewRecorder()
 			srv.Router().ServeHTTP(w, req)
 
@@ -1205,7 +1248,7 @@ func TestCORSFromConfig(t *testing.T) {
 	srv := NewServer(cfg, nil, sched, testLogger())
 
 	// Request from allowed origin
-	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/health", nil)
 	req.Header.Set("Origin", "http://localhost:3000")
 	w := httptest.NewRecorder()
 	srv.Router().ServeHTTP(w, req)
@@ -1213,7 +1256,7 @@ func TestCORSFromConfig(t *testing.T) {
 		"expected CORS header for allowed origin")
 
 	// Request from disallowed origin
-	req2 := httptest.NewRequest(http.MethodGet, "/health", nil)
+	req2 := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/health", nil)
 	req2.Header.Set("Origin", "http://evil.com")
 	w2 := httptest.NewRecorder()
 	srv.Router().ServeHTTP(w2, req2)
@@ -1221,7 +1264,7 @@ func TestCORSFromConfig(t *testing.T) {
 		"expected no CORS header for disallowed origin")
 
 	// Preflight requests from allowed origins should advertise every API method.
-	req3 := httptest.NewRequest(http.MethodOptions, "/api/v1/cli/collections/Team/sources", nil)
+	req3 := httptest.NewRequestWithContext(t.Context(), http.MethodOptions, "/api/v1/cli/collections/Team/sources", nil)
 	req3.Header.Set("Origin", "http://localhost:3000")
 	w3 := httptest.NewRecorder()
 	srv.Router().ServeHTTP(w3, req3)
@@ -1238,7 +1281,7 @@ func TestCORSDisabledByDefault(t *testing.T) {
 	sched := newMockScheduler()
 	srv := NewServer(cfg, nil, sched, testLogger())
 
-	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/health", nil)
 	req.Header.Set("Origin", "http://localhost:3000")
 	w := httptest.NewRecorder()
 	srv.Router().ServeHTTP(w, req)
@@ -1271,22 +1314,34 @@ func TestTimeoutMiddlewareDeadlinePolicy(t *testing.T) {
 	const apiKey = "deadline-policy-test-key"
 	srv := NewServerWithOptions(ServerOptions{
 		Config: &config.Config{Server: config.ServerConfig{
-			APIPort: 8080,
-			APIKey:  apiKey,
+			APIPort:     8080,
+			APIKey:      apiKey,
+			AgentAccess: true,
 		}},
 		Logger: testLogger(),
 	})
 
-	handler := srv.timeoutMiddleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	t.Cleanup(srv.agentGrants.Close)
+	_, token, _, err := srv.agentGrants.Issue("reader", []agentgrant.Permission{agentgrant.PermissionSearchRead}, []agentgrant.SourceRef{{ID: 1, Type: "test", Identifier: "reader@example.test"}}, time.Time{})
+	require.NoError(t, err)
+	delegated := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/cli/search?q=needle", nil)
+	delegated.Header.Set(apiprotocol.AgentTokenHeader, token)
+	markedDelegated := delegated.Clone(t.Context())
+	markedDelegated.Header.Set(apiprotocol.ClientClassHeader, apiprotocol.ClientClassCLI)
+	var deadline time.Time
+	var hasDeadline bool
+	handler := srv.timeoutMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		deadline, hasDeadline = r.Context().Deadline()
 		w.WriteHeader(http.StatusOK)
 	}))
 
-	longPath := httptest.NewRequest(http.MethodPost, "/api/v1/cli/sync-full", nil)
-	marked := httptest.NewRequest(http.MethodGet, "/api/v1/cli/stats", nil)
+	longPath := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/cli/sync-full", nil)
+	marked := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/cli/stats", nil)
 	marked.RemoteAddr = "127.0.0.1:4242"
 	marked.Header.Set(apiprotocol.ClientClassHeader, apiprotocol.ClientClassCLI)
 	marked.Header.Set("X-Api-Key", apiKey)
-	markedDeleteDeduped := httptest.NewRequest(
+	markedDeleteDeduped := httptest.NewRequestWithContext(
+		t.Context(),
 		http.MethodPost,
 		"/api/v1/cli/delete-deduped",
 		nil,
@@ -1294,18 +1349,19 @@ func TestTimeoutMiddlewareDeadlinePolicy(t *testing.T) {
 	markedDeleteDeduped.RemoteAddr = "127.0.0.1:4242"
 	markedDeleteDeduped.Header.Set(apiprotocol.ClientClassHeader, apiprotocol.ClientClassCLI)
 	markedDeleteDeduped.Header.Set("X-Api-Key", apiKey)
-	meetingImport := httptest.NewRequest(http.MethodPost, "/api/v1/import/meeting", nil)
+	meetingImport := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/import/meeting", nil)
 	meetingImport.Header.Set("X-Api-Key", apiKey)
-	unauthorizedMeetingImport := httptest.NewRequest(http.MethodPost, "/api/v1/import/meeting", nil)
+	unauthorizedMeetingImport := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/import/meeting", nil)
 	unauthorizedMeetingImport.Header.Set("X-Api-Key", "invalid")
-	bounded := httptest.NewRequest(http.MethodGet, "/api/v1/cli/stats", nil)
+	bounded := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/cli/stats", nil)
 
 	tests := []struct {
-		name             string
-		request          *http.Request
-		wantReadClear    bool
-		wantReadDeadline bool
-		wantWriteClear   bool
+		name                string
+		request             *http.Request
+		wantReadClear       bool
+		wantReadDeadline    bool
+		wantWriteClear      bool
+		wantContextDeadline bool
 	}{
 		{name: "unmarked long path", request: longPath, wantWriteClear: true},
 		{name: "marked request", request: marked, wantReadClear: true, wantWriteClear: true},
@@ -1326,16 +1382,32 @@ func TestTimeoutMiddlewareDeadlinePolicy(t *testing.T) {
 			request:        unauthorizedMeetingImport,
 			wantWriteClear: true,
 		},
-		{name: "bounded request", request: bounded},
+		{name: "bounded request", request: bounded, wantContextDeadline: true},
+		{name: "delegated search", request: delegated, wantContextDeadline: true},
+		{name: "marked delegated search", request: markedDelegated, wantContextDeadline: true},
+		{name: "POST /api/v1/carddav/account/test", request: httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/carddav/account/test", nil), wantReadDeadline: true, wantContextDeadline: true},
+		{name: "PUT /api/v1/carddav/account", request: httptest.NewRequestWithContext(t.Context(), http.MethodPut, "/api/v1/carddav/account", nil), wantReadDeadline: true, wantContextDeadline: true},
+		{name: "POST /api/v1/carddav/publications/7", request: httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/carddav/publications/7", nil), wantReadDeadline: true, wantContextDeadline: true},
+		{name: "DELETE /api/v1/carddav/publications/7", request: httptest.NewRequestWithContext(t.Context(), http.MethodDelete, "/api/v1/carddav/publications/7", nil), wantReadDeadline: true, wantContextDeadline: true},
+		{name: "POST /api/v1/carddav/conflicts/7/resolve", request: httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/carddav/conflicts/7/resolve", nil), wantReadDeadline: true, wantContextDeadline: true},
+		{name: "POST /api/v1/carddav/sync", request: httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/carddav/sync", nil), wantReadDeadline: true, wantContextDeadline: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			assert := assert.New(t)
 			require := require.New(t)
+			deadline = time.Time{}
+			hasDeadline = false
 			recorder := &deadlineClearingRecorder{ResponseRecorder: httptest.NewRecorder()}
 			started := time.Now()
 			handler.ServeHTTP(recorder, tt.request)
+			if tt.wantContextDeadline {
+				assert.True(hasDeadline)
+			}
 			finished := time.Now()
+			if tt.wantReadDeadline && tt.wantContextDeadline {
+				assertDeadlineWithin(t, deadline, started, finished)
+			}
 			if tt.wantReadClear {
 				require.Len(recorder.readDeadlines, 1, "read deadline changes")
 				assert.True(recorder.readDeadlines[0].IsZero(), "read deadline cleared, not extended")
@@ -1361,47 +1433,6 @@ func assertDeadlineWithin(t *testing.T, deadline, started, finished time.Time) {
 	const timeout = DaemonLongRequestTimeout
 	assert.False(t, deadline.Before(started.Add(timeout)), "deadline %v is earlier than %v after the request started at %v", deadline, timeout, started)
 	assert.False(t, deadline.After(finished.Add(timeout)), "deadline %v is later than %v after the request finished at %v", deadline, timeout, finished)
-}
-
-func TestCardDAVNetworkRoutesReceiveProtectiveDeadline(t *testing.T) {
-	t.Parallel()
-	srv := NewServerWithOptions(ServerOptions{
-		Config:         &config.Config{Server: config.ServerConfig{APIPort: 8080}},
-		Logger:         testLogger(),
-		RequestTimeout: 5 * time.Millisecond,
-	})
-	routes := []struct {
-		method string
-		path   string
-	}{
-		{method: http.MethodPost, path: "/api/v1/carddav/account/test"},
-		{method: http.MethodPut, path: "/api/v1/carddav/account"},
-		{method: http.MethodPost, path: "/api/v1/carddav/publications/7"},
-		{method: http.MethodDelete, path: "/api/v1/carddav/publications/7"},
-		{method: http.MethodPost, path: "/api/v1/carddav/conflicts/7/resolve"},
-		{method: http.MethodPost, path: "/api/v1/carddav/sync"},
-	}
-
-	for _, route := range routes {
-		t.Run(route.method+" "+route.path, func(t *testing.T) {
-			assert := assert.New(t)
-			require := require.New(t)
-			var deadline time.Time
-			var hasDeadline bool
-			handler := srv.timeoutMiddleware(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
-				deadline, hasDeadline = r.Context().Deadline()
-			}))
-			recorder := &deadlineClearingRecorder{ResponseRecorder: httptest.NewRecorder()}
-			started := time.Now()
-			handler.ServeHTTP(recorder, httptest.NewRequest(route.method, route.path, nil))
-			finished := time.Now()
-
-			require.True(hasDeadline, "network route receives a context deadline")
-			assertDeadlineWithin(t, deadline, started, finished)
-			require.Len(recorder.readDeadlines, 1, "network route extends the server read deadline")
-			assert.Empty(recorder.writeDeadlines, "network route keeps the generous server write deadline")
-		})
-	}
 }
 
 func TestCLIRequestDurationPolicy(t *testing.T) {
@@ -1490,8 +1521,9 @@ func TestCLIRequestDurationPolicy(t *testing.T) {
 					Logger:         testLogger(),
 					RequestTimeout: 5 * time.Millisecond,
 				})
+				// Cleanup runs after t.Context() is canceled.
 				t.Cleanup(func() {
-					require.NoError(t, srv.Shutdown(context.Background()))
+					require.NoError(t, srv.Shutdown(context.WithoutCancel(t.Context())))
 				})
 
 				handlerResult := make(chan error, 1)
@@ -1503,7 +1535,7 @@ func TestCLIRequestDurationPolicy(t *testing.T) {
 						handlerResult <- r.Context().Err()
 					}
 				}))
-				req := httptest.NewRequest(http.MethodGet, "/api/v1/cli/stats", nil)
+				req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/cli/stats", nil)
 				if tt.configure != nil {
 					tt.configure(srv, req)
 				}
@@ -1533,7 +1565,7 @@ func TestCLIRepairMessageRouteParsesDedicatedRequestAndStreamsNDJSON(t *testing.
 		return emit(CLIRepairMessageEvent{Type: "stdout", Data: "repaired\n"})
 	}}
 	srv := NewServer(&config.Config{Server: config.ServerConfig{APIPort: 8080}}, store, newMockScheduler(), testLogger())
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/cli/repair-message",
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/cli/repair-message",
 		strings.NewReader(`{"reference":"gmail-42","source_id":7}`))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -1575,7 +1607,7 @@ func TestCLIRepairMessageRouteRejectsInvalidModeBeforeRunning(t *testing.T) {
 				return nil
 			}}
 			srv := NewServer(&config.Config{Server: config.ServerConfig{APIPort: 8080}}, store, newMockScheduler(), testLogger())
-			req := httptest.NewRequest(http.MethodPost, "/api/v1/cli/repair-message", strings.NewReader(test.body))
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/cli/repair-message", strings.NewReader(test.body))
 			req.Header.Set("Content-Type", "application/json")
 			w := httptest.NewRecorder()
 
@@ -1602,7 +1634,7 @@ func TestCLIRepairMessageRoutePropagatesCancellation(t *testing.T) {
 	}}
 	srv := NewServer(&config.Config{Server: config.ServerConfig{APIPort: 8080}}, store, newMockScheduler(), testLogger())
 	ctx, cancel := context.WithCancel(t.Context())
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/cli/repair-message",
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/cli/repair-message",
 		strings.NewReader(`{"audit":true}`)).WithContext(ctx)
 	req.Header.Set("Content-Type", "application/json")
 	done := make(chan struct{})
@@ -1617,126 +1649,64 @@ func TestCLIRepairMessageRoutePropagatesCancellation(t *testing.T) {
 	<-done
 }
 
-func TestCLIRepairMessageRepairWaitsForOperationGate(t *testing.T) {
-	t.Parallel()
-	gate := NewSerialOperationGate()
-	release, ok := gate.BeginWorkContext(t.Context())
-	require.True(t, ok)
-	called := make(chan struct{})
-	store := &mockStore{repairMessageFunc: func(
-		context.Context, CLIRepairMessageRequest, func(CLIRepairMessageEvent) error,
-	) error {
-		close(called)
-		return nil
-	}}
-	srv := NewServerWithOptions(ServerOptions{
-		Config: &config.Config{Server: config.ServerConfig{APIPort: 8080}},
-		Store:  store, Scheduler: newMockScheduler(), Logger: testLogger(), OperationGate: gate,
-	})
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/cli/repair-message",
-		strings.NewReader(`{"reference":"gmail-42"}`))
-	req.Header.Set("Content-Type", "application/json")
-	done := make(chan struct{})
-	go func() {
-		srv.Router().ServeHTTP(httptest.NewRecorder(), req)
-		close(done)
-	}()
-
-	select {
-	case <-called:
-		require.FailNow(t, "repair ran while another archive operation held the gate")
-	case <-time.After(30 * time.Millisecond):
-	}
-	release()
-	select {
-	case <-called:
-	case <-time.After(time.Second):
-		require.FailNow(t, "repair did not run after the operation gate was released")
-	}
-	<-done
-}
-
-func TestCLIRepairMessageValidAuditBypassesOperationGateAndPreservesBody(t *testing.T) { //nolint:paralleltest // expects the audit to reach the store inside a 250ms real-time window
-	assert := assert.New(t)
-	require := require.New(t)
-	gate := NewSerialOperationGate()
-	release, ok := gate.BeginWorkContext(t.Context())
-	require.True(ok)
-	var releaseOnce sync.Once
-	releaseGate := func() { releaseOnce.Do(release) }
-	defer releaseGate()
-
-	got := make(chan CLIRepairMessageRequest, 1)
-	store := &mockStore{repairMessageFunc: func(
-		_ context.Context, req CLIRepairMessageRequest, _ func(CLIRepairMessageEvent) error,
-	) error {
-		got <- req
-		return nil
-	}}
-	srv := NewServerWithOptions(ServerOptions{
-		Config: &config.Config{Server: config.ServerConfig{APIPort: 8080}},
-		Store:  store, Scheduler: newMockScheduler(), Logger: testLogger(), OperationGate: gate,
-	})
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/cli/repair-message",
-		strings.NewReader(`{"audit":true,"source_id":7,"json":true}`))
-	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-	done := make(chan struct{})
-	go func() {
-		srv.Router().ServeHTTP(w, req)
-		close(done)
-	}()
-
-	select {
-	case request := <-got:
-		assert.Equal(CLIRepairMessageRequest{Audit: true, SourceID: 7, JSON: true}, request)
-	case <-time.After(250 * time.Millisecond):
-		releaseGate()
-		<-done
-		require.FailNow("valid read-only audit waited on the mutation gate")
-	}
-	<-done
-	assert.Equal(http.StatusOK, w.Code)
-}
-
-func TestCLIRepairMessageInvalidAuditBodiesDoNotBypassOperationGate(t *testing.T) {
+func TestCLIRepairMessageTakesOperationGateUnlessValidAudit(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
-		name string
-		body string
+		name        string
+		body        string
+		wantStatus  int
+		wantGated   bool
+		wantRequest *CLIRepairMessageRequest
 	}{
-		{name: "audit with repair reference", body: `{"audit":true,"reference":"gmail-42"}`},
-		{name: "audit with negative source", body: `{"audit":true,"source_id":-1}`},
-		{name: "malformed JSON", body: `{"audit":true`},
+		{
+			name: "repair reference", body: `{"reference":"gmail-42"}`,
+			wantStatus: http.StatusOK, wantGated: true,
+			wantRequest: &CLIRepairMessageRequest{Reference: "gmail-42"},
+		},
+		{
+			name: "valid audit", body: `{"audit":true,"source_id":7,"json":true}`,
+			wantStatus:  http.StatusOK,
+			wantRequest: &CLIRepairMessageRequest{Audit: true, SourceID: 7, JSON: true},
+		},
+		{name: "audit with repair reference", body: `{"audit":true,"reference":"gmail-42"}`, wantStatus: http.StatusBadRequest, wantGated: true},
+		{name: "audit with negative source", body: `{"audit":true,"source_id":-1}`, wantStatus: http.StatusBadRequest, wantGated: true},
+		{name: "malformed JSON", body: `{"audit":true`, wantStatus: http.StatusBadRequest, wantGated: true},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			assert := assert.New(t)
 			gate := &recordingOperationGate{allow: true}
-			called := make(chan struct{}, 1)
+			got := make(chan CLIRepairMessageRequest, 1)
 			store := &mockStore{repairMessageFunc: func(
-				context.Context, CLIRepairMessageRequest, func(CLIRepairMessageEvent) error,
+				_ context.Context, req CLIRepairMessageRequest, _ func(CLIRepairMessageEvent) error,
 			) error {
-				called <- struct{}{}
+				got <- req
 				return nil
 			}}
 			srv := NewServerWithOptions(ServerOptions{
 				Config: &config.Config{Server: config.ServerConfig{APIPort: 8080}},
 				Store:  store, Scheduler: newMockScheduler(), Logger: testLogger(), OperationGate: gate,
 			})
-			req := httptest.NewRequest(http.MethodPost, "/api/v1/cli/repair-message", strings.NewReader(test.body))
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/cli/repair-message", strings.NewReader(test.body))
 			req.Header.Set("Content-Type", "application/json")
 			w := httptest.NewRecorder()
 			srv.Router().ServeHTTP(w, req)
 
-			assert.Equal(http.StatusBadRequest, w.Code)
+			assert.Equal(test.wantStatus, w.Code)
 			begin, done := gate.counts()
-			assert.Equal(1, begin, "invalid audit body must remain gated")
-			assert.Equal(1, done, "gate must be released after handler rejection")
+			wantCalls := 0
+			if test.wantGated {
+				wantCalls = 1
+			}
+			assert.Equal(wantCalls, begin, "operation gate calls")
+			assert.Equal(wantCalls, done, "gate must be released after the handler returns")
 			select {
-			case <-called:
-				require.FailNow(t, "invalid audit body reached the repair runner")
+			case request := <-got:
+				if assert.NotNil(test.wantRequest, "request reached the repair runner") {
+					assert.Equal(*test.wantRequest, request)
+				}
 			default:
+				assert.Nil(test.wantRequest, "request did not reach the repair runner")
 			}
 		})
 	}
@@ -1756,9 +1726,9 @@ func TestCLIRepairMessageWholeArchiveAuditHasNoOrdinaryRequestDeadline(t *testin
 	}}
 	srv := NewServerWithOptions(ServerOptions{
 		Config: &config.Config{Server: config.ServerConfig{APIPort: 8080}},
-		Store:  store, Scheduler: newMockScheduler(), Logger: testLogger(), RequestTimeout: time.Millisecond,
+		Store:  store, Scheduler: newMockScheduler(), Logger: testLogger(), RequestTimeout: time.Second,
 	})
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/cli/repair-message", strings.NewReader(`{"audit":true}`))
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/cli/repair-message", strings.NewReader(`{"audit":true}`))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 
@@ -1780,7 +1750,7 @@ func TestTimeoutMiddlewareMarkedRequestPreservesCallerCancellation(t *testing.T)
 			Logger:         testLogger(),
 			RequestTimeout: 5 * time.Second,
 		})
-		defer func() { require.NoError(srv.Shutdown(context.Background()), "shutdown") }()
+		defer func() { require.NoError(srv.Shutdown(t.Context()), "shutdown") }()
 
 		started := make(chan struct{})
 		handlerResult := make(chan error, 1)
@@ -1790,9 +1760,9 @@ func TestTimeoutMiddlewareMarkedRequestPreservesCallerCancellation(t *testing.T)
 			handlerResult <- r.Context().Err()
 		}))
 
-		ctx, cancel := context.WithCancel(context.Background())
+		ctx, cancel := context.WithCancel(t.Context())
 		defer cancel()
-		req := httptest.NewRequest(http.MethodGet, "/api/v1/cli/stats", nil).WithContext(ctx)
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/cli/stats", nil).WithContext(ctx)
 		req.RemoteAddr = "127.0.0.1:4242"
 		req.Header.Set(apiprotocol.ClientClassHeader, apiprotocol.ClientClassCLI)
 		requestDone := make(chan struct{})
@@ -1856,7 +1826,7 @@ func TestMarkedCLIProtectiveCeilingInventory(t *testing.T) {
 			handler := srv.timeoutMiddleware(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
 				deadline, hasDeadline = r.Context().Deadline()
 			}))
-			req := httptest.NewRequest(route.method, route.path, nil)
+			req := httptest.NewRequestWithContext(t.Context(), route.method, route.path, nil)
 			req.Header.Set("X-Api-Key", cliTimeoutTestAPIKey)
 			req.Header.Set(apiprotocol.ClientClassHeader, apiprotocol.ClientClassCLI)
 			recorder := &deadlineClearingRecorder{ResponseRecorder: httptest.NewRecorder()}
@@ -1877,113 +1847,96 @@ func TestMarkedCLIProtectiveCeilingInventory(t *testing.T) {
 
 func TestMarkedCLIProtectiveRouteCanReadBodyPastOrdinaryServerTimeout(t *testing.T) {
 	t.Parallel()
-	const ordinaryReadTimeout = 100 * time.Millisecond
+	for _, tt := range []struct {
+		name       string
+		path       string
+		marked     bool
+		wantStatus int
+	}{
+		{
+			name:       "protective route extends read deadline",
+			path:       "/api/v1/cli/build-cache",
+			marked:     true,
+			wantStatus: http.StatusNoContent,
+		},
+		{
+			name:       "unmarked route keeps ordinary read deadline",
+			path:       "/api/v1/cli/stats",
+			wantStatus: http.StatusRequestTimeout,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				const ordinaryReadTimeout = 100 * time.Millisecond
+				srv := NewServerWithOptions(ServerOptions{
+					Config: &config.Config{Server: config.ServerConfig{
+						APIPort: 8080,
+						APIKey:  cliTimeoutTestAPIKey,
+					}},
+					Logger: testLogger(),
+				})
+				t.Cleanup(func() { require.NoError(t, srv.Shutdown(context.WithoutCancel(t.Context())), "shutdown") })
+				handlerEntered := make(chan struct{})
+				handler := srv.timeoutMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					close(handlerEntered)
+					body, err := io.ReadAll(r.Body)
+					if err != nil {
+						http.Error(w, err.Error(), http.StatusRequestTimeout)
+						return
+					}
+					if string(body) != "ab" {
+						http.Error(w, "unexpected body", http.StatusBadRequest)
+						return
+					}
+					w.WriteHeader(http.StatusNoContent)
+				}))
+				// Keep real HTTP parsing and connection deadlines, with an
+				// in-memory network so runner scheduling cannot consume the budget.
+				server := httptest.NewTestServer(t, handler)
+				server.Config.ReadTimeout = ordinaryReadTimeout
+				transport, ok := server.Client().Transport.(*http.Transport)
+				require.True(t, ok, "test server uses an HTTP transport")
+				conn, err := transport.DialContext(t.Context(), "tcp", "example.com:80")
+				require.NoError(t, err, "dial server")
+				defer func() { _ = conn.Close() }()
+				require.NoError(t, conn.SetDeadline(time.Now().Add(5*time.Second)), "bound test connection")
 
-	srv := NewServerWithOptions(ServerOptions{
-		Config: &config.Config{Server: config.ServerConfig{
-			APIPort: 8080,
-			APIKey:  cliTimeoutTestAPIKey,
-		}},
-		Logger: testLogger(),
-	})
-	srv.readTimeout = ordinaryReadTimeout
-	handlerEntered := make(chan struct{}, 1)
-	srv.router = srv.timeoutMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		handlerEntered <- struct{}{}
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusRequestTimeout)
-			return
-		}
-		if string(body) != "ab" {
-			http.Error(w, "unexpected body", http.StatusBadRequest)
-			return
-		}
-		w.WriteHeader(http.StatusNoContent)
-	}))
-
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err, "listen")
-	serveErr := make(chan error, 1)
-	go func() {
-		serveErr <- srv.StartOnListener(listener)
-	}()
-	t.Cleanup(func() {
-		// net/http delays closing connections with unread request data, then
-		// polls for shutdown. Allow cleanup time beyond the request deadlines.
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		require.NoError(t, srv.Shutdown(ctx), "shutdown")
-		require.ErrorIs(t, <-serveErr, http.ErrServerClosed, "serve result")
-	})
-
-	slowBodyStatus := func(t *testing.T, path string, marked bool) (int, error) {
-		t.Helper()
-		conn, err := net.Dial("tcp", listener.Addr().String())
-		require.NoError(t, err, "dial server")
-		defer func() { _ = conn.Close() }()
-		require.NoError(t, conn.SetDeadline(time.Now().Add(2*time.Second)), "bound test connection")
-
-		marker := ""
-		if marked {
-			marker = fmt.Sprintf("%s: %s\r\n",
-				apiprotocol.ClientClassHeader, apiprotocol.ClientClassCLI)
-		}
-		_, err = fmt.Fprintf(conn,
-			"POST %s HTTP/1.1\r\n"+
-				"Host: %s\r\n"+
-				"X-Api-Key: %s\r\n"+
-				"%s"+
-				"Content-Length: 2\r\n\r\n"+
-				"a",
-			path,
-			listener.Addr().String(),
-			cliTimeoutTestAPIKey,
-			marker,
-		)
-		require.NoError(t, err, "write headers and first body byte")
-
-		select {
-		case <-handlerEntered:
-		case <-time.After(2 * time.Second):
-			require.FailNow(t, "inner handler did not start")
-		}
-		time.Sleep(2 * ordinaryReadTimeout) //nolint:kennlint // outlasts the real socket read deadline
-		if marked {
-			_, err = conn.Write([]byte("b"))
-			require.NoError(t, err, "write delayed body byte")
-		} else {
-			// The server may close the connection as soon as the ordinary
-			// read deadline expires, so a late control write can return
-			// EPIPE/closed socket before the 408 response is read.
-			_, _ = conn.Write([]byte("b"))
-		}
-
-		resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: http.MethodPost})
-		if err != nil {
-			return 0, err
-		}
-		defer func() { _ = resp.Body.Close() }()
-		return resp.StatusCode, nil
+				marker := ""
+				if tt.marked {
+					marker = fmt.Sprintf("%s: %s\r\n",
+						apiprotocol.ClientClassHeader, apiprotocol.ClientClassCLI)
+				}
+				_, err = fmt.Fprintf(conn,
+					"POST %s HTTP/1.1\r\n"+
+						"Host: example.com\r\n"+
+						"X-Api-Key: %s\r\n"+
+						"%s"+
+						"Content-Length: 2\r\n\r\n"+
+						"a",
+					tt.path,
+					cliTimeoutTestAPIKey,
+					marker,
+				)
+				require.NoError(t, err, "write headers and first body byte")
+				synctest.Wait()
+				select {
+				case <-handlerEntered:
+				default:
+					require.FailNow(t, "inner handler did not start")
+				}
+				if tt.marked {
+					time.Sleep(2 * ordinaryReadTimeout)
+					_, err = conn.Write([]byte("b"))
+					require.NoError(t, err, "write delayed body byte")
+				}
+				// The unmarked body stays incomplete until its read deadline fires.
+				resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: http.MethodPost})
+				require.NoError(t, err, "read response")
+				defer func() { _ = resp.Body.Close() }()
+				assert.Equal(t, tt.wantStatus, resp.StatusCode)
+			})
+		})
 	}
-
-	t.Run("protective route extends read deadline", func(t *testing.T) {
-		status, err := slowBodyStatus(t, "/api/v1/cli/build-cache", true)
-		require.NoError(t, err, "read marked response")
-		assert.Equal(t, http.StatusNoContent, status)
-	})
-	t.Run("unmarked route keeps ordinary read deadline", func(t *testing.T) {
-		status, err := slowBodyStatus(t, "/api/v1/cli/stats", false)
-		if err != nil {
-			// net/http may write a 408 before closing the connection, or the
-			// platform may abort the connection as soon as the read deadline
-			// expires. Either outcome proves the delayed body was bounded.
-			var netErr *net.OpError
-			require.ErrorAs(t, err, &netErr, "read deadline closes the connection")
-			return
-		}
-		assert.Equal(t, http.StatusRequestTimeout, status)
-	})
 }
 
 type blockingAddrListener struct {
@@ -2004,7 +1957,7 @@ func TestServerWaitStartedHonorsCancellationAndReportsReadiness(t *testing.T) {
 	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
-	base, err := net.Listen("tcp", "127.0.0.1:0")
+	base, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	require.NoError(err, "listen")
 	listener := &blockingAddrListener{
 		Listener:    base,
@@ -2032,12 +1985,12 @@ func TestServerWaitStartedHonorsCancellationAndReportsReadiness(t *testing.T) {
 		require.FailNow("server did not reach listener-start setup")
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 	require.ErrorIs(srv.WaitStarted(ctx), context.Canceled)
 
 	close(listener.release)
-	require.NoError(srv.WaitStarted(context.Background()), "listener startup")
+	require.NoError(srv.WaitStarted(t.Context()), "listener startup")
 	srv.serverMu.RLock()
 	server := srv.server
 	bound := srv.listenerBound
@@ -2045,7 +1998,7 @@ func TestServerWaitStartedHonorsCancellationAndReportsReadiness(t *testing.T) {
 	assert.NotNil(server)
 	assert.True(bound)
 
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), time.Second)
+	shutdownCtx, shutdownCancel := context.WithTimeout(t.Context(), time.Second)
 	defer shutdownCancel()
 	require.NoError(srv.Shutdown(shutdownCtx), "shutdown")
 	require.ErrorIs(<-serveErr, http.ErrServerClosed, "serve result")
@@ -2054,7 +2007,7 @@ func TestServerWaitStartedHonorsCancellationAndReportsReadiness(t *testing.T) {
 func TestServerWaitStartedReportsListenError(t *testing.T) {
 	t.Parallel()
 	require := require.New(t)
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	listener, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	require.NoError(err, "reserve listener")
 	defer func() { _ = listener.Close() }()
 	addr, ok := listener.Addr().(*net.TCPAddr)
@@ -2064,9 +2017,9 @@ func TestServerWaitStartedReportsListenError(t *testing.T) {
 	c.Server.BindAddr = "127.0.0.1"
 	c.Server.APIPort = addr.Port
 	srv := NewServerWithOptions(ServerOptions{Config: c, Logger: testLogger()})
-	startErr := srv.Start()
+	startErr := srv.Start(t.Context())
 	require.Error(startErr)
-	waitErr := srv.WaitStarted(context.Background())
+	waitErr := srv.WaitStarted(t.Context())
 	require.Error(waitErr)
 	assert.EqualError(t, waitErr, startErr.Error())
 }

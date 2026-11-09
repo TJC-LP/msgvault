@@ -37,7 +37,7 @@ Examples:
 				return runDaemonCLICommandHTTPFromCobra(cmd, args)
 			}
 
-			imp, accountIDs, dbPath, cleanup, err := openBeeperImporter(backfillBeeperMediaAccounts, state)
+			imp, s, accountIDs, dbPath, cleanup, err := openBeeperImporter(cmd.Context(), backfillBeeperMediaAccounts, state, true)
 			if err != nil {
 				return err
 			}
@@ -51,21 +51,19 @@ Examples:
 				sum, err := imp.BackfillMedia(ctx, opts)
 				if ctx.Err() != nil {
 					_, _ = fmt.Fprintln(cmd.OutOrStdout(), "\nInterrupted — re-run backfill-beeper-media to resume (idempotent).")
-					return rebuildCacheAfterWrite(dbPath, state)
+					return rebuildCacheAfterWrite(ctx, dbPath, state)
 				}
 				if err != nil {
 					return errors.Join(
 						fmt.Errorf("beeper media backfill failed for %s: %w", accountID, err),
-						rebuildCacheAfterWrite(dbPath, state),
+						rebuildCacheAfterWrite(ctx, dbPath, state),
 					)
 				}
 				writeBeeperMediaBackfillSummary(cmd.OutOrStdout(), accountID, sum)
-				if sum.Errors > 0 {
-					_, _ = fmt.Fprintf(cmd.OutOrStdout(), "  %d errors — see sync run items; re-run to retry\n", sum.Errors)
-				}
+				writeBeeperRunFailures(ctx, cmd.OutOrStdout(), s, sum, accountID, "backfill-beeper-media")
 			}
 
-			return rebuildCacheAfterWrite(dbPath, state)
+			return rebuildCacheAfterWrite(ctx, dbPath, state)
 		},
 	}
 	cmd.Flags().StringArrayVar(&backfillBeeperMediaAccounts, "account", nil, "Beeper accountID to backfill (repeatable; default: all registered accounts)")

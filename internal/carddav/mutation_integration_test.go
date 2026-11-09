@@ -38,6 +38,7 @@ type mutationFixture struct {
 	deleteStatus        int
 	putFailures         int
 	href                string
+	exactGet            bool
 }
 
 func (f *mutationFixture) handler(t *testing.T) http.HandlerFunc {
@@ -105,7 +106,11 @@ func (f *mutationFixture) handler(t *testing.T) http.HandlerFunc {
 				return
 			}
 			w.Header().Set("ETag", f.etag)
-			_, err := w.Write(append(append([]byte(nil), f.body[:len(f.body)-len("END:VCARD\r\n")]...), []byte("PRODID:-//Server//EN\r\nEND:VCARD\r\n")...))
+			body := f.body
+			if !f.exactGet {
+				body = append(append([]byte(nil), f.body[:len(f.body)-len("END:VCARD\r\n")]...), []byte("PRODID:-//Server//EN\r\nEND:VCARD\r\n")...)
+			}
+			_, err := w.Write(body)
 			assert.NoError(t, err)
 		case http.MethodDelete:
 			f.deletes++
@@ -185,7 +190,6 @@ func seededMutationService(t *testing.T, fixture *mutationFixture) (*Service, *s
 	server := httptest.NewServer(fixture.handler(t))
 	t.Cleanup(server.Close)
 	service, st, book := newPullService(t, server, false)
-	service.dav().client.requestTimeout = 250 * time.Millisecond
 	var personID int64
 	err := st.DB().QueryRow(st.Rebind(`INSERT INTO persons (vcard_uid, display_name)
 		VALUES (?, ?) RETURNING id`), "person", "Alice Example").Scan(&personID)
@@ -194,6 +198,7 @@ func seededMutationService(t *testing.T, fixture *mutationFixture) (*Service, *s
 }
 
 func TestPublishPersonCreatesConditionallyAndCommitsCanonicalCard(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -217,6 +222,7 @@ func TestPublishPersonCreatesConditionallyAndCommitsCanonicalCard(t *testing.T) 
 }
 
 func TestPublishThenSyncAcceptsEscapedUIDChild(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -239,6 +245,7 @@ func TestPublishThenSyncAcceptsEscapedUIDChild(t *testing.T) {
 }
 
 func TestPublishPersonSkipsSemanticallyUnchangedMappedCard(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -262,6 +269,7 @@ func TestPublishPersonSkipsSemanticallyUnchangedMappedCard(t *testing.T) {
 }
 
 func TestTimedOutUpdatePersistsIntentAndSyncRecoveryDoesNotReplay(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -274,6 +282,7 @@ func TestTimedOutUpdatePersistsIntentAndSyncRecoveryDoesNotReplay(t *testing.T) 
 	require.NoError(err)
 	fixture.timeout = true
 
+	service.dav().client.requestTimeout = 250 * time.Millisecond //nolint:kennlint // deadlinetest: the fixture withholds mutation replies until expiry to test ambiguous write recovery
 	err = service.PublishPerson(t.Context(), personID)
 	require.Error(err)
 	assert.Equal(2, fixture.puts)
@@ -281,6 +290,9 @@ func TestTimedOutUpdatePersistsIntentAndSyncRecoveryDoesNotReplay(t *testing.T) 
 	require.NoError(err)
 	assert.Equal(store.CardDAVMutationUpdate, publication.PendingOperation)
 
+	// Only the ambiguous write needs the fixture's short deadline. Recovery
+	// must not depend on normal HTTP reads finishing within 250 milliseconds.
+	service.dav().client.requestTimeout = defaultRequestTimeout
 	fixture.reportCurrent = true
 	_, err = service.Sync(t.Context(), SyncOptions{})
 	require.NoError(err)
@@ -291,11 +303,13 @@ func TestTimedOutUpdatePersistsIntentAndSyncRecoveryDoesNotReplay(t *testing.T) 
 }
 
 func TestTimedOutCreateRecoveryProvesCanonicalResourceWithoutReplay(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
 	fixture := &mutationFixture{timeout: true}
 	service, st, personID, _ := seededMutationService(t, fixture)
+	service.dav().client.requestTimeout = 250 * time.Millisecond //nolint:kennlint // deadlinetest: the fixture withholds mutation replies until expiry to test ambiguous write recovery
 	_, err := st.DB().Exec(st.Rebind(`UPDATE persons SET display_name = ? WHERE id = ?`), "Alice\nExample", personID)
 	require.NoError(err)
 
@@ -318,11 +332,13 @@ func TestTimedOutCreateRecoveryProvesCanonicalResourceWithoutReplay(t *testing.T
 }
 
 func TestTimedOutCreateRecoveryAdoptsResourceMaterializedByPull(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
 	fixture := &mutationFixture{timeout: true}
 	service, st, personID, _ := seededMutationService(t, fixture)
+	service.dav().client.requestTimeout = 250 * time.Millisecond //nolint:kennlint // deadlinetest: the fixture withholds mutation replies until expiry to test ambiguous write recovery
 
 	require.Error(service.PublishPerson(t.Context(), personID))
 	assert.Equal(1, fixture.puts)
@@ -336,6 +352,7 @@ func TestTimedOutCreateRecoveryAdoptsResourceMaterializedByPull(t *testing.T) {
 }
 
 func TestCreateRecoveryAcceptsOneConditional412OnlyAfterCanonicalProof(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -374,7 +391,7 @@ func TestCreateRecoveryAcceptsOneConditional412OnlyAfterCanonicalProof(t *testin
 	}))
 	t.Cleanup(server.Close)
 	service, st, personID, _ := seededMutationServiceForServer(t, server)
-	service.dav().client.requestTimeout = 250 * time.Millisecond
+	service.dav().client.requestTimeout = 250 * time.Millisecond //nolint:kennlint // deadlinetest: the first create response must expire before a conditional retry proves the canonical resource
 
 	require.Error(service.PublishPerson(t.Context(), personID))
 	require.NoError(service.PublishPerson(t.Context(), personID))
@@ -386,6 +403,7 @@ func TestCreateRecoveryAcceptsOneConditional412OnlyAfterCanonicalProof(t *testin
 }
 
 func TestCreateRecoveryRetriesAfterRepeatedTransientFailures(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -404,6 +422,7 @@ func TestCreateRecoveryRetriesAfterRepeatedTransientFailures(t *testing.T) {
 }
 
 func TestDefinitiveCreateRejectionClearsPendingIntent(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -423,6 +442,7 @@ func TestDefinitiveCreateRejectionClearsPendingIntent(t *testing.T) {
 }
 
 func TestDefinitiveMappedMutationRejectionRestoresFence(t *testing.T) {
+	t.Parallel()
 	for _, test := range []struct {
 		name   string
 		mutate func(*testing.T, *mutationFixture, *Service, *store.Store, int64) error
@@ -446,6 +466,7 @@ func TestDefinitiveMappedMutationRejectionRestoresFence(t *testing.T) {
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
 			assert := assert.New(t)
 			require := require.New(t)
 			fixture := &mutationFixture{}
@@ -469,6 +490,7 @@ func TestDefinitiveMappedMutationRejectionRestoresFence(t *testing.T) {
 }
 
 func TestDefinitiveCreateRecoveryRejectionClearsPendingIntent(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -486,6 +508,7 @@ func TestDefinitiveCreateRecoveryRejectionClearsPendingIntent(t *testing.T) {
 }
 
 func TestMutationRejectsExplicitlyDeniedCapabilityBeforeNetwork(t *testing.T) {
+	t.Parallel()
 	for _, test := range []struct {
 		name       string
 		capability string
@@ -525,6 +548,7 @@ func TestMutationRejectsExplicitlyDeniedCapabilityBeforeNetwork(t *testing.T) {
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
 			fixture := &mutationFixture{}
 			service, st, personID, book := seededMutationService(t, fixture)
 			test.prepare(t, service, st, personID)
@@ -541,6 +565,7 @@ func TestMutationRejectsExplicitlyDeniedCapabilityBeforeNetwork(t *testing.T) {
 }
 
 func TestConditionalCreateCollisionRecordsResolvableConflict(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 	remoteBody := []byte("BEGIN:VCARD\r\nVERSION:4.0\r\nUID:remote-owner\r\nFN:Remote Owner\r\nEND:VCARD\r\n")
@@ -579,10 +604,12 @@ func TestConditionalCreateCollisionRecordsResolvableConflict(t *testing.T) {
 }
 
 func TestTimedOutCreateRecoveryRoutesDivergentCanonicalCardToConflict(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 	fixture := &mutationFixture{timeout: true}
 	service, st, personID, _ := seededMutationService(t, fixture)
+	service.dav().client.requestTimeout = 250 * time.Millisecond //nolint:kennlint // deadlinetest: the fixture withholds mutation replies until expiry to test ambiguous write recovery
 	require.Error(service.PublishPerson(t.Context(), personID))
 	remoteBody := []byte("BEGIN:VCARD\r\nVERSION:4.0\r\nUID:person\r\nFN:Remote Owner\r\nEND:VCARD\r\n")
 	fixture.mu.Lock()
@@ -602,6 +629,7 @@ func TestTimedOutCreateRecoveryRoutesDivergentCanonicalCardToConflict(t *testing
 }
 
 func TestUnpublishPersonDeletesConditionallyButKeepsPerson(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 
 	fixture := &mutationFixture{}
@@ -617,6 +645,7 @@ func TestUnpublishPersonDeletesConditionallyButKeepsPerson(t *testing.T) {
 }
 
 func TestUnpublishRemoteImportWithoutPublicationPreservesSource(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -655,8 +684,10 @@ func TestUnpublishRemoteImportWithoutPublicationPreservesSource(t *testing.T) {
 }
 
 func TestUnpublishPersonTreatsAbsentRemoteAsComplete(t *testing.T) {
+	t.Parallel()
 	for _, status := range []int{http.StatusNotFound, http.StatusGone} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
+			t.Parallel()
 			fixture := &mutationFixture{}
 			service, _, personID, _ := seededMutationService(t, fixture)
 			require.NoError(t, service.PublishPerson(t.Context(), personID))
@@ -669,6 +700,7 @@ func TestUnpublishPersonTreatsAbsentRemoteAsComplete(t *testing.T) {
 }
 
 func TestTimedOutDeleteRecoveryAcceptsPullTombstoneWithoutReplay(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -677,6 +709,7 @@ func TestTimedOutDeleteRecoveryAcceptsPullTombstoneWithoutReplay(t *testing.T) {
 	require.NoError(service.PublishPerson(t.Context(), personID))
 	fixture.deleteTimeout = true
 
+	service.dav().client.requestTimeout = 250 * time.Millisecond //nolint:kennlint // deadlinetest: the fixture withholds mutation replies until expiry to test ambiguous write recovery
 	err := service.UnpublishPerson(t.Context(), personID)
 	require.Error(err)
 	publication, getErr := st.GetCardDAVPublicationContext(t.Context(), personID)
@@ -694,6 +727,7 @@ func TestTimedOutDeleteRecoveryAcceptsPullTombstoneWithoutReplay(t *testing.T) {
 }
 
 func TestTimedOutDeleteRecoveryAcceptsCanonicalGoneWithoutReplay(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -702,6 +736,7 @@ func TestTimedOutDeleteRecoveryAcceptsCanonicalGoneWithoutReplay(t *testing.T) {
 	require.NoError(service.PublishPerson(t.Context(), personID))
 	fixture.deleteTimeout = true
 
+	service.dav().client.requestTimeout = 250 * time.Millisecond //nolint:kennlint // deadlinetest: the fixture withholds mutation replies until expiry to test ambiguous write recovery
 	require.Error(service.UnpublishPerson(t.Context(), personID))
 	assert.Equal(1, fixture.deletes)
 	require.NoError(service.ReconcilePublications(t.Context()))
@@ -711,6 +746,7 @@ func TestTimedOutDeleteRecoveryAcceptsCanonicalGoneWithoutReplay(t *testing.T) {
 }
 
 func TestPublishPersonUsesV4ForV4OnlyWriteTarget(t *testing.T) {
+	t.Parallel()
 	fixture := &mutationFixture{}
 	service, st, personID, book := seededMutationService(t, fixture)
 	_, err := st.DB().Exec(st.Rebind(`UPDATE carddav_address_books
@@ -722,6 +758,7 @@ func TestPublishPersonUsesV4ForV4OnlyWriteTarget(t *testing.T) {
 }
 
 func TestPublishPersonRejectsWildcardStoredETagBeforeNetwork(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 
 	fixture := &mutationFixture{}
@@ -737,6 +774,7 @@ func TestPublishPersonRejectsWildcardStoredETagBeforeNetwork(t *testing.T) {
 }
 
 func TestRetryAfterRollsBackIntentAndClampsGateToOneHour(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -762,6 +800,7 @@ func TestRetryAfterRollsBackIntentAndClampsGateToOneHour(t *testing.T) {
 }
 
 func TestNon429RetryAfterRollsBackIntentAndPersistsGate(t *testing.T) {
+	t.Parallel()
 	assertions := assert.New(t)
 	required := require.New(t)
 
@@ -789,6 +828,7 @@ func TestNon429RetryAfterRollsBackIntentAndPersistsGate(t *testing.T) {
 }
 
 func TestThrottledUnpublishRetriesAfterGateExpires(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -818,6 +858,7 @@ func TestThrottledUnpublishRetriesAfterGateExpires(t *testing.T) {
 }
 
 func TestActiveRetryGateStopsSyncBeforeAnyRequest(t *testing.T) {
+	t.Parallel()
 	fixture := &mutationFixture{}
 	service, st, _, _ := seededMutationService(t, fixture)
 	setRetryGate(t, st, time.Now().Add(time.Hour))
@@ -828,11 +869,13 @@ func TestActiveRetryGateStopsSyncBeforeAnyRequest(t *testing.T) {
 }
 
 func TestActiveRetryGateStopsPendingRecoveryBeforeAnyRequest(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
 	fixture := &mutationFixture{timeout: true}
 	service, st, personID, _ := seededMutationService(t, fixture)
+	service.dav().client.requestTimeout = 250 * time.Millisecond //nolint:kennlint // deadlinetest: the fixture withholds mutation replies until expiry to test ambiguous write recovery
 	require.Error(service.PublishPerson(t.Context(), personID))
 	setRetryGate(t, st, time.Now().Add(time.Hour))
 	requestsBefore := fixture.puts + fixture.gets + fixture.deletes + fixture.reports
@@ -846,6 +889,7 @@ func TestActiveRetryGateStopsPendingRecoveryBeforeAnyRequest(t *testing.T) {
 }
 
 func TestCanonicalGet429PersistsGateAndPreservesAmbiguousUpdateIntent(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -884,6 +928,7 @@ func TestCanonicalGet429PersistsGateAndPreservesAmbiguousUpdateIntent(t *testing
 }
 
 func TestRecoveryGet429PersistsGateAndPreservesPendingIntent(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -892,6 +937,7 @@ func TestRecoveryGet429PersistsGateAndPreservesPendingIntent(t *testing.T) {
 	require.NoError(service.PublishPerson(t.Context(), personID))
 	addProjectedEmail(t, st, personID)
 	fixture.timeout = true
+	service.dav().client.requestTimeout = 250 * time.Millisecond //nolint:kennlint // deadlinetest: the fixture withholds mutation replies until expiry to test ambiguous write recovery
 	require.Error(service.PublishPerson(t.Context(), personID))
 	fixture.throttleGets = 1
 	before := time.Now()
@@ -914,6 +960,7 @@ func TestRecoveryGet429PersistsGateAndPreservesPendingIntent(t *testing.T) {
 }
 
 func TestPull429PersistsAccountRetryGate(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -933,6 +980,7 @@ func TestPull429PersistsAccountRetryGate(t *testing.T) {
 }
 
 func TestConcurrent429sPreserveLongestAccountRetryGate(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 

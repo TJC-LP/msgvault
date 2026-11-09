@@ -29,9 +29,14 @@ func NewImporter(st *store.Store) *Importer {
 }
 
 type ImportOptions struct {
-	Identifier   string
-	AccountEmail string
-	DBPath       string
+	Recordings        bool
+	RecordingMaxBytes int64
+	AttachmentsDir    string
+	// SendRecording streams a prepared, immutable recording to the remote daemon.
+	SendRecording func(context.Context, RecordingUpload, *Recording) error
+	Identifier    string
+	AccountEmail  string
+	DBPath        string
 	// Full rewrites every archived meeting even when its evidence matches,
 	// which refreshes attribution after identity changes.
 	Full bool
@@ -45,9 +50,18 @@ type ImportOptions struct {
 	ContactsPath     string
 	PhoneCountryCode string
 	Progress         func(string)
+	// MeetingID restricts a completion-hook pass to one local row.
+	MeetingID int64
+	// LockDir holds a remote scan's source lock and upload record.
+	LockDir string
+	// RemoteTarget names the daemon a remote scan uploads to. It scopes the
+	// record of acknowledged meetings.
+	RemoteTarget string
 }
 
 type ImportSummary struct {
+	RecordingsStored  int64
+	RecordingsSkipped int64
 	SourceID          int64
 	MeetingsProcessed int64
 	MeetingsAdded     int64
@@ -77,7 +91,7 @@ func (imp *Importer) Import(ctx context.Context, opts ImportOptions) (sum *Impor
 	}
 	started := imp.now()
 	identifier := strings.TrimSpace(opts.Identifier)
-	source, err := imp.store.GetSourceByTypeAndIdentifier(SourceType, identifier)
+	source, err := imp.store.GetSourceByTypeAndIdentifier(ctx, SourceType, identifier)
 	if err != nil {
 		if errors.Is(err, store.ErrSourceNotFound) {
 			return nil, fmt.Errorf("muesli source %q is not registered; run msgvault add-muesli %s first",
@@ -131,7 +145,7 @@ func (imp *Importer) Import(ctx context.Context, opts ImportOptions) (sum *Impor
 	sum.ContactsState = contacts.State()
 	sharedAddresses := contacts.sharedAddresses(opts.PhoneCountryCode)
 
-	meetings, err := reader.ListMeetings(ctx)
+	meetings, err := reader.listMeetings(ctx, opts.MeetingID)
 	if err != nil {
 		sum.Errors++
 		return sum, err
@@ -168,7 +182,7 @@ func (imp *Importer) Import(ctx context.Context, opts ImportOptions) (sum *Impor
 		}
 		sum.MeetingsProcessed++
 
-		if err := imp.resolveParticipants(source.ID, &meeting, contacts, opts.PhoneCountryCode, sharedAddresses); err != nil {
+		if err := imp.resolveParticipants(ctx, source.ID, &meeting, contacts, opts.PhoneCountryCode, sharedAddresses); err != nil {
 			return sum, err
 		}
 		snapshot, err := meeting.ArchiveSnapshot(source.ID, identifier, opts.AccountEmail)
@@ -184,7 +198,7 @@ func (imp *Importer) Import(ctx context.Context, opts ImportOptions) (sum *Impor
 		case result.Created:
 			sum.MeetingsAdded++
 			progress(fmt.Sprintf("added Muesli meeting %d", meeting.ID))
-		case result.Changed:
+		case result.Changed || result.Links.Linked > 0:
 			sum.MeetingsUpdated++
 			progress(fmt.Sprintf("updated Muesli meeting %d", meeting.ID))
 		}
@@ -192,6 +206,29 @@ func (imp *Importer) Import(ctx context.Context, opts ImportOptions) (sum *Impor
 			sum.Errors++
 			meetingErrors = append(meetingErrors, fmt.Errorf("muesli meeting %d: %w", meeting.ID, err))
 			continue
+		}
+		if err := imp.recordContactReviewCandidates(ctx, source.ID, meeting); err != nil {
+			return sum, err
+		}
+		if opts.Recordings {
+			recording, err := PrepareRecording(ctx, opts.DBPath, meeting.SavedRecordingPath, opts.RecordingMaxBytes)
+			if recording != nil {
+				changed, archiveErr := NewImporter(scoped).storeRecording(ctx, result.MessageID, opts.AttachmentsDir, recording)
+				err = archiveErr
+				_ = recording.Close()
+				if archiveErr == nil {
+					sum.RecordingsStored++
+					if changed && !result.Created && !result.Changed {
+						sum.MeetingsUpdated++
+					}
+				}
+			} else if meeting.SavedRecordingPath != "" {
+				sum.RecordingsSkipped++
+			}
+			if err != nil {
+				sum.Errors++
+				meetingErrors = append(meetingErrors, fmt.Errorf("muesli meeting %d recording: %w", meeting.ID, err))
+			}
 		}
 		if sum.MeetingsProcessed%checkpointInterval == 0 {
 			if err := scoped.UpdateSyncCheckpoint(syncID, checkpoint()); err != nil {

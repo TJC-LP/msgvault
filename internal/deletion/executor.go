@@ -67,6 +67,9 @@ type Executor struct {
 	logger   *slog.Logger
 	progress Progress
 	sourceID int64
+	// beforeSourceExecutionAcquireForTest lets tests reproduce a source
+	// retirement between manifest validation and ownership acquisition.
+	beforeSourceExecutionAcquireForTest func()
 }
 
 // WithSourceID scopes legacy version-1 manifests to the source selected by
@@ -101,7 +104,7 @@ func (e *Executor) WithProgress(p Progress) *Executor {
 
 // ExecuteOptions configures deletion execution.
 type ExecuteOptions struct {
-	Method    Method // Trash or permanent delete
+	Method    Method // Must be MethodTrash or MethodDelete; unset or unknown is an error
 	BatchSize int    // Messages per batch for batch delete API
 	Resume    bool   // Resume from last checkpoint
 }
@@ -139,7 +142,9 @@ func (e *Executor) deleteOne(ctx context.Context, sourceID int64, gmailID string
 		if err != nil {
 			e.logger.Debug("message already deleted", "gmail_id", gmailID)
 		}
-		if markErr := e.store.MarkMessageDeletedBySourceMessageID(sourceID, method == MethodDelete, gmailID); markErr != nil {
+		// The provider already removed the message, so record that locally
+		// even when a cancel arrives now.
+		if markErr := e.store.MarkMessageDeletedBySourceMessageID(context.WithoutCancel(ctx), sourceID, method == MethodDelete, gmailID); markErr != nil {
 			e.logger.Warn("failed to mark deleted in DB", "gmail_id", gmailID, "error", markErr)
 			return resultFailed, fmt.Errorf("%w: %w", errLocalTombstone, markErr)
 		}
@@ -154,18 +159,71 @@ func (e *Executor) deleteOne(ctx context.Context, sourceID int64, gmailID string
 	return resultFailed, err
 }
 
-func (e *Executor) manifestSourceID(manifest *Manifest) (int64, error) {
+func (e *Executor) manifestSourceID(ctx context.Context, manifest *Manifest) (int64, error) {
 	if err := manifest.ValidateVersion(); err != nil {
-		return 0, err
+		return 0, permanentManifestValidationError{err: err}
 	}
 	if manifest.Version == 1 {
-		return e.sourceID, nil
+		sourceID, err := e.requireManifestSourceWritable(ctx, e.sourceID)
+		return sourceID, classifyManifestSourceLifecycleError(err)
 	}
-	source, err := e.store.GetSourceByTypeAndIdentifier(manifest.Source.Type, manifest.Source.Identifier)
+	source, err := e.store.GetSourceByTypeAndIdentifier(ctx, manifest.Source.Type, manifest.Source.Identifier)
 	if err != nil {
-		return 0, fmt.Errorf("resolve manifest source: %w", err)
+		err = fmt.Errorf("resolve manifest source: %w", err)
+		if errors.Is(err, store.ErrSourceNotFound) {
+			return 0, permanentManifestValidationError{err: err}
+		}
+		return 0, err
 	}
-	return source.ID, nil
+	sourceID, err := e.requireManifestSourceWritable(ctx, source.ID)
+	return sourceID, classifyManifestSourceLifecycleError(err)
+}
+
+func classifyManifestSourceLifecycleError(err error) error {
+	if errors.Is(err, store.ErrSourceRetired) || errors.Is(err, store.ErrSourceNotFound) {
+		return permanentManifestValidationError{err: err}
+	}
+	return err
+}
+
+func (e *Executor) acquireSourceExecution(ctx context.Context, sourceID int64) (*store.SyncExecution, error) {
+	execution, err := e.store.AcquireSyncExecutionContext(ctx, sourceID)
+	if err != nil {
+		return nil, fmt.Errorf("acquire source %d execution lock for deletion: %w", sourceID, err)
+	}
+	return execution, nil
+}
+
+func (e *Executor) rejectArchiveOnlyTargets(ctx context.Context, sourceID int64, manifest *Manifest) error {
+	if sourceID <= 0 {
+		return nil
+	}
+	ids := slices.Clone(manifest.GmailIDs)
+	if manifest.Execution != nil {
+		ids = slices.Concat(ids, manifest.Execution.FailedIDs, manifest.Execution.TombstoneIDs)
+	}
+	if err := e.store.RejectArchiveOnlyDeletionTargetsContext(ctx, sourceID, ids); err != nil {
+		if errors.Is(err, store.ErrArchiveOnlyDeletionTarget) {
+			return permanentManifestValidationError{err: err}
+		}
+		return err
+	}
+	return nil
+}
+
+// Saved manifests retain their original provider identity after a merge.
+func (e *Executor) requireManifestSourceWritable(ctx context.Context, sourceID int64) (int64, error) {
+	if sourceID == 0 {
+		return sourceID, nil
+	} // Legacy callers without an archive binding.
+	settings, err := e.store.GetSourceSettingsContext(ctx, sourceID)
+	if err != nil {
+		return 0, fmt.Errorf("read manifest source lifecycle: %w", err)
+	}
+	if settings.MergedIntoSourceID != 0 {
+		return 0, fmt.Errorf("manifest source %d: %w", sourceID, store.ErrSourceRetired)
+	}
+	return sourceID, nil
 }
 
 // manifestCancelled reports whether the manifest was cancelled by a concurrent
@@ -184,26 +242,21 @@ func (e *Executor) manifestCancelled(manifestID string) bool {
 		!e.manager.InProgressManifestExists(manifestID)
 }
 
-// saveCheckpoint persists the current execution progress through
-// Manager.WriteInProgressCheckpoint, which holds the per-manifest lock and
-// writes atomically. If a concurrent daemon cancel already moved
-// in_progress/<id>.json to cancelled/, the write is skipped (the lock
-// serializes it with the cancel rename and it returns ErrManifestCancelled)
-// rather than resurrecting the cancelled deletion. finalizeExecution remains
-// the authoritative crash-safe commit (it claims the file with a locked atomic
-// rename before completing).
-func (e *Executor) saveCheckpoint(manifest *Manifest, manifestID string, index, succeeded, failed int, failedIDs []string) {
+// saveCheckpoint appends progress while serializing with daemon cancellation.
+func (e *Executor) saveCheckpoint(manifest *Manifest, manifestID string, index, succeeded, failed int, failedIDs []string, failedFrom int) bool {
 	manifest.Execution.LastProcessedIndex = index
 	manifest.Execution.Succeeded = succeeded
 	manifest.Execution.Failed = failed
 	manifest.Execution.FailedIDs = failedIDs
-	if err := e.manager.WriteInProgressCheckpoint(manifest, manifestID); err != nil {
+	if err := e.manager.WriteInProgressCheckpoint(manifest, manifestID, failedFrom); err != nil {
 		if errors.Is(err, ErrManifestCancelled) {
 			e.logger.Info("manifest no longer in progress; skipping checkpoint", "manifest", manifestID)
-			return
+			return false
 		}
 		e.logger.Error("failed to save checkpoint", "error", err)
+		return false
 	}
+	return true
 }
 
 func (e *Executor) saveTombstoneCheckpoint(manifest *Manifest, manifestID string, index, succeeded, failed int, failedIDs, tombstoneIDs []string) {
@@ -211,7 +264,8 @@ func (e *Executor) saveTombstoneCheckpoint(manifest *Manifest, manifestID string
 		return
 	}
 	manifest.Execution.TombstoneIDs = tombstoneIDs
-	e.saveCheckpoint(manifest, manifestID, index, succeeded, failed, failedIDs)
+	// A tombstone stop may persist a rebuilt retry list, so write it whole.
+	e.saveCheckpoint(manifest, manifestID, index, succeeded, failed, failedIDs, 0)
 }
 
 // prepareExecution claims a manifest into in_progress/ (or resumes one
@@ -265,15 +319,6 @@ func (e *Executor) prepareExecution(manifestID string, method Method) (*Manifest
 // reverse order could report success while leaving a completed manifest
 // serialized as in_progress.
 func (e *Executor) finalizeExecution(manifestID string, manifest *Manifest, succeeded, failed int, failedIDs []string, failOnAllErrors bool) error {
-	// A durable cancelled/ marker is authoritative: even in the pathological
-	// case where a stray write recreated in_progress/<id>.json, completing here
-	// would leave the manifest in both cancelled/ and completed/ (a double
-	// copy). Refuse to finalize when cancellation is on record.
-	if e.manager.ManifestCancelled(manifestID) {
-		e.logger.Info("manifest cancelled; not finalizing", "manifest", manifestID)
-		return ErrManifestCancelled
-	}
-
 	var targetStatus Status
 	if failed == 0 || succeeded > 0 || !failOnAllErrors {
 		targetStatus = StatusCompleted
@@ -290,21 +335,8 @@ func (e *Executor) finalizeExecution(manifestID string, manifest *Manifest, succ
 	manifest.Execution.Succeeded = succeeded
 	manifest.Execution.Failed = failed
 	manifest.Execution.FailedIDs = failedIDs
-	manifest.Status = targetStatus
-	if err := e.manager.WriteInProgressCheckpoint(manifest, manifestID); err != nil {
-		if errors.Is(err, ErrManifestCancelled) {
-			e.logger.Info("manifest cancelled during finalize; not completing", "manifest", manifestID)
-			return ErrManifestCancelled
-		}
-		return fmt.Errorf("persist final state for manifest %s: %w", manifestID, err)
-	}
-
-	if err := e.manager.FinalizeInProgress(manifestID, targetStatus); err != nil {
-		if errors.Is(err, ErrManifestCancelled) || errors.Is(err, os.ErrNotExist) {
-			e.logger.Info("manifest cancelled during finalize; not completing", "manifest", manifestID)
-			return ErrManifestCancelled
-		}
-		return fmt.Errorf("finalize manifest %s: %w", manifestID, err)
+	if err := e.persistTerminalManifest(manifestID, manifest, targetStatus); err != nil {
+		return err
 	}
 
 	e.progress.OnComplete(succeeded, failed)
@@ -317,19 +349,99 @@ func (e *Executor) finalizeExecution(manifestID string, manifest *Manifest, succ
 	return nil
 }
 
+// rejectManifestValidation terminalizes a claimed manifest when permanent
+// source or target validation fails before any provider deletion begins.
+func (e *Executor) rejectManifestValidation(
+	ctx context.Context, manifestID string, manifest *Manifest, validationErr error,
+) error {
+	if ctx.Err() != nil {
+		return errors.Join(validationErr, ctx.Err())
+	}
+	if _, ok := errors.AsType[permanentManifestValidationError](validationErr); !ok {
+		return validationErr
+	}
+	if manifest.Execution == nil {
+		manifest.Execution = &Execution{StartedAt: time.Now(), Method: "unknown"}
+	}
+	now := time.Now()
+	manifest.Execution.CompletedAt = &now
+	if err := e.persistTerminalManifest(manifestID, manifest, StatusFailed); err != nil {
+		return errors.Join(validationErr, fmt.Errorf("finalize rejected manifest %s: %w", manifestID, err))
+	}
+	return validationErr
+}
+
+type permanentManifestValidationError struct {
+	err error
+}
+
+func (e permanentManifestValidationError) Error() string { return e.err.Error() }
+
+func (e permanentManifestValidationError) Unwrap() error { return e.err }
+
+// persistTerminalManifest writes the chosen terminal status before moving the
+// manifest out of in_progress. The checkpoint and rename share the manager's
+// cancellation lock so a concurrent cancel cannot resurrect the manifest.
+func (e *Executor) persistTerminalManifest(manifestID string, manifest *Manifest, status Status) error {
+	// A durable cancelled/ marker is authoritative: even a stray in_progress
+	// file must not create a second terminal copy.
+	if e.manager.ManifestCancelled(manifestID) {
+		e.logger.Info("manifest cancelled; not finalizing", "manifest", manifestID)
+		return ErrManifestCancelled
+	}
+	manifest.Status = status
+	if err := e.manager.WriteInProgressManifest(manifest, manifestID); err != nil {
+		if errors.Is(err, ErrManifestCancelled) {
+			e.logger.Info("manifest cancelled during finalize; not completing", "manifest", manifestID)
+			return ErrManifestCancelled
+		}
+		return fmt.Errorf("persist final state for manifest %s: %w", manifestID, err)
+	}
+	if err := e.manager.FinalizeInProgress(manifestID, status); err != nil {
+		if errors.Is(err, ErrManifestCancelled) || errors.Is(err, os.ErrNotExist) {
+			e.logger.Info("manifest cancelled during finalize; not completing", "manifest", manifestID)
+			return ErrManifestCancelled
+		}
+		return fmt.Errorf("finalize manifest %s: %w", manifestID, err)
+	}
+	return nil
+}
+
 // Execute performs the deletion for a manifest.
-func (e *Executor) Execute(ctx context.Context, manifestID string, opts *ExecuteOptions) error {
+func (e *Executor) Execute(ctx context.Context, manifestID string, opts *ExecuteOptions) (retErr error) {
 	if opts == nil {
 		opts = DefaultExecuteOptions()
+	}
+	if opts.Method != MethodTrash && opts.Method != MethodDelete {
+		return fmt.Errorf("unsupported deletion method %q", opts.Method)
+	}
+	batchSize := opts.BatchSize
+	if batchSize == 0 {
+		batchSize = DefaultExecuteOptions().BatchSize
 	}
 
 	manifest, err := e.prepareExecution(manifestID, opts.Method)
 	if err != nil {
 		return err
 	}
-	sourceID, err := e.manifestSourceID(manifest)
+	sourceID, err := e.manifestSourceID(ctx, manifest)
 	if err != nil {
-		return fmt.Errorf("validate manifest source: %w", err)
+		return e.rejectManifestValidation(ctx, manifestID, manifest, fmt.Errorf("validate manifest source: %w", err))
+	}
+	if sourceID > 0 {
+		if e.beforeSourceExecutionAcquireForTest != nil {
+			e.beforeSourceExecutionAcquireForTest()
+		}
+		execution, err := e.acquireSourceExecution(ctx, sourceID)
+		if err != nil {
+			return e.rejectManifestValidation(
+				ctx, manifestID, manifest, classifyManifestSourceLifecycleError(err),
+			)
+		}
+		defer func() { retErr = errors.Join(retErr, execution.Release()) }()
+	}
+	if err := e.rejectArchiveOnlyTargets(ctx, sourceID, manifest); err != nil {
+		return e.rejectManifestValidation(ctx, manifestID, manifest, fmt.Errorf("validate manifest targets: %w", err))
 	}
 
 	// Determine starting point
@@ -337,6 +449,7 @@ func (e *Executor) Execute(ctx context.Context, manifestID string, opts *Execute
 	succeeded := manifest.Execution.Succeeded
 	failed := manifest.Execution.Failed
 	failedIDs := manifest.Execution.FailedIDs
+	persistedFailed := len(failedIDs)
 	tombstoneIDs := slices.Clone(manifest.Execution.TombstoneIDs)
 	var retryIDs []string
 	if opts.Resume {
@@ -347,6 +460,7 @@ func (e *Executor) Execute(ctx context.Context, manifestID string, opts *Execute
 		// and still finalize as completed.
 		if len(failedIDs) > 0 {
 			retryIDs = failedIDs
+			persistedFailed = 0
 			failedIDs = nil
 			failed = 0
 		}
@@ -378,7 +492,7 @@ func (e *Executor) Execute(ctx context.Context, manifestID string, opts *Execute
 			e.saveTombstoneCheckpoint(manifest, manifestID, startIndex, succeeded, len(retryIDs), retryIDs, tombstoneIDs[ti:])
 			return ErrManifestCancelled
 		}
-		if err := e.store.MarkMessageDeletedBySourceMessageID(sourceID, opts.Method == MethodDelete, gmailID); err != nil {
+		if err := e.store.MarkMessageDeletedBySourceMessageID(ctx, sourceID, opts.Method == MethodDelete, gmailID); err != nil {
 			remaining := tombstoneIDs[ti:]
 			e.saveTombstoneCheckpoint(
 				manifest,
@@ -401,7 +515,7 @@ func (e *Executor) Execute(ctx context.Context, manifestID string, opts *Execute
 		select {
 		case <-ctx.Done():
 			remaining := slices.Concat(failedIDs, retryIDs[ri:])
-			e.saveCheckpoint(manifest, manifestID, startIndex, succeeded, len(remaining), remaining)
+			e.saveCheckpoint(manifest, manifestID, startIndex, succeeded, len(remaining), remaining, 0)
 			return ctx.Err()
 		default:
 		}
@@ -417,7 +531,7 @@ func (e *Executor) Execute(ctx context.Context, manifestID string, opts *Execute
 			succeeded++
 		case resultFatal:
 			remaining := slices.Concat(failedIDs, retryIDs[ri:])
-			e.saveCheckpoint(manifest, manifestID, startIndex, succeeded, len(remaining), remaining)
+			e.saveCheckpoint(manifest, manifestID, startIndex, succeeded, len(remaining), remaining, 0)
 			return fmt.Errorf("delete message: %w", delErr)
 		case resultFailed:
 			if errors.Is(delErr, errLocalTombstone) {
@@ -441,7 +555,7 @@ func (e *Executor) Execute(ctx context.Context, manifestID string, opts *Execute
 	for i := startIndex; i < len(manifest.GmailIDs); i++ {
 		select {
 		case <-ctx.Done():
-			e.saveCheckpoint(manifest, manifestID, i, succeeded, failed, failedIDs)
+			e.saveCheckpoint(manifest, manifestID, i, succeeded, failed, failedIDs, persistedFailed)
 			return ctx.Err()
 		default:
 		}
@@ -459,7 +573,7 @@ func (e *Executor) Execute(ctx context.Context, manifestID string, opts *Execute
 		case resultSuccess:
 			succeeded++
 		case resultFatal:
-			e.saveCheckpoint(manifest, manifestID, i, succeeded, failed, failedIDs)
+			e.saveCheckpoint(manifest, manifestID, i, succeeded, failed, failedIDs, persistedFailed)
 			return fmt.Errorf("delete message: %w", delErr)
 		case resultFailed:
 			if errors.Is(delErr, errLocalTombstone) {
@@ -472,8 +586,10 @@ func (e *Executor) Execute(ctx context.Context, manifestID string, opts *Execute
 		}
 
 		// Save checkpoint periodically
-		if (i+1)%opts.BatchSize == 0 {
-			e.saveCheckpoint(manifest, manifestID, i+1, succeeded, failed, failedIDs)
+		if (i+1)%batchSize == 0 {
+			if e.saveCheckpoint(manifest, manifestID, i+1, succeeded, failed, failedIDs, persistedFailed) {
+				persistedFailed = len(failedIDs)
+			}
 			e.progress.OnProgress(i+1, succeeded, failed)
 		}
 	}
@@ -482,14 +598,29 @@ func (e *Executor) Execute(ctx context.Context, manifestID string, opts *Execute
 }
 
 // ExecuteBatch performs batch deletion (more efficient but permanent).
-func (e *Executor) ExecuteBatch(ctx context.Context, manifestID string) error {
+func (e *Executor) ExecuteBatch(ctx context.Context, manifestID string) (retErr error) {
 	manifest, err := e.prepareExecution(manifestID, MethodDelete)
 	if err != nil {
 		return err
 	}
-	sourceID, err := e.manifestSourceID(manifest)
+	sourceID, err := e.manifestSourceID(ctx, manifest)
 	if err != nil {
-		return fmt.Errorf("validate manifest source: %w", err)
+		return e.rejectManifestValidation(ctx, manifestID, manifest, fmt.Errorf("validate manifest source: %w", err))
+	}
+	if sourceID > 0 {
+		if e.beforeSourceExecutionAcquireForTest != nil {
+			e.beforeSourceExecutionAcquireForTest()
+		}
+		execution, err := e.acquireSourceExecution(ctx, sourceID)
+		if err != nil {
+			return e.rejectManifestValidation(
+				ctx, manifestID, manifest, classifyManifestSourceLifecycleError(err),
+			)
+		}
+		defer func() { retErr = errors.Join(retErr, execution.Release()) }()
+	}
+	if err := e.rejectArchiveOnlyTargets(ctx, sourceID, manifest); err != nil {
+		return e.rejectManifestValidation(ctx, manifestID, manifest, fmt.Errorf("validate manifest targets: %w", err))
 	}
 
 	if e.manifestCancelled(manifestID) {
@@ -501,7 +632,7 @@ func (e *Executor) ExecuteBatch(ctx context.Context, manifestID string) error {
 	// through the locked writer anyway: a daemon cancel could land in the
 	// window between the check above and this write, and the write must not
 	// recreate a manifest that cancel just moved to cancelled/.
-	if err := e.manager.WriteInProgressCheckpoint(manifest, manifestID); err != nil {
+	if err := e.manager.WriteInProgressCheckpoint(manifest, manifestID, len(manifest.Execution.FailedIDs)); err != nil {
 		if errors.Is(err, ErrManifestCancelled) {
 			e.logger.Info("deletion cancelled before batch start; stopping", "manifest", manifestID)
 			return ErrManifestCancelled
@@ -565,7 +696,7 @@ func (e *Executor) ExecuteBatch(ctx context.Context, manifestID string) error {
 			e.saveTombstoneCheckpoint(manifest, manifestID, startIndex, succeeded, len(retryIDs), retryIDs, tombstoneIDs[ti:])
 			return ErrManifestCancelled
 		}
-		if err := e.store.MarkMessageDeletedBySourceMessageID(sourceID, true, gmailID); err != nil {
+		if err := e.store.MarkMessageDeletedBySourceMessageID(ctx, sourceID, true, gmailID); err != nil {
 			remaining := slices.Clone(tombstoneIDs[ti:])
 			e.saveTombstoneCheckpoint(
 				manifest,
@@ -590,7 +721,7 @@ func (e *Executor) ExecuteBatch(ctx context.Context, manifestID string) error {
 			select {
 			case <-ctx.Done():
 				remaining := slices.Concat(failedIDs, retryIDs[ri:])
-				e.saveCheckpoint(manifest, manifestID, startIndex, succeeded, len(remaining), remaining)
+				e.saveCheckpoint(manifest, manifestID, startIndex, succeeded, len(remaining), remaining, 0)
 				return ctx.Err()
 			default:
 			}
@@ -606,7 +737,7 @@ func (e *Executor) ExecuteBatch(ctx context.Context, manifestID string) error {
 				succeeded++
 			case resultFatal:
 				remaining := slices.Concat(failedIDs, retryIDs[ri:])
-				e.saveCheckpoint(manifest, manifestID, startIndex, succeeded, len(remaining), remaining)
+				e.saveCheckpoint(manifest, manifestID, startIndex, succeeded, len(remaining), remaining, 0)
 				return fmt.Errorf("delete message: %w", delErr)
 			case resultFailed:
 				if errors.Is(delErr, errLocalTombstone) {
@@ -635,7 +766,7 @@ func (e *Executor) ExecuteBatch(ctx context.Context, manifestID string) error {
 	for i := startIndex; i < len(manifest.GmailIDs); i += batchSize {
 		select {
 		case <-ctx.Done():
-			e.saveCheckpoint(manifest, manifestID, i, succeeded, failed, failedIDs)
+			e.saveCheckpoint(manifest, manifestID, i, succeeded, failed, failedIDs, 0)
 			return ctx.Err()
 		default:
 		}
@@ -653,7 +784,7 @@ func (e *Executor) ExecuteBatch(ctx context.Context, manifestID string) error {
 
 		if err := e.client.BatchDeleteMessages(ctx, batch); err != nil {
 			if isInsufficientScopeError(err) {
-				e.saveCheckpoint(manifest, manifestID, i, succeeded, failed, failedIDs)
+				e.saveCheckpoint(manifest, manifestID, i, succeeded, failed, failedIDs, 0)
 				return fmt.Errorf("batch delete: %w", err)
 			}
 			if !errors.Is(err, gmail.ErrBatchUnsupported) {
@@ -663,7 +794,7 @@ func (e *Executor) ExecuteBatch(ctx context.Context, manifestID string) error {
 			for j, gmailID := range batch {
 				select {
 				case <-ctx.Done():
-					e.saveCheckpoint(manifest, manifestID, i+j, succeeded, failed, failedIDs)
+					e.saveCheckpoint(manifest, manifestID, i+j, succeeded, failed, failedIDs, 0)
 					return ctx.Err()
 				default:
 				}
@@ -678,7 +809,7 @@ func (e *Executor) ExecuteBatch(ctx context.Context, manifestID string) error {
 				case resultSuccess:
 					succeeded++
 				case resultFatal:
-					e.saveCheckpoint(manifest, manifestID, i+j, succeeded, failed, failedIDs)
+					e.saveCheckpoint(manifest, manifestID, i+j, succeeded, failed, failedIDs, 0)
 					return fmt.Errorf("delete message: %w", delErr)
 				case resultFailed:
 					if errors.Is(delErr, errLocalTombstone) {
@@ -694,8 +825,9 @@ func (e *Executor) ExecuteBatch(ctx context.Context, manifestID string) error {
 				e.progress.OnProgress(i+j+1, succeeded, failed)
 			}
 		} else {
-			// Mark all as deleted in DB using batch update
-			if markErr := e.store.MarkMessagesDeletedBySourceMessageIDBatch(sourceID, batch); markErr != nil {
+			// Mark all as deleted in DB using batch update. The provider
+			// already removed them, so a cancel must not skip the record.
+			if markErr := e.store.MarkMessagesDeletedBySourceMessageIDBatch(context.WithoutCancel(ctx), sourceID, batch); markErr != nil {
 				e.logger.Warn("failed to mark batch as deleted in DB", "count", len(batch), "error", markErr)
 				// The remote batch is complete, so retry only its tombstones;
 				// later IDs must remain on the normal batch path.

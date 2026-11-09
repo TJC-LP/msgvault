@@ -31,22 +31,39 @@ import (
 	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/peoplesweep"
 	"go.kenn.io/msgvault/internal/personenrollment"
+	"go.kenn.io/msgvault/internal/providercredentials"
 	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/testutil"
 	"go.kenn.io/msgvault/internal/vector"
 )
 
-// requireStoredCredentialStorePlatform skips tests that assert the stored
-// people provider credential lifecycle. The file-backed store is deliberately
-// unsupported off linux/darwin (it needs secure no-follow atomic filesystem
-// operations and fails closed there, covered by the peoplesweep package's own
-// fail-closed test), so its happy-path transactions can only be proven on the
-// platforms that implement the store.
-func requireStoredCredentialStorePlatform(t *testing.T) {
+func savePeopleCredentialForTest(t *testing.T, store peoplesweep.CredentialStore, name, endpoint, value string) {
 	t.Helper()
-	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
-		t.Skip("people provider stored credentials are unsupported on " + runtime.GOOS)
+	revision, _, err := store.Revision(name, endpoint)
+	require.NoError(t, err)
+	_, err = store.SaveIfRevision(name, endpoint, value, revision)
+	require.NoError(t, err)
+}
+
+// writeLegacyPeopleCredentialForTest writes a key file in the format older
+// releases used. Windows drops inherited access from older children when the
+// shared store first secures the tokens directory, so the store is created first
+// there; other OSes keep the real upgrade order, with no store yet.
+func writeLegacyPeopleCredentialForTest(t *testing.T, tokensDir, name, contents string) string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		unused := providercredentials.PeopleProviderID("unused-fixture")
+		empty, err := providercredentials.Read(tokensDir)
+		require.NoError(t, err)
+		absent, err := empty.Revision(unused)
+		require.NoError(t, err)
+		_, err = providercredentials.DeleteIfRevision(tokensDir, absent, unused, func() error { return nil })
+		require.NoError(t, err)
 	}
+	path := filepath.Join(tokensDir, "people-providers", name+".json")
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o700))
+	require.NoError(t, os.WriteFile(path, []byte(contents), 0o600))
+	return path
 }
 
 func personProviderTestConfig() peoplesweep.Config {
@@ -123,7 +140,7 @@ func (s *grantFailingPersonProviderStore) GrantPersonInferenceConsent(
 	context.Context,
 	string,
 	string,
-) (*store.PersonInferenceConsent, bool, error) {
+) (*store.ProviderConsent, bool, error) {
 	return nil, false, s.err
 }
 
@@ -203,16 +220,16 @@ func historicalPersonProviderProfileWithMutation(
 	disclosedFields, err := json.Marshal(historical.DisclosedPacketFields)
 	require.NoError(t, err)
 	if withCheck {
-		_, err = st.DB().Exec(st.Rebind(`
+		_, err = st.DB().ExecContext(t.Context(), st.Rebind(`
 			DELETE FROM person_inference_checks WHERE profile_fingerprint = ?`), profile.Fingerprint)
 		require.NoError(t, err)
 	}
 	if withActiveConsent {
-		_, err = st.DB().Exec(st.Rebind(`
-			DELETE FROM person_inference_consents WHERE profile_fingerprint = ?`), profile.Fingerprint)
+		_, err = st.DB().ExecContext(t.Context(), st.Rebind(`
+			DELETE FROM provider_consents WHERE purpose = 'people_inference' AND fingerprint = ?`), profile.Fingerprint)
 		require.NoError(t, err)
 	}
-	_, err = st.DB().Exec(st.Rebind(`
+	_, err = st.DB().ExecContext(t.Context(), st.Rebind(`
 		UPDATE person_inference_profiles
 		SET fingerprint = ?, provider_kind = ?, endpoint = ?, model = ?,
 			api_key_env = ?, allow_anonymous = ?, auth_scheme = ?,
@@ -235,7 +252,7 @@ func historicalPersonProviderProfileWithMutation(
 		profile.Fingerprint)
 	require.NoError(t, err)
 	if withCheck {
-		_, err = st.DB().Exec(st.Rebind(`
+		_, err = st.DB().ExecContext(t.Context(), st.Rebind(`
 			INSERT INTO person_inference_checks
 				(profile_fingerprint, checked_at, driver_version, output_mode, model_version)
 			VALUES (?, CURRENT_TIMESTAMP, ?, ?, ?)`), historical.Fingerprint,
@@ -243,9 +260,10 @@ func historicalPersonProviderProfileWithMutation(
 		require.NoError(t, err)
 	}
 	if withActiveConsent {
-		_, err = st.DB().Exec(st.Rebind(`
-			INSERT INTO person_inference_consents (profile_fingerprint, granted_by)
-			VALUES (?, ?)`), historical.Fingerprint, "cli")
+		_, err = st.DB().ExecContext(t.Context(), st.Rebind(`
+			INSERT INTO provider_consents (purpose, id, fingerprint, granted_by)
+			SELECT 'people_inference', COALESCE(MAX(id), 0) + 1, ?, ?
+			FROM provider_consents WHERE purpose = 'people_inference'`), historical.Fingerprint, "cli")
 		require.NoError(t, err)
 	}
 	return historical

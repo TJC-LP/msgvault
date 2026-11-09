@@ -2,7 +2,9 @@ package deletion
 
 import (
 	"context"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -44,9 +46,9 @@ func newE2EFixture(t *testing.T) *e2eFixture {
 	require.NoError(err, "GetOrCreateSource A")
 	srcB, err := st.GetOrCreateSource("gmail", "bob@example.com")
 	require.NoError(err, "GetOrCreateSource B")
-	convA, err := st.EnsureConversation(srcA.ID, "thread-A", "Thread A")
+	convA, err := st.EnsureConversation(t.Context(), srcA.ID, "thread-A", "Thread A")
 	require.NoError(err, "EnsureConversation A")
-	convB, err := st.EnsureConversation(srcB.ID, "thread-B", "Thread B")
+	convB, err := st.EnsureConversation(t.Context(), srcB.ID, "thread-B", "Thread B")
 	require.NoError(err, "EnsureConversation B")
 
 	f := &e2eFixture{
@@ -100,7 +102,7 @@ func (f *e2eFixture) upsertAttachment(gmailID, filename, storagePath, contentHas
 	f.t.Helper()
 	msgID, ok := f.msgIDs[gmailID]
 	require.Truef(f.t, ok, "upsertAttachment: unknown gmail ID %q", gmailID)
-	err := f.store.UpsertAttachment(msgID, filename, "application/pdf",
+	err := f.store.UpsertAttachment(f.t.Context(), msgID, filename, "application/pdf",
 		storagePath, contentHash, 100)
 	require.NoErrorf(f.t, err, "UpsertAttachment(%s, %s)", gmailID, filename)
 }
@@ -153,7 +155,7 @@ func TestExecutor_E2E_TrashOnlyMarksTargetSource(t *testing.T) {
 	manifest := tc.CreateManifest("trash-source-a",
 		[]string{"msg-a1", "msg-a2", "msg-a3"})
 
-	err := tc.Exec.Execute(context.Background(), manifest.ID, &ExecuteOptions{
+	err := tc.Exec.Execute(t.Context(), manifest.ID, &ExecuteOptions{
 		Method:    MethodTrash,
 		BatchSize: 100,
 		Resume:    true,
@@ -179,15 +181,15 @@ func TestExecutor_E2E_VersionTwoScopesDuplicateRemoteID(t *testing.T) {
 		execute func(*e2eContext, string) error
 	}{
 		{name: "trash", execute: func(tc *e2eContext, id string) error {
-			return tc.Exec.Execute(context.Background(), id, DefaultExecuteOptions())
+			return tc.Exec.Execute(t.Context(), id, DefaultExecuteOptions())
 		}},
 		{name: "permanent", execute: func(tc *e2eContext, id string) error {
 			opts := DefaultExecuteOptions()
 			opts.Method = MethodDelete
-			return tc.Exec.Execute(context.Background(), id, opts)
+			return tc.Exec.Execute(t.Context(), id, opts)
 		}},
 		{name: "batch", execute: func(tc *e2eContext, id string) error {
-			return tc.Exec.ExecuteBatch(context.Background(), id)
+			return tc.Exec.ExecuteBatch(t.Context(), id)
 		}},
 	}
 	for _, tt := range tests {
@@ -234,7 +236,7 @@ func TestExecutor_E2E_MissingVersionTwoSourceMakesNoRemoteCall(t *testing.T) {
 	})
 	require.NoError(tc.Mgr.SaveManifest(manifest))
 
-	err := tc.Exec.Execute(context.Background(), manifest.ID, DefaultExecuteOptions())
+	err := tc.Exec.Execute(t.Context(), manifest.ID, DefaultExecuteOptions())
 	require.ErrorContains(err, "resolve manifest source")
 	assert.Empty(tc.MockAPI.TrashCalls)
 	assert.Empty(tc.MockAPI.DeleteCalls)
@@ -251,7 +253,7 @@ func TestExecutor_E2E_PermanentDeletePreservesArchive(t *testing.T) {
 	manifest := tc.CreateManifest("delete-a1-a2",
 		[]string{"msg-a1", "msg-a2"})
 
-	err := tc.Exec.Execute(context.Background(), manifest.ID, &ExecuteOptions{
+	err := tc.Exec.Execute(t.Context(), manifest.ID, &ExecuteOptions{
 		Method:    MethodDelete,
 		BatchSize: 100,
 		Resume:    true,
@@ -281,7 +283,7 @@ func TestExecutor_E2E_BatchDeleteMarksDBAcrossSources(t *testing.T) {
 	manifest := tc.CreateManifest("batch-cross-source",
 		[]string{"msg-a1", "msg-b1"})
 
-	err := tc.Exec.ExecuteBatch(context.Background(), manifest.ID)
+	err := tc.Exec.ExecuteBatch(t.Context(), manifest.ID)
 	require.NoError(t, err, "ExecuteBatch")
 
 	// Both sources see one of their messages soft-deleted.
@@ -305,7 +307,7 @@ func TestExecutor_E2E_PermanentDeletePreservesOtherSourceAttachmentFile(t *testi
 	// Permanently delete msg-a1 (shared hash) and msg-a2 (unique to A).
 	manifest := tc.CreateManifest("perm-delete-a1-a2",
 		[]string{"msg-a1", "msg-a2"})
-	err := tc.Exec.Execute(context.Background(), manifest.ID, &ExecuteOptions{
+	err := tc.Exec.Execute(t.Context(), manifest.ID, &ExecuteOptions{
 		Method:    MethodDelete,
 		BatchSize: 100,
 		Resume:    true,
@@ -349,4 +351,86 @@ func newE2EContext(t *testing.T, f *e2eFixture) *e2eContext {
 		t:        t,
 	}
 	return &e2eContext{TestContext: tc, fix: f}
+}
+
+func TestExecutorRejectsRetiredLegacyManifestSourceBeforeProviderCall(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	f := newE2EFixture(t)
+	tc := newE2EContext(t, f)
+	manifest := NewManifest("historical source", []string{"msg-a1"})
+	require.NoError(tc.Mgr.SaveManifest(manifest))
+	_, err := f.store.MergeSourcesContext(t.Context(), store.MergeSourcesRequest{FromSourceID: f.sourceA.ID, IntoSourceID: f.sourceB.ID})
+	require.NoError(err)
+	tc.Exec.WithSourceID(f.sourceA.ID)
+	err = tc.Exec.Execute(t.Context(), manifest.ID, DefaultExecuteOptions())
+	require.ErrorIs(err, store.ErrSourceRetired)
+	assert.Empty(tc.MockAPI.TrashCalls)
+	assert.Empty(tc.MockAPI.DeleteCalls)
+}
+
+func TestExecutorOwnsSourceExecutionLockUntilRemoteDeletionFinishes(t *testing.T) {
+	tests := []struct {
+		name    string
+		execute func(*Executor, context.Context, string) error
+	}{
+		{name: "trash", execute: func(e *Executor, ctx context.Context, id string) error {
+			return e.Execute(ctx, id, DefaultExecuteOptions())
+		}},
+		{name: "batch delete", execute: func(e *Executor, ctx context.Context, id string) error {
+			return e.ExecuteBatch(ctx, id)
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			require := require.New(t)
+			assert := assert.New(t)
+			f := newE2EFixture(t)
+			tc := newE2EContext(t, f)
+			manifest := NewManifestForSource("serialized deletion", []string{"msg-a1"}, SourceReference{
+				ID: f.sourceA.ID, Type: f.sourceA.SourceType, Identifier: f.sourceA.Identifier,
+			})
+			require.NoError(tc.Mgr.SaveManifest(manifest))
+
+			entered := make(chan struct{}, 1)
+			release := make(chan struct{})
+			var releaseOnce sync.Once
+			releaseRemote := func() { releaseOnce.Do(func() { close(release) }) }
+			defer releaseRemote()
+			blockRemote := func() {
+				entered <- struct{}{}
+				<-release
+			}
+			switch test.name {
+			case "trash":
+				tc.MockAPI.BeforeTrash = func(string) error { blockRemote(); return nil }
+			case "batch delete":
+				tc.MockAPI.BeforeBatchDelete = func([]string) error { blockRemote(); return nil }
+			}
+
+			executionResult := make(chan error, 1)
+			go func() { executionResult <- test.execute(tc.Exec, t.Context(), manifest.ID) }()
+			select {
+			case <-entered:
+			case err := <-executionResult:
+				assert.Failf("executor returned before the provider request", "error: %v", err)
+				return
+			case <-time.After(10 * time.Second):
+				assert.Fail("executor did not reach the provider request")
+				return
+			}
+
+			_, mergeErr := f.store.MergeSourcesContext(t.Context(), store.MergeSourcesRequest{
+				FromSourceID: f.sourceA.ID, IntoSourceID: f.sourceB.ID,
+			})
+			require.ErrorIs(mergeErr, store.ErrSyncAlreadyActive)
+			releaseRemote()
+			require.NoError(<-executionResult)
+
+			_, err := f.store.MergeSourcesContext(t.Context(), store.MergeSourcesRequest{
+				FromSourceID: f.sourceA.ID, IntoSourceID: f.sourceB.ID,
+			})
+			require.NoError(err)
+		})
+	}
 }

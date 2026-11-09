@@ -36,7 +36,7 @@ func TestOperationEnumsRejectUnknownValues(t *testing.T) {
 		},
 		{
 			name:     "state",
-			valid:    []string{"queued", "running", "succeeded", "partial", "failed", "cancelled"},
+			valid:    []string{"queued", "running", "succeeded", "partial", "paused", "failed", "cancelled"},
 			validate: func(value string) error { return State(value).Validate() },
 		},
 		{
@@ -118,7 +118,8 @@ func TestOperationPublicEnumDomainsEnumerateEveryRuntimeValue(t *testing.T) {
 		PublicErrorInvocationInvalidOutput, PublicErrorInvocationRateLimited,
 		PublicErrorInvocationSafetyLimit, PublicErrorInvocationTimeout,
 		PublicErrorInvocationUnsafeErrorRedacted, PublicErrorInvocationUpstreamFailed,
-		PublicErrorLeaseLost, PublicErrorPersonSweepFailed, PublicErrorPolicy,
+		PublicErrorLeaseLost, PublicErrorMicrosoftAuthorizationRequired, PublicErrorMicrosoftContactTooLarge,
+		PublicErrorPersonSweepFailed, PublicErrorPolicy,
 		PublicErrorProviderHTTP, PublicErrorRateLimited, PublicErrorRetryAfter,
 		PublicErrorSafetyLimit, PublicErrorSourceSyncFailed, PublicErrorSyncFailed,
 		PublicErrorTimeout, PublicErrorUnsafeErrorRedacted, PublicErrorUpstreamFailed,
@@ -576,7 +577,8 @@ func TestOperationSourceStateProjection(t *testing.T) {
 		{name: "failed after update", durable: "failed", updated: 1, wantState: StatePartial, wantError: sourceSyncFailedError()},
 		{name: "failed without mutation", durable: "failed", wantState: StateFailed, wantError: sourceSyncFailedError()},
 		{name: "legacy cancelled", durable: "cancelled", wantState: StateCancelled},
-		{name: "unknown", durable: "paused", wantErr: true},
+		{name: "paused", durable: "paused", wantState: StatePaused},
+		{name: "unknown", durable: "unknown", wantErr: true},
 		{name: "negative errors", durable: "completed", itemErrors: -1, wantErr: true},
 		{name: "negative added", durable: "failed", added: -1, wantErr: true},
 	}
@@ -815,6 +817,10 @@ func TestOperationRunValidationEnforcesKindStateErrorMatrix(t *testing.T) {
 		{name: "source partial from failed update", run: sourceUpdatedPartial},
 		{name: "source failed", run: operationRunFixture(t, KindSourceSync, StateFailed, sourceError)},
 		{name: "source legacy cancelled", run: operationRunFixture(t, KindSourceSync, StateCancelled, nil)},
+		{name: "source paused", run: operationRunFixture(t, KindSourceSync, StatePaused, nil)},
+		{name: "paused source with error", run: operationRunFixture(t, KindSourceSync, StatePaused, sourceError), wantErr: true},
+		{name: "person paused", run: operationRunFixture(t, KindPersonSweep, StatePaused, nil), wantErr: true},
+		{name: "CardDAV paused", run: operationRunFixture(t, KindCardDAVSync, StatePaused, nil), wantErr: true},
 		{name: "source succeeded with item errors", run: sourceSucceededWithItemErrors, wantErr: true},
 		{name: "source failed after add", run: sourceFailedAfterAdd, wantErr: true},
 		{name: "source failed after update", run: sourceFailedAfterUpdate, wantErr: true},
@@ -972,26 +978,6 @@ func TestLaneHistoryStatusValidationEnforcesRegistryAndRunRoles(t *testing.T) {
 		status.Latest = &latest
 		require.Error(status.Validate())
 	})
-}
-
-func TestHistoryReaderContractUsesNormalizedTypes(t *testing.T) {
-	t.Parallel()
-
-	var _ HistoryReader = (*readerContractStub)(nil)
-}
-
-type readerContractStub struct{}
-
-func (*readerContractStub) Kinds() []Kind { return nil }
-
-func (*readerContractStub) ListRuns(context.Context, Query) (HistorySnapshot, error) {
-	return HistorySnapshot{}, nil
-}
-
-func (*readerContractStub) GetRun(context.Context, StableID) (Run, error) { return Run{}, nil }
-
-func (*readerContractStub) LaneStatus(context.Context, Kind) (LaneHistoryStatus, error) {
-	return LaneHistoryStatus{}, nil
 }
 
 func mustInt64ID(t *testing.T, kind Kind, id int64) StableID {

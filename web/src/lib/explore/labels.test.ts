@@ -7,19 +7,11 @@ import {
   entryKindPresentation,
   fileTypeLabel,
   filterDimensionLabel,
-  preflightReasonLabel,
-  presentationLabel,
-  searchModeLabel
+  filterValueLabel,
+  preflightReasonLabel
 } from './labels';
 
 describe('explore labels', () => {
-  it('names search modes and presentations', () => {
-    expect(searchModeLabel('full_text')).toBe('Full text');
-    expect(searchModeLabel('semantic')).toBe('Semantic');
-    expect(searchModeLabel('hybrid')).toBe('Hybrid');
-    expect(presentationLabel('timeline')).toBe('Timeline');
-  });
-
   it('names filter dimensions as chips and falls back to sentence case', () => {
     expect(filterDimensionLabel('source')).toBe('Source');
     expect(filterDimensionLabel('participant')).toBe('Person');
@@ -27,6 +19,14 @@ describe('explore labels', () => {
     expect(filterDimensionLabel('message_type')).toBe('Message type');
     expect(filterDimensionLabel('mailing_list')).toBe('Mailing list');
     expect(filterDimensionLabel('made_up_dimension' as never)).toBe('Made up dimension');
+  });
+
+  it('shows account filter keys as the address or bucket they name', () => {
+    expect(filterValueLabel('account', 'identity:7:d29ya0BleGFtcGxlLm9yZw')).toBe('work@example.org');
+    expect(filterValueLabel('account', 'unattributed:7')).toBe('Unattributed');
+    expect(filterValueLabel('account', 'mask@example.org')).toBe('mask@example.org');
+    expect(filterValueLabel('account', 'identity:7:!!')).toBe('identity:7:!!');
+    expect(filterValueLabel('source', 'unattributed:7')).toBe('unattributed:7');
   });
 
   it('labels every filter dimension the API defines', () => {
@@ -56,10 +56,6 @@ describe('explore labels', () => {
   it('turns every server preflight reason into a sentence', () => {
     const reasons: [string, string, string][] = [
       [
-        'open_in_source', 'trusted_source_link_unavailable',
-        'Your sources don’t provide links to open these items.'
-      ],
-      [
         'export', 'browser_export_requires_single_message',
         'Export works for one message at a time.'
       ],
@@ -88,9 +84,15 @@ describe('entryKindPresentation', () => {
     ['sms', 'Conversation'],
     ['whatsapp', 'Conversation'],
     ['slack', 'Conversation'],
+    ['inline', 'Conversation'],
+    ['chatwoot', 'Conversation'],
     ['fbmessenger', 'Conversation'],
+    ['matrix', 'Conversation'],
+    ['telegram', 'Conversation'],
     ['chat', 'Conversation'],
     ['meeting_transcript', 'Meeting'],
+    ['meeting_note', 'Meeting'],
+    ['meeting_minutes', 'Meeting'],
     ['calendar_event', 'Calendar event'],
     ['email', 'Email'],
     ['', 'Item'],
