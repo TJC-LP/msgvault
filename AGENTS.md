@@ -25,6 +25,9 @@ provide different ways to use the same archive.
   ending the turn; do not ask for permission to commit. Preserve unrelated work.
 - Before committing, inspect `git diff` and `git status`. Include all changes
   from the task, including formatting and generated output.
+- Pull requests must have a user-facing benefit or improve the developer
+  experience, and the body must say which one.
+- Write issues and pull requests in English.
 - Keep PR descriptions focused on the problem, resulting behavior, and review
   boundaries. Do not add `Validation`, `Test plan`, or equivalent command-run
   sections; CI carries routine check results.
@@ -34,6 +37,34 @@ provide different ways to use the same archive.
 - Never name private downstream projects or codebases in public artifacts.
   Describe reusable requirements generically and run the private-data scrub
   before publishing.
+
+## Commit messages
+
+Commit subjects must use the Conventional Commits format. Pull requests are
+squash-merged: the PR title becomes the commit subject and the PR description
+becomes the commit body, so PR titles use the same format.
+
+```text
+type(scope): summary
+```
+
+The scope is optional and names the part of the project the change touches.
+Use one of these types:
+
+- `feat`: a new capability users can see or use.
+- `fix`: a bug fix users can notice.
+- `perf`: faster or lighter behavior users can notice.
+- `refactor`, `test`, `docs`, `build`, `ci`, or `chore`: a change that leaves
+  product behavior as it was.
+
+Mark a breaking change with `!` before the colon, as in
+`feat(api)!: remove the v1 endpoints`, and describe the break in a
+`BREAKING CHANGE:` footer at the end of the commit body or PR description.
+
+This format is required. Releases and release notes are generated from these
+messages: the type decides whether a change appears in the notes and under
+which heading, and the version bump follows the largest change since the last
+release, from a breaking change to `feat` to `fix`.
 
 ## Documentation
 
@@ -52,6 +83,9 @@ provide different ways to use the same archive.
   proposals, and historical decisions. Preserve rationale, approvals, and active
   exceptions with their removal conditions; label superseded designs and keep
   them outside normal navigation.
+- Release notes state what changed for the reader. Put any required action in
+  the entry for that change. Do not add precautionary warnings, upgrade
+  checklists, or internals such as schema versions.
 - Keep the website, its Markdown companions, README, and documentation on
   message. Distinguish the latest release from newer `main` functionality.
   Follow [docs/README.md](docs/README.md) for the publishing layout and checks.
@@ -76,8 +110,14 @@ Use these as reasoning checkpoints, not a requirement to create a design doc.
 
 - Use `make build` for a worktree binary. `make install` changes the user's
   installed binary and needs intentional authorization.
-- All `go test` invocations need `-tags "fts5 sqlite_vec"`; prefer `make test`.
+- Tests that construct configuration directly must set `Data.DataDir` to a
+  temporary directory before writing or purging attachments. Changing
+  `HomeDir` after `config.NewDefaultConfig()` does not change `Data.DataDir`.
+- All `go test` invocations need `-tags "fts5 sqlite_vec"`. Run the packages you
+  changed; `make test` (and CI) runs the full suite.
   PostgreSQL tests use the targets documented in [Development](docs/development.md).
+  The PostgreSQL-only library profile is the exception: use `make test-pg-nocgo`,
+  which omits native-driver tags and disables CGO.
 - After Go changes, run `go fmt ./...` and `go vet ./...` before committing.
   Include resulting formatting changes. Use `make lint-ci` for lint checks.
 - All new or modified Go assertions must use testify: `require.X` for setup or
@@ -92,8 +132,24 @@ Use these as reasoning checkpoints, not a requirement to create a design doc.
   the commit message.
 - Do not write shell tests that grep scripts, workflows, config, or docs for
   expected implementation text. Use real execution or tool-native validation.
+- Never locate files from a path returned by `runtime.Caller` or a stack
+  trace; builds use `-trimpath`, so those paths are module-relative. Tests run
+  from their package directory, so use paths relative to it.
+- A test package that loads a named time zone must import `time/tzdata` in a
+  `_test.go` file. Trimmed builds cannot fall back to GOROOT's zone database,
+  and Windows has no system database.
 - A timeout may bound a wait for an observable transition. Do not make runner
   throughput a correctness requirement, such as ten polls within one second.
+
+## CI runners
+
+CI jobs use GitHub-hosted runners. The `CI gate`, `changes`, and
+`Sibling pins on main` jobs take seconds and run on the Namespace profile
+`namespace-profile-linux-1cpu`, so they do not wait in the GitHub-hosted queue.
+That profile uses Namespace's
+[Restricted access level](https://namespace.so/docs/solutions/github-actions/runner-controls/access-levels),
+which disables workload access to Namespace features and APIs. GitHub fork
+approvals, token permissions, and secrets are separate controls.
 
 ## Test data
 
@@ -108,11 +164,37 @@ before publication. This exception does not permit reuse in ordinary tests.
 
 ## Code and SQL conventions
 
+- Parse every cron schedule with `cronexpr.Parser`, which is go-cron with five
+  fields and `DowOrDom`. Use go-cron's grammar and run times as they are. Do
+  not add parser rules, pre-checks, or daylight-saving workarounds. The only
+  exception is the comma-only field check in `ValidateCronExpr`; delete it if
+  go-cron starts rejecting those fields.
+- `web/src/lib/settings/cron.ts` mirrors go-cron and nothing else, and
+  `web/src/lib/settings/cron-corpus.json` holds both parsers to the same
+  answers. When go-cron changes, record its behaviour in the corpus first, then
+  update the browser parser to match. Never change the corpus to fit the
+  browser parser.
+- Increment `store.SchemaVersion` for any main archive schema change, including
+  indexes, or required data migration. Embedded readers open without DDL and
+  require completed setup at their exact expected version. See
+  [schema version maintenance](docs/development.md#archive-schema-version-maintenance).
 - Use Bubble Tea and lipgloss for the TUI; Svelte and the shared UI toolkit for
   the Web UI. See [Development](docs/development.md) for the dependency map.
 - Route database operations through `Store`. Use DuckDB for Parquet queries,
   `mattn/go-sqlite3` for SQLite, context cancellation for long operations, and
   wrapped errors with useful context. Prefer table-driven tests.
+- Pass the caller's `context.Context` to database, HTTP, and subprocess calls:
+  `QueryContext`, `ExecContext`, `BeginTx`, `http.NewRequestWithContext`, and
+  `exec.CommandContext`. The `noctx` linter in `make lint-ci` rejects the forms
+  without a context. A function that does such work takes `ctx` as its first
+  parameter; call `context.Background()` only at a process root.
+- Use `context.WithoutCancel(ctx)` only for work that must finish after
+  cancellation, such as recording a failed sync run, a resume checkpoint, or
+  cleanup. Add a short comment that says why.
+- Tests use `t.Context()`. The `usetesting` linter rejects
+  `context.Background()` and `context.TODO()` in tests. `t.Cleanup` callbacks
+  run after `t.Context()` is canceled, so use
+  `context.WithoutCancel(t.Context())` there.
 - Use `gogs/chardet` for charset detection and `golang.org/x/text/encoding` for
   conversion.
 - Never use `SELECT DISTINCT` with JOINs; use `EXISTS` subqueries to avoid

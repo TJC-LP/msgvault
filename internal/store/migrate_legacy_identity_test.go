@@ -176,7 +176,7 @@ func TestMigrateLegacyIdentityConfigRefreshesExistingMessages(t *testing.T) {
 	require.True(applied, "migration should insert the configured identity")
 
 	var sourceDerived, identityDerived, isFromMe bool
-	require.NoError(st.DB().QueryRow(st.Rebind(`
+	require.NoError(st.DB().QueryRowContext(t.Context(), st.Rebind(`
 		SELECT source_is_from_me, identity_is_from_me, is_from_me
 		FROM messages
 		WHERE id = ?
@@ -279,21 +279,6 @@ func TestMigrateLegacyIdentityConfig_TrimsWhitespace(t *testing.T) {
 	require.NoError(err, "ListAccountIdentities")
 	require.Len(ids, 1)
 	assert.Equal(t, "ME@Example.COM", ids[0].Address, "address")
-}
-
-func TestMigrateLegacyIdentityConfig_PreservesCase(t *testing.T) {
-	require := require.New(t)
-	f := storetest.New(t)
-	st := f.Store
-
-	applied, _, _, _, err := st.MigrateLegacyIdentityConfig([]string{"Alice@Example.com"}) //nolint:dogsled // 5-return migration; test needs only applied+err
-	require.NoError(err, "MigrateLegacyIdentityConfig")
-	require.True(applied, "expected applied=true on first run")
-
-	rows, err := st.ListAccountIdentities(f.Source.ID)
-	require.NoError(err, "ListAccountIdentities")
-	require.Len(rows, 1)
-	assert.Equal(t, "Alice@Example.com", rows[0].Address, "address")
 }
 
 // TestMigrateLegacyIdentityConfig_DedupesEmailCaseVariants verifies that

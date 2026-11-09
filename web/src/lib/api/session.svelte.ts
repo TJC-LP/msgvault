@@ -6,7 +6,7 @@ import {
 import type { SessionStatus as GeneratedSessionStatus } from './generated/models';
 import { createSessionAwareAPIClient, type APIClient } from './client';
 type SessionStatus = GeneratedSessionStatus;
-function errorMessage(error: unknown, fallback: string): string {
+export function errorMessage(error: unknown, fallback: string): string {
   if (typeof error === 'object' && error !== null && 'message' in error) {
     const message = (
       error as {
@@ -22,12 +22,14 @@ export class SessionController {
   loading = $state(false);
   error = $state<string>();
   readonly client: APIClient;
+  readonly telemetryClient: APIClient;
   constructor(fetchFn: typeof fetch = fetch) {
     this.client = createSessionAwareAPIClient(
       fetchFn,
       () => this.csrfToken,
       () => this.requireLogin(),
     );
+    this.telemetryClient = createSessionAwareAPIClient(fetchFn, () => this.csrfToken);
   }
   get authMode(): SessionStatus['auth_mode'] | undefined {
     return this.status?.auth_mode;

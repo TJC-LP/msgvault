@@ -3,7 +3,6 @@
 package cmd
 
 import (
-	"context"
 	"database/sql"
 	"path/filepath"
 	"testing"
@@ -13,6 +12,7 @@ import (
 
 	"go.kenn.io/msgvault/internal/search"
 	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/testutil"
 	"go.kenn.io/msgvault/internal/vector"
 	"go.kenn.io/msgvault/internal/vector/sqlitevec"
 )
@@ -29,12 +29,9 @@ import (
 // four.
 func seedLifecycleShapedArchive(t *testing.T) *store.Store {
 	t.Helper()
-	s, err := store.Open(filepath.Join(t.TempDir(), "msgvault.db"))
-	require.NoError(t, err, "open store")
-	t.Cleanup(func() { require.NoError(t, s.Close()) })
-	require.NoError(t, s.InitSchema(), "init schema")
+	s := testutil.NewSQLiteTestStoreAt(t, filepath.Join(t.TempDir(), "msgvault.db"))
 
-	_, err = s.DB().Exec(`
+	_, err := s.DB().ExecContext(t.Context(), `
 INSERT INTO sources (id, source_type, identifier) VALUES (1, 'gmail', 'me@example.com');
 INSERT INTO conversations (id, source_id, source_conversation_id, conversation_type) VALUES
 	(1, 1, 'thread-1', 'email_thread'),
@@ -71,8 +68,8 @@ func TestCollectCorpusStats_CountsOnlyTheSearchablePopulation(t *testing.T) {
 	// What the raw tables hold, so a change to the fixture cannot quietly
 	// make the assertions below trivially true.
 	var rawMessages, rawConversations int64
-	require.NoError(s.DB().QueryRow(`SELECT COUNT(*) FROM messages`).Scan(&rawMessages))
-	require.NoError(s.DB().QueryRow(`SELECT COUNT(*) FROM conversations`).Scan(&rawConversations))
+	require.NoError(s.DB().QueryRowContext(t.Context(), `SELECT COUNT(*) FROM messages`).Scan(&rawMessages))
+	require.NoError(s.DB().QueryRowContext(t.Context(), `SELECT COUNT(*) FROM conversations`).Scan(&rawConversations))
 	require.EqualValues(5, rawMessages)
 	require.EqualValues(4, rawConversations)
 
@@ -121,7 +118,7 @@ func seedTwoGenerations(
 	t *testing.T, dataDir, mainPath string, mainDB *sql.DB, vecCfg vector.Config,
 ) (total, active int64) {
 	t.Helper()
-	ctx := context.Background()
+	ctx := t.Context()
 	require.NoError(t, sqlitevec.RegisterExtension(), "RegisterExtension")
 	b, err := sqlitevec.Open(ctx, sqlitevec.Options{
 		Path:      filepath.Join(dataDir, "vectors.db"),

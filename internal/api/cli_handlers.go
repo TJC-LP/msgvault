@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -33,6 +34,7 @@ import (
 	"go.kenn.io/msgvault/internal/provideridentity"
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/search"
+	"go.kenn.io/msgvault/internal/senderauth"
 	"go.kenn.io/msgvault/internal/store"
 )
 
@@ -118,6 +120,7 @@ type ContextCLIStore interface {
 	CountMessagesForSourceContext(ctx context.Context, sourceID int64) (int64, error)
 	CountSourceDeletedMessagesContext(ctx context.Context, sourceIDs ...int64) (int64, error)
 	NeedsFTSBackfillQuickContext(ctx context.Context) bool
+	NeedsFTSBackfillContext(ctx context.Context) (bool, error)
 	RebuildFTSContext(ctx context.Context, progress func(done, total int64)) (int64, error)
 }
 
@@ -677,6 +680,9 @@ type cliDeleteDedupedExecuteResponse struct {
 }
 
 type cliSearchResponse struct {
+	HasMore          bool                   `json:"has_more,omitzero"`
+	Hints            []query.SearchHint     `json:"hints,omitempty"`
+	HybridAvailable  bool                   `json:"hybrid_available,omitzero"`
 	Results          []query.MessageSummary `json:"results"`
 	ScopeLabel       string                 `json:"scope_label,omitempty"`
 	ScopeSourceCount int                    `json:"scope_source_count,omitzero"`
@@ -686,16 +692,16 @@ type cliSearchResponse struct {
 	// schema so new CLIs understand old daemons.
 	IndexBuilt      bool  `json:"index_built,omitzero"`
 	IndexedMessages int64 `json:"indexed_messages,omitzero"`
-	// IndexState is "checking" while the FTS completeness probe runs and
-	// "building" while a backfill is repopulating the index (results may be
-	// incomplete); empty once the index is known complete.
+	// IndexState is checking, building, or awaiting_owner when repair needs owner authority.
 	IndexState string `json:"index_state,omitempty"`
 }
 
 // CLI search index states reported in cliSearchResponse.IndexState.
 const (
-	cliSearchIndexStateChecking = "checking"
-	cliSearchIndexStateBuilding = "building"
+	cliSearchIndexStateUnverified    = "unverified"
+	cliSearchIndexStateChecking      = "checking"
+	cliSearchIndexStateBuilding      = "building"
+	cliSearchIndexStateAwaitingOwner = "awaiting_owner"
 )
 
 type CLIQueryMessageSummary query.MessageSummary
@@ -706,12 +712,44 @@ type cliAccountsResponse struct {
 	// fresh counts did not finish in time; AsOf says when it was taken.
 	Stale bool      `json:"stale,omitempty"`
 	AsOf  time.Time `json:"as_of,omitzero"`
+	// CountsPending reports that the first count refresh is still running, so
+	// every count is a zero placeholder. Only callers sending
+	// apiprotocol.AllowPendingCountsHeader get it.
+	CountsPending bool `json:"counts_pending,omitempty"`
+	// VirtualAccountsUnavailable reports that the catalog read failed, timed
+	// out, or was served from an earlier snapshot. Accounts then carry the
+	// last known virtual_accounts, if any, which can miss identities confirmed
+	// since, so absence from them does not prove an address is unknown.
+	VirtualAccountsUnavailable bool `json:"virtual_accounts_unavailable,omitempty"`
 }
 
 // sourceMessageCounter is implemented by stores that count every source's
 // messages in one pass.
 type sourceMessageCounter interface {
 	CountMessagesBySourceContext(ctx context.Context) (map[int64]store.SourceMessageCounts, error)
+}
+
+// virtualAccountLister reads the virtual account catalog. Its freshness
+// depends on the confirmed identities, so a store that offers the catalog
+// also reports the revision that changes when one is added or removed.
+type virtualAccountLister interface {
+	ListVirtualAccountsContext(ctx context.Context) (map[int64][]store.VirtualAccount, error)
+	AccountIdentityRevisionContext(ctx context.Context) (int64, error)
+}
+
+// virtualAccountCatalogFreshFor is how long a completed catalog read serves
+// as current. Confirming or removing an identity starts a new read at once.
+const virtualAccountCatalogFreshFor = 2 * time.Minute
+
+// virtualAccountCatalogVersion is the identity revision a catalog read
+// depends on, so a read from before an identity change is never fresh.
+func (s *Server) virtualAccountCatalogVersion(ctx context.Context, lister virtualAccountLister) string {
+	revision, err := lister.AccountIdentityRevisionContext(ctx)
+	if err != nil {
+		s.logger.Warn("reading account identity revision for the account catalog", "error", err)
+		return ""
+	}
+	return strconv.FormatInt(revision, 10)
 }
 
 type cliCollectionsResponse struct {
@@ -836,30 +874,42 @@ type cliAccountResponse struct {
 	MessageCount       int64      `json:"message_count"`
 	SourceDeletedCount int64      `json:"source_deleted_count"`
 	LastSync           *time.Time `json:"last_sync"`
+	// VirtualAccounts lists the source's confirmed identities and its
+	// unattributed rows, each with live counts, for account pickers.
+	VirtualAccounts    []store.VirtualAccount `json:"virtual_accounts,omitempty"`
+	Identifier         string                 `json:"identifier"`
+	Alias              string                 `json:"alias"`
+	HistoryOnly        bool                   `json:"history_only"`
+	ReanchorRequired   bool                   `json:"reanchor_required"`
+	MergedIntoSourceID int64                  `json:"merged_into_source_id"`
 }
 
 type cliMessageResponse struct {
-	ID                   int64                  `json:"id"`
-	SourceMessageID      string                 `json:"source_message_id"`
-	RFC822MessageID      string                 `json:"rfc822_message_id,omitempty"`
-	ConversationID       int64                  `json:"conversation_id"`
-	SourceConversationID string                 `json:"source_conversation_id"`
-	Subject              string                 `json:"subject"`
-	MessageType          string                 `json:"message_type,omitempty"`
-	Snippet              string                 `json:"snippet"`
-	SentAt               time.Time              `json:"sent_at"`
-	ReceivedAt           *time.Time             `json:"received_at"`
-	DeletedAt            *time.Time             `json:"deleted_at"`
-	SizeEstimate         int64                  `json:"size_estimate"`
-	HasAttachments       bool                   `json:"has_attachments"`
-	From                 []cliMessageAddress    `json:"from"`
-	To                   []cliMessageAddress    `json:"to"`
-	Cc                   []cliMessageAddress    `json:"cc"`
-	Bcc                  []cliMessageAddress    `json:"bcc"`
-	Labels               []string               `json:"labels"`
-	Attachments          []cliMessageAttachment `json:"attachments"`
-	BodyText             string                 `json:"body_text"`
-	BodyHTML             string                 `json:"body_html"`
+	SenderAuth           *senderauth.Verdict       `json:"sender_auth,omitempty"`
+	RelatedMessageID     *int64                    `json:"related_message_id,omitempty"`
+	Calendar             *store.CalendarProjection `json:"calendar,omitempty"`
+	ID                   int64                     `json:"id"`
+	SourceMessageID      string                    `json:"source_message_id"`
+	RFC822MessageID      string                    `json:"rfc822_message_id,omitempty"`
+	ConversationID       int64                     `json:"conversation_id"`
+	SourceConversationID string                    `json:"source_conversation_id"`
+	Subject              string                    `json:"subject"`
+	MessageType          string                    `json:"message_type,omitempty"`
+	Snippet              string                    `json:"snippet"`
+	SentAt               time.Time                 `json:"sent_at"`
+	ReceivedAt           *time.Time                `json:"received_at"`
+	DeletedAt            *time.Time                `json:"deleted_at"`
+	SizeEstimate         int64                     `json:"size_estimate"`
+	HasAttachments       bool                      `json:"has_attachments"`
+	HiddenTextPresent    bool                      `json:"hidden_text_present"`
+	From                 []cliMessageAddress       `json:"from"`
+	To                   []cliMessageAddress       `json:"to"`
+	Cc                   []cliMessageAddress       `json:"cc"`
+	Bcc                  []cliMessageAddress       `json:"bcc"`
+	Labels               []string                  `json:"labels"`
+	Attachments          []cliMessageAttachment    `json:"attachments"`
+	BodyText             string                    `json:"body_text"`
+	BodyHTML             string                    `json:"body_html"`
 }
 
 type cliMessageAddress struct {
@@ -868,12 +918,13 @@ type cliMessageAddress struct {
 }
 
 type cliMessageAttachment struct {
-	ID          int64  `json:"id"`
-	Filename    string `json:"filename"`
-	MimeType    string `json:"mime_type"`
-	Size        int64  `json:"size"`
-	ContentHash string `json:"content_hash"`
-	URL         string `json:"url,omitempty"`
+	Docbank     []store.DocbankAttachmentRef `json:"docbank,omitempty"`
+	ID          int64                        `json:"id"`
+	Filename    string                       `json:"filename"`
+	MimeType    string                       `json:"mime_type"`
+	Size        int64                        `json:"size"`
+	ContentHash string                       `json:"content_hash"`
+	URL         string                       `json:"url,omitempty"`
 }
 
 type cliScope struct {
@@ -901,6 +952,10 @@ func (s cliScope) displayName() string {
 }
 
 func (s *Server) handleCLIStats(w http.ResponseWriter, r *http.Request) {
+	if s.requestAuthentication(r).Grant != nil {
+		s.agentScopedStats(w, r, true)
+		return
+	}
 	if s.store == nil {
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "Database not available")
 		return
@@ -931,7 +986,7 @@ func (s *Server) handleCLIStats(w http.ResponseWriter, r *http.Request) {
 	}
 	cliStore = bindCLIStoreContext(r.Context(), cliStore)
 
-	scope, err := resolveCLIStatsScope(cliStore, account, collection)
+	scope, err := resolveCLIStatsScope(r.Context(), cliStore, account, collection)
 	if err != nil {
 		writeAPIHTTPError(w, s.cliScopeError(err))
 		return
@@ -1354,6 +1409,15 @@ func (s *Server) handleCLIRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_args", "--grant-decided is not accepted through the daemon CLI runner")
 		return
 	}
+	// A proxied watch would keep a daemon subprocess polling until the
+	// request is cancelled; status callers poll the endpoint themselves. Only
+	// `embeddings status` has --watch, and a flag can precede the subcommand,
+	// so the whole group is checked.
+	if req.Args[0] == "embeddings" && cliRunArgsContainFlag(req.Args, "watch") {
+		writeError(w, http.StatusBadRequest, "invalid_args",
+			"--watch is not accepted through the daemon CLI runner; poll GET /api/v1/embeddings/status instead")
+		return
+	}
 	if proof := r.Header.Get(apiprotocol.DaemonRuntimeTokenHeader); proof != "" {
 		if req.Args[0] != "add-account" || s.shutdownToken == "" ||
 			subtle.ConstantTimeCompare([]byte(proof), []byte(s.shutdownToken)) != 1 {
@@ -1370,7 +1434,7 @@ func (s *Server) handleCLIRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeEvent := newCLINDJSONEventWriter[CLIRunEvent](w)
-	if err := runner.RunCLICommand(r.Context(), req, writeEvent); err != nil {
+	if err := runner.RunCLICommand(s.withPublishedVectorConfig(r.Context()), req, writeEvent); err != nil {
 		if coded, ok := errors.AsType[*CLIRunCodedError](err); ok {
 			s.logger.Error("failed to run CLI command", "command", req.Args[0], "error_code", coded.Code, "cause", coded.Err)
 		} else {
@@ -1387,6 +1451,9 @@ func (s *Server) handleCLIRun(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) cliRunEnvAllowedForCommand(args []string, name string) bool {
+	if name == clirun.EnvInlineOAuth {
+		return len(args) > 0 && args[0] == "add-inline"
+	}
 	if IsCLIRunDraftCreate(args) || IsCLIRunDraftLifecycle(args) || IsCLIRunDraftSendAs(args) {
 		return false
 	}
@@ -1524,7 +1591,7 @@ func (s *Server) handleCLIEmbeddingsPlan(w http.ResponseWriter, r *http.Request)
 	if !requireSingleJSONValue(w, dec, "invalid_request") {
 		return
 	}
-	resp, err := planner.PlanCLIEmbeddings(r.Context(), req)
+	resp, err := planner.PlanCLIEmbeddings(s.withPublishedVectorConfig(r.Context()), req)
 	if err != nil {
 		writeAPIHTTPError(w, newAPIHTTPError(http.StatusBadRequest, "embeddings_plan_failed", err.Error()))
 		return
@@ -1624,6 +1691,10 @@ const cliRunPersonCommand = "person"
 // nested command path. Backup admits only the frozen create path, documents
 // admits only mutations that must run under the daemon's writer lock, and
 // person admits only the provider consent boundary and sweep operations.
+// cliRunStatusSubcommand is the read-only status subcommand shared by the
+// document and document-vector command groups.
+const cliRunStatusSubcommand = "status"
+
 func cliRunCommandAllowed(args []string) bool {
 	if len(args) == 0 {
 		return false
@@ -1654,14 +1725,14 @@ func cliRunCommandAllowed(args []string) bool {
 				return false
 			}
 			switch args[2] {
-			case "build", "consent", "rebuild", "resume", "retire", "retry", "status":
+			case "build", "consent", "rebuild", "resume", "retire", "retry", cliRunStatusSubcommand:
 				return true
 			default:
 				return false
 			}
 		}
 		switch args[1] {
-		case "build", "consent-mistral", "purge-derived", "resume", "retire", "retry":
+		case "build", "consent-mistral", "consent-docling", "purge-derived", "resume", "retire", "retry", cliRunStatusSubcommand:
 			return true
 		default:
 			return false
@@ -1682,6 +1753,11 @@ func cliRunCommandAllowed(args []string) bool {
 			case "run", "status", "history":
 				return true
 			}
+		case "tiers":
+			switch args[2] {
+			case "preview", "explain":
+				return true
+			}
 		}
 		return false
 	}
@@ -1690,20 +1766,28 @@ func cliRunCommandAllowed(args []string) bool {
 		"archive-remote-images",
 		"activity",
 		"add-beeper",
+		"add-matrix",
 		"add-calendar",
 		"add-circleback",
+		"add-chatwoot",
 		"add-plaud",
+		"add-twenty",
+		"add-pocket",
 		"add-discord",
 		"add-granola",
+		"add-omi",
 		"add-imap",
+		"add-inline",
 		"add-muesli",
 		"add-notion-meetings",
 		"add-o365",
 		"add-slack",
 		"add-synctech-sms-drive",
 		"add-teams",
+		"add-twilio",
 		"backfill-beeper-media",
 		"backfill-discord-media",
+		"backfill-inline-media",
 		"backfill-slack-media",
 		"backfill-teams-media",
 		"build-embeddings",
@@ -1726,6 +1810,7 @@ func cliRunCommandAllowed(args []string) bool {
 		"import-messenger",
 		"import-pst",
 		"import-slackdump",
+		"import-telegram",
 		"import-synctech-sms",
 		"import-whatsapp",
 		"list-deletions",
@@ -1733,6 +1818,7 @@ func cliRunCommandAllowed(args []string) bool {
 		"logs",
 		"pack-attachments",
 		"purge-excluded-media",
+		"policy",
 		"repair-dates",
 		"repair-identity",
 		"repair-labels",
@@ -1743,16 +1829,23 @@ func cliRunCommandAllowed(args []string) bool {
 		"repair-derived",
 		"show-deletion",
 		"sync-beeper",
+		"sync-matrix",
 		"sync-calendar",
 		"sync-circleback",
+		"sync-chatwoot",
 		"sync-plaud",
+		"sync-twenty",
+		"sync-pocket",
 		"sync-discord",
 		"sync-granola",
+		"sync-inline",
 		"sync-muesli",
+		"sync-omi",
 		"sync-notion-meetings",
 		"sync-slack",
 		"sync-synctech-sms",
-		"sync-teams":
+		"sync-teams",
+		"sync-twilio":
 		return true
 	default:
 		return false
@@ -2064,7 +2157,7 @@ func (s *Server) currentPeopleSweepConfig() (peoplesweep.Config, bool) {
 	if !snapshot.Exists {
 		return s.cfg.People.Sweep, true
 	}
-	loaded, err := config.LoadConfigFile(snapshot, s.cfg.HomeDir)
+	loaded, err := config.LoadClientConfigFile(snapshot, s.cfg.HomeDir)
 	if err != nil {
 		return peoplesweep.Config{}, false
 	}
@@ -2317,14 +2410,28 @@ func (s *Server) handleCLISearch(w http.ResponseWriter, r *http.Request) {
 	account := r.URL.Query().Get("account")
 	collection := r.URL.Query().Get("collection")
 
+	includeSnippet := false
+	if r.URL.Query().Has("include_snippet") {
+		var err error
+		includeSnippet, err = strconv.ParseBool(r.URL.Query().Get("include_snippet"))
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_include_snippet", "include_snippet must be a boolean")
+			return
+		}
+	}
+
 	limit := parseCLISearchInt(r.URL.Query().Get("limit"), 50)
 	if limit <= 0 {
 		limit = 50
 	}
+	if limit > remoteSearchLimit && s.remoteClientRequest(r) {
+		writeError(w, http.StatusBadRequest, "remote_search_limit", fmt.Sprintf("Remote client search limit must not exceed %d", remoteSearchLimit))
+		return
+	}
 	offset := max(parseCLISearchInt(r.URL.Query().Get("offset"), 0), 0)
 
 	queryStr := r.URL.Query().Get("q")
-	parsed := search.Parse(queryStr)
+	parsed := search.ParseOR(queryStr)
 	if err := parsed.Err(); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_query", err.Error())
 		return
@@ -2345,44 +2452,89 @@ func (s *Server) handleCLISearch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var scope cliScope
-	if account != "" || collection != "" {
-		var err error
-		scope, err = resolveCLIStatsScope(cliStore, account, collection)
+	grant := s.requestAuthentication(r).Grant
+	admitted, _ := r.Context().Value(agentReadScopeKey{}).(agentReadScope)
+	if grant != nil {
+		scope = admitted.scope
+		if scope.Collection != nil {
+			collection = scope.Collection.Name
+		}
+	} else if account != "" || collection != "" {
+		scope, err = resolveCLIStatsScope(r.Context(), cliStore, account, collection)
 		if err != nil {
 			writeAPIHTTPError(w, s.cliScopeError(err))
 			return
 		}
-		sourceIDs := scope.sourceIDs()
-		if len(sourceIDs) == 0 {
-			writeError(w, http.StatusBadRequest, "empty_scope", cliEmptyScopeMessage(account, collection))
+	}
+	if scope.Account.Input != "" {
+		if len(scope.sourceIDs()) == 0 {
+			writeError(w, http.StatusBadRequest, "empty_scope", cliEmptyScopeMessage(scope.Account.Input, collection))
 			return
 		}
-		parsed.AccountIDs = append(parsed.AccountIDs, sourceIDs...)
+		parsed.AccountIDs = append(parsed.AccountIDs, scope.sourceIDs()...)
 	}
-
 	if parsed.IsEmpty() {
 		writeError(w, http.StatusBadRequest, "empty_search", "empty search query")
 		return
 	}
-
+	if grant != nil {
+		parsed.AccountIDs = admitted.ids
+	}
 	resp := cliSearchResponse{
 		ScopeLabel:       scope.displayName(),
 		ScopeSourceCount: len(scope.sourceIDs()),
-		// The FTS completeness probe scans every message (a minute on a
-		// large archive, once per daemon process), so the search never
-		// waits on it: the probe and any backfill run in the background
-		// and the response only reports their state so the CLI can warn
-		// that results may be incomplete while a backfill runs.
-		IndexState: s.ensureCLISearchIndexAsync(cliStore),
 	}
 
-	results, err := s.queryEngineForContext(r.Context()).Search(r.Context(), parsed, limit, offset)
+	if grant != nil {
+		resp.ScopeSourceCount = admitted.sourceCount()
+		if admitted.scope.Account.Input == "" {
+			resp.ScopeLabel = "agent grant"
+		}
+	}
+	resp.IndexState = admitted.indexState
+	if grant == nil {
+		resp.IndexState = s.ensureCLISearchIndexAsync(cliStore, true)
+	}
+	results, err := s.queryEngineForContext(r.Context()).Search(r.Context(), parsed, limit+1, offset)
 	if err != nil {
+		if s.writeIfContextError(w, err) {
+			return
+		}
 		s.logger.Error("CLI search failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "search_failed", err.Error())
 		return
 	}
+	resp.HasMore = len(results) > limit
+	if resp.HasMore {
+		results = results[:limit]
+	}
+	if includeSnippet {
+		metadata, err := s.searchMetadata(r.Context(), resultIDs(results), parsed, true)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "search_failed", err.Error())
+			return
+		}
+		for i := range results {
+			if item, ok := metadata[results[i].ID]; ok {
+				results[i].AttachmentNames = item.AttachmentNames
+				results[i].MatchSnippet = item.MatchSnippet
+			}
+		}
+	}
 	resp.Results = results
+	if len(results) == 0 && offset == 0 {
+		if matcher, ok := s.queryEngineForContext(r.Context()).(query.SenderNameMatcher); ok {
+			resp.Hints = matcher.MatchSenderName(r.Context(), parsed)
+			if s.writeIfContextError(w, r.Context().Err()) {
+				return
+			}
+		}
+	}
+	if grant == nil && len(results) == 0 && offset == 0 && len(parsed.TextTerms) > 0 &&
+		len(parsed.AccountAddrs) == 0 && len(parsed.ReceivedAddrs) == 0 &&
+		parsed.DeletionScope != search.DeletionScopeDeleted && parsed.DeletionScope != search.DeletionScopeAny {
+		resp.HybridAvailable = s.hybridHintAvailable(r.Context(), parsed.MessageTypes)
+	}
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -2392,84 +2544,170 @@ func (s *Server) handleCLISearch(w http.ResponseWriter, r *http.Request) {
 // never wait on this work: the completeness probe alone scans every message
 // — a minute on a large archive — and it used to run inline on the first
 // search of every daemon process, which reads as a hung CLI. A failed
-// backfill clears the running flag so a later search retries.
-func (s *Server) ensureCLISearchIndexAsync(cliStore CLIStore) string {
+// backfill clears the running flag so an owner search retries; agents retain
+// uncertainty until owner verification, rebuild or restart.
+func (s *Server) ensureCLISearchIndexAsync(cliStore CLIStore, mayRepair bool) string {
+	s.ftsEnsureMu.Lock()
+	defer s.ftsEnsureMu.Unlock()
 	if s.ftsIndexComplete.Load() {
 		return ""
 	}
-	if s.ftsEnsureRunning.CompareAndSwap(false, true) {
-		// The quick probe (a couple of index lookups) classifies the initial
-		// state: a visibly stale index reports "building" right away, so the
-		// very first search already warns that results may be incomplete
-		// instead of staying silent for the minutes the full probe can take.
-		state := cliSearchIndexStateChecking
-		if cliStore.NeedsFTSBackfillQuick() {
-			state = cliSearchIndexStateBuilding
-		}
-		s.ftsIndexState.Store(state)
-		go s.runCLISearchIndexEnsure(cliStore)
-	}
 	state, _ := s.ftsIndexState.Load().(string)
+	if s.ftsEnsureRunning.Load() {
+		if mayRepair {
+			s.ftsEnsureMayRepair = true
+		}
+		return state
+	}
+	if !mayRepair && (state == cliSearchIndexStateUnverified || state == cliSearchIndexStateAwaitingOwner) {
+		return state
+	}
+	knownIncomplete := state == cliSearchIndexStateAwaitingOwner
+	needsQuick := false
+	if mayRepair && !knownIncomplete {
+		s.ftsEnsureMu.Unlock()
+		needsQuick = cliStore.NeedsFTSBackfillQuick()
+		s.ftsEnsureMu.Lock()
+		if s.ftsIndexComplete.Load() {
+			return ""
+		}
+		state, _ = s.ftsIndexState.Load().(string)
+		if s.ftsEnsureRunning.Load() {
+			s.ftsEnsureMayRepair = true
+			return state
+		}
+		knownIncomplete = state == cliSearchIndexStateAwaitingOwner
+	}
+	failed := state == cliSearchIndexStateUnverified
+	state = cliSearchIndexStateChecking
+	if mayRepair && (knownIncomplete || needsQuick) {
+		state = cliSearchIndexStateBuilding
+	} else if failed {
+		state = cliSearchIndexStateUnverified
+	}
+	if bound, ok := cliStore.(*requestCLIStore); ok {
+		cliStore = bound.CLIStore
+	}
+	s.ftsEnsureMayRepair = mayRepair
+	s.ftsEnsureRunning.Store(true)
+	s.ftsIndexState.Store(state)
+	go s.runCLISearchIndexEnsure(cliStore, knownIncomplete, !mayRepair)
 	return state
 }
 
-func (s *Server) runCLISearchIndexEnsure(cliStore CLIStore) {
-	defer s.ftsEnsureRunning.Store(false)
-	// The probe runs outside the operation gate, so a rebuild-fts can clear
-	// and repopulate the index while it scans. A "complete" observation is
-	// only memoized when no rebuild was in progress at the snapshot (even
-	// generation — an odd one means a rebuild handler is mid-flight and the
-	// probe's read snapshot may predate its index clear) and none started
-	// since; otherwise it is discarded and the next search re-triggers the
-	// worker. The backfill path below needs no generation check: it
-	// re-probes and backfills under the gate, serialized with rebuilds.
+func (s *Server) runCLISearchIndexEnsure(cliStore CLIStore, knownIncomplete, bounded bool) {
 	rebuildGen := s.ftsRebuildGen.Load()
-	if !s.probeFTSBackfillNeeded(cliStore) {
-		if rebuildGen%2 == 0 && s.ftsRebuildGen.Load() == rebuildGen {
-			s.ftsIndexComplete.Store(true)
+	state := ""
+	complete := false
+	published := false
+	defer func() {
+		if published {
+			return
 		}
-		s.ftsIndexState.Store("")
+		s.ftsEnsureMu.Lock()
+		defer s.ftsEnsureMu.Unlock()
+		if rebuildGen%2 == 0 && rebuildGen == s.ftsRebuildGen.Load() {
+			if complete {
+				s.ftsIndexComplete.Store(true)
+			}
+			s.ftsIndexState.Store(state)
+		}
+		s.ftsEnsureRunning.Store(false)
+	}()
+	needs := knownIncomplete
+	for !knownIncomplete {
+		var err error
+		needs, err = s.probeFTSBackfillNeeded(cliStore, bounded)
+		if err == nil {
+			break
+		}
+		s.ftsEnsureMu.Lock()
+		if bounded && s.ftsEnsureMayRepair && s.importContext.Err() == nil {
+			s.ftsEnsureMu.Unlock()
+			bounded = false
+			continue
+		}
+		if rebuildGen%2 == 0 && rebuildGen == s.ftsRebuildGen.Load() {
+			state = cliSearchIndexStateUnverified
+			s.ftsIndexState.Store(state)
+		}
+		s.ftsEnsureRunning.Store(false)
+		published = true
+		s.ftsEnsureMu.Unlock()
+		return
+	}
+	if !needs {
+		complete = true
+		return
+	}
+	state = cliSearchIndexStateAwaitingOwner
+	s.ftsEnsureMu.Lock()
+	if !s.ftsEnsureMayRepair {
+		if rebuildGen%2 == 0 && rebuildGen == s.ftsRebuildGen.Load() {
+			s.ftsIndexState.Store(state)
+		}
+		s.ftsEnsureRunning.Store(false)
+		published = true
+		s.ftsEnsureMu.Unlock()
 		return
 	}
 	s.ftsIndexState.Store(cliSearchIndexStateBuilding)
-	// Background gate work, not request work: a backfill queued behind a
-	// long sync should wait its turn rather than force the sync to yield,
-	// since no request is blocked on it anymore.
-	done, ok := s.beginBackgroundOperationGateWork(context.Background(), "a search index build")
+	s.ftsEnsureMu.Unlock()
+	done, ok := s.beginBackgroundOperationGateWork(s.importContext, "a search index build")
 	if !ok {
-		s.ftsIndexState.Store("")
 		return
 	}
 	defer done()
-	if !cliStore.NeedsFTSBackfill() {
-		s.ftsIndexComplete.Store(true)
-		s.ftsIndexState.Store("")
+	if needed, err := s.probeFTSBackfillNeeded(cliStore, false); err != nil {
+		s.logger.Error("failed to verify CLI search index", "error", err)
+		return
+	} else if !needed {
+		state = ""
+		rebuildGen = s.ftsRebuildGen.Load()
+		complete = true
 		return
 	}
-	if _, err := s.backfillFTSWithActivity(cliStore); err != nil {
+	if _, err := s.backfillFTSWithActivity(bindCLIStoreContext(s.importContext, cliStore)); err != nil {
 		s.logger.Error("failed to build CLI search index", "error", err)
-		s.ftsIndexState.Store("")
 		return
 	}
-	s.ftsIndexComplete.Store(true)
-	s.ftsIndexState.Store("")
+	// Repair ran under the rebuild gate, so its final index supersedes earlier observations.
+	state = ""
+	rebuildGen = s.ftsRebuildGen.Load()
+	complete = true
 }
 
-// probeFTSBackfillNeeded runs the expensive first-search completeness probe
-// as a labeled activity, and logs the duration when it is slow enough to be
-// what a user just sat through.
-func (s *Server) probeFTSBackfillNeeded(cliStore CLIStore) bool {
+func (s *Server) probeFTSBackfillNeeded(cliStore CLIStore, bounded bool) (bool, error) {
+	ctx := s.importContext
+	if bounded {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, QueryEndpointTimeout)
+		defer cancel()
+	}
 	end := s.beginActivity("checking the search index")
 	defer end()
 	started := time.Now()
-	needs := cliStore.NeedsFTSBackfill()
-	if elapsed := time.Since(started); elapsed > time.Second {
-		s.logger.Info("search index completeness probe finished",
-			"needs_backfill", needs,
-			"duration", elapsed.Round(time.Millisecond).String(),
-		)
+	if bounded && bindCLIStoreContext(ctx, cliStore).NeedsFTSBackfillQuick() {
+		s.ftsEnsureMu.Lock()
+		state := cliSearchIndexStateAwaitingOwner
+		if s.ftsEnsureMayRepair {
+			state = cliSearchIndexStateBuilding
+		}
+		s.ftsIndexState.Store(state)
+		s.ftsEnsureMu.Unlock()
 	}
-	return needs
+	var needs bool
+	var err error
+	if st, ok := cliStore.(ContextCLIStore); ok {
+		needs, err = st.NeedsFTSBackfillContext(ctx)
+	} else {
+		needs = cliStore.NeedsFTSBackfill()
+		err = ctx.Err()
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		s.logger.Info("search index completeness probe finished", "needs_backfill", needs, "duration", elapsed.Round(time.Millisecond).String())
+	}
+	return needs, err
 }
 
 // backfillFTSWithActivity runs the FTS backfill with its progress mirrored
@@ -2521,6 +2759,7 @@ func (s *Server) handleCLIRebuildFTS(w http.ResponseWriter, r *http.Request) {
 	s.ftsRebuildGen.Add(1)
 	defer s.ftsRebuildGen.Add(1)
 	s.ftsIndexComplete.Store(false)
+	s.ftsIndexState.Store("")
 
 	var writeErr error
 	indexed, err := cliStore.RebuildFTS(func(done, total int64) {
@@ -2546,6 +2785,7 @@ func (s *Server) handleCLIRebuildFTS(w http.ResponseWriter, r *http.Request) {
 	// The rebuild fully repopulated the index; safe to re-memoize so later CLI
 	// searches skip the expensive backfill probe again.
 	s.ftsIndexComplete.Store(true)
+	s.ftsIndexState.Store("")
 	if writeErr == nil {
 		writeErr = writeEvent(cliRebuildFTSEvent{
 			Type:    "complete",
@@ -2576,13 +2816,19 @@ func (s *Server) handleCLIAccounts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if s.requestAuthentication(r).Grant != nil {
+		sources = slices.DeleteFunc(sources, func(src *store.Source) bool { return !slices.Contains(agentReadSourceIDs(r), src.ID) })
+	}
+	// Opted-in callers accept placeholder counts and immediate reuse of a matching catalog.
+	allowPending := r.Header.Get(apiprotocol.AllowPendingCountsHeader) == "true"
 	var grouped map[int64]store.SourceMessageCounts
 	var response cliAccountsResponse
-	if counter, ok := s.store.(sourceMessageCounter); ok {
+	if counter, ok := s.store.(sourceMessageCounter); ok && !s.sourceScopedRead(r) {
 		grouped, response.AsOf, response.Stale, err = s.accountCountSnapshots.get(
 			r.Context(), s.importContext, "", s.statsSnapshotWait, counter.CountMessagesBySourceContext,
 		)
-		if err != nil {
+		response.CountsPending = allowPending && errors.Is(err, errSnapshotWaitTimeout)
+		if err != nil && !response.CountsPending {
 			if s.writeIfContextError(w, err) {
 				return
 			}
@@ -2594,6 +2840,10 @@ func (s *Server) handleCLIAccounts(w http.ResponseWriter, r *http.Request) {
 
 	accounts := make([]cliAccountResponse, 0, len(sources))
 	for _, src := range sources {
+		if response.CountsPending {
+			accounts = append(accounts, newCLIAccountResponse(src, 0, 0))
+			continue
+		}
 		if grouped != nil {
 			accounts = append(accounts, newCLIAccountResponse(src, grouped[src.ID].Live, grouped[src.ID].SourceDeleted))
 			continue
@@ -2619,12 +2869,50 @@ func (s *Server) handleCLIAccounts(w http.ResponseWriter, r *http.Request) {
 		accounts = append(accounts, newCLIAccountResponse(src, count, sourceDeleted))
 	}
 
+	if lister, ok := s.store.(virtualAccountLister); ok {
+		var virtual map[int64][]store.VirtualAccount
+		var stale bool
+		var err error
+		if s.sourceScopedRead(r) {
+			// Scoped readers use their authorization snapshot:
+			// the shared cache may predate a source whose ID was reused.
+			virtual, err = lister.ListVirtualAccountsContext(r.Context())
+		} else {
+			virtual, _, stale, err = s.virtualAccountSnapshots.getVersion(
+				r.Context(), s.importContext, "", s.virtualAccountCatalogVersion(r.Context(), lister),
+				s.statsSnapshotWait, allowPending, lister.ListVirtualAccountsContext,
+			)
+		}
+		// The catalog is extra detail; a slow or failed read still returns
+		// the accounts with whatever children the last snapshot held.
+		if err != nil && s.writeIfContextError(w, r.Context().Err()) {
+			return
+		}
+		if err != nil {
+			s.logger.Warn("listing accounts without virtual accounts", "error", err)
+		}
+		response.VirtualAccountsUnavailable = stale || err != nil
+		for i := range accounts {
+			accounts[i].VirtualAccounts = virtual[accounts[i].ID]
+		}
+	}
+
+	if s.sourceScopedRead(r) {
+		// A merge target outside the authorized sources stays hidden.
+		for i := range accounts {
+			if !slices.ContainsFunc(sources, func(src *store.Source) bool { return src.ID == accounts[i].MergedIntoSourceID }) {
+				accounts[i].MergedIntoSourceID = 0
+			}
+		}
+	}
 	response.Accounts = accounts
 	writeJSON(w, http.StatusOK, response)
 }
 
 func newCLIAccountResponse(src *store.Source, count, sourceDeleted int64) cliAccountResponse {
 	account := cliAccountResponse{
+		Identifier: src.Identifier, Alias: src.Alias, HistoryOnly: src.HistoryOnly,
+		ReanchorRequired: src.ReanchorRequired, MergedIntoSourceID: src.MergedIntoSourceID,
 		ID:                 src.ID,
 		Email:              src.Identifier,
 		Type:               src.SourceType,
@@ -2654,7 +2942,13 @@ func (s *Server) updateCLIAccount(
 	}
 	cliStore = bindCLIStoreContext(ctx, cliStore)
 
-	result, err := accountops.UpdateDisplayName(cliStore, req)
+	var result accountops.UpdateResult
+	var err error
+	if settings, ok := s.store.(accountops.SettingsStore); ok {
+		result, err = accountops.UpdateAccount(ctx, settings, req)
+	} else {
+		result, err = accountops.UpdateDisplayName(ctx, cliStore, req)
+	}
 	if err != nil {
 		return accountops.UpdateResult{}, s.operationError(
 			err,
@@ -2682,6 +2976,11 @@ func (s *Server) handleCLICollections(w http.ResponseWriter, r *http.Request) {
 
 	resp := make([]cliCollectionResponse, 0, len(collections))
 	for _, coll := range collections {
+		if s.requestAuthentication(r).Grant != nil {
+			if len(coll.SourceIDs) == 0 || slices.ContainsFunc(coll.SourceIDs, func(id int64) bool { return !slices.Contains(agentReadSourceIDs(r), id) }) {
+				continue
+			}
+		}
 		item, err := cliCollectionResponseFromStore(cliStore, coll)
 		if err != nil {
 			s.logger.Error("failed to hydrate CLI collection", "collection", coll.Name, "error", err)
@@ -2733,7 +3032,7 @@ func (s *Server) createCLICollection(
 		return collectionops.MutationResult{}, apiErr
 	}
 	cliStore = bindCLIStoreContext(ctx, cliStore)
-	result, err := collectionops.Create(cliStore, req)
+	result, err := collectionops.Create(ctx, cliStore, req)
 	if err != nil {
 		return collectionops.MutationResult{}, s.operationError(
 			err,
@@ -2754,7 +3053,7 @@ func (s *Server) addCLICollectionSources(
 		return collectionops.MutationResult{}, apiErr
 	}
 	cliStore = bindCLIStoreContext(ctx, cliStore)
-	result, err := collectionops.AddSources(cliStore, name, req)
+	result, err := collectionops.AddSources(ctx, cliStore, name, req)
 	if err != nil {
 		return collectionops.MutationResult{}, s.operationError(
 			err,
@@ -2775,7 +3074,7 @@ func (s *Server) removeCLICollectionSources(
 		return collectionops.MutationResult{}, apiErr
 	}
 	cliStore = bindCLIStoreContext(ctx, cliStore)
-	result, err := collectionops.RemoveSources(cliStore, name, req)
+	result, err := collectionops.RemoveSources(ctx, cliStore, name, req)
 	if err != nil {
 		return collectionops.MutationResult{}, s.operationError(
 			err,
@@ -2850,7 +3149,7 @@ func (s *Server) getCLIIdentities(
 	var sourceIDs []int64
 	switch {
 	case sourceIDSet:
-		src, err := identityops.ResolveSource(cliStore, identityops.SourceSelector{SourceID: sourceID})
+		src, err := identityops.ResolveSource(ctx, cliStore, identityops.SourceSelector{SourceID: sourceID})
 		if err != nil {
 			return cliIdentitiesResponse{}, s.cliScopeError(err)
 		}
@@ -2863,7 +3162,7 @@ func (s *Server) getCLIIdentities(
 				"primary_only requires account scope",
 			)
 		}
-		scope, err := resolveCLIAccountScope(cliStore, account)
+		scope, err := resolveCLIAccountScope(ctx, cliStore, account)
 		if err != nil {
 			return cliIdentitiesResponse{}, s.cliScopeError(err)
 		}
@@ -2876,7 +3175,7 @@ func (s *Server) getCLIIdentities(
 		}
 		sourceIDs = []int64{scope.Account.Source.ID}
 	case account != "" || collection != "":
-		scope, err := resolveCLIStatsScope(cliStore, account, collection)
+		scope, err := resolveCLIStatsScope(ctx, cliStore, account, collection)
 		if err != nil {
 			return cliIdentitiesResponse{}, s.cliScopeError(err)
 		}
@@ -2918,7 +3217,7 @@ func (s *Server) addCLIIdentity(ctx context.Context, req identityops.AddRequest)
 	}
 	cliStore = bindCLIStoreContext(ctx, cliStore)
 
-	result, err := identityops.Add(cliStore, req)
+	result, err := identityops.Add(ctx, cliStore, req)
 	if err != nil {
 		return identityops.AddResult{}, s.operationError(
 			err,
@@ -3014,7 +3313,7 @@ func (s *Server) handleCLIIdentityDiscover(w http.ResponseWriter, r *http.Reques
 
 	var externalEvidence []identityops.ExternalEvidence
 	if req.Provider {
-		source, resolveErr := identityops.ResolveSource(discoveryStore, req.SourceSelector)
+		source, resolveErr := identityops.ResolveSource(r.Context(), discoveryStore, req.SourceSelector)
 		if resolveErr != nil {
 			writeAPIHTTPError(w, s.operationError(
 				resolveErr,
@@ -3163,7 +3462,7 @@ func (s *Server) removeCLIIdentity(ctx context.Context, req identityops.RemoveRe
 	}
 	cliStore = bindCLIStoreContext(ctx, cliStore)
 
-	result, err := identityops.Remove(cliStore, req)
+	result, err := identityops.Remove(ctx, cliStore, req)
 	if err != nil {
 		return identityops.RemoveResult{}, s.operationError(
 			err,
@@ -3255,6 +3554,10 @@ func (s *Server) handleCLIMessage(w http.ResponseWriter, r *http.Request) {
 
 	msg, err := s.resolveCLIMessage(r, idStr)
 	if err != nil {
+		if errors.Is(err, query.ErrOriginalMessageTooLarge) {
+			writeError(w, http.StatusRequestEntityTooLarge, "remote_message_too_large", "Message content exceeds the remote client byte limit")
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to retrieve message")
 		return
 	}
@@ -3263,6 +3566,11 @@ func (s *Server) handleCLIMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	from := ""
+	if len(msg.From) == 1 {
+		from = msg.From[0].Email
+	}
+	msg.SenderAuth = s.senderAuth(r.Context(), msg.ID, msg.SourceID, msg.MessageType, from)
 	writeJSON(w, http.StatusOK, cliMessageResponseFromQuery(msg))
 }
 
@@ -3277,19 +3585,34 @@ func (s *Server) handleCLIMessageRaw(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	msg, err := s.resolveCLIMessage(r, idStr)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to retrieve message")
+	resolver, ok := s.queryEngineForContext(r.Context()).(query.MessageIDResolver)
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, "engine_unavailable", "Raw message export is not available for this archive engine")
 		return
 	}
-	if msg == nil {
+	// Resolve only the ID so the byte limit applies to the raw bytes returned, never the decoded body.
+	id, sourceMessageID, err := resolver.ResolveMessageID(r.Context(), idStr)
+	if errors.Is(err, query.ErrAmbiguousReference) {
+		s.writeOriginalExportError(w, "resolve raw message", err)
+		return
+	}
+	if errors.Is(err, store.ErrMessageNotFound) {
 		writeError(w, http.StatusNotFound, cliErrorMessageNotFound, "Message not found")
 		return
 	}
-
-	raw, err := s.queryEngineForContext(r.Context()).GetMessageRaw(r.Context(), msg.ID)
 	if err != nil {
-		s.logger.Error("failed to get CLI raw message", "id", msg.ID, "error", err)
+		s.logger.Error("failed to resolve CLI raw message", "id", idStr, "error", err)
+		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to retrieve message")
+		return
+	}
+
+	raw, err := s.queryEngineForContext(r.Context()).GetMessageRaw(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, query.ErrOriginalMessageTooLarge) {
+			writeError(w, http.StatusRequestEntityTooLarge, "remote_message_too_large", "Message content exceeds the remote client byte limit")
+			return
+		}
+		s.logger.Error("failed to get CLI raw message", "id", id, "error", err)
 		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to retrieve raw message")
 		return
 	}
@@ -3299,11 +3622,12 @@ func (s *Server) handleCLIMessageRaw(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "message/rfc822")
-	w.Header().Set("X-Msgvault-Message-Id", strconv.FormatInt(msg.ID, 10))
-	w.Header().Set("X-Msgvault-Source-Message-Id", msg.SourceMessageID)
+	w.Header().Set("X-Msgvault-Message-Id", strconv.FormatInt(id, 10))
+	w.Header().Set("X-Msgvault-Source-Message-Id", sourceMessageID)
 	w.WriteHeader(http.StatusOK)
+	// #nosec G705 -- stored MIME bytes are served as message/rfc822, not rendered as HTML.
 	if _, err := w.Write(raw); err != nil {
-		s.logger.Error("failed to write CLI raw message", "id", msg.ID, "error", err)
+		s.logger.Error("failed to write CLI raw message", "id", id, "error", err)
 	}
 }
 
@@ -3321,7 +3645,14 @@ func (s *Server) handleCLIAttachment(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_content_hash", err.Error())
 		return
 	}
+	if s.requestAuthentication(r).Grant != nil {
+		if _, apiErr := s.attachmentCandidatesForRequest(r, contentHash); apiErr != nil {
+			writeAPIHTTPError(w, apiErr)
+			return
+		}
+	}
 
+	releaseReadSnapshot(r)
 	if s.blobStore != nil {
 		rc, size, err := s.blobStore.OpenStream(r.Context(), contentHash)
 		if err != nil {
@@ -3331,6 +3662,11 @@ func (s *Server) handleCLIAttachment(w http.ResponseWriter, r *http.Request) {
 			}
 			s.logger.Error("failed to open CLI attachment", "content_hash", contentHash, "error", err)
 			writeError(w, http.StatusInternalServerError, "internal_error", "Failed to retrieve attachment")
+			return
+		}
+		if (size < 0 || size > remoteAttachmentBytes) && s.remoteClientRequest(r) {
+			_ = rc.Close()
+			writeError(w, http.StatusRequestEntityTooLarge, "remote_attachment_too_large", "Attachment exceeds the remote client byte limit")
 			return
 		}
 		w.Header().Set("Content-Type", "application/octet-stream")
@@ -3365,6 +3701,18 @@ func (s *Server) handleCLIAttachment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer func() { _ = f.Close() }()
+	if s.remoteClientRequest(r) {
+		info, err := f.Stat()
+		if err != nil {
+			s.logger.Error("failed to stat CLI attachment", "content_hash", contentHash, "error", err)
+			writeError(w, http.StatusInternalServerError, "internal_error", "Failed to retrieve attachment")
+			return
+		}
+		if info.Size() > remoteAttachmentBytes {
+			writeError(w, http.StatusRequestEntityTooLarge, "remote_attachment_too_large", "Attachment exceeds the remote client byte limit")
+			return
+		}
+	}
 
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("X-Msgvault-Content-Hash", contentHash)
@@ -3382,14 +3730,22 @@ func (s *Server) resolveCLIMessage(r *http.Request, idStr string) (*query.Messag
 	if id, parseErr := strconv.ParseInt(idStr, 10, 64); parseErr == nil {
 		msg, err = s.queryEngineForContext(r.Context()).GetMessage(r.Context(), id)
 		if err != nil {
-			s.logger.Error("failed to get CLI message by id", "id", id, "error", err)
+			if !errors.Is(err, query.ErrOriginalMessageTooLarge) {
+				s.logger.Error("failed to get CLI message by id", "id", id, "error", err)
+			}
 			return nil, err
+		}
+		// An internal ID outside the grant may still name a granted message's source ID.
+		if msg != nil && !s.agentObjectSourceAllowed(r, msg.SourceID) {
+			msg = nil
 		}
 	}
 	if msg == nil {
-		msg, err = s.queryEngineForContext(r.Context()).GetMessageBySourceID(r.Context(), idStr)
+		msg, err = s.queryEngineForContext(r.Context()).GetMessageBySourceID(r.Context(), idStr, agentReadSourceIDs(r))
 		if err != nil {
-			s.logger.Error("failed to get CLI message by source id", "id", idStr, "error", err)
+			if !errors.Is(err, query.ErrOriginalMessageTooLarge) {
+				s.logger.Error("failed to get CLI message by source id", "id", idStr, "error", err)
+			}
 			return nil, err
 		}
 	}
@@ -3398,6 +3754,8 @@ func (s *Server) resolveCLIMessage(r *http.Request, idStr string) (*query.Messag
 
 func cliMessageResponseFromQuery(msg *query.MessageDetail) cliMessageResponse {
 	return cliMessageResponse{
+		SenderAuth:           msg.SenderAuth,
+		Calendar:             msg.Calendar,
 		ID:                   msg.ID,
 		SourceMessageID:      msg.SourceMessageID,
 		RFC822MessageID:      msg.RFC822MessageID,
@@ -3405,12 +3763,14 @@ func cliMessageResponseFromQuery(msg *query.MessageDetail) cliMessageResponse {
 		SourceConversationID: msg.SourceConversationID,
 		Subject:              msg.Subject,
 		MessageType:          msg.MessageType,
+		RelatedMessageID:     msg.RelatedMessageID,
 		Snippet:              msg.Snippet,
 		SentAt:               msg.SentAt,
 		ReceivedAt:           msg.ReceivedAt,
 		DeletedAt:            msg.DeletedAt,
 		SizeEstimate:         msg.SizeEstimate,
 		HasAttachments:       msg.HasAttachments,
+		HiddenTextPresent:    msg.HiddenTextPresent,
 		From:                 cliMessageAddresses(msg.From),
 		To:                   cliMessageAddresses(msg.To),
 		Cc:                   cliMessageAddresses(msg.Cc),
@@ -3439,6 +3799,7 @@ func cliMessageAttachments(atts []query.AttachmentInfo) []cliMessageAttachment {
 			MimeType:    att.MimeType,
 			Size:        att.Size,
 			ContentHash: att.ContentHash,
+			Docbank:     att.Docbank,
 			URL:         att.URL,
 		}
 	}
@@ -3548,16 +3909,16 @@ func statsResponseFromStore(stats *store.Stats) StatsResponse {
 		TotalAccounts:         stats.SourceCount,
 		TotalLabels:           stats.LabelCount,
 		TotalAttach:           stats.AttachmentCount,
-		DatabaseSize:          stats.DatabaseSize,
+		DatabaseSize:          &stats.DatabaseSize,
 	}
 }
 
-func resolveCLIStatsScope(st CLIStore, account, collection string) (cliScope, error) {
+func resolveCLIStatsScope(ctx context.Context, st CLIStore, account, collection string) (cliScope, error) {
 	switch {
 	case account != "" && collection != "":
 		return cliScope{}, opserr.Invalid(errMutuallyExclusiveScope)
 	case account != "":
-		return resolveCLIAccountScope(st, account)
+		return resolveCLIAccountScope(ctx, st, account)
 	case collection != "":
 		return resolveCLICollectionScope(st, collection)
 	default:
@@ -3576,8 +3937,8 @@ func cliEmptyScopeMessage(account, collection string) string {
 	}
 }
 
-func resolveCLIAccountScope(st CLIStore, input string) (cliScope, error) {
-	scope, err := collectionops.ResolveAccount(st, input)
+func resolveCLIAccountScope(ctx context.Context, st CLIStore, input string) (cliScope, error) {
+	scope, err := collectionops.ResolveAccountContext(ctx, st, input)
 	return cliScope{Account: scope}, err
 }
 

@@ -8,6 +8,7 @@ import (
 	"fmt"
 
 	"go.kenn.io/msgvault/internal/gcal"
+	"go.kenn.io/msgvault/internal/rederive"
 	"go.kenn.io/msgvault/internal/store"
 )
 
@@ -19,7 +20,7 @@ func (s *Syncer) Incremental(ctx context.Context) (Result, error) {
 	if err := ValidateMinAccessRole(s.opts.MinAccessRole); err != nil {
 		return Result{}, err
 	}
-	sources, err := s.store.GetSourcesByTypeAndAccount(gcal.SourceType, s.opts.AccountEmail)
+	sources, err := s.store.GetSourcesByTypeAndAccountContext(ctx, gcal.SourceType, s.opts.AccountEmail)
 	if err != nil {
 		return Result{}, fmt.Errorf("enumerate calendar sources: %w", err)
 	}
@@ -32,11 +33,27 @@ func (s *Syncer) Incremental(ctx context.Context) (Result, error) {
 			firstErr = err
 		}
 	}
+	selectedCalendars := make(map[string]struct{}, len(s.opts.Calendars))
+	for _, calendarID := range s.opts.Calendars {
+		selectedCalendars[calendarID] = struct{}{}
+	}
+	activeSources := make([]*store.Source, 0, len(sources))
+	for _, src := range sources {
+		if src.MergedIntoSourceID != 0 {
+			cfg := parseSourceConfig(src.SyncConfig)
+			if _, selected := selectedCalendars[cfg.CalendarID]; selected {
+				recordErr(fmt.Errorf("calendar %q source is retired: %w", cfg.CalendarID, store.ErrSourceRetired))
+			}
+			continue
+		}
+		activeSources = append(activeSources, src)
+	}
+	sources = activeSources
 
 	if s.shouldPersistOAuthApp() {
 		for _, src := range sources {
 			cfg := parseSourceConfig(src.SyncConfig)
-			if err := s.updateCalendarSourceOAuthApp(src.ID, cfg.CalendarID); err != nil {
+			if err := s.updateCalendarSourceOAuthApp(ctx, src.ID, cfg.CalendarID); err != nil {
 				recordErr(err)
 			}
 		}
@@ -102,6 +119,7 @@ func (s *Syncer) Incremental(ctx context.Context) (Result, error) {
 // so the next sync re-delivers and retries the failed events rather than losing
 // them. A 410 surfaces as ErrSyncTokenExpired for the caller to self-heal.
 func (s *Syncer) incrementalCalendar(ctx context.Context, src *store.Source, cal gcal.Calendar, result *Result) error {
+	rederive.Heal(ctx, s.logger, s.store, src)
 	syncID, err := s.store.StartSync(src.ID, "incremental")
 	if err != nil {
 		return fmt.Errorf("start sync: %w", err)
@@ -144,7 +162,7 @@ func (s *Syncer) incrementalCalendar(ctx context.Context, src *store.Source, cal
 
 		for i := range page.Items {
 			ev := page.Items[i]
-			added, cancelled, perr := s.persistOne(src.ID, cal, ev, result)
+			added, cancelled, perr := s.persistOne(ctx, src.ID, cal, ev, result)
 			if perr != nil {
 				cp.ErrorsCount++
 				s.recordItemError(syncID, ev.ID, perr)
@@ -184,7 +202,7 @@ func (s *Syncer) incrementalCalendar(ctx context.Context, src *store.Source, cal
 		return fail(fmt.Errorf("%d calendar event(s) failed to persist; sync token not advanced so they retry on the next sync", cp.ErrorsCount))
 	}
 
-	if err := s.store.RecomputeConversationStats(src.ID); err != nil {
+	if err := s.store.RecomputeConversationStatsContext(ctx, src.ID); err != nil {
 		s.logger.Warn("recompute conversation stats failed", "calendar", cal.ID, "error", err)
 	}
 	var completeErr error

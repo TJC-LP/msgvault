@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -74,7 +75,7 @@ func TestOperationGateMiddlewareSkipsReadMethods(t *testing.T) {
 				w.WriteHeader(http.StatusNoContent)
 			}))
 
-			req := httptest.NewRequest(method, "/api/v1/messages", nil)
+			req := httptest.NewRequestWithContext(t.Context(), method, "/api/v1/messages", nil)
 			resp := httptest.NewRecorder()
 			handler.ServeHTTP(resp, req)
 			assert.True(called, "handler called")
@@ -100,7 +101,7 @@ func TestOperationGateMiddlewareBypassesUnauthenticatedRequests(t *testing.T) {
 		w.WriteHeader(http.StatusUnauthorized)
 	}))
 
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/cli/sync", nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/cli/sync", nil)
 	resp := httptest.NewRecorder()
 	handler.ServeHTTP(resp, req)
 
@@ -110,7 +111,7 @@ func TestOperationGateMiddlewareBypassesUnauthenticatedRequests(t *testing.T) {
 	assert.Equal(0, begin, "unauthenticated request must not touch gate state")
 	assert.Equal(0, done, "done calls")
 
-	authedReq := httptest.NewRequest(http.MethodPost, "/api/v1/cli/sync", nil)
+	authedReq := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/cli/sync", nil)
 	authedReq.Header.Set("X-Api-Key", "secret")
 	authedResp := httptest.NewRecorder()
 	handler.ServeHTTP(authedResp, authedReq)
@@ -127,7 +128,7 @@ func TestOperationGateMiddlewareGatesMutatingMethods(t *testing.T) {
 				w.WriteHeader(http.StatusNoContent)
 			}))
 
-			req := httptest.NewRequest(method, "/api/v1/cli/collections", nil)
+			req := httptest.NewRequestWithContext(t.Context(), method, "/api/v1/cli/collections", nil)
 			resp := httptest.NewRecorder()
 			handler.ServeHTTP(resp, req)
 
@@ -161,7 +162,7 @@ func TestOperationGateMiddlewareSkipsUnauthorizedDelegatedCLIRun(t *testing.T) {
 			}))
 			body, err := json.Marshal(CLIRunRequest{Args: []string{tc.command, "42"}})
 			require.NoError(t, err)
-			req := httptest.NewRequest(http.MethodPost, "/api/v1/cli/run", strings.NewReader(string(body)))
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/cli/run", strings.NewReader(string(body)))
 			req = req.WithContext(context.WithValue(req.Context(), requestSecurityContextKey{}, requestSecurity{
 				auth: requestAuthentication{Mode: AuthModeDelegated, Grant: tc.grant},
 			}))
@@ -186,7 +187,7 @@ func TestOperationGateMiddlewareSkipsDaemonShutdown(t *testing.T) {
 		w.WriteHeader(http.StatusAccepted)
 	}))
 
-	req := httptest.NewRequest(http.MethodPost, DaemonShutdownPath, nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, DaemonShutdownPath, nil)
 	resp := httptest.NewRecorder()
 	handler.ServeHTTP(resp, req)
 	assert.True(called, "handler called")
@@ -210,7 +211,7 @@ func TestOperationGateMiddlewareSkipsLogCLIRunAndRestoresBody(t *testing.T) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
 
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/cli/run", strings.NewReader(`{"args":["logs","--follow"]}`))
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/cli/run", strings.NewReader(`{"args":["logs","--follow"]}`))
 	resp := httptest.NewRecorder()
 	handler.ServeHTTP(resp, req)
 
@@ -231,7 +232,7 @@ func TestOperationGateMiddlewareRejectsOversizedCLIRunInspectionBody(t *testing.
 	}))
 
 	body := `{"args":["logs"],"padding":"` + strings.Repeat("x", 2<<20) + `"}`
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/cli/run", strings.NewReader(body))
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/cli/run", strings.NewReader(body))
 	resp := httptest.NewRecorder()
 	handler.ServeHTTP(resp, req)
 
@@ -249,20 +250,33 @@ func TestOperationGateMiddlewareRejectsOversizedCLIRunInspectionBody(t *testing.
 
 func TestOperationGateMiddlewareStillGatesMutatingCLIRun(t *testing.T) {
 	t.Parallel()
-	assert := assert.New(t)
-	gate := &recordingOperationGate{allow: true}
-	handler := operationGateMiddleware(gate, nil)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusNoContent)
-	}))
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{"create-subset", `{"args":["create-subset","subset"]}`},
+		{"policy set", `{"args":["policy","set","1","room","cold"]}`},
+		{"import", `{"args":["import-mbox","archive.mbox"]}`},
+		{"flag value matches status", `{"args":["embeddings","--config","status","build"]}`},
+		{"unknown flag", `{"args":["embeddings","--account","status","build"]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert := assert.New(t)
+			gate := &recordingOperationGate{allow: true}
+			handler := operationGateMiddleware(gate, nil)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusNoContent)
+			}))
 
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/cli/run", strings.NewReader(`{"args":["import-mbox","archive.mbox"]}`))
-	resp := httptest.NewRecorder()
-	handler.ServeHTTP(resp, req)
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/cli/run", strings.NewReader(tc.body))
+			resp := httptest.NewRecorder()
+			handler.ServeHTTP(resp, req)
 
-	assert.Equal(http.StatusNoContent, resp.Code, "status")
-	begin, done := gate.counts()
-	assert.Equal(1, begin, "begin calls")
-	assert.Equal(1, done, "done calls")
+			assert.Equal(http.StatusNoContent, resp.Code, "status")
+			begin, done := gate.counts()
+			assert.Equal(1, begin, "begin calls")
+			assert.Equal(1, done, "done calls")
+		})
+	}
 }
 
 func TestOperationGateMiddlewareStillGatesMutatingDocumentCommands(t *testing.T) {
@@ -275,6 +289,8 @@ func TestOperationGateMiddlewareStillGatesMutatingDocumentCommands(t *testing.T)
 		{"consent", `{"args":["documents","consent-mistral","--yes"]}`},
 		{"retry", `{"args":["documents","retry","--hash","abc"]}`},
 		{"retire", `{"args":["documents","retire","profile","--yes"]}`},
+		// Status reconciles the occurrence index, which writes.
+		{"status", `{"args":["documents","status","--json"]}`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -283,7 +299,7 @@ func TestOperationGateMiddlewareStillGatesMutatingDocumentCommands(t *testing.T)
 				w.WriteHeader(http.StatusNoContent)
 			}))
 
-			req := httptest.NewRequest(http.MethodPost, "/api/v1/cli/run", strings.NewReader(tc.body))
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/cli/run", strings.NewReader(tc.body))
 			resp := httptest.NewRecorder()
 			handler.ServeHTTP(resp, req)
 
@@ -293,28 +309,6 @@ func TestOperationGateMiddlewareStillGatesMutatingDocumentCommands(t *testing.T)
 			assert.Equal(t, 1, done)
 		})
 	}
-}
-
-func TestOperationGateMiddlewareGatesMessageExport(t *testing.T) {
-	t.Parallel()
-	assert := assert.New(t)
-	gate := &recordingOperationGate{allow: true}
-	handler := operationGateMiddleware(gate, nil)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusNoContent)
-	}))
-
-	req := httptest.NewRequest(
-		http.MethodPost,
-		"/api/v1/cli/run",
-		strings.NewReader(`{"args":["export-messages","--start","2026-07-20T00:00:00Z","--end","2026-07-21T00:00:00Z"]}`),
-	)
-	resp := httptest.NewRecorder()
-	handler.ServeHTTP(resp, req)
-
-	assert.Equal(http.StatusNoContent, resp.Code, "status")
-	begin, done := gate.counts()
-	assert.Equal(1, begin, "begin calls")
-	assert.Equal(1, done, "done calls")
 }
 
 func TestOperationGateMiddlewareRejectsUnavailableGate(t *testing.T) {
@@ -328,7 +322,7 @@ func TestOperationGateMiddlewareRejectsUnavailableGate(t *testing.T) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
 
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/accounts", nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/accounts", nil)
 	resp := httptest.NewRecorder()
 	handler.ServeHTTP(resp, req)
 	assert.False(called, "handler should not run")
@@ -358,8 +352,8 @@ func TestOperationGateMiddlewareStopsWaitingWhenRequestContextCancels(t *testing
 		w.WriteHeader(http.StatusNoContent)
 	}))
 
-	ctx, cancel := context.WithCancel(context.Background())
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/accounts", nil).WithContext(ctx)
+	ctx, cancel := context.WithCancel(t.Context())
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/accounts", nil).WithContext(ctx)
 	resp := httptest.NewRecorder()
 	done := make(chan struct{})
 	go func() {
@@ -370,7 +364,7 @@ func TestOperationGateMiddlewareStopsWaitingWhenRequestContextCancels(t *testing
 	cancel()
 	select {
 	case <-done:
-	case <-time.After(500 * time.Millisecond):
+	case <-time.After(5 * time.Second):
 		release()
 		require.FailNow("handler did not return after request cancellation")
 	}
@@ -405,78 +399,40 @@ func waitForParkedContext(t *testing.T, parked <-chan struct{}, work string) {
 	}
 }
 
-func TestServerEmbeddingsOptimizeHoldsOperationGateUntilRunnerReturns(t *testing.T) {
+func TestServerEmbeddingsOptimizeLeavesOperationGateToRunner(t *testing.T) {
 	t.Parallel()
-	for _, ending := range []string{"complete", "cancel"} {
-		t.Run(ending, func(t *testing.T) {
-			synctest.Test(t, func(t *testing.T) {
-				gate := NewSerialOperationGate()
-				requestCtx, cancelRequest := context.WithCancel(t.Context())
-				defer cancelRequest()
-				cleanupCtx, finishCleanup := context.WithCancel(t.Context())
-				defer finishCleanup()
-				commandFinished := make(chan struct{})
-				started := make(chan []string, 1)
-				srv := NewServerWithOptions(ServerOptions{
-					Config: &config.Config{Server: config.ServerConfig{APIPort: 8080}},
-					Store: &mockStore{runFunc: func(ctx context.Context, req CLIRunRequest, _ func(CLIRunEvent) error) error {
-						started <- req.Args
-						select {
-						case <-commandFinished:
-						case <-ctx.Done():
-						}
-						// The subprocess boundary returns only after worker cleanup.
-						<-cleanupCtx.Done()
-						return ctx.Err()
-					}},
-					Logger:        testLogger(),
-					OperationGate: gate,
-				})
-				defer func() {
-					cancelRequest()
-					finishCleanup()
-					synctest.Wait()
-					require.NoError(t, srv.Shutdown(context.Background()))
-				}()
-				req := httptest.NewRequestWithContext(requestCtx, http.MethodPost, "/api/v1/cli/run",
-					strings.NewReader(`{"args":["embeddings","optimize"]}`))
-				req.Header.Set("Content-Type", "application/json")
-				response := httptest.NewRecorder()
-				requestDone := make(chan struct{})
-				go func() {
-					srv.Router().ServeHTTP(response, req)
-					close(requestDone)
-				}()
-				synctest.Wait()
-				require.Len(t, started, 1, "optimize reaches the subprocess runner")
-				assert.Equal(t, []string{"embeddings", "optimize"}, <-started)
-
-				backgroundCtx, cancelBackground := context.WithCancel(t.Context())
-				defer cancelBackground()
-				backgroundStarted := make(chan bool, 1)
-				go func() {
-					release, ok := gate.BeginWorkContext(backgroundCtx)
-					defer release()
-					backgroundStarted <- ok
-				}()
-				synctest.Wait()
-				assert.Empty(t, backgroundStarted, "background embedding work waits during optimize")
-
-				if ending == "cancel" {
-					cancelRequest()
-				} else {
-					close(commandFinished)
-				}
-				synctest.Wait()
-				assert.Empty(t, backgroundStarted, "the gate stays held until the runner finishes cleanup")
-
-				finishCleanup()
-				synctest.Wait()
-				require.Len(t, backgroundStarted, 1, "runner return releases background work")
-				assert.True(t, <-backgroundStarted)
-				<-requestDone
-				assert.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	for _, args := range [][]string{
+		{"embeddings", "optimize"},
+		{"embeddings", "--verbose", "optimize", "--drop", "2"},
+		{"embeddings", "-vv", "optimize"},
+		{"embeddings", "--log-level", "debug", "optimize"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			assert := assert.New(t)
+			require := require.New(t)
+			gate := NewSerialOperationGate()
+			release, ok := gate.BeginWorkContext(t.Context())
+			require.True(ok)
+			defer release()
+			ran := false
+			srv := NewServerWithOptions(ServerOptions{
+				Config: &config.Config{Server: config.ServerConfig{APIPort: 8080}},
+				Store: &mockStore{runFunc: func(_ context.Context, req CLIRunRequest, _ func(CLIRunEvent) error) error {
+					ran = true
+					assert.Equal(args, req.Args)
+					return nil
+				}},
+				Logger: testLogger(), OperationGate: gate,
 			})
+			defer func() { require.NoError(srv.Shutdown(t.Context())) }()
+			body, err := json.Marshal(CLIRunRequest{Args: args})
+			require.NoError(err)
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/cli/run", bytes.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			srv.Router().ServeHTTP(response, req)
+			assert.True(ran, "the coordinator owns admission instead of middleware")
+			assert.Equal(http.StatusOK, response.Code, response.Body.String())
 		})
 	}
 }
@@ -488,9 +444,9 @@ func TestServerBackgroundOperationGateStopsWhenContextCancelsBehindRequest(t *te
 
 	gate := NewSerialOperationGate()
 	srv := &Server{operationGate: gate}
-	activeRelease, ok := gate.BeginLabeledWorkContext(context.Background(), "active work")
+	activeRelease, ok := gate.BeginLabeledWorkContext(t.Context(), "active work")
 	require.True(ok, "hold gate")
-	requestCtx, requestCancel := context.WithCancel(context.Background())
+	requestCtx, requestCancel := context.WithCancel(t.Context())
 	requestParked := make(chan struct{})
 	requestResult := make(chan bool, 1)
 	go func() {
@@ -505,7 +461,7 @@ func TestServerBackgroundOperationGateStopsWhenContextCancelsBehindRequest(t *te
 	}()
 	waitForParkedContext(t, requestParked, "request")
 
-	backgroundCtx, backgroundCancel := context.WithCancel(context.Background())
+	backgroundCtx, backgroundCancel := context.WithCancel(t.Context())
 	backgroundParked := make(chan struct{})
 	backgroundResult := make(chan bool, 1)
 	go func() {
@@ -556,7 +512,7 @@ func TestServerBackgroundOperationGateStopsWhenDrainStartsBehindRequest(t *testi
 			name: "Drain",
 			startDrain: func(gate *SerialOperationGate) <-chan error {
 				done := make(chan error, 1)
-				go func() { done <- gate.Drain(context.Background()) }()
+				go func() { done <- gate.Drain(t.Context()) }()
 				return done
 			},
 		},
@@ -568,9 +524,9 @@ func TestServerBackgroundOperationGateStopsWhenDrainStartsBehindRequest(t *testi
 
 			gate := NewSerialOperationGate()
 			srv := &Server{operationGate: gate}
-			activeRelease, ok := gate.BeginLabeledWorkContext(context.Background(), "active work")
+			activeRelease, ok := gate.BeginLabeledWorkContext(t.Context(), "active work")
 			require.True(ok, "hold gate")
-			requestCtx, requestCancel := context.WithCancel(context.Background())
+			requestCtx, requestCancel := context.WithCancel(t.Context())
 			requestParked := make(chan struct{})
 			requestResult := make(chan bool, 1)
 			go func() {
@@ -585,7 +541,7 @@ func TestServerBackgroundOperationGateStopsWhenDrainStartsBehindRequest(t *testi
 			}()
 			waitForParkedContext(t, requestParked, "request")
 
-			backgroundCtx := context.Background()
+			backgroundCtx := t.Context()
 			backgroundParked := make(chan struct{})
 			backgroundResult := make(chan bool, 1)
 			go func() {
@@ -639,7 +595,7 @@ func TestSerialOperationGateDrainRejectsQueuedWorkAndWaitsForActive(t *testing.T
 
 	queuedDone := make(chan bool, 1)
 	go func() {
-		releaseQueued, queuedOK := gate.BeginWorkContext(context.Background())
+		releaseQueued, queuedOK := gate.BeginWorkContext(t.Context())
 		if queuedOK {
 			releaseQueued()
 		}
@@ -649,18 +605,18 @@ func TestSerialOperationGateDrainRejectsQueuedWorkAndWaitsForActive(t *testing.T
 	select {
 	case queuedOK := <-queuedDone:
 		assert.Fail("queued work returned before drain", "ok=%v", queuedOK)
-	case <-time.After(25 * time.Millisecond):
+	case <-time.After(25 * time.Millisecond): //nolint:kennlint // deadlinetest: absence check: active work keeps queued work waiting
 	}
 
 	drainDone := make(chan error, 1)
 	go func() {
-		drainDone <- gate.Drain(context.Background())
+		drainDone <- gate.Drain(t.Context())
 	}()
 
 	select {
 	case queuedOK := <-queuedDone:
 		assert.False(queuedOK, "queued work should be rejected by drain")
-	case <-time.After(500 * time.Millisecond):
+	case <-time.After(5 * time.Second):
 		releaseActive()
 		require.FailNow("queued work did not return after drain started")
 	}
@@ -668,14 +624,14 @@ func TestSerialOperationGateDrainRejectsQueuedWorkAndWaitsForActive(t *testing.T
 	select {
 	case err := <-drainDone:
 		assert.Fail("drain returned before active work released", "err=%v", err)
-	case <-time.After(25 * time.Millisecond):
+	case <-time.After(25 * time.Millisecond): //nolint:kennlint // deadlinetest: absence check: unreleased active work keeps the drain waiting
 	}
 
 	releaseActive()
 	select {
 	case err := <-drainDone:
 		require.NoError(err, "drain")
-	case <-time.After(500 * time.Millisecond):
+	case <-time.After(5 * time.Second):
 		require.FailNow("drain did not finish after active work released")
 	}
 
@@ -697,12 +653,12 @@ func TestServerOperationGateWrapsMutatingRequests(t *testing.T) {
 		OperationGate: gate,
 	})
 
-	getReq := httptest.NewRequest(http.MethodGet, "/health", nil)
+	getReq := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/health", nil)
 	getResp := httptest.NewRecorder()
 	srv.Router().ServeHTTP(getResp, getReq)
 	assert.Equal(http.StatusOK, getResp.Code, "health status")
 
-	postReq := httptest.NewRequest(http.MethodPost, "/api/v1/accounts", nil)
+	postReq := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/accounts", nil)
 	postResp := httptest.NewRecorder()
 	srv.Router().ServeHTTP(postResp, postReq)
 	assert.Equal(http.StatusBadRequest, postResp.Code, "bad account request status")
@@ -718,9 +674,15 @@ func TestOperationGateMiddlewareSkipsReadOnlyCLIRunCommands(t *testing.T) {
 		name string
 		body string
 	}{
+		{"export-messages", `{"args":["export-messages","--start","2026-07-20T00:00:00Z","--end","2026-07-21T00:00:00Z"]}`},
+		{"export-discord", `{"args":["export-discord"]}`},
+		{"list-folders", `{"args":["list-folders"]}`},
+		{"policy list", `{"args":["policy","list"]}`},
 		{"embeddings list", `{"args":["embeddings","list"]}`},
+		{"embeddings value flag before status", `{"args":["embeddings","--source","42","--json=true","status"]}`},
 		{"documents search", `{"args":["documents","search","shipping damage"]}`},
-		{"documents status", `{"args":["documents","status","--capabilities","manifest.json"]}`},
+		{"person tiers preview", `{"args":["person","tiers","preview","--json"]}`},
+		{"person tiers explain", `{"args":["person","tiers","explain","7"]}`},
 		{"list-deletions", `{"args":["list-deletions"]}`},
 		{"show-deletion with id", `{"args":["show-deletion","batch-123"]}`},
 	}
@@ -734,7 +696,7 @@ func TestOperationGateMiddlewareSkipsReadOnlyCLIRunCommands(t *testing.T) {
 				w.WriteHeader(http.StatusNoContent)
 			}))
 
-			req := httptest.NewRequest(http.MethodPost, "/api/v1/cli/run", strings.NewReader(tc.body))
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/cli/run", strings.NewReader(tc.body))
 			resp := httptest.NewRecorder()
 			handler.ServeHTTP(resp, req)
 
@@ -756,7 +718,7 @@ func TestOperationGateMiddlewareSkipsSelfGatedCLIRunCommands(t *testing.T) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
 
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/cli/run", strings.NewReader(`{"args":["backup","create"]}`))
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/cli/run", strings.NewReader(`{"args":["backup","create"]}`))
 	resp := httptest.NewRecorder()
 	handler.ServeHTTP(resp, req)
 
@@ -786,7 +748,7 @@ func TestOperationGateMiddlewareSkipsReadOnlyPaths(t *testing.T) {
 				w.WriteHeader(http.StatusNoContent)
 			}))
 
-			req := httptest.NewRequest(http.MethodPost, path, nil)
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, path, nil)
 			resp := httptest.NewRecorder()
 			handler.ServeHTTP(resp, req)
 
@@ -819,6 +781,9 @@ func TestOperationGateMiddlewareSkipsReadOnlyAnalyticalPosts(t *testing.T) {
 		"/api/v1/relationships",
 		"/api/v1/relationships/7/calendar",
 		"/api/v1/relationships/7/timeline",
+		"/api/v1/meetings/actions",
+		"/api/v1/meetings/context",
+		"/api/v1/meetings/metrics",
 		"/api/v1/search/coverage",
 	}
 	for _, path := range paths {
@@ -831,7 +796,7 @@ func TestOperationGateMiddlewareSkipsReadOnlyAnalyticalPosts(t *testing.T) {
 				w.WriteHeader(http.StatusNoContent)
 			}))
 
-			req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{}`))
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, path, strings.NewReader(`{}`))
 			resp := httptest.NewRecorder()
 			handler.ServeHTTP(resp, req)
 
@@ -839,6 +804,32 @@ func TestOperationGateMiddlewareSkipsReadOnlyAnalyticalPosts(t *testing.T) {
 			assert.Equal(http.StatusNoContent, resp.Code, "status")
 			begin, _ := gate.counts()
 			assert.Equal(0, begin, "begin calls")
+		})
+	}
+}
+
+func TestOperationGateMessageTagsExactRoute(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		path       string
+		wantStatus int
+	}{
+		{"/api/v1/messages/7/tags", http.StatusNoContent},
+		{"/api/v1/messages/7/attachments/tags", http.StatusServiceUnavailable},
+	} {
+		t.Run(tc.path, func(t *testing.T) {
+			assert := assert.New(t)
+			gate := &recordingOperationGate{allow: false}
+			called := false
+			handler := operationGateMiddleware(gate, nil)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				called = true
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, tc.path, strings.NewReader(`{}`))
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, req)
+			assert.Equal(tc.wantStatus, response.Code)
+			assert.Equal(tc.wantStatus == http.StatusNoContent, called)
 		})
 	}
 }
@@ -852,7 +843,7 @@ func TestOperationGateMiddlewareSkipsCardDAVAccountTestWhileGateHeld(t *testing.
 	t.Cleanup(func() { operationGateWaitLimit = oldLimit })
 
 	gate := NewSerialOperationGate()
-	release, ok := gate.BeginLabeledWorkContext(context.Background(), "msgvault sync")
+	release, ok := gate.BeginLabeledWorkContext(t.Context(), "msgvault sync")
 	require.True(ok, "occupy operation gate")
 	defer release()
 
@@ -861,7 +852,7 @@ func TestOperationGateMiddlewareSkipsCardDAVAccountTestWhileGateHeld(t *testing.
 		called = true
 		w.WriteHeader(http.StatusNoContent)
 	}))
-	req := httptest.NewRequest(http.MethodPost, cardDAVAccountTestPath, strings.NewReader(`{}`))
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, cardDAVAccountTestPath, strings.NewReader(`{}`))
 	resp := httptest.NewRecorder()
 	handler.ServeHTTP(resp, req)
 
@@ -874,9 +865,10 @@ func TestOperationGateMiddlewareSkipsCardDAVAccountTestWhileGateHeld(t *testing.
 // operation tagged "Exploration" (registerExploreRoute and the search
 // coverage route) must be classified read-only, and the table must not
 // carry stale entries for routes that no longer exist. The remote-image proxy,
-// CardDAV account test, participant completion, and Saved View run endpoints
-// are the pinned non-Exploration entries. They must remain registered POST routes for
-// their table entries to stay valid.
+// CardDAV account test, participant completion, evidence preparation, Saved View
+// run, meeting actions, context, and metrics, and message tag endpoints are
+// pinned non-Exploration entries. Message tags acquire the gate in their handler
+// for writes. Each entry must remain a POST route.
 func TestReadOnlyPostRoutePatternsMatchExplorationRoutes(t *testing.T) {
 	t.Parallel()
 	require := require.New(t)
@@ -894,7 +886,16 @@ func TestReadOnlyPostRoutePatternsMatchExplorationRoutes(t *testing.T) {
 	require.NotNil(completion, "participant completion route must exist")
 	require.NotNil(completion.Post, "participant completion must be registered as POST")
 
-	expected := []string{remoteImagePath, cardDAVAccountTestPath, completionPath, "/api/v1/saved-views/{id}/run"}
+	messageTagsPath := "/api/v1/messages/{id}/tags"
+	messageTags := doc.Paths[messageTagsPath]
+	require.NotNil(messageTags, "message tags route must exist")
+	require.NotNil(messageTags.Post, "message tags must be registered as POST")
+
+	meetingActionsPath := "/api/v1/meetings/actions"
+	meetingContextPath := "/api/v1/meetings/context"
+	meetingMetricsPath := "/api/v1/meetings/metrics"
+
+	expected := []string{remoteImagePath, cardDAVAccountTestPath, completionPath, kataEvidencePreparePath, "/api/v1/saved-views/{id}/run", messageTagsPath, meetingActionsPath, meetingContextPath, meetingMetricsPath}
 	for path, item := range doc.Paths {
 		if item.Post != nil && slices.Contains(item.Post.Tags, "Exploration") {
 			expected = append(expected, path)
@@ -905,7 +906,7 @@ func TestReadOnlyPostRoutePatternsMatchExplorationRoutes(t *testing.T) {
 	slices.Sort(table)
 	assert.Equal(t, expected, table,
 		"readOnlyPostRoutePatterns must match the POST routes tagged Exploration plus the "+
-			"pinned read-only POST routes; classify new analytical routes consciously in "+
+			"pinned POST routes that bypass the middleware gate; classify new analytical routes consciously in "+
 			"operation_gate.go")
 }
 
@@ -1015,7 +1016,7 @@ func TestServerReadOnlyAnalyticalPostsBypassHeldOperationGate(t *testing.T) { //
 	t.Cleanup(func() { operationGateWaitLimit = oldLimit })
 
 	gate := NewSerialOperationGate()
-	release, ok := gate.BeginLabeledWorkContext(context.Background(), "msgvault embeddings build")
+	release, ok := gate.BeginLabeledWorkContext(t.Context(), "msgvault embeddings build")
 	require.True(ok, "occupy gate")
 	defer release()
 
@@ -1038,7 +1039,7 @@ func TestServerReadOnlyAnalyticalPostsBypassHeldOperationGate(t *testing.T) { //
 		"/api/v1/participants/7/summary",
 	}
 	for _, path := range readOnly {
-		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{}`))
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, path, strings.NewReader(`{}`))
 		req.Header.Set("Content-Type", "application/json")
 		resp := httptest.NewRecorder()
 		srv.Router().ServeHTTP(resp, req)
@@ -1049,7 +1050,7 @@ func TestServerReadOnlyAnalyticalPostsBypassHeldOperationGate(t *testing.T) { //
 	assert.Equal(http.StatusOK, run.Code, run.Body.String())
 	assert.Equal(view.ID, page.SavedView.ID)
 
-	mutating := httptest.NewRequest(http.MethodPost, "/api/v1/deletions", strings.NewReader(`{}`))
+	mutating := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/deletions", strings.NewReader(`{}`))
 	mutating.Header.Set("Content-Type", "application/json")
 	resp := httptest.NewRecorder()
 	srv.Router().ServeHTTP(resp, mutating)
@@ -1063,7 +1064,7 @@ func TestServerReadOnlyAnalyticalPostsBypassHeldOperationGate(t *testing.T) { //
 func TestServerParticipantInboxesBypassesHeldOperationGate(t *testing.T) {
 	t.Parallel()
 	gate := NewSerialOperationGate()
-	release, ok := gate.BeginLabeledWorkContext(context.Background(), "msgvault embeddings build")
+	release, ok := gate.BeginLabeledWorkContext(t.Context(), "msgvault embeddings build")
 	require.True(t, ok, "occupy gate")
 	defer release()
 
@@ -1075,7 +1076,8 @@ func TestServerParticipantInboxesBypassesHeldOperationGate(t *testing.T) {
 		OperationGate: gate,
 	})
 	response := httptest.NewRecorder()
-	srv.Router().ServeHTTP(response, httptest.NewRequest(
+	srv.Router().ServeHTTP(response, httptest.NewRequestWithContext(
+		t.Context(),
 		http.MethodGet, "/api/v1/participants/7/inboxes", nil))
 
 	assert.Equal(t, http.StatusOK, response.Code, response.Body.String())
@@ -1090,14 +1092,14 @@ func TestOperationGateMiddlewareNamesHolderWhenBusy(t *testing.T) { //nolint:par
 	t.Cleanup(func() { operationGateWaitLimit = oldLimit })
 
 	gate := NewSerialOperationGate()
-	release, ok := gate.BeginLabeledWorkContext(context.Background(), "msgvault embeddings build")
+	release, ok := gate.BeginLabeledWorkContext(t.Context(), "msgvault embeddings build")
 	require.True(ok, "occupy gate")
 	defer release()
 
 	handler := operationGateMiddleware(gate, nil)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/cli/run", strings.NewReader(`{"args":["sync","user@example.com"]}`))
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/cli/run", strings.NewReader(`{"args":["sync","user@example.com"]}`))
 	resp := httptest.NewRecorder()
 	handler.ServeHTTP(resp, req)
 
@@ -1119,7 +1121,7 @@ func TestOperationGateMiddlewareReportsShutdownWhenDraining(t *testing.T) {
 	handler := operationGateMiddleware(gate, nil)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/accounts", nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/accounts", nil)
 	resp := httptest.NewRecorder()
 	handler.ServeHTTP(resp, req)
 
@@ -1138,7 +1140,7 @@ func TestSerialOperationGateHolderTracksLabel(t *testing.T) {
 	_, _, held := gate.Holder()
 	assert.False(held, "idle gate has no holder")
 
-	release, ok := gate.BeginLabeledWorkContext(context.Background(), "a scheduled sync")
+	release, ok := gate.BeginLabeledWorkContext(t.Context(), "a scheduled sync")
 	require.True(ok, "acquire gate")
 	label, since, held := gate.Holder()
 	assert.True(held, "held while acquired")
@@ -1157,14 +1159,14 @@ func TestSerialOperationGateCountsRequestWaiters(t *testing.T) {
 		assert := assert.New(t)
 
 		gate := NewSerialOperationGate()
-		release, ok := gate.BeginLabeledWorkContext(context.Background(), "a scheduled sync")
+		release, ok := gate.BeginLabeledWorkContext(t.Context(), "a scheduled sync")
 		require.True(ok, "occupy gate")
 		defer release()
 		assert.False(gate.HasRequestWaiters(), "no waiters yet")
 
 		acquired := make(chan bool, 1)
 		go func() {
-			waiterRelease, waiterOK := gate.BeginRequestWorkContext(context.Background(), "msgvault sync")
+			waiterRelease, waiterOK := gate.BeginRequestWorkContext(t.Context(), "msgvault sync")
 			if waiterOK {
 				waiterRelease()
 			}
@@ -1187,7 +1189,7 @@ func TestSerialOperationGatePrioritizesQueuedRequestOverBackgroundWork(t *testin
 		require := require.New(t)
 
 		gate := NewSerialOperationGate()
-		releaseActive, ok := gate.BeginLabeledWorkContext(context.Background(), "first scheduled sync")
+		releaseActive, ok := gate.BeginLabeledWorkContext(t.Context(), "first scheduled sync")
 		require.True(ok, "occupy gate")
 		defer releaseActive()
 
@@ -1224,7 +1226,7 @@ func TestSerialOperationGatePrioritizesQueuedRequestOverBackgroundWork(t *testin
 			synctest.Wait()
 		}()
 		go func() {
-			release, acquired := gate.BeginRequestWorkContext(context.Background(), "meeting import")
+			release, acquired := gate.BeginRequestWorkContext(t.Context(), "meeting import")
 			requestAcquired <- acquisition{release: release, ok: acquired}
 		}()
 		synctest.Wait()
@@ -1232,7 +1234,7 @@ func TestSerialOperationGatePrioritizesQueuedRequestOverBackgroundWork(t *testin
 			"request must register before the next background admission")
 
 		go func() {
-			release, acquired := gate.BeginLabeledWorkContext(context.Background(), "manual sync")
+			release, acquired := gate.BeginLabeledWorkContext(t.Context(), "manual sync")
 			backgroundAcquired <- acquisition{release: release, ok: acquired}
 		}()
 		synctest.Wait()
@@ -1277,13 +1279,13 @@ func TestBeginLabeledOperationGateWorkCountsAsRequestWaiter(t *testing.T) {
 		gate := NewSerialOperationGate()
 		srv := &Server{operationGate: gate}
 
-		holderRelease, ok := gate.BeginLabeledWorkContext(context.Background(), "a scheduled sync")
+		holderRelease, ok := gate.BeginLabeledWorkContext(t.Context(), "a scheduled sync")
 		require.True(ok, "occupy gate")
 		defer holderRelease()
 
 		acquired := make(chan bool, 1)
 		go func() {
-			release, workOK := srv.beginLabeledOperationGateWork(context.Background(), "a search index build")
+			release, workOK := srv.beginLabeledOperationGateWork(t.Context(), "a search index build")
 			if workOK {
 				release()
 			}
@@ -1328,7 +1330,7 @@ func TestCLIRunEnvAllowedPermitsConfiguredAPIKeyEnv(t *testing.T) {
 
 func healthResponseForServer(t *testing.T, srv *Server) HealthResponse {
 	t.Helper()
-	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/health", nil)
 	resp := httptest.NewRecorder()
 	srv.Router().ServeHTTP(resp, req)
 	require.Equal(t, http.StatusOK, resp.Code, "health status")
@@ -1352,11 +1354,11 @@ func TestHealthReportsActiveOperation(t *testing.T) {
 	gate := NewSerialOperationGate()
 	srv := newOperationHealthTestServer(gate)
 
-	release, ok := gate.BeginLabeledWorkContext(context.Background(), "POST /api/v1/auth/token/alice@example.com")
+	release, ok := gate.BeginLabeledWorkContext(t.Context(), "POST /api/v1/auth/token/alice@example.com")
 	require.True(ok, "acquire gate")
 	defer release()
 
-	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/health", nil)
 	resp := httptest.NewRecorder()
 	srv.Router().ServeHTTP(resp, req)
 	require.Equal(http.StatusOK, resp.Code, "health status")
@@ -1380,11 +1382,11 @@ func TestAuthenticatedHealthReportsActiveOperationDetails(t *testing.T) {
 		OperationGate: gate,
 	})
 
-	release, ok := gate.BeginLabeledWorkContext(context.Background(), "POST /api/v1/auth/token/alice@example.com")
+	release, ok := gate.BeginLabeledWorkContext(t.Context(), "POST /api/v1/auth/token/alice@example.com")
 	require.True(ok, "acquire gate")
 	defer release()
 
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/health", nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/health", nil)
 	req.Header.Set("X-Api-Key", "secret-key")
 	resp := httptest.NewRecorder()
 	srv.Router().ServeHTTP(resp, req)
@@ -1433,7 +1435,7 @@ func TestOperationHealthPrefersActivityOverGateLabel(t *testing.T) {
 	gate := NewSerialOperationGate()
 	srv := newOperationHealthTestServer(gate)
 
-	release, ok := gate.BeginLabeledWorkContext(context.Background(), "a search index build")
+	release, ok := gate.BeginLabeledWorkContext(t.Context(), "a search index build")
 	require.True(ok, "acquire gate")
 	defer release()
 

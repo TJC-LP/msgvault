@@ -99,37 +99,6 @@ func TestPersonFactLedgerStoresInvalidSubmittedValueWithNullNormalizedValue(t *t
 	assert.Nil(normalized)
 }
 
-func TestPersonFactLedgerRejectsDuplicateEnvelopeBeforePersistence(t *testing.T) {
-	st, personID := newPersonFactLedgerStore(t)
-	baseClaim := personFactLedgerClaim(personID, "duplicate", `"value"`, "duplicate")
-	duplicateEvidenceClaim := baseClaim
-	duplicateEvidenceClaim.Evidence = append(duplicateEvidenceClaim.Evidence,
-		duplicateEvidenceClaim.Evidence[0])
-
-	for _, test := range []struct {
-		name   string
-		claims []personfacts.ProposedClaim
-	}{
-		{name: "evidence key", claims: []personfacts.ProposedClaim{duplicateEvidenceClaim}},
-		{name: "canonical claim", claims: []personfacts.ProposedClaim{baseClaim, baseClaim}},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			_, err := personfacts.PreparePersonFactGeneration(t.Context(),
-				personFactLedgerGenerationInput(personID, "duplicate-"+test.name, test.claims, nil), nil)
-			require.Error(t, err)
-		})
-	}
-
-	for _, table := range []string{
-		"person_fact_generations", "person_fact_claims", "person_fact_evidence",
-	} {
-		var count int
-		require.NoError(t, st.db.QueryRowContext(t.Context(),
-			`SELECT COUNT(*) FROM `+table+` WHERE person_id = ?`, personID).Scan(&count))
-		assert.Zero(t, count, table)
-	}
-}
-
 func TestPersonFactLedgerRejectsCanonicalKeyCollision(t *testing.T) {
 	t.Run("generation", func(t *testing.T) {
 		st, personID := newPersonFactLedgerStore(t)
@@ -631,10 +600,10 @@ func newPersonFactLedgerStore(t *testing.T) (*Store, int64) {
 	var st *Store
 	testDB := os.Getenv("MSGVAULT_TEST_DB")
 	if IsPostgresURL(testDB) {
-		st = newPGStoreInternal(t, testDB)
+		st = newPGStoreInternal(t)
 	} else {
 		var err error
-		st, err = OpenForTest(filepath.Join(t.TempDir(), "fact-ledger.db"))
+		st, err = OpenForTest(t.Context(), filepath.Join(t.TempDir(), "fact-ledger.db"))
 		require.NoError(t, err)
 		t.Cleanup(func() { _ = st.Close() })
 		require.NoError(t, st.InitSchema())

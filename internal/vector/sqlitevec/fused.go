@@ -11,10 +11,12 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"time"
 
 	"go.kenn.io/kit/search/rrf"
 
 	"go.kenn.io/msgvault/internal/query"
+	"go.kenn.io/msgvault/internal/search"
 	"go.kenn.io/msgvault/internal/sqliteutil"
 	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/vector"
@@ -52,8 +54,10 @@ func (b *Backend) FusedSearch(ctx context.Context, req vector.FusedRequest) ([]v
 			return b.fuseSignals(ctx, req, vectorHits, metadata)
 		}
 	}
-	hits, saturated, err := b.fusedSearchExact(ctx, req)
+	omission := candidateOmission{requestedLimit: req.Limit}
+	hits, saturated, err := b.fusedSearchExact(ctx, req, &omission)
 	metadata.PoolSaturated = saturated
+	metadata.CandidatePoolOmitted = omission.omitted
 	return hits, metadata, err
 }
 
@@ -64,11 +68,16 @@ func (b *Backend) fuseSignals(
 	metadata vector.SearchMetadata,
 ) ([]vector.FusedHit, vector.SearchMetadata, error) {
 	poolLimit := max(req.KPerSignal, 0)
-	vectorSaturated := metadata.PoolSaturated || len(vectorHits) > poolLimit
-	if len(vectorHits) > poolLimit {
+	vectorOverflow := len(vectorHits) > poolLimit
+	vectorSaturated := metadata.PoolSaturated || vectorOverflow
+	if vectorOverflow {
 		vectorHits = vectorHits[:poolLimit]
 	}
 
+	omission := candidateOmission{vectorOverflow: vectorOverflow, requestedLimit: req.Limit}
+	for _, hit := range vectorHits {
+		omission.vectorIDs = append(omission.vectorIDs, hit.MessageID)
+	}
 	var bm25Hits []vector.FusedHit
 	bm25Saturated := false
 	if len(req.FTSTerms) > 0 {
@@ -78,7 +87,7 @@ func (b *Backend) fuseSignals(
 		bm25Request.SubjectBoost = 1
 		bm25Request.SubjectTerms = nil
 		var err error
-		bm25Hits, bm25Saturated, err = b.fusedSearchExact(ctx, bm25Request)
+		bm25Hits, bm25Saturated, err = b.fusedSearchExact(ctx, bm25Request, &omission)
 		if err != nil {
 			return nil, vector.SearchMetadata{}, err
 		}
@@ -128,8 +137,19 @@ func (b *Backend) fuseSignals(
 	if len(hits) > req.Limit {
 		hits = hits[:req.Limit]
 	}
+	metadata.CandidatePoolOmitted = omission.omitted
+	if len(req.FTSTerms) == 0 {
+		metadata.CandidatePoolOmitted = vectorOverflow && req.Limit >= len(vectorHits)
+	}
 	metadata.PoolSaturated = bm25Saturated || vectorSaturated
 	return hits, metadata, nil
+}
+
+type candidateOmission struct {
+	vectorIDs      []int64
+	vectorOverflow bool
+	requestedLimit int
+	omitted        bool
 }
 
 // fusedSearchExact runs the single-query hybrid CTE (spec §5.3) by opening a
@@ -141,7 +161,7 @@ func (b *Backend) fuseSignals(
 // (BM25 via LIMIT KPerSignal+1, ANN via k=KPerSignal+1) and trimmed to
 // KPerSignal before fusion. The extra "probe" row exists only so the
 // outer query can report whether the pool was full on either side.
-func (b *Backend) fusedSearchExact(ctx context.Context, req vector.FusedRequest) ([]vector.FusedHit, bool, error) {
+func (b *Backend) fusedSearchExact(ctx context.Context, req vector.FusedRequest, omission *candidateOmission) ([]vector.FusedHit, bool, error) {
 	if err := vector.ValidateFilter(req.Filter); err != nil {
 		return nil, false, err
 	}
@@ -246,15 +266,12 @@ func (b *Backend) fusedSearchExact(ctx context.Context, req vector.FusedRequest)
 	if req.Filter.HasAttachment != nil {
 		hasAttachment = sql.NullBool{Valid: true, Bool: *req.Filter.HasAttachment}
 	}
-	// Format date bounds with the canonical SQLite datetime layout used
-	// elsewhere in the repo so boundary comparisons on the text sent_at
-	// column agree with the existing SQLite query paths.
 	var after, before sql.NullString
 	if req.Filter.After != nil {
-		after = sql.NullString{Valid: true, String: req.Filter.After.Format(sqliteDatetimeFormat)}
+		after = sql.NullString{Valid: true, String: req.Filter.After.UTC().Format(time.RFC3339Nano)}
 	}
 	if req.Filter.Before != nil {
-		before = sql.NullString{Valid: true, String: req.Filter.Before.Format(sqliteDatetimeFormat)}
+		before = sql.NullString{Valid: true, String: req.Filter.Before.UTC().Format(time.RFC3339Nano)}
 	}
 	var largerThan, smallerThan sql.NullInt64
 	if req.Filter.LargerThan != nil {
@@ -353,6 +370,21 @@ func (b *Backend) fusedSearchExact(ctx context.Context, req vector.FusedRequest)
 			sqliteutil.UnicodeLowerFunction, sqliteutil.UnicodeLowerFunction)
 	}
 
+	filenameSQL := ""
+	var filenamePatterns string
+	if len(req.Filter.FilenameSubstrings) > 0 {
+		patterns := make([]string, len(req.Filter.FilenameSubstrings))
+		for i, term := range req.Filter.FilenameSubstrings {
+			patterns[i] = "%" + escapeLikeSubject(term) + "%"
+		}
+		buf, err := json.Marshal(patterns, json.Deterministic(true))
+		if err != nil {
+			return nil, false, fmt.Errorf("encode filename filters: %w", err)
+		}
+		filenamePatterns = string(buf)
+		filenameSQL = fmt.Sprintf(`AND NOT EXISTS (SELECT 1 FROM json_each(:filename_patterns) fp WHERE NOT EXISTS (SELECT 1 FROM attachments fa WHERE fa.message_id = m.id AND %s(fa.filename) LIKE %s(fp.value) ESCAPE '\'))`, sqliteutil.UnicodeLowerFunction, sqliteutil.UnicodeLowerFunction)
+	}
+
 	filterWhere := fmt.Sprintf(`%s
        AND (:message_ids IS NULL OR m.id IN (SELECT value FROM json_each(:message_ids)))
        AND (:source_ids IS NULL OR m.source_id IN (SELECT value FROM json_each(:source_ids)))
@@ -365,8 +397,8 @@ func (b *Backend) fusedSearchExact(ctx context.Context, req vector.FusedRequest)
 	   %s
 	   %s
        AND (:has_attachment IS NULL OR m.has_attachments = :has_attachment)
-       AND (:after IS NULL OR m.sent_at >= :after)
-       AND (:before IS NULL OR m.sent_at < :before)
+       AND (:after IS NULL OR julianday(m.sent_at) >= julianday(:after))
+       AND (:before IS NULL OR julianday(m.sent_at) < julianday(:before))
        AND (:larger_than IS NULL OR m.size_estimate > :larger_than)
        AND (:smaller_than IS NULL OR m.size_estimate < :smaller_than)
        AND (:subject_patterns IS NULL OR NOT EXISTS (
@@ -375,7 +407,15 @@ func (b *Backend) fusedSearchExact(ctx context.Context, req vector.FusedRequest)
 	   %s
 	   %s`,
 		store.LiveMessagesWhere("m", true), conversationSQL, messageTypeSQL, senderGroupSQL, senderExactGroupSQL,
-		recipientAnyGroupSQL, toGroupSQL, ccGroupSQL, bccGroupSQL, labelGroupSQL, listIDSQL)
+		recipientAnyGroupSQL, toGroupSQL, ccGroupSQL, bccGroupSQL, labelGroupSQL, listIDSQL+"\n"+filenameSQL)
+	var accountArgs []any
+	if clauses := search.AccountScopeConditionsBound(req.Filter.AccountScopes, "m", func(v any) string {
+		name := fmt.Sprintf("account_scope_%d", len(accountArgs))
+		accountArgs = append(accountArgs, sql.Named(name, v))
+		return ":" + name
+	}); len(clauses) > 0 {
+		filterWhere += " AND " + strings.Join(clauses, " AND ")
+	}
 
 	// buildQuery interpolates a fresh query string for a given chunkK,
 	// so the widening loop below can re-issue the fused CTE with a
@@ -433,14 +473,29 @@ WITH
            CASE WHEN v.vec_dist IS NULL THEN NULL ELSE 1.0 - v.vec_dist END AS vector_score
       FROM bm25_used b
       FULL OUTER JOIN ann_used v USING (message_id)
+  ),
+  retained AS (
+    SELECT message_id FROM fused
+    UNION SELECT value FROM json_each(:retained_vector_ids)
   )
 SELECT message_id, rrf_score, bm25_score, vector_score,
        (SELECT COUNT(*) FROM bm25) AS bm25_pool_size,
-       (SELECT COUNT(*) FROM ann)  AS ann_pool_size
-  FROM fused
+       (SELECT COUNT(*) FROM ann)  AS ann_pool_size,
+       CASE WHEN :requested_limit >= (SELECT COUNT(*) FROM retained) THEN
+         (CASE WHEN (SELECT COUNT(*) FROM bm25) > %d THEN EXISTS (
+           SELECT 1 FROM messages_fts fts JOIN filtered f ON f.id = fts.rowid
+            WHERE :fts_query IS NOT NULL AND messages_fts MATCH :fts_query
+              AND fts.rowid NOT IN (SELECT message_id FROM retained)
+         ) ELSE 0 END) OR (CASE WHEN (SELECT COUNT(*) FROM ann) > %d OR :vector_overflow THEN EXISTS (
+           SELECT 1 FROM vec.embeddings e
+            WHERE e.generation_id = :gen AND e.message_id IN (SELECT id FROM filtered)
+              AND e.message_id NOT IN (SELECT message_id FROM retained)
+         ) ELSE 0 END)
+       ELSE 0 END AS candidate_omitted
+  FROM (SELECT 1) LEFT JOIN fused ON TRUE
  ORDER BY rrf_score DESC, message_id ASC
  LIMIT :limit
-`, filterWhere, kPlus1, req.KPerSignal, vecTable, currentChunkK, req.KPerSignal)
+`, filterWhere, kPlus1, req.KPerSignal, vecTable, currentChunkK, req.KPerSignal, req.KPerSignal, req.KPerSignal)
 	}
 
 	var queryVecArg any
@@ -507,6 +562,10 @@ SELECT message_id, rrf_score, bm25_score, vector_score,
 			sql.Named("list_id_exact_groups", exactListIDGroups),
 		)
 	}
+	if filenameSQL != "" {
+		filterArgs = append(filterArgs, sql.Named("filename_patterns", filenamePatterns))
+	}
+
 	filterArgs = append(filterArgs, senderGroupArgs...)
 	filterArgs = append(filterArgs, senderExactGroupArgs...)
 	filterArgs = append(filterArgs, recipientAnyGroupArgs...)
@@ -514,6 +573,7 @@ SELECT message_id, rrf_score, bm25_score, vector_score,
 	filterArgs = append(filterArgs, ccGroupArgs...)
 	filterArgs = append(filterArgs, bccGroupArgs...)
 	filterArgs = append(filterArgs, labelGroupArgs...)
+	filterArgs = append(filterArgs, accountArgs...)
 
 	// Two ceilings bound the widening loop. The generation-wide
 	// chunkCeiling is the hard upper bound on currentChunkK so the
@@ -548,13 +608,20 @@ SELECT message_id, rrf_score, bm25_score, vector_score,
 	// Query-specific named args: only the main fused query
 	// references these. Concatenated onto filterArgs at the end so
 	// both args slices share storage for the filter-side names.
-	args := make([]any, 0, len(filterArgs)+4)
+	retainedIDs, err := idsToJSON(omission.vectorIDs)
+	if err != nil {
+		return nil, false, fmt.Errorf("encode retained vector IDs: %w", err)
+	}
+	args := make([]any, 0, len(filterArgs)+7)
 	args = append(args, filterArgs...)
 	args = append(args,
 		sql.Named("fts_query", ftsArg),
 		sql.Named("query_vec", queryVecArg),
 		sql.Named("rrf_k", req.RRFK),
 		sql.Named("limit", sqlLimit),
+		sql.Named("retained_vector_ids", retainedIDs),
+		sql.Named("vector_overflow", omission.vectorOverflow),
+		sql.Named("requested_limit", omission.requestedLimit),
 	)
 
 	// Loop the fused query with growing chunkK until either the ANN
@@ -588,16 +655,17 @@ SELECT message_id, rrf_score, bm25_score, vector_score,
 		// bm25_pool_size and ann_pool_size are correlated subqueries
 		// that evaluate to the same value on every row of the result.
 		// We only need them once, so capture from the first row.
-		// When the result set is empty, both pools are empty by
-		// construction (fused = bm25_used FULL OUTER JOIN ann_used,
-		// both capped at KPerSignal), so default-zero is correct.
+		// A metadata-only row preserves omission evidence when the lexical
+		// leg is empty and fuseSignals supplied retained vector identities.
 		bm25PoolSize, annPoolSize = 0, 0
 		poolSizeRead := false
 		for rows.Next() {
 			var h vector.FusedHit
+			var messageID sql.NullInt64
+			var rrfScore sql.NullFloat64
 			var bm, vec sql.NullFloat64
 			var bmPool, annPool int
-			if err := rows.Scan(&h.MessageID, &h.RRFScore, &bm, &vec, &bmPool, &annPool); err != nil {
+			if err := rows.Scan(&messageID, &rrfScore, &bm, &vec, &bmPool, &annPool, &omission.omitted); err != nil {
 				return fmt.Errorf("scan fused hit: %w", err)
 			}
 			if !poolSizeRead {
@@ -605,6 +673,10 @@ SELECT message_id, rrf_score, bm25_score, vector_score,
 				annPoolSize = annPool
 				poolSizeRead = true
 			}
+			if !messageID.Valid {
+				continue
+			}
+			h.MessageID, h.RRFScore = messageID.Int64, rrfScore.Float64
 			h.BM25Score = math.NaN()
 			if bm.Valid {
 				h.BM25Score = bm.Float64

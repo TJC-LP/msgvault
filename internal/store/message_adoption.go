@@ -33,8 +33,8 @@ func (s *Store) AdoptMessageSourceIDContext(
 			"adoption requires a changing non-empty source message ID")
 	}
 	var changed bool
-	err := s.withTxContext(ctx, func(tx *loggedTx) error {
-		if err := s.requireSyncMessageSourceTx(tx, messageID); err != nil {
+	err := s.withMessageAttributionTxContext(ctx, messageID, func(tx *loggedTx) error {
+		if err := s.requireSyncMessageSourceTx(boundQuerier{ctx: ctx, q: tx}, messageID); err != nil {
 			return err
 		}
 		result, err := tx.ExecContext(ctx, `

@@ -83,7 +83,7 @@ func saveAddAccountFlags(t *testing.T) {
 // the absence of that failure.
 func runAddAccountForTest(t *testing.T, args ...string) (string, error) {
 	t.Helper()
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 	return runAddAccountForTestContext(ctx, t, args...)
 }
@@ -444,11 +444,11 @@ func TestAddAccountTokenHasGmailScopes_Readonly(t *testing.T) {
 
 			cfg, err := config.Load("", "")
 			require.NoError(t, err)
-			mgr, err := oauth.NewManager(cfg.OAuth.ClientSecrets, cfg.TokensDir(), logger)
+			mgr, err := oauth.NewManagerWithCredentials(t.Context(), config.OAuthApp{ClientSecrets: cfg.OAuth.ClientSecrets}, cfg.TokensDir(), config.OAuthTokenCommands{}, logger, oauth.Scopes)
 			require.NoError(t, err)
 
 			assert.Equal(t, tt.want,
-				addAccountTokenHasGmailScopes(mgr, scopeEscalationAccount, tt.readonly))
+				addAccountTokenHasGmailScopes(t.Context(), mgr, scopeEscalationAccount, tt.readonly))
 		})
 	}
 }
@@ -509,7 +509,7 @@ func TestAddAccount_ReadonlyRemediationPreservesNamedOAuthApp(t *testing.T) {
 	cfg.OAuth.Apps = map[string]config.OAuthApp{
 		"workspace app": {ClientSecrets: cfg.OAuth.ClientSecrets},
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 	ctx = testInvocationContext(ctx, cfg, invocationOptions{})
 
@@ -905,10 +905,10 @@ func TestReadonlyGrantWarning(t *testing.T) {
 
 			loadedCfg, err := config.Load("", "")
 			require.NoError(err)
-			mgr, err := oauth.NewManager(loadedCfg.OAuth.ClientSecrets, loadedCfg.TokensDir(), logger)
+			mgr, err := oauth.NewManagerWithCredentials(t.Context(), config.OAuthApp{ClientSecrets: loadedCfg.OAuth.ClientSecrets}, loadedCfg.TokensDir(), config.OAuthTokenCommands{}, logger, oauth.Scopes)
 			require.NoError(err)
 
-			got := readonlyGrantWarning(mgr, scopeEscalationAccount, "")
+			got := readonlyGrantWarning(t.Context(), mgr, scopeEscalationAccount, "")
 
 			if !tt.wantWarn {
 				assert.Empty(got)
@@ -1041,10 +1041,10 @@ func TestAddAccount_ReadonlyRefusesAliasOfStoredToken(t *testing.T) {
 		seedAliasToken(t, gmailOnlyTokenJSON)
 		cfg, err := config.Load("", "")
 		require.NoError(err)
-		mgr, err := oauth.NewManager(cfg.OAuth.ClientSecrets, cfg.TokensDir(), logger)
+		mgr, err := oauth.NewManagerWithCredentials(t.Context(), config.OAuthApp{ClientSecrets: cfg.OAuth.ClientSecrets}, cfg.TokensDir(), config.OAuthTokenCommands{}, logger, oauth.Scopes)
 		require.NoError(err)
 
-		err = refuseReadonlyUnderAliasSpelling(mgr, "user.name@gmail.com", "workspace app")
+		err = refuseReadonlyUnderAliasSpelling(t.Context(), mgr, "user.name@gmail.com", "workspace app")
 
 		require.Error(err)
 		assert.Contains(err.Error(),

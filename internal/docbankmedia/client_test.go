@@ -19,6 +19,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
@@ -238,6 +239,10 @@ func TestClientMediaTrust(t *testing.T) {
 		switch r.URL.Path {
 		case "/api/v1/media/sources/redirect":
 			http.Redirect(w, r, "/next", http.StatusFound)
+		case "/api/v1/nodes/10":
+			w.Header().Set("Content-Type", "application/problem+json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"title":"Service Unavailable","status":503,"code":"content_missing","detail":"echoed input"}`))
 		case "/api/v1/media/sources/huge":
 			_, _ = w.Write(bytes.Repeat([]byte(" "), (1<<20)+1))
 		default:
@@ -259,6 +264,12 @@ func TestClientMediaTrust(t *testing.T) {
 	assert.NotContains(err.Error(), testKey)
 	assert.Equal("server_error", docbankmedia.ErrorCode(err))
 	assert.True(docbankmedia.Retryable(err))
+
+	// Docbank's own error code survives, and nothing else from the body.
+	_, err = client.CurrentVersion(t.Context(), 10)
+	httpErr, ok := errors.AsType[*docbankmedia.HTTPError](err)
+	require.True(ok, "%v", err)
+	assert.Equal(docbankmedia.HTTPError{Status: http.StatusServiceUnavailable, Code: "server_error", Reason: "content_missing"}, *httpErr)
 
 	missing, err := docbankmedia.NewClient(server.URL, func() (string, error) {
 		return "", errors.New("environment variable holds " + testKey)
@@ -317,6 +328,144 @@ func TestClientMediaProcessReceipts(t *testing.T) {
 	require.ErrorIs(err, docbankmedia.ErrInvalidReceipt)
 }
 
+func TestClientMediaTranscript(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	const (
+		sourceID  = "src/1"
+		versionID = "ver 1"
+		contentID = "content-1"
+	)
+	ready := map[string]any{
+		"vault_uid": "vault", "source_id": sourceID, "source_version_id": versionID,
+		"content_version_id": contentID, "evidence_state": "ready", "coverage_state": "complete",
+		"operation_state": "succeeded", "$schema": "https://example.com/transcript.schema.json",
+		"transcript": map[string]any{
+			"origin": "generated", "completeness": "partial", "truncated": true, "has_omissions": true,
+			"units": []any{
+				map[string]any{"text": "synthetic transcript", "time_span": map[string]any{"start_ms": 0, "end_ms": 1500}, "speaker": "alice"},
+				map[string]any{"text": "no timing"},
+			},
+		},
+	}
+	var mu sync.Mutex
+	responses := map[string]any{}
+	raw := map[string][]byte{}
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		requests++
+		assert.Equal(http.MethodGet, r.Method)
+		assert.Equal(testKey, r.Header.Get("X-Api-Key"))
+		if r.URL.EscapedPath() == "/api/v1/media/sources/status" {
+			_, _ = w.Write(raw["status"])
+			return
+		}
+		assert.Equal("/api/v1/media/sources/src%2F1/versions/ver%201/transcript", r.URL.EscapedPath())
+		key := r.URL.Query().Get("content_version_id")
+		if body, ok := raw[key]; ok {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(body)
+			return
+		}
+		writeJSON(w, responses[key])
+	}))
+	defer server.Close()
+	client, err := docbankmedia.NewClient(server.URL, func() (string, error) { return testKey, nil })
+	require.NoError(err)
+	respond := func(value map[string]any) {
+		mu.Lock()
+		defer mu.Unlock()
+		responses[contentID] = value
+	}
+	with := func(changes map[string]any) map[string]any {
+		out := maps.Clone(ready)
+		for key, value := range changes {
+			if value == nil {
+				delete(out, key)
+				continue
+			}
+			out[key] = value
+		}
+		return out
+	}
+
+	respond(ready)
+	transcript, err := client.Transcript(t.Context(), sourceID, versionID, contentID)
+	require.NoError(err)
+	assert.Equal("ready", transcript.EvidenceState)
+	require.NotNil(transcript.Transcript)
+	assert.Equal("generated", transcript.Transcript.Origin)
+	assert.Equal("partial", transcript.Transcript.Completeness)
+	assert.True(transcript.Transcript.Truncated)
+	assert.True(transcript.Transcript.HasOmissions)
+	require.Len(transcript.Transcript.Units, 2)
+	assert.Equal("synthetic transcript", transcript.Transcript.Units[0].Text)
+	assert.Equal(&docbankmedia.MediaTimeSpan{StartMS: 0, EndMS: 1500}, transcript.Transcript.Units[0].TimeSpan)
+	assert.Equal("alice", transcript.Transcript.Units[0].Speaker)
+	assert.Nil(transcript.Transcript.Units[1].TimeSpan)
+	assert.Empty(transcript.Transcript.Units[1].Speaker)
+
+	respond(with(map[string]any{"transcript": map[string]any{
+		"origin": "supplied", "supplied_input_id": "input", "build_id": "build", "completeness": "complete", "units": []any{},
+	}}))
+	transcript, err = client.Transcript(t.Context(), sourceID, versionID, contentID)
+	require.NoError(err)
+	require.NotNil(transcript.Transcript)
+	assert.Equal("input", transcript.Transcript.SuppliedInputID)
+	assert.Equal("build", transcript.Transcript.BuildID)
+
+	respond(with(map[string]any{"evidence_state": "pending", "transcript": nil}))
+	transcript, err = client.Transcript(t.Context(), sourceID, versionID, contentID)
+	require.NoError(err)
+	assert.Equal("pending", transcript.EvidenceState)
+	assert.Nil(transcript.Transcript)
+
+	for name, response := range map[string]map[string]any{
+		"mismatched source":  with(map[string]any{"source_id": "other"}),
+		"mismatched version": with(map[string]any{"source_version_id": "other"}),
+		"mismatched content": with(map[string]any{"content_version_id": "other"}),
+		"missing vault":      with(map[string]any{"vault_uid": ""}),
+		"ready without text": with(map[string]any{"transcript": nil}),
+		"text on pending":    with(map[string]any{"evidence_state": "pending"}),
+		"unknown origin":     with(map[string]any{"transcript": map[string]any{"origin": "invented", "units": []any{}}}),
+	} {
+		respond(response)
+		_, err = client.Transcript(t.Context(), sourceID, versionID, contentID)
+		require.ErrorIs(err, docbankmedia.ErrInvalidReceipt, name)
+		assert.Equal("invalid_receipt", docbankmedia.ErrorCode(err), name)
+	}
+
+	mu.Lock()
+	before := requests
+	mu.Unlock()
+	for _, version := range [][3]string{{"", versionID, contentID}, {sourceID, "", contentID}, {sourceID, versionID, ""}} {
+		_, err = client.Transcript(t.Context(), version[0], version[1], version[2])
+		require.ErrorIs(err, docbankmedia.ErrInvalidRequest)
+	}
+	mu.Lock()
+	assert.Equal(before, requests)
+	mu.Unlock()
+
+	// A supplied transcript may exceed the 1 MiB receipt cap on the way back.
+	large := with(map[string]any{"transcript": map[string]any{"origin": "supplied", "completeness": "complete",
+		"units": []any{map[string]any{"text": strings.Repeat("a", 2<<20)}}}})
+	respond(large)
+	transcript, err = client.Transcript(t.Context(), sourceID, versionID, contentID)
+	require.NoError(err)
+	require.Len(transcript.Transcript.Units, 1)
+	assert.Len(transcript.Transcript.Units[0].Text, 2<<20)
+
+	mu.Lock()
+	raw[contentID] = []byte(`{"vault_uid":"vault","source_id":"src/1","source_version_id":"ver 1","content_version_id":"content-1","evidence_state":"ready","transcript":{"origin":"supplied","build_id":"build","supplied_input_id":"input","units":[{"text":"` +
+		strings.Repeat("a", 2*(16<<20)+(1<<20)) + `"}]}}`)
+	mu.Unlock()
+	_, err = client.Transcript(t.Context(), sourceID, versionID, contentID)
+	require.ErrorIs(err, docbankmedia.ErrResponseTooLarge)
+	assert.Equal("response_too_large", docbankmedia.ErrorCode(err))
+}
+
 // TestDocbankMediaLiveContract exercises a real isolated Docbank daemon. It
 // skips in ordinary runs and fails when requested without that runtime.
 func TestDocbankMediaLiveContract(t *testing.T) {
@@ -351,6 +500,10 @@ func TestDocbankMediaLiveContract(t *testing.T) {
 		assert.Equal(first.ContentVersionID, replay.ContentVersionID)
 		assert.Equal(first.OccurrenceID, replay.OccurrenceID)
 
+		transcript, err := client.Transcript(t.Context(), first.SourceID, first.SourceVersionID, first.ContentVersionID)
+		require.NoError(err, sample.name)
+		assert.Contains([]string{"ready", "pending", "unavailable"}, transcript.EvidenceState)
+
 		text := []byte("synthetic provider transcript for " + sample.name)
 		artifact, err := client.ImportTranscript(t.Context(), first.SourceID, docbankmedia.ArtifactMetadata{
 			OperationID: uuid.NewString(), OccurrenceID: first.OccurrenceID, Kind: "transcript",
@@ -363,13 +516,24 @@ func TestDocbankMediaLiveContract(t *testing.T) {
 		processed, err := client.Process(t.Context(), first.SourceID, uuid.NewString(), docbankmedia.Processing{
 			Profile: "supplied-transcript", SuppliedInputID: artifact.SuppliedInputID,
 		})
-		if err != nil {
-			t.Logf("%s processing refused with %s", sample.name, docbankmedia.ErrorCode(err))
-			continue
-		}
+		// The window check below needs a processed transcript, so a refusal fails here.
+		require.NoError(err, "%s processing refused with %s", sample.name, docbankmedia.ErrorCode(err))
 		job, err := client.JobStatus(t.Context(), processed.JobID)
 		require.NoError(err)
 		t.Logf("%s job state %s", sample.name, job.State)
+
+		// The mirrored evidence structs read the processed transcript back.
+		var identity docbankmedia.EvidenceWindowRequest
+		require.Eventually(func() bool {
+			identity, err = client.EvidenceIdentity(t.Context(), first.ContentVersionID, metadata.SHA256, "supplied-transcript")
+			httpErr, ok := errors.AsType[*docbankmedia.HTTPError](err)
+			return !errors.Is(err, docbankmedia.ErrNoRendition) && (!ok || httpErr.Status != http.StatusNotFound)
+		}, 2*time.Minute, time.Second, sample.name)
+		require.NoError(err, sample.name)
+		identity.VaultUID, identity.MaxChars = first.VaultUID, 1000
+		window, err := client.ReadEvidenceWindow(t.Context(), identity)
+		require.NoError(err, sample.name)
+		assert.Contains(window.Text, "synthetic provider transcript", sample.name)
 	}
 }
 

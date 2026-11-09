@@ -5,8 +5,8 @@ description: Build, test, lint, and code conventions.
 
 ## Build
 
-The macOS and Linux builds require Go 1.27+, Bun 1.3.14+, Node.js (20.19+ on
-20.x, 22.13+ on 22.x, or 24+), and a C/C++ compiler. The Make targets install
+The macOS and Linux builds require Go 1.27.3+, Bun 1.4.4+, Node.js (22.23.4+ on
+22.x, 24.22.1+ on 24.x, or 26.12.1+), and a C/C++ compiler. The Make targets install
 the pinned browser dependencies when `web/package.json` or `web/bun.lock`
 changes, then embed the production UI in the Go binary; Node runs the embed
 validator in that path. On Debian/Ubuntu also install `libsqlite3-dev`, which
@@ -24,7 +24,38 @@ make build-release
 
 # Install to ~/.local/bin or GOPATH
 make install
+
+# Homebrew formula build into $BINDIR (default bin/)
+make homebrew VERSION=1.2.3
 ```
+
+`make homebrew` is the normal build with `DISTRIBUTION=homebrew`, so the binary
+refuses `msgvault update` and points at `brew upgrade msgvault`. It adds the
+`duckdb_use_lib` tag, which links a system `libduckdb`; set `CGO_LDFLAGS` (and
+`CGO_CFLAGS` for headers) when that library is outside the default search path.
+
+### Share the Go build cache across worktrees
+
+Make targets compile Go with `-trimpath`, so binaries record module-relative
+source paths instead of absolute ones. Without it, Go caches every package
+separately for each checkout directory, and each git worktree grows the build
+cache by another full copy. With it, identical source in any checkout reuses
+the same cache entries.
+
+- Run `make <target> GOFLAGS=-trimpath=false` to opt out for one command.
+- Plain `go` commands outside Make do not add the flag. Run
+  `go env -w GOFLAGS=-trimpath` to make it your default; Make keeps any value
+  saved that way.
+
+Debuggers need a source mapping for trimmed binaries:
+
+- `dlv debug` and `dlv test` inherit `GOFLAGS` and cannot find source files.
+  Pass `--build-flags=-trimpath=false`. Debug builds disable optimizations, so
+  they never shared cache entries anyway.
+- For `dlv exec` or `dlv attach` on a trimmed binary, start Delve from the
+  repository root and run `config substitute-path -guess` (Delve 1.24 or
+  later). It maps the module path to your checkout, the standard library to
+  `GOROOT`, and dependencies to the module cache.
 
 ### Windows
 
@@ -109,7 +140,14 @@ make test
 
 # Verbose output
 make test-v
+
+# Build the CLI and exercise search and thread reading on a synthetic archive
+make test-cli-e2e
 ```
+
+`test-cli-e2e` uses an isolated archive and a fixed synthetic embedding provider.
+Linux CI runs it against the built release binary. To reuse a binary locally,
+set `MSGVAULT_E2E_BINARY` to its absolute path.
 
 ### Build tags and assertions
 
@@ -124,26 +162,35 @@ Use `testing/synctest` bubbles for work owned by the test process, including
 goroutines, channels, timers, tickers, and fakes. Advance virtual time with
 `synctest.Sleep` and wait for durable state with `synctest.Wait`.
 
-Keep real budgets for PostgreSQL and SQLite locks, database clocks, network
-requests, subprocesses, DuckDB, and operating-system events. Name retained
-sub-second testify budgets so their event and owner are clear.
-
-The helper check rejects bare totals below one second in `Eventually`,
-`Eventuallyf`, `EventuallyWithT`, `EventuallyWithTf`, `Never`, and `Neverf`.
-Named budgets and variables stay outside this rule. Virtual sleeps are valid
-inside a bubble. CI runs this check on Ubuntu, so Windows-only test files still
-need Windows validation.
+Keep real waits for PostgreSQL and SQLite locks, database clocks, network
+requests, subprocesses, DuckDB, and operating-system events.
+Call Kit's `stacktest.Dump(t)` before failing a timeout while waiting on goroutines.
 
 `make lint` and `make lint-ci` build a pinned golangci-lint with Kit's
-`kennlint` plugin and run its `sleeptest` check. The check rejects `time.Sleep`
-in tests outside a `synctest.Test` bubble. A kept real wait carries
-`//nolint:kennlint // <what it waits for>` on the sleep line.
+`kennlint` plugin and run its `sleeptest` and `deadlinetest` checks. Outside a
+`synctest.Test` bubble, `sleeptest` rejects `time.Sleep` and `deadlinetest`
+rejects sub-second `context.WithTimeout`, `context.WithDeadline`, `time.After`,
+`time.NewTimer`, `time.AfterFunc`, and testify `Eventually` budgets, plus zero
+or negative `Never` windows. It also checks duration fields and same-module
+helper parameters whose camelCase or snake_case names contain a `timeout`,
+`deadline`, `budget`, or `wait` word, including plurals. Standalone
+`time.Now().Add` deadlines are checked too. A kept real wait carries
+`//nolint:kennlint // sleeptest: <what it waits for>` on the flagged line.
+Use `deadlinetest:` for a deadline, only when its expiry is the asserted result
+or a `select` shows an event does not happen.
 
 ### PostgreSQL tests
 
 `MSGVAULT_TEST_DB=postgres://...` runs PostgreSQL-backed
 tests. pgvector tests require a PostgreSQL instance with the `vector`
 extension and the `pgvector` build tag.
+
+`MSGVAULT_TEST_DB=postgres://... make test-pg-nocgo` checks the PostgreSQL-only
+library profile. It builds the store, query engine, Slack and Discord importers,
+and HTTP API with `CGO_ENABLED=0`, then tests archive writes, full-text search,
+and reads against PostgreSQL. It deliberately omits the `fts5` and `sqlite_vec`
+build tags. SQLite archives, local SQLite imports, and DuckDB/Parquet analytics
+require the normal CGO build; this profile does not build the standalone CLI.
 
 The PostgreSQL deadlock tests also require permission to set
 `deadlock_timeout`. They defer the blocker transaction's deadlock detector
@@ -174,6 +221,13 @@ server releases when the binary exits, so the next binary reclaims whatever an
 earlier one left behind; a role without `CREATEDB` falls back to a private
 schema in the configured database.
 
+`dbtest.NewTestDB` copies an in-memory `schema.sql` template per test with
+SQLite's backup API.
+Query Parquet fixtures are built once per distinct content and copied per test,
+so each test can change its own directory freely.
+Query tests call `t.Parallel()`; a test that replaces a package global stays
+serial and explains why in a `// serial:` comment.
+
 
 ### Local test scheduling
 
@@ -202,6 +256,39 @@ explicitly also retains sequential package jobs with the requested shard count.
 The PostgreSQL targets keep their existing connection-oriented concurrency
 limits; setting `MSGVAULT_TEST_DB` disables automatic scaling in `make test` too.
 CI's explicit `test-unsharded` and package-shard jobs keep their existing layout.
+
+Go tests run through [gotestsum](https://github.com/gotestyourself/gotestsum),
+a tool dependency in `go.mod`. `make test`, the PostgreSQL targets, and CI's
+inline test steps rerun each failed test up to twice and list rerun tests in
+`gotestsum/<suite>-reruns.txt`. Every run records its `go test -json` events in
+`gotestsum/<suite>.json`. CI uploads those files as
+`gotestsum-<suite>-attempt-<n>` artifacts when a step fails, when gotestsum
+reruns a test, and on every rerun attempt of the workflow, so a test that failed
+in one attempt can be matched with its result in the next.
+
+The shard scripts do not rerun tests. They write every shard's events to
+`gotestsum/<suite>.json`, where the suite defaults to the package's last path
+element. Successful shards print named passing and skipped test outcomes,
+including subtests, followed by the package line `go test` prints. Failed
+shards print the full verbose test output, then the package's `FAIL` line.
+
+Bash shards balance test time with recorded durations from a package's
+`testdata/shard-weights-<backend>.txt`. Only PostgreSQL store has a weights
+file; a missing file keeps round-robin assignment. Unlisted tests get the median
+recorded duration, and removed tests are ignored. Each successful shard line
+reports its summed top-level test-seconds. Refresh
+`internal/store/testdata/shard-weights-postgres.txt` from a recent successful
+main run's `test-postgres-sharded (store)` job with:
+
+```bash
+gh run view -R kenn-io/msgvault --job <job-id> --log | cut -f3- | sed 's/^[^ ]* //' | grep -E '^--- (PASS|SKIP|FAIL): ' | sort
+```
+
+In CI, Vitest and Playwright retry a failed test twice and write JSON reports
+under `web/test-results/vitest/` and `web/test-results/playwright/`. CI uploads
+each report as a `vitest-<suite>-attempt-<n>` or
+`playwright-<suite>-attempt-<n>` artifact. `MSGVAULT_PLAYWRIGHT_SUITE` names a
+Playwright run's report.
 
 ## Lint & Format
 
@@ -285,6 +372,112 @@ without an accelerator, embedding calls, or HTTP result projection. Use the
 request timing headers to determine which phase needs attention on a real
 archive before comparing it with this narrower benchmark.
 
+### SQLite metadata substring search
+
+Compare indexed candidates with the historical scan on one generated
+20,000-message archive:
+
+```bash
+go test -tags 'fts5 sqlite_vec' ./internal/query -run '^$' \
+  -bench '^BenchmarkMetadataSubstring$' -benchtime=3x -count=3 -benchmem
+```
+
+Setup and index maintenance are excluded. The benchmark covers rare subject,
+participant, and recipient-name matches, common terms, short terms, and
+common-term narrow-date counts. The scoped case keeps the existing date query
+path. Use the same machine and corpus for comparisons; these numbers
+do not predict latency on a larger archive.
+
+The built-in fuzz target compares ordered pages, exact counts, and stats with
+the original substring predicate over generated metadata:
+
+```bash
+go test -tags 'fts5 sqlite_vec' ./internal/query -run '^$' \
+  -fuzz '^FuzzMetadataSearchParity$' -fuzztime=30s -parallel=2
+```
+
+### Synthetic filename discovery measurements
+
+Use generated metadata to compare the Directory verifier and bounded filename
+suggestions without a private archive:
+
+```bash
+go test -tags 'fts5 sqlite_vec' ./internal/store \
+  -run '^TestFilenameDiscoverySyntheticRecall$' -count=1
+go test -tags 'fts5 sqlite_vec' ./internal/namematch -run '^$' \
+  -bench '^BenchmarkDirectoryVerifier$' -benchmem -count=3
+go test -tags 'fts5 sqlite_vec sqlite_dbstat' ./internal/store -run '^$' \
+  -bench '^BenchmarkFilenameDiscovery$' -benchtime=3x -benchmem -count=3
+```
+
+The existing native-driver `sqlite_dbstat` diagnostic tag enables physical
+projection table and index page-byte measurement. Ordinary correctness and
+shipped builds retain their usual tags. The filename benchmark uses durable
+SQLite at 1k, 10k and 100k generated names plus one 512-rune filename, with 64
+synthetic identities bound to one person. Exact, typo, short-prefix, no-hit,
+dense-collision, restrictive-empty, maximum-name and 64-person cases share the
+same fixture and policy.
+
+Indexed timings cover in-process HTTP dispatch and response decoding. The
+exhaustive baseline scans the same fixture's filename metadata in memory,
+applies the same policy and sorts results; it is test-only and excludes HTTP
+overhead. Setup and warmup are outside request timings. Separate metrics report
+durable bootstrap, one journaled rename, one idle maintenance batch, physical
+index bytes, posting rows, admitted/verified IDs, returned rows, recall, and
+missing matches for limited results. Repeated short samples characterize this
+synthetic workload; they do not predict every archive or impose latency
+thresholds on correctness tests. Complete results must equal the exhaustive
+oracle within the requested output limit; limited results report their missing
+output and candidate-pool matches explicitly.
+
+Run the recall test with `MSGVAULT_TEST_DB` set to a disposable PostgreSQL test
+database for backend parity. Existing native query-plan tests exercise indexed
+posting seeks and bounded authority/provenance reads on both backends.
+
+## MCP memory measurements
+
+`TestMCPMemory` guards the retained Go heap of a `msgvault mcp` process. It
+samples two fresh child processes, because the package caches tool catalogs and
+resolved SDK schemas for reuse:
+
+- `startup`: package initialization, before a server exists.
+- `initialized`: a server after `initialize` and `tools/list` over OS pipes,
+  with every backend a daemon-backed stdio proxy can enable. The backends are
+  empty stand-ins; neither sample opens an archive or calls a tool.
+
+Each sample must keep less than 64 MiB of Go heap after garbage collection.
+The budget catches eager construction of tool catalogs, which retained over
+300 MiB in v0.20.0, without setting a startup-time target. If you add a catalog
+capability, enable it in `daemonProxyMemoryOptions`; the test fails until you do.
+
+Run the guard and the allocation benchmarks:
+
+```bash
+go test -tags 'fts5 sqlite_vec' ./internal/mcp -run '^TestMCPMemory$' -count=1 -v
+go test -tags 'fts5 sqlite_vec' ./internal/mcp -run '^$' \
+  -bench '^BenchmarkOperationCatalogMemory$' -benchtime=3x -benchmem
+```
+
+The `cold` benchmark builds one catalog, `cached` looks it up again, and
+`server` constructs a server with warmed caches, as the stateless HTTP listener
+does for each request. Benchmark bytes are allocations, not retained heap.
+
+To profile one phase, run the child test directly so the profile covers the
+measured process rather than the parent:
+
+```bash
+MSGVAULT_MCP_MEMORY_PHASE=initialized go test -tags 'fts5 sqlite_vec' ./internal/mcp \
+  -run '^TestMCPMemoryChild$' -count=1 -v -memprofile=/tmp/mcp.heap
+go tool pprof -top -inuse_space /tmp/mcp.heap
+```
+
+`HeapAlloc` is live Go heap; `TotalAlloc` counts cumulative allocation. Neither
+includes native allocations or executable mappings. Linux RSS and the macOS
+`top` MEM column (physical footprint, which includes compressed memory) measure
+different things, so do not compare them directly with Go heap figures.
+
+For several simultaneous clients, see [transport selection](usage/chat.md#choose-a-transport-for-concurrent-sessions).
+
 ## Evaluate search quality
 
 Use [`msgvault eval`](cli-reference.md#eval) to compare keyword, semantic, and
@@ -310,6 +503,44 @@ The codec preserves ordered properties, source spelling, parameter quoting,
 unknown extensions, and raw values. Keep new registry elements covered by an
 explicit handling declaration so an upstream addition cannot be silently
 ignored.
+
+## Archive schema version maintenance
+
+`internal/store/schema_version.go` owns `store.SchemaVersion`, the monotonic
+integer for required main archive schema work. Increase it whenever the main
+archive schema changes, including indexes, or a required data migration changes.
+Embedded readers require an exact version match. Once an archive is migrated to
+a higher version, applications using an older `pkg/archive` must upgrade too,
+even if the schema change only added an index.
+
+Filename suggestions require archive schema version 6 and API schema 3.15,
+newer than the latest release. Version 6 creates empty projection tables;
+background maintenance establishes readiness separately. Schema migration does
+not scan attachments or populate the index, and suggestion requests never
+perform setup or backfill. Embedded readers require completed version-6 setup.
+
+`TestSchemaVersionContract` hashes the schema and migration ledger a fresh archive
+gets on each backend, plus the legacy column statements only older archives run,
+and fails until the version moves; its message gives the digest to append.
+Append entries for the new version to both `schemaContractDigests` and
+`schemaContractPostgresDigests`; keep earlier entries unchanged. The SQLite lane
+also requires a PostgreSQL entry. Obtain that digest by running the store tests
+with `MSGVAULT_TEST_DB` set to a PostgreSQL URL. Without local PostgreSQL, use the digest from the CI
+PostgreSQL lane's failure log, append it, and rerun CI to verify it.
+
+A data-only repair that runs outside the migration ledger leaves both digests
+alone, so bump the version by hand for one. SQLite and PostgreSQL use the
+`schema_version` key in `archive_metadata`. `InitSchemaContext` refuses future
+versions before DDL and stamps this version only after its required steps succeed,
+using the caller's context. Keep optional and best-effort maintenance behavior separate from that
+completion guarantee.
+Writer opens and daemon start on a current PostgreSQL archive skip the full initializer; `msgvault migrate` and setup run it in full.
+
+The contract began in 0.22.0. Existing archives start at
+`0`; successful initialization upgrades them to the binary's expected version.
+The [CLI reference](cli-reference.md#schema-version) owns the probe contract,
+and [Setup](setup.md#migrate-before-replacing-the-executable) owns the operator
+upgrade procedure.
 
 ## Code Conventions
 

@@ -7,25 +7,8 @@ import (
 
 const TimestampKeyFunction = "msgvault_timestamp_key"
 
-// timestampKey returns an exact sortable instant, or SQL NULL for absent,
-// invalid and zero timestamps, matching the Store's nullable timestamp reader.
-// Separate seconds and nanoseconds retain dates outside UnixNano's range.
-func timestampKey(value any) []byte {
-	var text string
-	switch value := value.(type) {
-	case string:
-		text = value
-	case []byte:
-		text = string(value)
-	default:
-		return nil
-	}
-	parsed := ParseTime(text)
-	if parsed.IsZero() {
-		return nil
-	}
-	return TimestampKey(parsed)
-}
+// ZeroTimeJulianDay is the SQLite SQL literal for Go's zero timestamp.
+const ZeroTimeJulianDay = "1721425.5"
 
 // TimestampKey encodes a typed query instant, including the zero-time bound.
 // Stored timestamp parsing separately treats zero as unavailable.

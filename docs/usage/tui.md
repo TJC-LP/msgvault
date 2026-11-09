@@ -1,5 +1,5 @@
 ---
-last_edited: "2026-09-25"
+last_edited: "2026-10-09"
 title: Interactive TUI
 description: Browse messages and people, search your archive, save attachments, and stage email deletion from the terminal.
 ---
@@ -62,8 +62,11 @@ Deletion staging and attachment export use the selected daemon. When connected t
 
 ### Email Account and Collection Scopes
 
-Press `A` in Email mode to choose `All Accounts`, an individual account, or a
-named collection. A collection is a daemon-owned group of accounts, and the
+Press `A` in Email mode to choose `All Accounts`, an individual account, a
+receiving address, or a named collection. When confirmed addresses divide a
+source's mail, the picker lists each address under the source, plus an
+Unattributed entry for mail no confirmed address claims; see
+[Searching](searching.md#find-mail-by-the-address-that-received-it). A collection is a daemon-owned group of accounts, and the
 title shows `Collection: <name>` while its exact member sources scope
 aggregates, message lists, fast search, statistics, and deletion-target
 inspection. An empty collection shows no results and makes no scoped HTTP read.
@@ -160,8 +163,8 @@ Navigation and interaction in Text mode work the same as Email mode. Press `Ente
 ## Meetings
 
 Meetings mode is a read-only browser for archived transcripts and notes from
-[meeting sources](/docs/usage/meetings/), including Granola, Plaud, Circleback,
-Notion, and Muesli. It shows a flat, newest-first list
+[meeting sources](/docs/usage/meetings/), including Omi, Granola, Plaud, Circleback,
+Notion, Muesli, Twilio, Twenty, and Chatwoot. It shows a flat, newest-first list
 with each meeting's date, title, organizer, and source. Press `Enter` to open
 the transcript and notes, `Esc` or `Backspace` to return to the list, and the
 left/right arrow keys to move between meeting details.
@@ -188,6 +191,8 @@ move between their detail tabs. The browser brings profile information,
 attributes, inboxes, meetings, files, and dated activity together. See
 [People, Profiles, and Source Identities](/docs/usage/people/)
 for curation, tracking, and provider setup.
+
+The Relationship calendar groups days in your system's named timezone. When the system zone can't be named, such as on Windows, it uses UTC and shows "UTC" by the year. Dated activity lists show local time.
 
 ### Person briefs
 

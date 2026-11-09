@@ -5,6 +5,8 @@ import type { HybridSearchMatch } from "./hybridSearchMatch";
 import type { ScoreBreakdown } from "./scoreBreakdown";
 
 export interface HybridSearchItem {
+  attachment_count?: number;
+  attachment_names?: string[];
   bcc?: string[];
   cc?: string[];
   conversation_id?: number;
@@ -14,6 +16,7 @@ export interface HybridSearchItem {
   from_name?: string;
   from_phone?: string;
   has_attachments: boolean;
+  hidden_text_present: boolean;
   id: number;
   labels: string[];
   matches?: HybridSearchMatch[];

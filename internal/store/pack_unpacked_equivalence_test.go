@@ -68,7 +68,7 @@ func TestUnpackedBlobQueriesMatchRowByRowDefinition(t *testing.T) {
 	require := require.New(t)
 	const iterations = 300
 	dir := t.TempDir()
-	st, err := OpenForTest(filepath.Join(dir, "equiv.db"))
+	st, err := OpenForTest(t.Context(), filepath.Join(dir, "equiv.db"))
 	require.NoError(err)
 	defer func() { require.NoError(st.Close()) }()
 	require.NoError(st.InitSchema())

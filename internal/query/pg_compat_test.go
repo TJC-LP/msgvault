@@ -34,21 +34,22 @@ import (
 // to. The test never asserts on dialect-specific error text; a bug
 // would surface as a generic Scan/Exec failure on PG.
 func TestQueryEngine_PostgresPortability(t *testing.T) {
-	require := require.New(t)
+	t.Parallel()
+	setupRequire := require.New(t)
 	st := testutil.NewTestStore(t)
 	src, err := st.GetOrCreateSource("gmail", "pgcompat@example.com")
-	require.NoError(err, "GetOrCreateSource")
+	setupRequire.NoError(err, "GetOrCreateSource")
 
-	convID, err := st.EnsureConversation(src.ID, "thread-1", "Thread 1")
-	require.NoError(err, "EnsureConversation")
+	convID, err := st.EnsureConversation(t.Context(), src.ID, "thread-1", "Thread 1")
+	setupRequire.NoError(err, "EnsureConversation")
 
 	aliceID, err := st.EnsureParticipant("alice@example.com", "Alice", "example.com")
-	require.NoError(err, "EnsureParticipant alice")
+	setupRequire.NoError(err, "EnsureParticipant alice")
 	bobID, err := st.EnsureParticipant("bob@example.com", "Bob", "example.com")
-	require.NoError(err, "EnsureParticipant bob")
+	setupRequire.NoError(err, "EnsureParticipant bob")
 
-	labelID, err := st.EnsureLabel(src.ID, "Label_1", "Important", "user")
-	require.NoError(err, "EnsureLabel")
+	labelID, err := st.EnsureLabel(t.Context(), src.ID, "Label_1", "Important", "user")
+	setupRequire.NoError(err, "EnsureLabel")
 
 	base := time.Date(2024, 6, 1, 12, 0, 0, 0, time.UTC)
 	for i := range 4 {
@@ -62,19 +63,47 @@ func TestQueryEngine_PostgresPortability(t *testing.T) {
 			Snippet:         sql.NullString{String: "snippet", Valid: true},
 			SizeEstimate:    int64(1000 + i*250),
 		})
-		require.NoError(err, "UpsertMessage")
-		require.NoError(st.ReplaceMessageRecipients(mid, "from", []int64{aliceID}, []string{"Alice"}),
+		setupRequire.NoError(err, "UpsertMessage")
+		setupRequire.NoError(st.ReplaceMessageRecipients(mid, "from", []int64{aliceID}, []string{"Alice"}),
 			"ReplaceMessageRecipients from")
 
-		require.NoError(st.ReplaceMessageRecipients(mid, "to", []int64{bobID}, []string{"Bob"}),
+		setupRequire.NoError(st.ReplaceMessageRecipients(mid, "to", []int64{bobID}, []string{"Bob"}),
 			"ReplaceMessageRecipients to")
 
-		require.NoError(st.ReplaceMessageLabels(mid, []int64{labelID}),
+		setupRequire.NoError(st.ReplaceMessageLabels(mid, []int64{labelID}),
 			"ReplaceMessageLabels")
 	}
 
 	eng := query.NewEngine(st.DB(), st.IsPostgreSQL())
-	ctx := context.Background()
+	ctx := t.Context()
+
+	t.Run("sender_retry", func(t *testing.T) {
+		assertions, requirements := assert.New(t), require.New(t)
+		matcher, ok := eng.(query.SenderNameMatcher)
+		requirements.True(ok)
+		hints := matcher.MatchSenderName(ctx, search.Parse("from:alice@exam"))
+		requirements.Len(hints, 1)
+		assertions.Contains(hints[0].Message, "alice@example.com (4 messages)")
+		assertions.Equal("from:alice@example.com", hints[0].RetryWith.Query)
+	})
+
+	t.Run("sender_name_label_page", func(t *testing.T) {
+		msgs, err := eng.ListMessages(ctx, query.MessageFilter{
+			Sender: "alice@example.com", SenderName: "Alice", Label: "Important",
+			Sorting:    query.MessageSorting{Field: query.MessageSortByDate, Direction: query.SortDesc},
+			Pagination: query.Pagination{Limit: 2, Offset: 1},
+		})
+		require.NoError(t, err)
+		require.Len(t, msgs, 2)
+		assert.Equal(t, []string{gmailSourceID(2), gmailSourceID(1)}, []string{msgs[0].SourceMessageID, msgs[1].SourceMessageID})
+	})
+
+	t.Run("pipe_or", func(t *testing.T) {
+		require := require.New(t)
+		rows, err := eng.Search(ctx, search.ParseOR("from:alice@example.com | subject:missing"), 50, 0)
+		require.NoError(err)
+		assert.Len(t, rows, 4)
+	})
 
 	// (1) Aggregate — must not error with "syntax error near ')'" on PG.
 	t.Run("aggregate_senders", func(t *testing.T) {
@@ -83,8 +112,8 @@ func TestQueryEngine_PostgresPortability(t *testing.T) {
 			SortDirection: query.SortDesc,
 			Limit:         50,
 		})
-		require.NoError(err, "Aggregate")
-		require.NotEmpty(rows, "Aggregate returned no rows; expected at least the Alice sender bucket")
+		setupRequire.NoError(err, "Aggregate")
+		setupRequire.NotEmpty(rows, "Aggregate returned no rows; expected at least the Alice sender bucket")
 	})
 
 	// (2) GetDeletionTargetsByFilter — must not error from a SELECT DISTINCT +
@@ -100,7 +129,7 @@ func TestQueryEngine_PostgresPortability(t *testing.T) {
 			},
 		})
 
-		require.NoError(err, "GetDeletionTargetsByFilter")
+		setupRequire.NoError(err, "GetDeletionTargetsByFilter")
 		ids := make([]string, len(targets))
 		for i := range targets {
 			ids[i] = targets[i].SourceMessageID
@@ -138,13 +167,14 @@ func TestQueryEngine_PostgresPortability(t *testing.T) {
 				},
 				Pagination: query.Pagination{Limit: 50},
 			})
-			require.NoError(err, "ListMessages %s", sort.name)
+			setupRequire.NoError(err, "ListMessages %s", sort.name)
 			assert.Len(t, msgs, 4, "ListMessages %s", sort.name)
 		})
 	}
 }
 
 func TestNewEnginePostgresSatisfiesMessageBodySearcher(t *testing.T) {
+	t.Parallel()
 	st := testutil.NewTestStore(t)
 	eng := query.NewEngine(st.DB(), true)
 
@@ -160,11 +190,12 @@ func TestNewEnginePostgresSatisfiesMessageBodySearcher(t *testing.T) {
 // rows that the equivalent store API path (which lowercases) returns.
 // Bare-LIKE divergence was H3 in the codex review.
 func TestQueryEngine_CaseInsensitiveSearch_Subject(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	st := testutil.NewTestStore(t)
 	src, err := st.GetOrCreateSource("gmail", "case-search@example.com")
 	require.NoError(err, "GetOrCreateSource")
-	convID, err := st.EnsureConversation(src.ID, "case-thread", "case thread")
+	convID, err := st.EnsureConversation(t.Context(), src.ID, "case-thread", "case thread")
 	require.NoError(err, "EnsureConversation")
 	mid, err := st.UpsertMessage(&store.Message{
 		ConversationID:  convID,
@@ -180,7 +211,7 @@ func TestQueryEngine_CaseInsensitiveSearch_Subject(t *testing.T) {
 	_ = mid
 
 	eng := query.NewEngine(st.DB(), st.IsPostgreSQL())
-	ctx := context.Background()
+	ctx := t.Context()
 
 	for _, term := range []string{"invoice", "INVOICE", "Invoice"} {
 		got, err := eng.Search(ctx,
@@ -206,11 +237,12 @@ func TestQueryEngine_CaseInsensitiveSearch_Subject(t *testing.T) {
 // MSGVAULT_TEST_DB to a postgres:// DSN exercises the PG path too, since
 // NewPostgreSQLEngine wraps the same dialect-parameterized builder.
 func TestQueryEngine_MultiFromNoDuplication(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	st := testutil.NewTestStore(t)
 	src, err := st.GetOrCreateSource("gmail", "multifrom@example.com")
 	require.NoError(err, "GetOrCreateSource")
-	convID, err := st.EnsureConversation(src.ID, "thread-mf", "Thread MF")
+	convID, err := st.EnsureConversation(t.Context(), src.ID, "thread-mf", "Thread MF")
 	require.NoError(err, "EnsureConversation")
 
 	// Two distinct 'from' participants that share a domain AND a display
@@ -257,7 +289,7 @@ func TestQueryEngine_MultiFromNoDuplication(t *testing.T) {
 		[]int64{otherFrom}, []string{"Other"}), "ReplaceMessageRecipients other")
 
 	eng := query.NewEngine(st.DB(), st.IsPostgreSQL())
-	ctx := context.Background()
+	ctx := t.Context()
 
 	t.Run("list_messages_domain", func(t *testing.T) {
 		msgs, err := eng.ListMessages(ctx, query.MessageFilter{
@@ -312,11 +344,12 @@ func TestQueryEngine_MultiFromNoDuplication(t *testing.T) {
 // MSGVAULT_TEST_DB selects PostgreSQL, while the default SQLite path provides
 // the same behavior check without requiring a local PostgreSQL service.
 func TestQueryEngine_ListIDCaseInsensitiveParity(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	st := testutil.NewTestStore(t)
 	src, err := st.GetOrCreateSource("gmail", "list-parity@example.test")
 	require.NoError(err)
-	conversationID, err := st.EnsureConversation(src.ID, "list-parity-thread", "List parity")
+	conversationID, err := st.EnsureConversation(t.Context(), src.ID, "list-parity-thread", "List parity")
 	require.NoError(err)
 
 	addMessage := func(sourceMessageID, listID string) int64 {
@@ -339,7 +372,7 @@ func TestQueryEngine_ListIDCaseInsensitiveParity(t *testing.T) {
 	addMessage("list-decoy", "<devA1@example.test>")
 
 	engine := query.NewEngine(st.DB(), st.IsPostgreSQL())
-	ctx := context.Background()
+	ctx := t.Context()
 	filter := query.MessageFilter{ListID: "<DEV_1@EXAMPLE.TEST>"}
 
 	rows, err := engine.Aggregate(ctx, query.ViewLists, query.DefaultAggregateOptions())
@@ -377,6 +410,7 @@ func TestQueryEngine_ListIDCaseInsensitiveParity(t *testing.T) {
 // testutil.NewTestStore selects, so it doubles as a SQLite<->PG parity test:
 // both backends must return the body-only hit.
 func TestQueryEngine_FTSBodySearch(t *testing.T) {
+	t.Parallel()
 	assert :=
 		assert.
 			New(t)
@@ -389,7 +423,7 @@ func TestQueryEngine_FTSBodySearch(t *testing.T) {
 
 	src, err := st.GetOrCreateSource("gmail", "fts-body@example.com")
 	require.NoError(err, "GetOrCreateSource")
-	convID, err := st.EnsureConversation(src.ID, "fts-thread", "fts thread")
+	convID, err := st.EnsureConversation(t.Context(), src.ID, "fts-thread", "fts thread")
 	require.NoError(err, "EnsureConversation")
 
 	const bodyOnlyTerm = "zorblax"
@@ -415,7 +449,7 @@ func TestQueryEngine_FTSBodySearch(t *testing.T) {
 	require.NoError(st.UpsertFTS(mid, "Quarterly report", body, "", "", ""), "UpsertFTS")
 
 	eng := query.NewEngine(st.DB(), st.IsPostgreSQL())
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// (1) Body-only TextTerms search must find the message — only the FTS path
 	// can, since the term is absent from subject/snippet.
@@ -445,6 +479,7 @@ func TestQueryEngine_FTSBodySearch(t *testing.T) {
 // connection's search_path is scoped to the one WITHOUT it; the probe must
 // return 0 (FTS not available here) even though a sibling has the column.
 func TestQueryDialect_HasFTSTableSQL_SchemaScoped(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	dbURL := os.Getenv("MSGVAULT_TEST_DB")
 	if !strings.HasPrefix(dbURL, "postgres://") && !strings.HasPrefix(dbURL, "postgresql://") {
@@ -465,18 +500,19 @@ func TestQueryDialect_HasFTSTableSQL_SchemaScoped(t *testing.T) {
 		name    string
 		withFTS bool
 	}{{hasSchema, true}, {noSchema, false}} {
-		_, err := setupDB.Exec("CREATE SCHEMA " + s.name)
+		_, err := setupDB.ExecContext(t.Context(), "CREATE SCHEMA "+s.name)
 		require.NoErrorf(err, "create schema %s", s.name)
 		cols := "id BIGINT"
 		if s.withFTS {
 			cols += ", search_fts TSVECTOR"
 		}
-		_, err = setupDB.Exec("CREATE TABLE " + s.name + ".messages (" + cols + ")")
+		_, err = setupDB.ExecContext(t.Context(), "CREATE TABLE "+s.name+".messages ("+cols+")")
 		require.NoErrorf(err, "create messages in %s", s.name)
 	}
+	// Cleanup runs after t.Context() is canceled.
 	t.Cleanup(func() {
-		_, _ = setupDB.Exec("DROP SCHEMA " + hasSchema + " CASCADE")
-		_, _ = setupDB.Exec("DROP SCHEMA " + noSchema + " CASCADE")
+		_, _ = setupDB.ExecContext(context.WithoutCancel(t.Context()), "DROP SCHEMA "+hasSchema+" CASCADE")
+		_, _ = setupDB.ExecContext(context.WithoutCancel(t.Context()), "DROP SCHEMA "+noSchema+" CASCADE")
 	})
 
 	// Connection scoped to the schema WITHOUT search_fts.
@@ -490,7 +526,7 @@ func TestQueryDialect_HasFTSTableSQL_SchemaScoped(t *testing.T) {
 
 	var count int
 	require.NoError(
-		scopedDB.QueryRow(query.PostgreSQLQueryDialect{}.HasFTSTableSQL()).Scan(&count),
+		scopedDB.QueryRowContext(t.Context(), query.PostgreSQLQueryDialect{}.HasFTSTableSQL()).Scan(&count),
 		"run HasFTSTableSQL probe")
 
 	assert.Equal(t, 0, count,
@@ -510,6 +546,7 @@ func TestQueryDialect_HasFTSTableSQL_SchemaScoped(t *testing.T) {
 // read as 07:00 UTC and exclude the message. With time.Time binding it is
 // included regardless of session TimeZone.
 func TestQueryEngine_SearchDateRange_TimezoneStable(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	st := testutil.NewTestStore(t)
 	if !st.IsPostgreSQL() {
@@ -518,7 +555,7 @@ func TestQueryEngine_SearchDateRange_TimezoneStable(t *testing.T) {
 
 	src, err := st.GetOrCreateSource("gmail", "tz-search@example.com")
 	require.NoError(err, "GetOrCreateSource")
-	convID, err := st.EnsureConversation(src.ID, "tz-thread", "tz thread")
+	convID, err := st.EnsureConversation(t.Context(), src.ID, "tz-thread", "tz thread")
 	require.NoError(err, "EnsureConversation")
 
 	mid, err := st.UpsertMessage(&store.Message{
@@ -537,8 +574,9 @@ func TestQueryEngine_SearchDateRange_TimezoneStable(t *testing.T) {
 	// search_path, applied per-connection by pgx) both stick for the search.
 	db := st.DB()
 	db.SetMaxOpenConns(1)
+	// Cleanup runs after t.Context() is canceled.
 	t.Cleanup(func() {
-		_, _ = db.Exec("SET TIME ZONE 'UTC'")
+		_, _ = db.ExecContext(context.WithoutCancel(t.Context()), "SET TIME ZONE 'UTC'")
 		db.SetMaxOpenConns(0)
 	})
 
@@ -547,7 +585,7 @@ func TestQueryEngine_SearchDateRange_TimezoneStable(t *testing.T) {
 	q := &search.Query{AfterDate: &after, BeforeDate: &before}
 
 	eng := query.NewEngine(db, true)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	for _, tz := range []string{"UTC", "America/Los_Angeles"} {
 		_, err := db.ExecContext(ctx, "SET TIME ZONE '"+tz+"'")
@@ -575,4 +613,114 @@ func subjectFor(i int) string {
 	default:
 		return "delta subject"
 	}
+}
+
+func TestAggregatePipeOREmailDefault(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+	eng := newPipeORAggregateEngine(t)
+	runPipeORAggregateCases(t, eng)
+	opts := query.DefaultAggregateOptions()
+	opts.SearchQuery = pipeORAggregateCases[0].query
+	rows, err := eng.Aggregate(t.Context(), query.ViewSenders, opts)
+	require.NoError(err)
+	require.Len(rows, 1)
+	resolver, ok := eng.(query.DeletionTargetAggregateSearchResolver)
+	require.True(ok)
+	targets, err := resolver.GetDeletionTargetsByAggregateSearch(t.Context(), opts.SearchQuery, query.MessageFilter{}, query.ViewSenders, rows[0].Key)
+	require.NoError(err)
+	assert.Equal(t, rows[0].Count, int64(len(targets)))
+}
+
+func TestDuckDBAggregatePipeOREmailDefault(t *testing.T) {
+	t.Parallel()
+	runPipeORAggregateCases(t, newDuckDBPipeORAggregateEngine(t))
+}
+
+var pipeORAggregateRows = []struct{ subject, typ string }{
+	{"invoice", "email"}, {"invoice", "sms"}, {"receipt", "sms"},
+}
+
+func newPipeORAggregateEngine(t *testing.T) query.Engine {
+	t.Helper()
+	setupRequire := require.New(t)
+	st := testutil.NewTestStore(t)
+	src, err := st.GetOrCreateSource("gmail", "analytics@example.com")
+	setupRequire.NoError(err)
+	conv, err := st.EnsureConversation(t.Context(), src.ID, "analytics", "Analytics")
+	setupRequire.NoError(err)
+	sender, err := st.EnsureParticipant("sender@example.com", "Sender", "example.com")
+	setupRequire.NoError(err)
+	for i, row := range pipeORAggregateRows {
+		id, err := st.UpsertMessage(&store.Message{
+			SourceID: src.ID, ConversationID: conv, SourceMessageID: gmailSourceID(i),
+			Subject: sql.NullString{String: row.subject, Valid: true}, MessageType: row.typ,
+		})
+		setupRequire.NoError(err)
+		setupRequire.NoError(st.ReplaceMessageRecipients(id, "from", []int64{sender}, []string{"Sender"}))
+	}
+	_, err = st.BackfillFTS(nil)
+	setupRequire.NoError(err)
+	return query.NewEngine(st.DB(), st.IsPostgreSQL())
+}
+
+func newDuckDBPipeORAggregateEngine(t *testing.T) query.Engine {
+	t.Helper()
+	b := query.NewTestDataBuilder(t)
+	b.AddSource("analytics@example.com")
+	sender := b.AddParticipant("sender@example.com", "example.com", "Sender")
+	for _, row := range pipeORAggregateRows {
+		id := b.AddMessage(query.MessageOpt{Subject: row.subject, MessageType: row.typ})
+		b.AddFrom(id, sender, "Sender")
+	}
+	return b.BuildEngine()
+}
+
+func runPipeORAggregateCases(t *testing.T, eng query.Engine) {
+	t.Helper()
+	for _, tc := range pipeORAggregateCases {
+		t.Run(tc.query, func(t *testing.T) {
+			require := require.New(t)
+			assert := assert.New(t)
+			opts := query.DefaultAggregateOptions()
+			opts.SearchQuery = tc.query
+			rows, err := eng.Aggregate(t.Context(), query.ViewSenders, opts)
+			require.NoError(err)
+			if tc.wantDefault == 0 {
+				assert.Empty(rows)
+			} else {
+				require.Len(rows, 1)
+				assert.Equal(tc.wantDefault, rows[0].Count)
+			}
+			rows, err = eng.SubAggregate(t.Context(), query.MessageFilter{}, query.ViewSenders, opts)
+			require.NoError(err)
+			if tc.wantDefault == 0 {
+				assert.Empty(rows)
+			} else {
+				require.Len(rows, 1)
+				assert.Equal(tc.wantDefault, rows[0].Count)
+			}
+			stats, err := eng.GetTotalStats(t.Context(), query.StatsOptions{SearchQuery: tc.query})
+			require.NoError(err)
+			assert.Equal(tc.wantDefault, stats.MessageCount)
+			stats, err = eng.GetTotalStats(t.Context(), query.StatsOptions{SearchQuery: tc.query, SearchScope: true})
+			require.NoError(err)
+			assert.Equal(tc.wantAll, stats.MessageCount)
+			stats, err = eng.GetTotalStats(t.Context(), query.StatsOptions{SearchQuery: tc.query, Filter: &query.MessageFilter{MessageType: "sms"}})
+			require.NoError(err)
+			assert.Equal(tc.wantSMS, stats.MessageCount)
+		})
+	}
+}
+
+var pipeORAggregateCases = []struct {
+	query       string
+	wantDefault int64
+	wantAll     int64
+	wantSMS     int64
+}{
+	{query: "invoice | message_type:sms subject:receipt", wantDefault: 2, wantAll: 3, wantSMS: 2},
+	{query: "message_type:sms subject:receipt | invoice", wantDefault: 2, wantAll: 3, wantSMS: 2},
+	{query: "invoice | account:missing@example.org", wantDefault: 1, wantAll: 2, wantSMS: 1},
+	{query: "invoice | subject:receipt", wantDefault: 1, wantAll: 3, wantSMS: 2},
 }

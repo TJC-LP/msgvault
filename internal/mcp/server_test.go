@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"math"
 	"net"
 	"net/http"
@@ -23,12 +24,15 @@ import (
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/msgvault/internal/daemonclient"
 	"go.kenn.io/msgvault/internal/deletion"
 	"go.kenn.io/msgvault/internal/export"
+	"go.kenn.io/msgvault/internal/msgsegment"
 	"go.kenn.io/msgvault/internal/personscope"
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/query/querytest"
 	"go.kenn.io/msgvault/internal/search"
+	"go.kenn.io/msgvault/internal/senderauth"
 	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/testutil"
 	"go.kenn.io/msgvault/internal/testutil/storetest"
@@ -160,7 +164,7 @@ func (e *listAccountsTrackingEngine) ListAccounts(ctx context.Context) ([]query.
 func callToolDirect(t *testing.T, name string, fn toolHandler, args map[string]any) *toolResult {
 	t.Helper()
 	req := toolRequest{arguments: args}
-	result, err := fn(context.Background(), req)
+	result, err := fn(t.Context(), req)
 	require.NoError(t, err, "%s handler returned error", name)
 	return result
 }
@@ -189,35 +193,13 @@ func runToolExpectError(t *testing.T, name string, fn toolHandler, args map[stri
 	return r
 }
 
-func TestJSONResultIsStructured(t *testing.T) {
-	must := require.New(t)
-	localResult, err := jsonResult(map[string]any{
-		"count": float64(2),
-		"items": []any{"alpha", "beta"},
-	})
-	must.NoError(err)
-	wireResult, output, err := officialToolHandler(func(context.Context, toolRequest) (*toolResult, error) {
-		return localResult, nil
-	})(context.Background(), &sdkmcp.CallToolRequest{}, map[string]any{})
-	must.NoError(err)
-	must.NotNil(wireResult)
-
-	var textPayload any
-	must.NoError(json.Unmarshal([]byte(resultText(t, localResult)), &textPayload))
-	var outputPayload any
-	outputJSON, err := json.Marshal(output)
-	must.NoError(err)
-	must.NoError(json.Unmarshal(outputJSON, &outputPayload))
-	assert.Equal(t, textPayload, outputPayload)
-}
-
 func TestToolErrorHasNoStructuredOutput(t *testing.T) {
 	checks := assert.New(t)
 	must := require.New(t)
 	localResult := toolErrorResult("test failure")
 	wireResult, output, err := officialToolHandler(func(context.Context, toolRequest) (*toolResult, error) {
 		return localResult, nil
-	})(context.Background(), &sdkmcp.CallToolRequest{}, map[string]any{})
+	})(t.Context(), &sdkmcp.CallToolRequest{}, map[string]any{})
 	must.NoError(err)
 	checks.Nil(output)
 	wireJSON, err := json.Marshal(wireResult)
@@ -232,7 +214,7 @@ func TestOfficialToolHandlerSanitizesInternalErrors(t *testing.T) {
 	checks := assert.New(t)
 	wireResult, output, err := officialToolHandler(func(context.Context, toolRequest) (*toolResult, error) {
 		return nil, &internalError{operation: "load private archive", cause: errors.New("secret filesystem path")}
-	})(context.Background(), &sdkmcp.CallToolRequest{}, map[string]any{})
+	})(t.Context(), &sdkmcp.CallToolRequest{}, map[string]any{})
 
 	checks.Nil(wireResult)
 	checks.Nil(output)
@@ -260,7 +242,7 @@ func TestErrorIsolationMiddlewarePreservesWrappedJSONRPCErrors(t *testing.T) {
 		return nil, wrappedErr
 	})
 
-	result, err := handler(context.Background(), "tools/call", nil)
+	result, err := handler(t.Context(), "tools/call", nil)
 
 	checks.Nil(result)
 	must.Same(wrappedErr, err)
@@ -273,9 +255,6 @@ func TestSearchMetadata(t *testing.T) {
 	eng := &querytest.MockEngine{
 		SearchFastResults: []query.MessageSummary{
 			testutil.NewMessageSummary(1).WithSubject("Hello").WithFromEmail("alice@example.com").WithSourceConversationID("thread-abc").WithConversationID(99).Build(),
-		},
-		SearchFastCountFunc: func(_ context.Context, _ *search.Query, _ query.MessageFilter) (int64, error) {
-			return 1, nil
 		},
 	}
 	h := newTestHandlers(eng)
@@ -295,6 +274,48 @@ func TestSearchMetadata(t *testing.T) {
 		runToolExpectError(t, "search_metadata", h.searchMetadata, map[string]any{})
 	})
 
+	t.Run("delegated pagination", func(t *testing.T) {
+		for _, tc := range []struct {
+			name     string
+			rows     int
+			total    int64
+			returned int
+			hasMore  bool
+		}{
+			{"unknown extra", 3, -1, 2, true},
+			{"unknown exact", 2, -1, 2, false},
+			{"unknown short", 1, -1, 1, false},
+			{"unknown empty", 0, -1, 0, false},
+			{"known extra", 3, 10, 2, true},
+			{"known last", 1, 5, 1, false},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				checks := assert.New(t)
+				eng := &querytest.MockEngine{
+					SearchFastWithStatsFunc: func(_ context.Context, _ *search.Query, _ string, _ query.MessageFilter, _ query.ViewType, limit, offset int) (*query.SearchFastResult, error) {
+						checks.Equal(3, limit)
+						checks.Equal(4, offset)
+						return &query.SearchFastResult{
+							Messages: make([]query.MessageSummary, tc.rows), TotalCount: tc.total, IndexState: "building",
+						}, nil
+					},
+				}
+				h := newTestHandlers(eng)
+				h.delegatedOnly = true
+				resp := runTool[searchMetadataResponse](t, "search_metadata", h.searchMetadata, map[string]any{
+					"query": "from:alice", "limit": float64(2), "offset": float64(4),
+				})
+				checks.Len(resp.Data, tc.returned)
+				checks.NotNil(resp.Data)
+				checks.Equal(tc.returned, resp.Returned)
+				checks.Equal(tc.total, resp.Total)
+				checks.Equal(4, resp.Offset)
+				checks.Equal(tc.hasMore, resp.HasMore)
+				checks.Equal("building", resp.IndexState)
+			})
+		}
+	})
+
 	for _, tc := range []struct {
 		name  string
 		query string
@@ -307,12 +328,10 @@ func TestSearchMetadata(t *testing.T) {
 			require := require.New(t)
 			var got *search.Query
 			eng := &querytest.MockEngine{
-				SearchFastFunc: func(_ context.Context, q *search.Query, _ query.MessageFilter, _, _ int) ([]query.MessageSummary, error) {
+				SearchFastWithStatsFunc: func(_ context.Context, q *search.Query, _ string, _ query.MessageFilter, group query.ViewType, _, _ int) (*query.SearchFastResult, error) {
+					assert.Equal(query.ViewNoStats, group)
 					got = q
-					return []query.MessageSummary{testutil.NewMessageSummary(1).Build()}, nil
-				},
-				SearchFastCountFunc: func(_ context.Context, _ *search.Query, _ query.MessageFilter) (int64, error) {
-					return 1, nil
+					return &query.SearchFastResult{Messages: []query.MessageSummary{testutil.NewMessageSummary(1).Build()}, TotalCount: 1}, nil
 				},
 			}
 
@@ -513,9 +532,9 @@ func TestSearchRejectsInvalidQueryBeforeDispatch(t *testing.T) {
 				var backendCalled bool
 				engine := &listAccountsTrackingEngine{MockEngine: &querytest.MockEngine{
 					Accounts: []query.AccountInfo{{ID: 1, Identifier: "alice@example.com"}},
-					SearchFastFunc: func(context.Context, *search.Query, query.MessageFilter, int, int) ([]query.MessageSummary, error) {
+					SearchFastWithStatsFunc: func(context.Context, *search.Query, string, query.MessageFilter, query.ViewType, int, int) (*query.SearchFastResult, error) {
 						backendCalled = true
-						return nil, nil
+						return &query.SearchFastResult{}, nil
 					},
 				}}
 				h := &handlers{engine: engine}
@@ -575,9 +594,6 @@ func TestSearchMetadata_MetadataOnly(t *testing.T) {
 		SearchResults: []query.MessageSummary{
 			testutil.NewMessageSummary(2).WithSubject("Body match").WithFromEmail("bob@example.com").Build(),
 		},
-		SearchFastCountFunc: func(_ context.Context, _ *search.Query, _ query.MessageFilter) (int64, error) {
-			return 1, nil
-		},
 	}
 	h := newTestHandlers(eng)
 
@@ -598,15 +614,11 @@ func TestSearchMetadata_NonPositiveLimitUsesDefault(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			assert := assert.New(t)
 			eng := &querytest.MockEngine{
-				SearchFastFunc: func(_ context.Context, _ *search.Query, _ query.MessageFilter, gotLimit, offset int) ([]query.MessageSummary, error) {
-					assert.Equal(defaultSearchLimit, gotLimit, "limit")
+				SearchFastWithStatsFunc: func(_ context.Context, _ *search.Query, _ string, _ query.MessageFilter, group query.ViewType, gotLimit, offset int) (*query.SearchFastResult, error) {
+					assert.Equal(query.ViewNoStats, group)
+					assert.Equal(defaultSearchLimit+1, gotLimit, "limit")
 					assert.Equal(0, offset, "offset")
-					return []query.MessageSummary{
-						testutil.NewMessageSummary(1).WithSubject("Hello").Build(),
-					}, nil
-				},
-				SearchFastCountFunc: func(context.Context, *search.Query, query.MessageFilter) (int64, error) {
-					return 1, nil
+					return &query.SearchFastResult{Messages: []query.MessageSummary{testutil.NewMessageSummary(1).WithSubject("Hello").Build()}, TotalCount: 1}, nil
 				},
 			}
 			h := newTestHandlers(eng)
@@ -625,9 +637,6 @@ func TestSearchMessagesCompatibilityDispatchesMetadata(t *testing.T) {
 	eng := &querytest.MockEngine{
 		SearchFastResults: []query.MessageSummary{
 			testutil.NewMessageSummary(3).WithSubject("legacy metadata result").Build(),
-		},
-		SearchFastCountFunc: func(context.Context, *search.Query, query.MessageFilter) (int64, error) {
-			return 1, nil
 		},
 	}
 	h := newTestHandlers(eng)
@@ -1229,7 +1238,7 @@ func TestSearchMessageBodies_HonorsBackendCancellation(t *testing.T) {
 		},
 	}
 	h := newTestHandlers(engine)
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 	req := toolRequest{arguments: map[string]any{"query": "needle"}}
 
@@ -1374,6 +1383,7 @@ func TestSearchMessageBodies_HybridUsesDaemonSearcher(t *testing.T) {
 	var gotReq HybridSearchRequest
 	rrf := 0.42
 	engine := &querytest.MockEngine{
+		Accounts: []query.AccountInfo{{ID: 1, Identifier: "alice@example.com"}},
 		GetMessageSummariesByIDsFunc: func(_ context.Context, ids []int64) ([]query.MessageSummary, error) {
 			assert.Equal([]int64{102}, ids, "hydrated ids")
 			return []query.MessageSummary{
@@ -1450,6 +1460,26 @@ func TestSearchMessageBodies_HybridUsesDaemonSearcher(t *testing.T) {
 	}, resp.Timings, "phase timings")
 }
 
+func TestSemanticSearchMessages_DaemonIndexStaleKeepsRebuildAdvice(t *testing.T) {
+	const advice = "the vector index does not match configured embedding settings; run `msgvault embeddings build --full-rebuild`"
+	h := &handlers{
+		engine: &querytest.MockEngine{},
+		hybridSearcher: hybridSearcherFunc(func(context.Context, HybridSearchRequest) (*HybridSearchResult, error) {
+			return nil, fmt.Errorf("search daemon: %w", &daemonclient.APIError{
+				Status: http.StatusServiceUnavailable, Code: "index_stale", Message: advice,
+			})
+		}),
+	}
+
+	r := runToolExpectError(t, "semantic_search_messages", h.semanticSearchMessages, map[string]any{
+		"query": "semantic terms",
+		"mode":  searchModeHybrid,
+	})
+	text := resultText(t, r)
+	assert.Equal(t, "index_stale: "+advice, text)
+	assert.NotContains(t, text, "restart that daemon")
+}
+
 func TestSearchMessageBodies_HybridDaemonFilterOnlyGuidance(t *testing.T) {
 	searcherCalled := false
 	h := &handlers{
@@ -1508,7 +1538,7 @@ func TestAttachVectorChunkMatches_HTMLOnlyUsesEmbeddingCorpus(t *testing.T) {
 	}
 	items := []searchMessageItem{{ID: messageID}}
 
-	require.NoError(t, h.attachVectorChunkMatches(context.Background(), 1, []float32{1}, items, 0))
+	require.NoError(t, h.attachVectorChunkMatches(t.Context(), 1, []float32{1}, items, 0))
 
 	require.Len(t, items[0].Matches, 1)
 	assert.Equal(t, "semantic needle", items[0].Matches[0].Snippet)
@@ -1972,6 +2002,99 @@ func TestSearchMessageBodies_UnknownMode(t *testing.T) {
 }
 
 func TestGetMessage(t *testing.T) {
+	t.Run("segment windows and limits", func(t *testing.T) {
+		for _, tc := range []struct {
+			name, body, messageType, html string
+			args                          map[string]any
+			want                          []msgsegment.Segment
+			truncated                     bool
+		}{
+			{"first page", "New\n> Old\n", "email", "", map[string]any{"max_chars": float64(6)}, []msgsegment.Segment{{Kind: msgsegment.Authored, Start: 0, End: 4}, {Kind: msgsegment.Quoted, Start: 4, End: 10, Depth: 1}}, false},
+			{"second page", "New\n> Old\n", "email", "", map[string]any{"offset": float64(6)}, []msgsegment.Segment{{Kind: msgsegment.Quoted, Start: 4, End: 10, Depth: 1}}, false},
+			{"chat", "> my markdown\n", "beeper", "", nil, []msgsegment.Segment{{Kind: msgsegment.Authored, Start: 0, End: 14}}, false},
+			{"HTML only", "", "email", "<p>Hello</p>", nil, nil, false},
+			{"explicit HTML", "Hello", "email", "<p>Hello</p>", map[string]any{"body_format": "html"}, nil, false},
+			{"empty text", "", "beeper", "", nil, nil, false},
+			{"past end", "New\n> Old\n", "email", "", map[string]any{"offset": float64(10)}, nil, false},
+			{"scan limit", strings.Repeat("a", msgsegment.MaxBodyBytes+1), "email", "", nil, []msgsegment.Segment{{Kind: msgsegment.Authored, Start: 0, End: msgsegment.MaxBodyBytes + 1}}, true},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				message := testutil.NewMessageDetail(42).WithBodyText(tc.body).WithBodyHTML(tc.html).BuildPtr()
+				message.MessageType = tc.messageType
+				h := newTestHandlers(&querytest.MockEngine{Messages: map[int64]*query.MessageDetail{42: message}})
+				args := map[string]any{"id": float64(42), "include_segments": true}
+				maps.Copy(args, tc.args)
+				got := runTool[getMessageResponse](t, ToolGetMessage, h.getMessage, args)
+				assert.Equal(t, tc.want, got.Segments)
+				assert.Equal(t, tc.truncated, got.SegmentsTruncated)
+				if got.BodyFormat == bodyFormatHTML {
+					assert.Equal(t, "unsupported_format", got.SegmentsUnavailable)
+					assert.Empty(t, got.SegmentsVersion)
+				} else {
+					assert.Equal(t, "seg-v1", got.SegmentsVersion)
+					assert.Empty(t, got.SegmentsUnavailable)
+				}
+			})
+		}
+	})
+
+	t.Run("alternating body", func(t *testing.T) {
+		assert := assert.New(t)
+		body := strings.Repeat("a\n> b\n", 70000)
+		h := newTestHandlers(&querytest.MockEngine{Messages: map[int64]*query.MessageDetail{
+			42: testutil.NewMessageDetail(42).WithBodyText(body).BuildPtr(),
+		}})
+		page := runTool[getMessageResponse](t, ToolGetMessage, h.getMessage, map[string]any{"id": float64(42), "include_segments": true, "max_chars": float64(4)})
+		assert.Equal([]msgsegment.Segment{{Kind: msgsegment.Authored, Start: 0, End: 2}, {Kind: msgsegment.Quoted, Start: 2, End: 6, Depth: 1}}, page.Segments)
+		assert.False(page.SegmentsTruncated)
+		late := runTool[getMessageResponse](t, ToolGetMessage, h.getMessage, map[string]any{"id": float64(42), "include_segments": true, "offset": float64(419996), "max_chars": float64(4)})
+		assert.Equal([]msgsegment.Segment{{Kind: msgsegment.Quoted, Start: 419996, End: 420000, Depth: 1}}, late.Segments)
+		assert.False(late.SegmentsTruncated)
+	})
+
+	t.Run("segment flag off", func(t *testing.T) {
+		h := newTestHandlers(&querytest.MockEngine{Messages: map[int64]*query.MessageDetail{
+			42: testutil.NewMessageDetail(42).WithBodyText("New\n> Old\n").BuildPtr(),
+		}})
+		for _, args := range []map[string]any{{"id": float64(42)}, {"id": float64(42), "include_segments": false}} {
+			got := runTool[map[string]any](t, ToolGetMessage, h.getMessage, args)
+			for _, key := range []string{"segments", "segments_version", "segments_truncated", "segments_unavailable"} {
+				assert.NotContains(t, got, key)
+			}
+		}
+	})
+
+	t.Run("segments through SDK", func(t *testing.T) {
+		assert := assert.New(t)
+		require := require.New(t)
+		eng := &querytest.MockEngine{Messages: map[int64]*query.MessageDetail{
+			42: testutil.NewMessageDetail(42).WithBodyText("New\n> Old\n").BuildPtr(),
+			43: testutil.NewMessageDetail(43).WithBodyText("New\n> Old\n>> Older\n-- \nSender\nBegin forwarded message:\nOld").BuildPtr(),
+		}}
+		ctx := t.Context()
+		session := task5ConnectClient(t, ServeOptions{Engine: eng}, false)
+		result, err := session.CallTool(ctx, &sdkmcp.CallToolParams{Name: ToolGetMessage, Arguments: map[string]any{"id": 42, "include_segments": true}})
+		require.NoError(err)
+		require.False(result.IsError)
+		got := task5StructuredAs[map[string]any](t, result)
+		assert.Equal("seg-v1", got["segments_version"])
+		assert.Equal([]any{
+			map[string]any{"kind": "authored", "start": float64(0), "end": float64(4)},
+			map[string]any{"kind": "quoted", "start": float64(4), "end": float64(10), "depth": float64(1)},
+		}, got["segments"])
+		result, err = session.CallTool(ctx, &sdkmcp.CallToolParams{Name: ToolGetMessage, Arguments: map[string]any{"id": 43, "include_segments": true}})
+		require.NoError(err)
+		require.False(result.IsError)
+		got = task5StructuredAs[map[string]any](t, result)
+		assert.Equal([]any{
+			map[string]any{"kind": "authored", "start": float64(0), "end": float64(4)},
+			map[string]any{"kind": "quoted", "start": float64(4), "end": float64(10), "depth": float64(1)},
+			map[string]any{"kind": "quoted", "start": float64(10), "end": float64(19), "depth": float64(2)},
+			map[string]any{"kind": "signature", "start": float64(19), "end": float64(30)},
+			map[string]any{"kind": "forwarded", "start": float64(30), "end": float64(58)},
+		}, got["segments"])
+	})
+
 	eng := &querytest.MockEngine{
 		Messages: map[int64]*query.MessageDetail{
 			42: testutil.NewMessageDetail(42).WithSubject("Test Message").WithBodyText("Hello world").WithSourceConversationID("thread-xyz").BuildPtr(),
@@ -1991,6 +2114,38 @@ func TestGetMessage(t *testing.T) {
 		assert.False(msg.HasMore, "has_more")
 	})
 
+	t.Run("sender authentication", func(t *testing.T) {
+		verdict := &senderauth.Verdict{Verified: true, Domain: "example.test", AuthservID: "mx.google.com", DMARC: "pass"}
+		handlers := newTestHandlers(&querytest.MockEngine{Messages: map[int64]*query.MessageDetail{42: {ID: 42, BodyText: "Archived body", SenderAuth: verdict}}})
+		got := runTool[getMessageResponse](t, "get_message", handlers.getMessage, map[string]any{"id": float64(42)})
+		assert.Equal(t, verdict, got.SenderAuth)
+	})
+
+	t.Run("stored HTML hidden text", func(t *testing.T) {
+		for _, tc := range []struct {
+			name   string
+			html   string
+			hidden bool
+		}{
+			{"hidden", `<p>Visible</p><div style="display:none">Hidden text</div>`, true},
+			{"visible", `<p>Visible</p>`, false},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				f := storetest.New(t)
+				messageID := f.CreateMessage("stored-html")
+				require.NoError(t, f.Store.UpsertMessageBody(messageID,
+					sql.NullString{String: "Previously archived text", Valid: true},
+					sql.NullString{String: tc.html, Valid: true}))
+				_, err := f.Store.DB().ExecContext(t.Context(), f.Store.Rebind(`UPDATE messages SET hidden_text_present = ? WHERE id = ?`), tc.hidden, messageID)
+				require.NoError(t, err)
+				handlers := newTestHandlers(query.NewEngine(f.Store.DB(), f.Store.IsPostgreSQL()))
+				msg := runTool[map[string]any](t, "get_message", handlers.getMessage, map[string]any{"id": float64(messageID)})
+				assert.Equal(t, tc.hidden, msg["hidden_text_present"])
+				assert.Equal(t, "Previously archived text", msg["body_text"])
+			})
+		}
+	})
+
 	t.Run("sender-id-only message", func(t *testing.T) {
 		f := storetest.New(t)
 		senderID := f.EnsureParticipant("sender@example.com", "Test Sender", "example.com")
@@ -1998,7 +2153,7 @@ func TestGetMessage(t *testing.T) {
 			WithSourceMessageID("beeper-sender-only").
 			WithSubject("Synthetic Beeper message").
 			Create(t, f.Store)
-		_, err := f.Store.DB().Exec(f.Store.Rebind(
+		_, err := f.Store.DB().ExecContext(t.Context(), f.Store.Rebind(
 			`UPDATE messages SET message_type = 'beeper', sender_id = ? WHERE id = ?`,
 		), senderID, messageID)
 		require.NoError(t, err, "set direct sender")
@@ -2237,15 +2392,6 @@ func TestGetMessage(t *testing.T) {
 	}
 }
 
-func TestGetMessageToolDescriptionDoesNotReferenceFutureTools(t *testing.T) {
-	tool := getMessageDefinition(&handlers{}).tool()
-	assert.NotContains(t, tool.Description, "search_in_message")
-	centerAt := toolInputSchema(t, tool).Properties["center_at"]
-	raw, err := json.Marshal(centerAt)
-	require.NoError(t, err, "marshal center_at schema")
-	assert.NotContains(t, string(raw), "search_in_message")
-}
-
 func TestGetStats_VectorDisabled(t *testing.T) {
 	assert := assert.New(t)
 	eng := &querytest.MockEngine{
@@ -2351,35 +2497,11 @@ func TestGetStats_VectorStatsFailureReturnsPartialResponse(t *testing.T) {
 	checks.Contains(logs.String(), sentinel)
 }
 
-// toolPropertyDescription returns the description string for a tool input property.
 func toolInputSchema(t *testing.T, tool *sdkmcp.Tool) *jsonschema.Schema {
 	t.Helper()
 	schema, ok := tool.InputSchema.(*jsonschema.Schema)
 	require.True(t, ok, "input schema type: %T", tool.InputSchema)
 	return schema
-}
-
-func toolPropertyDescription(t *testing.T, tool *sdkmcp.Tool, name string) string {
-	t.Helper()
-	property := toolInputSchema(t, tool).Properties[name]
-	if property == nil {
-		return ""
-	}
-	return property.Description
-}
-
-// TestAggregateTool_DocumentsTimeGranularity guards the group_by=time contract:
-// MCP always buckets by calendar year (the handler does not set TimeGranularity).
-func TestAggregateTool_DocumentsTimeGranularity(t *testing.T) {
-	tool := aggregateDefinition(&handlers{}).tool()
-	desc := tool.Description
-	groupByDesc := toolPropertyDescription(t, tool, "group_by")
-
-	assert := assert.New(t)
-	assert.Contains(desc, "calendar year", "tool description should document yearly time buckets")
-	assert.Contains(desc, "TotalUnique", "tool description should list response fields")
-	assert.Contains(groupByDesc, "calendar year", "group_by description should document yearly granularity")
-	assert.Contains(groupByDesc, `"2024"`, "group_by description should show example year key")
 }
 
 func TestAggregate(t *testing.T) {
@@ -2401,7 +2523,7 @@ func TestAggregate(t *testing.T) {
 	t.Run("list uses mailing-list dimension", func(t *testing.T) {
 		f := storetest.New(t)
 		messageID := f.NewMessage().WithSourceMessageID("mcp-list-aggregate").Create(t, f.Store)
-		_, err := f.Store.DB().Exec(f.Store.Rebind(`UPDATE messages SET list_id = ? WHERE id = ?`),
+		_, err := f.Store.DB().ExecContext(t.Context(), f.Store.Rebind(`UPDATE messages SET list_id = ? WHERE id = ?`),
 			"<announce.example.test>", messageID)
 		require.NoError(t, err)
 		realHandlers := newTestHandlers(query.NewEngine(f.Store.DB(), f.Store.IsPostgreSQL()))
@@ -2943,9 +3065,6 @@ func TestAccountFilter(t *testing.T) {
 	h := newTestHandlers(eng)
 
 	t.Run("search with valid account", func(t *testing.T) {
-		eng.SearchFastCountFunc = func(_ context.Context, _ *search.Query, _ query.MessageFilter) (int64, error) {
-			return 1, nil
-		}
 		resp := runTool[paginatedSearchMessages](t, "search_metadata", h.searchMetadata, map[string]any{
 			"query":   "test",
 			"account": "alice@gmail.com",
@@ -2956,7 +3075,7 @@ func TestAccountFilter(t *testing.T) {
 	t.Run("search with invalid account", func(t *testing.T) {
 		r := runToolExpectError(t, "search_message_bodies", h.searchMessageBodies, map[string]any{
 			"query":   "test",
-			"account": "unknown@gmail.com",
+			"account": "unknown-account",
 		})
 		txt := resultText(t, r)
 		assert.Contains(t, txt, "account not found", "expected 'account not found' error, got: %s")
@@ -2971,7 +3090,7 @@ func TestAccountFilter(t *testing.T) {
 
 	t.Run("list with invalid account", func(t *testing.T) {
 		r := runToolExpectError(t, "list_messages", h.listMessages, map[string]any{
-			"account": "unknown@gmail.com",
+			"account": "unknown-account",
 		})
 		txt := resultText(t, r)
 		assert.Contains(t, txt, "account not found", "expected 'account not found' error, got: %s")
@@ -2988,7 +3107,7 @@ func TestAccountFilter(t *testing.T) {
 	t.Run("aggregate with invalid account", func(t *testing.T) {
 		r := runToolExpectError(t, "aggregate", h.aggregate, map[string]any{
 			"group_by": "sender",
-			"account":  "unknown@gmail.com",
+			"account":  "unknown-account",
 		})
 		txt := resultText(t, r)
 		assert.Contains(t, txt, "account not found", "expected 'account not found' error, got: %s")
@@ -2996,15 +3115,62 @@ func TestAccountFilter(t *testing.T) {
 
 	t.Run("empty account means no filter", func(t *testing.T) {
 		// Empty string should not filter - return all results
-		eng.SearchFastCountFunc = func(_ context.Context, _ *search.Query, _ query.MessageFilter) (int64, error) {
-			return 1, nil
-		}
 		resp := runTool[paginatedSearchMessages](t, "search_metadata", h.searchMetadata, map[string]any{
 			"query":   "test",
 			"account": "",
 		})
 		assert.Len(t, resp.Data, 1, "data")
 	})
+}
+
+func TestSearchInMessageHiddenHTMLText(t *testing.T) {
+	for _, tc := range []struct {
+		name, html, mode string
+		offset, matches  int
+		hidden           bool
+	}{
+		{"hidden keyword", `<div hidden>semantic body</div>`, "keyword", 0, 1, true},
+		{"hidden keyword exhausted", `<div hidden>semantic body</div>`, "keyword", 99, 0, true},
+		{"visible keyword", `<p>semantic body</p>`, "keyword", 0, 1, false},
+		{"hidden vector", `<div hidden>semantic body</div>`, searchModeVector, 0, 1, true},
+		{"hidden vector exhausted", `<div hidden>semantic body</div>`, searchModeVector, 99, 0, true},
+		{"visible vector", `<p>semantic body</p>`, searchModeVector, 0, 1, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert, require := assert.New(t), require.New(t)
+			f := storetest.New(t)
+			id := f.CreateMessage("stored-html")
+			require.NoError(f.Store.UpsertMessageBody(id,
+				sql.NullString{String: "semantic body", Valid: true},
+				sql.NullString{String: tc.html, Valid: true}))
+			_, err := f.Store.DB().ExecContext(t.Context(), f.Store.Rebind(`UPDATE messages SET hidden_text_present = ? WHERE id = ?`), tc.hidden, id)
+			require.NoError(err)
+			h := newTestHandlers(query.NewEngine(f.Store.DB(), f.Store.IsPostgreSQL()))
+			if tc.mode == searchModeVector {
+				h.vectorCfg = testSimilarVectorConfig()
+				backend := &fakeBackend{
+					active: testSimilarActiveGeneration(h.vectorCfg),
+					chunkHits: map[int64][]vector.ChunkHit{
+						id: {{ChunkCharStart: 0, ChunkCharEnd: len("semantic body"), Score: 0.9}},
+					},
+				}
+				h.backend = backend
+				h.hybridEngine = hybrid.NewEngine(backend, nil, realEmbedder{dim: 4}, hybrid.Config{
+					ExpectedFingerprint: h.vectorCfg.GenerationFingerprint(), RRFK: 60, KPerSignal: 10,
+				})
+			}
+			resp := runTool[struct {
+				paginatedInMessageMatches
+
+				HiddenTextPresent *bool `json:"hidden_text_present"`
+			}](t, "search_in_message", h.searchInMessage, map[string]any{
+				"id": float64(id), "query": "semantic", "mode": tc.mode, "offset": float64(tc.offset),
+			})
+			require.NotNil(resp.HiddenTextPresent)
+			assert.Equal(tc.hidden, *resp.HiddenTextPresent)
+			assert.Len(resp.Data, tc.matches)
+		})
+	}
 }
 
 func TestSearchInMessage(t *testing.T) {
@@ -3185,27 +3351,14 @@ func (s *captureDeletionManifestSaver) SaveManifest(_ context.Context, manifest 
 func TestStageDeletion(t *testing.T) {
 	eng := &querytest.MockEngine{
 		Accounts: []query.AccountInfo{
-			{ID: 1, SourceType: "gmail", Identifier: "alice@gmail.com"},
+			{ID: 1, SourceType: "gmail", Identifier: "alice@example.com"},
 		},
-		SearchFastResults: []query.MessageSummary{
-			{ID: 1, SourceID: 1, Subject: "Newsletter", FromEmail: "news@example.com", SourceMessageID: "gmail-001"},
-			{ID: 2, SourceID: 1, Subject: "Promo", FromEmail: "promo@example.com", SourceMessageID: "gmail-002"},
+		DeletionTargets: []query.DeletionTarget{
+			{MessageID: 1, SourceID: 1, SourceType: "gmail", SourceIdentifier: "alice@example.com", SourceMessageID: "gmail-001"},
+			{MessageID: 2, SourceID: 1, SourceType: "gmail", SourceIdentifier: "alice@example.com", SourceMessageID: "gmail-002"},
 		},
 		GmailIDs: []string{"gmail-010", "gmail-011"},
 	}
-
-	t.Run("query-based staging", func(t *testing.T) {
-		dataDir := t.TempDir()
-		h := &handlers{engine: eng, dataDir: dataDir}
-
-		resp := runTool[stageDeletionResponse](
-			t, "stage_deletion", h.stageDeletion,
-			map[string]any{"query": "from:news"},
-		)
-		assert.Equal(t, 2, resp.MessageCount, "MessageCount")
-		assert.Equal(t, "pending", resp.Status, "Status")
-		assert.NotEmpty(t, resp.BatchID, "BatchID")
-	})
 
 	t.Run("structured filter staging", func(t *testing.T) {
 		dataDir := t.TempDir()
@@ -3235,38 +3388,8 @@ func TestStageDeletion(t *testing.T) {
 		assert.Equal([]string{"gmail-001", "gmail-002"}, saver.manifest.GmailIDs, "gmail IDs")
 		assert.Equal(2, saver.manifest.Version)
 		require.NotNil(t, saver.manifest.Source)
-		assert.Equal(deletion.SourceReference{ID: 1, Type: "gmail", Identifier: "alice@gmail.com"}, *saver.manifest.Source)
+		assert.Equal(deletion.SourceReference{ID: 1, Type: "gmail", Identifier: "alice@example.com"}, *saver.manifest.Source)
 		assert.NoDirExists(filepath.Join(dataDir, "deletions"), "local fallback should not be used")
-	})
-
-	t.Run("query result without source ID is rejected", func(t *testing.T) {
-		saver := &captureDeletionManifestSaver{}
-		h := &handlers{
-			engine: &querytest.MockEngine{
-				Accounts:          []query.AccountInfo{{ID: 1, SourceType: "gmail", Identifier: "alice@gmail.com"}},
-				SearchFastResults: []query.MessageSummary{{ID: 7, SourceMessageID: "gmail-007"}},
-			},
-			dataDir: t.TempDir(), manifestSaver: saver,
-		}
-
-		result := runToolExpectError(t, "stage_deletion", h.stageDeletion, map[string]any{"query": "from:news"})
-		assert.Contains(t, resultText(t, result), "has no source metadata")
-		assert.Nil(t, saver.manifest)
-	})
-
-	t.Run("query result with incomplete account source is rejected", func(t *testing.T) {
-		saver := &captureDeletionManifestSaver{}
-		h := &handlers{
-			engine: &querytest.MockEngine{
-				Accounts:          []query.AccountInfo{{ID: 1, Identifier: "alice@gmail.com"}},
-				SearchFastResults: []query.MessageSummary{{ID: 8, SourceID: 1, SourceMessageID: "gmail-008"}},
-			},
-			dataDir: t.TempDir(), manifestSaver: saver,
-		}
-
-		result := runToolExpectError(t, "stage_deletion", h.stageDeletion, map[string]any{"query": "from:news"})
-		assert.Contains(t, resultText(t, result), "has incomplete source metadata")
-		assert.Nil(t, saver.manifest)
 	})
 
 	t.Run("whitespace-only query rejected", func(t *testing.T) {
@@ -3329,13 +3452,13 @@ func TestStageDeletion(t *testing.T) {
 		var capturedFilter query.MessageFilter
 		eng := &querytest.MockEngine{
 			Accounts: []query.AccountInfo{
-				{ID: 1, Identifier: "alice@gmail.com"},
+				{ID: 1, Identifier: "alice@example.com"},
 			},
 			GetDeletionTargetsByFilterFunc: func(_ context.Context, f query.MessageFilter) ([]query.DeletionTarget, error) {
 				capturedFilter = f
 				return []query.DeletionTarget{{
 					MessageID: 100, SourceID: 1, SourceType: "gmail",
-					SourceIdentifier: "alice@gmail.com", SourceMessageID: "gmail-100",
+					SourceIdentifier: "alice@example.com", SourceMessageID: "gmail-100",
 				}}, nil
 			},
 		}
@@ -3344,7 +3467,7 @@ func TestStageDeletion(t *testing.T) {
 		runTool[stageDeletionResponse](
 			t, "stage_deletion", h.stageDeletion,
 			map[string]any{
-				"account": "alice@gmail.com",
+				"account": "alice@example.com",
 				"from":    "news@example.com",
 			},
 		)
@@ -3359,7 +3482,7 @@ func TestStageDeletion(t *testing.T) {
 		r := runToolExpectError(
 			t, "stage_deletion", h.stageDeletion,
 			map[string]any{
-				"account": "unknown@gmail.com",
+				"account": "unknown-account",
 				"from":    "news@example.com",
 			},
 		)
@@ -3387,26 +3510,79 @@ func TestStageDeletion(t *testing.T) {
 		assert.Contains(t, resultText(t, r), "matches multiple sources")
 	})
 
-	t.Run("structured filter limit enforced", func(t *testing.T) {
-		dataDir := t.TempDir()
-		var capturedFilter query.MessageFilter
-		eng := &querytest.MockEngine{
-			GetDeletionTargetsByFilterFunc: func(_ context.Context, f query.MessageFilter) ([]query.DeletionTarget, error) {
-				capturedFilter = f
-				return []query.DeletionTarget{{
-					MessageID: 200, SourceID: 1, SourceType: "gmail",
-					SourceIdentifier: "test@gmail.com", SourceMessageID: "gmail-200",
-				}}, nil
-			},
-		}
-		h := &handlers{engine: eng, dataDir: dataDir}
-
-		runTool[stageDeletionResponse](
-			t, "stage_deletion", h.stageDeletion,
-			map[string]any{"domain": "example.com"},
-		)
-		assert.Equal(t, maxStageDeletionResults, capturedFilter.Pagination.Limit, "limit")
+	t.Run("older daemon returns an upgrade error without a batch", func(t *testing.T) {
+		assertions := assert.New(t)
+		engine := &querytest.MockEngine{GetDeletionTargetsBySearchBoundedFunc: func(context.Context, *search.Query, query.MessageFilter, query.DeletionSearchMode, int) ([]query.DeletionTarget, int, error) {
+			return nil, 0, daemonclient.ErrBoundedDeletionSearchUnsupported
+		}}
+		saver := &captureDeletionManifestSaver{}
+		h := &handlers{engine: engine, manifestSaver: saver}
+		result := runToolExpectError(t, "stage_deletion", h.stageDeletion, map[string]any{"query": "from:news"})
+		assertions.Contains(resultText(t, result), daemonclient.ErrBoundedDeletionSearchUnsupported.Error())
+		assertions.Nil(saver.manifest)
 	})
+
+	t.Run("selection over the limit is refused without a batch", func(t *testing.T) {
+		saver := &captureDeletionManifestSaver{}
+		engine := &querytest.MockEngine{GetDeletionTargetsBySearchBoundedFunc: func(_ context.Context, _ *search.Query, _ query.MessageFilter, mode query.DeletionSearchMode, limit int) ([]query.DeletionTarget, int, error) {
+			assert.Equal(t, query.DeletionSearchFast, mode)
+			assert.Equal(t, 100001, limit)
+			return nil, 100001, nil
+		}}
+		h := &handlers{engine: engine, manifestSaver: saver}
+		result := runToolExpectError(t, "stage_deletion", h.stageDeletion, map[string]any{"query": "from:news"})
+		assert.Contains(t, resultText(t, result), "before:/after: or account")
+		assert.Nil(t, saver.manifest)
+	})
+	t.Run("structured selection over the limit is refused without a batch", func(t *testing.T) {
+		saver := &captureDeletionManifestSaver{}
+		engine := &querytest.MockEngine{GetDeletionTargetsByFilterFunc: func(_ context.Context, f query.MessageFilter) ([]query.DeletionTarget, error) {
+			assert.Equal(t, 100001, f.Pagination.Limit)
+			return make([]query.DeletionTarget, 100001), nil
+		}}
+		h := &handlers{engine: engine, manifestSaver: saver}
+		result := runToolExpectError(t, "stage_deletion", h.stageDeletion, map[string]any{"domain": "example.com"})
+		assert.Contains(t, resultText(t, result), "before:/after: or account")
+		assert.Nil(t, saver.manifest)
+	})
+	for _, tc := range []struct {
+		name    string
+		targets []query.DeletionTarget
+		matched int
+	}{
+		{name: "query-based staging", targets: eng.DeletionTargets, matched: 2},
+		{name: "all matches undeletable refuses without a batch", matched: 3},
+		{name: "undeletable matches are skipped and counted", targets: eng.DeletionTargets, matched: 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert := assert.New(t)
+			require := require.New(t)
+			saver := &captureDeletionManifestSaver{}
+			engine := &querytest.MockEngine{GetDeletionTargetsBySearchBoundedFunc: func(context.Context, *search.Query, query.MessageFilter, query.DeletionSearchMode, int) ([]query.DeletionTarget, int, error) {
+				return tc.targets, tc.matched, nil
+			}}
+			h := &handlers{engine: engine, manifestSaver: saver}
+			if len(tc.targets) == 0 {
+				result := runToolExpectError(t, "stage_deletion", h.stageDeletion, map[string]any{"query": "archive"})
+				assert.Contains(resultText(t, result), "3 messages match, but none can be deleted from their source")
+				assert.Nil(saver.manifest)
+				return
+			}
+			resp := runTool[stageDeletionResponse](t, "stage_deletion", h.stageDeletion, map[string]any{"query": "archive"})
+			assert.Equal(2, resp.MessageCount)
+			assert.Equal("pending", resp.Status)
+			assert.NotEmpty(resp.BatchID)
+			if tc.matched == 2 {
+				assert.Zero(resp.SkippedCount)
+				assert.NotContains(resp.NextStep, "skipped")
+			} else {
+				assert.Equal(1, resp.SkippedCount)
+				assert.Contains(resp.NextStep, "1 of 3 matching item(s)")
+			}
+			require.NotNil(saver.manifest)
+			assert.Equal([]string{"gmail-001", "gmail-002"}, saver.manifest.GmailIDs)
+		})
+	}
 }
 
 func TestStageDeletionRejectsInvalidOrEmptyParsedQuery(t *testing.T) {
@@ -3609,7 +3785,7 @@ func TestFindSimilarMessages_UsesDaemonSearcher(t *testing.T) {
 	hasAttachment := true
 	after := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
 	h := &handlers{
-		engine: &querytest.MockEngine{},
+		engine: &querytest.MockEngine{Accounts: []query.AccountInfo{{ID: 1, Identifier: "alice@example.com"}}},
 		similarSearcher: similarSearcherFunc(func(_ context.Context, req SimilarSearchRequest) (*SimilarSearchResult, error) {
 			gotReq = req
 			return &SimilarSearchResult{
@@ -3726,80 +3902,6 @@ func TestSearchInMessageTool_AdvertisesVectorModeWhenConfigured(t *testing.T) {
 	assert.Contains(enabled.Description, "mode=vector", "vector-in-message available: tool description should mention vector mode, got: %q", enabled.Description)
 }
 
-func TestFindSimilarMessagesTool_AdvertisesMessageTypeFilter(t *testing.T) {
-	assert := assert.New(t)
-	tool := findSimilarMessagesDefinition(&handlers{}).tool()
-	assert.Contains(toolInputSchema(t, tool).Properties, "message_type")
-}
-
-// TestSearchMetadataTool_DocumentsQuerySyntax guards the operator-support
-// contract so clients do not assume full Gmail compatibility.
-func TestSearchMetadataTool_DocumentsQuerySyntax(t *testing.T) {
-	assert := assert.New(t)
-	tool := searchMetadataDefinition(&handlers{}).tool()
-	desc := tool.Description
-	for _, want := range []string{
-		"cc:",
-		"bcc:",
-		"older_than:",
-		"Not supported: negation",
-		"subject, snippet",
-	} {
-		assert.Contains(desc, want, "description missing %q", want)
-	}
-	assert.NotContains(desc, "Gmail-like", "description should not over-promise Gmail compatibility")
-	assert.Contains(desc, "semantic_search_messages", "metadata guidance should name the semantic tool")
-
-	queryDesc := toolPropertyDescription(t, tool, "query")
-	assert.Contains(queryDesc, "supported operators", "query param should reference operator docs")
-}
-
-// TestSearchMessageBodiesTool_DocumentsQuerySyntax guards the query-syntax
-// contract so MCP clients know how body FTS interprets free-text terms.
-func TestSearchMessageBodiesTool_DocumentsQuerySyntax(t *testing.T) {
-	assert := assert.New(t)
-	tool := searchMessageBodiesDefinition(&handlers{}).tool()
-
-	assert.Contains(tool.Description, "ANDed", "tool description should document implicit AND, got: %q", tool.Description)
-	assert.Contains(tool.Description, "double-quoted phrase", "tool description should document phrase matching, got: %q", tool.Description)
-	assert.Contains(tool.Description, "OR and NOT are not supported", "tool description should document missing boolean ops, got: %q", tool.Description)
-
-	queryDesc := toolPropertyDescription(t, tool, "query")
-	assert.Contains(queryDesc, "ANDed", "query param should document implicit AND, got: %q", queryDesc)
-	assert.Contains(queryDesc, "double quotes", "query param should document phrase matching, got: %q", queryDesc)
-	assert.Contains(queryDesc, "OR/NOT unsupported", "query param should document missing boolean ops, got: %q", queryDesc)
-}
-
-// TestSearchMessageBodiesTool_DocumentsFilterVsFreeText guards the contract
-// that Gmail operators are metadata filters and unrecognized word:value
-// tokens are literal body text.
-func TestSearchMessageBodiesTool_DocumentsFilterVsFreeText(t *testing.T) {
-	assert := assert.New(t)
-	tool := searchMessageBodiesDefinition(&handlers{}).tool()
-
-	assert.Contains(tool.Description, "metadata filters", "tool description should distinguish filters from free text, got: %q", tool.Description)
-	assert.Contains(tool.Description, "Unrecognized word:value", "tool description should document literal colon tokens, got: %q", tool.Description)
-
-	queryDesc := toolPropertyDescription(t, tool, "query")
-	assert.Contains(queryDesc, "metadata filters", "query param should distinguish filters from free text, got: %q", queryDesc)
-	assert.Contains(queryDesc, "subject:test alone is rejected", "query param should warn subject: is not free text, got: %q", queryDesc)
-	assert.Contains(queryDesc, "Unrecognized word:value", "query param should document literal colon tokens, got: %q", queryDesc)
-}
-
-// TestSearchMessageBodiesTool_DocumentsMatchesTruncated guards the response-field
-// contract for when excerpt lists are capped.
-func TestSearchMessageBodiesTool_DocumentsMatchesTruncated(t *testing.T) {
-	assert := assert.New(t)
-	tool := searchMessageBodiesDefinition(&handlers{}).tool()
-
-	assert.Contains(tool.Description, "matches_truncated",
-		"tool description should document matches_truncated, got: %q", tool.Description)
-	assert.Contains(tool.Description, "search_in_message",
-		"tool description should point callers to search_in_message, got: %q", tool.Description)
-	assert.Contains(tool.Description, "get_message",
-		"tool description should point callers to get_message, got: %q", tool.Description)
-}
-
 func TestFindSimilarMessages_MissingID(t *testing.T) {
 	h := &handlers{
 		engine:  &querytest.MockEngine{},
@@ -3855,6 +3957,7 @@ func TestFindSimilarMessages_HappyPath(t *testing.T) {
 }
 
 func TestFindSimilarMessages_RejectsStaleActiveGeneration(t *testing.T) {
+	assert := assert.New(t)
 	cfg := vector.Config{
 		Embeddings: vector.EmbeddingsConfig{
 			Model:         "nomic-embed",
@@ -3878,9 +3981,10 @@ func TestFindSimilarMessages_RejectsStaleActiveGeneration(t *testing.T) {
 		"message_id": float64(100),
 	})
 	txt := resultText(t, r)
-	assert.Contains(t, txt, "index_stale", "expected stale-index error, got: %s", txt)
-	assert.Equal(t, 0, fb.searchCalls, "backend search calls")
-	assert.Equal(t, 0, fb.loadCalls, "seed vector load calls")
+	assert.Contains(txt, "index_stale", "expected stale-index error, got: %s", txt)
+	assert.Contains(txt, "if the embedding settings on the archive host changed since its daemon started, restart that daemon")
+	assert.Equal(0, fb.searchCalls, "backend search calls")
+	assert.Equal(0, fb.loadCalls, "seed vector load calls")
 }
 
 func TestFindSimilarMessages_ScopedIndexRequiresMatchingMessageTypeFilter(t *testing.T) {
@@ -4020,46 +4124,54 @@ func TestSearchByDomains(t *testing.T) {
 		var capturedDomains []string
 		var capturedLimit, capturedOffset int
 		eng := &querytest.MockEngine{
-			SearchByDomainsFunc: func(_ context.Context, domains []string, after, before *time.Time, limit, offset int) ([]query.MessageSummary, error) {
+			SearchByDomainsFunc: func(_ context.Context, domains []string, after, before *time.Time, limit, offset int, _ []int64) (query.DomainSearchResult, error) {
 				capturedDomains = domains
 				capturedLimit = limit
 				capturedOffset = offset
 				assert.NotNil(after, "expected after to be set")
 				assert.NotNil(before, "expected before to be set")
-				return []query.MessageSummary{
-					testutil.NewMessageSummary(1).WithSubject("Match").Build(),
+				return query.DomainSearchResult{
+					Messages: []query.MessageSummary{
+						testutil.NewMessageSummary(1).WithSubject("Match").Build(),
+					},
+					HasMore: true,
 				}, nil
 			},
 		}
 		h := newTestHandlers(eng)
 
-		response := runTool[dataResponse[query.MessageSummary]](t, "search_by_domains", h.searchByDomains,
+		response := runTool[searchByDomainsResponse](t, "search_by_domains", h.searchByDomains,
 			map[string]any{
 				"domains": "acme.com,globex.com",
-				"limit":   float64(50),
+				"limit":   float64(1),
 				"offset":  float64(10),
 				"after":   "2024-01-01",
 				"before":  "2024-12-31",
 			})
 		assert.Len(response.Data, 1, "msgs")
+		assert.Equal(1, response.Returned, "returned")
+		assert.Equal(10, response.Offset, "offset echoed")
+		assert.True(response.HasMore, "the engine's has_more is reported as is")
 		assert.Equal([]string{"acme.com", "globex.com"}, capturedDomains, "domains")
-		assert.Equal(50, capturedLimit, "limit")
+		assert.Equal(1, capturedLimit, "limit")
 		assert.Equal(10, capturedOffset, "offset")
 	})
 
 	t.Run("default limit and offset", func(t *testing.T) {
-		var capturedLimit, capturedOffset int
+		var capturedLimit, capturedOffset, calls int
 		eng := &querytest.MockEngine{
-			SearchByDomainsFunc: func(_ context.Context, _ []string, _, _ *time.Time, limit, offset int) ([]query.MessageSummary, error) {
+			SearchByDomainsFunc: func(_ context.Context, _ []string, _, _ *time.Time, limit, offset int, _ []int64) (query.DomainSearchResult, error) {
+				calls++
 				capturedLimit = limit
 				capturedOffset = offset
-				return nil, nil
+				return query.DomainSearchResult{}, nil
 			},
 		}
 		h := newTestHandlers(eng)
 
-		runTool[dataResponse[query.MessageSummary]](t, "search_by_domains", h.searchByDomains,
+		runTool[searchByDomainsResponse](t, "search_by_domains", h.searchByDomains,
 			map[string]any{"domains": "acme.com"})
+		assert.Equal(t, 1, calls, "one engine call per page")
 		assert.Equal(t, 100, capturedLimit, "default limit")
 		assert.Equal(t, 0, capturedOffset, "default offset")
 	})
@@ -4070,7 +4182,7 @@ func TestSearchByDomains(t *testing.T) {
 // down and returning ctx.Err(). Regression-guards a roborev #299
 // finding where Start was called without ever consulting ctx.
 func TestServeHTTPWithOptions_ContextCancellation(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 
 	// Bind on :0 so we don't conflict with anything on the host.
 	opts := ServeOptions{
@@ -4088,7 +4200,7 @@ func TestServeHTTPWithOptions_ContextCancellation(t *testing.T) {
 	}()
 
 	// Give the goroutine a moment to start the listener.
-	time.Sleep(50 * time.Millisecond) //nolint:kennlint // gives the real TCP listener time to start
+	time.Sleep(50 * time.Millisecond) //nolint:kennlint // sleeptest: gives the real TCP listener time to start
 	cancel()
 
 	select {
@@ -4103,12 +4215,12 @@ func TestServeHTTPWithOptionsLiveListenerRequiresBearerAuth(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
 
-	probe, err := net.Listen("tcp", "127.0.0.1:0")
+	probe, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	require.NoError(err)
 	addr := probe.Addr().String()
 	require.NoError(probe.Close())
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
 	stopped := make(chan struct{})
 	attachmentsDir := t.TempDir()
@@ -4135,7 +4247,7 @@ func TestServeHTTPWithOptionsLiveListenerRequiresBearerAuth(t *testing.T) {
 	var responseChallenge string
 	var responseCloseErr error
 	require.Eventually(func() bool {
-		req, requestErr := http.NewRequest(http.MethodPatch, "http://"+addr+"/mcp", nil)
+		req, requestErr := http.NewRequestWithContext(t.Context(), http.MethodPatch, "http://"+addr+"/mcp", nil)
 		if requestErr != nil {
 			return false
 		}
@@ -4210,7 +4322,7 @@ func TestBearerAuthHandler(t *testing.T) {
 					w.WriteHeader(http.StatusNoContent)
 				})
 				handler := bearerAuthHandler(apiKey, next)
-				req := httptest.NewRequest(method, "/mcp", nil)
+				req := httptest.NewRequestWithContext(t.Context(), method, "/mcp", nil)
 				req.Header.Set("Mcp-Session-Id", "test-session")
 				if tt.addAuth != nil {
 					tt.addAuth(req)
@@ -4244,7 +4356,7 @@ func TestBearerAuthHandlerRejectsMalformedCredentials(t *testing.T) {
 			handler := bearerAuthHandler("test-api-key", http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 				called = true
 			}))
-			req := httptest.NewRequest(http.MethodPost, "/mcp", nil)
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/mcp", nil)
 			for _, header := range tt.headers {
 				req.Header.Add("Authorization", header)
 			}
@@ -4268,7 +4380,7 @@ func TestBearerAuthHandlerCompatibilityAndSchemeCase(t *testing.T) {
 		}))
 		resp := httptest.NewRecorder()
 
-		handler.ServeHTTP(resp, httptest.NewRequest(http.MethodPost, "/mcp", nil))
+		handler.ServeHTTP(resp, httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/mcp", nil))
 
 		assert.Equal(t, http.StatusAccepted, resp.Code)
 		assert.True(t, called)
@@ -4280,7 +4392,7 @@ func TestBearerAuthHandlerCompatibilityAndSchemeCase(t *testing.T) {
 			called = true
 			w.WriteHeader(http.StatusAccepted)
 		}))
-		req := httptest.NewRequest(http.MethodPost, "/mcp", nil)
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/mcp", nil)
 		req.Header.Set("Authorization", "bEaReR test-api-key")
 		resp := httptest.NewRecorder()
 
@@ -4302,24 +4414,40 @@ func TestMCPHTTPServerMountsProtectedEndpoint(t *testing.T) {
 	checks.Equal(120*time.Second, stdlibServer.IdleTimeout)
 
 	missing := httptest.NewRecorder()
-	missingRequest := httptest.NewRequest(http.MethodPatch, "/mcp", nil)
+	missingRequest := httptest.NewRequestWithContext(t.Context(), http.MethodPatch, "/mcp", nil)
 	missingRequest.Header.Set("Mcp-Session-Id", "test-session")
 	stdlibServer.Handler.ServeHTTP(missing, missingRequest)
 	checks.Equal(http.StatusUnauthorized, missing.Code)
 
 	authorized := httptest.NewRecorder()
-	authorizedRequest := httptest.NewRequest(http.MethodPatch, "/mcp", nil)
+	authorizedRequest := httptest.NewRequestWithContext(t.Context(), http.MethodPatch, "/mcp", nil)
 	authorizedRequest.Header.Set("Authorization", "Bearer test-api-key")
 	stdlibServer.Handler.ServeHTTP(authorized, authorizedRequest)
 	checks.Equal(http.StatusMethodNotAllowed, authorized.Code)
 	checks.Equal(http.MethodPost, authorized.Header().Get("Allow"))
+
+	must := require.New(t)
+	live := httptest.NewServer(stdlibServer.Handler)
+	defer live.Close()
+	request, err := http.NewRequestWithContext(t.Context(), http.MethodPost, live.URL+"/mcp", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`))
+	must.NoError(err)
+	request.Host = "archive.example"
+	request.Header.Set("Authorization", "Bearer test-api-key")
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "application/json, text/event-stream")
+	request.Header.Set("Mcp-Protocol-Version", "2025-11-25")
+	response, err := live.Client().Do(request)
+	must.NoError(err)
+	defer func() { must.NoError(response.Body.Close()) }()
+	checks.Equal(http.StatusForbidden, response.StatusCode)
 }
 
-func TestGetMessagePreservesBrowserURL(t *testing.T) {
+func TestGetMessagePreservesBrowserURLAndRelatedID(t *testing.T) {
 	const link = "https://archive.example/?explore=%7B%22workspace%22%3A%22everything%22%2C%22selectedRow%22%3A%22message%3A42%22%7D"
-	h := newTestHandlers(&querytest.MockEngine{Messages: map[int64]*query.MessageDetail{42: {ID: 42, WebURL: link}}})
+	h := newTestHandlers(&querytest.MockEngine{Messages: map[int64]*query.MessageDetail{42: {ID: 42, WebURL: link, RelatedMessageID: new(int64(43))}}})
 	result := runTool[map[string]any](t, "get_message", h.getMessage, map[string]any{"id": float64(42)})
 	assert.Equal(t, link, result["web_url"])
+	assert.InDelta(t, 43, result["related_message_id"], 0)
 }
 
 func TestGetStats_AccountLastSyncAt(t *testing.T) {
@@ -4341,4 +4469,99 @@ func TestGetStats_AccountLastSyncAt(t *testing.T) {
 	must.Len(raw.Accounts, 2)
 	checks.JSONEq(`"2026-03-04T05:06:07Z"`, string(raw.Accounts[0]["LastSyncAt"]))
 	checks.NotContains(raw.Accounts[1], "LastSyncAt", "unknown sync time is omitted, not null")
+}
+
+func TestStageDeletionPipeORUsesSearch(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		query   string
+		account string
+		mode    query.DeletionSearchMode
+	}{
+		{name: "metadata OR", query: "subject:first | subject:second", mode: query.DeletionSearchFast},
+		{name: "full-text OR", query: "alpha | gamma", account: "archive@example.com", mode: query.DeletionSearchDeep},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert := assert.New(t)
+			require := require.New(t)
+			var mode query.DeletionSearchMode
+			var parsed *search.Query
+			engine := &querytest.MockEngine{
+				Accounts: []query.AccountInfo{
+					{ID: 1, SourceType: "gmail", Identifier: "other@example.com"},
+					{ID: 2, SourceType: "gmail", Identifier: "archive@example.com"},
+				},
+				GetDeletionTargetsBySearchBoundedFunc: func(_ context.Context, q *search.Query, _ query.MessageFilter, selected query.DeletionSearchMode, _ int) ([]query.DeletionTarget, int, error) {
+					mode = selected
+					parsed = q
+					return []query.DeletionTarget{
+						{MessageID: 3, SourceID: 2, SourceType: "gmail", SourceIdentifier: "archive@example.com", SourceMessageID: "gmail-alpha"},
+						{MessageID: 4, SourceID: 2, SourceType: "gmail", SourceIdentifier: "archive@example.com", SourceMessageID: "gmail-gamma"},
+					}, 2, nil
+				},
+			}
+			saver := &captureDeletionManifestSaver{}
+			h := &handlers{engine: engine, manifestSaver: saver}
+			args := map[string]any{"query": tc.query}
+			if tc.account != "" {
+				args["account"] = tc.account
+			}
+			resp := runTool[stageDeletionResponse](t, "stage_deletion", h.stageDeletion, args)
+			require.NotNil(saver.manifest)
+			assert.Equal([]string{"gmail-alpha", "gmail-gamma"}, saver.manifest.GmailIDs)
+			assert.Equal(2, resp.MessageCount)
+			assert.Equal(tc.mode, mode)
+			if tc.mode == query.DeletionSearchFast {
+				assert.NotContains(resp.NextStep, "body matches")
+			} else {
+				assert.Equal("archive@example.com", saver.manifest.Filters.Account)
+				require.NotNil(saver.manifest.Source)
+				assert.Equal(deletion.SourceReference{ID: 2, Type: "gmail", Identifier: "archive@example.com"}, *saver.manifest.Source)
+				require.NotNil(parsed)
+				assert.Equal([]int64{2}, parsed.AccountIDs)
+				assert.Contains(resp.NextStep, "Full-text OR search includes body matches.")
+			}
+		})
+	}
+}
+
+func TestMetadataSearchLiteralORWarning(t *testing.T) {
+	h := newTestHandlers(&querytest.MockEngine{})
+	for _, tc := range []struct {
+		query string
+		warn  bool
+	}{
+		{"from:@a.example OR from:@b.example", true},
+		{`"OR"`, false},
+		{"or", false},
+		{"WORD", false},
+	} {
+		t.Run(tc.query, func(t *testing.T) {
+			for _, handler := range []toolHandler{h.searchMetadata, h.searchMessages} {
+				result := runTool[searchMetadataResponse](t, "search_metadata", handler, map[string]any{"query": tc.query})
+				assert.Equal(t, tc.warn, len(result.Warnings) > 0)
+			}
+		})
+	}
+}
+
+func (*fakeBackend) EmbeddingCheckpoints() vector.EmbeddingCheckpoints {
+	return vector.EmbeddingCheckpoints{}
+}
+
+func TestHTTPCallsSkipFamilyDiscovery(t *testing.T) {
+	probes := 0
+	handler, closeHandler := NewHTTPHandler(ServeOptions{
+		Engine:           &querytest.MockEngine{Messages: map[int64]*query.MessageDetail{42: {ID: 42, Subject: "synthetic message"}}},
+		DiscoverFamilies: func(context.Context) *ArchiveFamilies { probes++; return &ArchiveFamilies{} },
+	}, HTTPOptions{})
+	defer closeHandler()
+	request := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/mcp", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_message","arguments":{"id":42}}}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "application/json, text/event-stream")
+	request.Header.Set("Mcp-Protocol-Version", "2025-11-25")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	assert.Zero(t, probes)
 }

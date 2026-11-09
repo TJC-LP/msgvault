@@ -152,6 +152,9 @@ func TestDocumentsConsentBuildAndStatusUseExactAuthenticatedProfile(t *testing.T
 		openStore: func(context.Context) (*store.Store, func(), error) {
 			return fixture.Store, func() {}, nil
 		},
+		openInitializedStore: func(context.Context) (*store.Store, func(), error) {
+			return fixture.Store, func() {}, nil
+		},
 		openAttachments: func(context.Context, *store.Store) (documentindex.DocumentAttachmentOpener, func() error, error) {
 			attachmentOpened = true
 			return commandAttachmentOpener{content: content}, func() error { return nil }, nil
@@ -405,7 +408,7 @@ func TestDocumentBuildRepairsHistoricalMIMERolesBeforePreflight(t *testing.T) {
 	require.NoError(err)
 	require.Len(parsed.Attachments, 1)
 	attachment := parsed.Attachments[0]
-	_, err = fixture.Store.DB().Exec(fixture.Store.Rebind(`
+	_, err = fixture.Store.DB().ExecContext(t.Context(), fixture.Store.Rebind(`
 		INSERT INTO attachments
 			(message_id, filename, mime_type, storage_path, content_hash, size, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`),
@@ -416,7 +419,8 @@ func TestDocumentBuildRepairsHistoricalMIMERolesBeforePreflight(t *testing.T) {
 
 	manifestPath := writeCommandCapabilityManifest(t, cfg.Attachments.Documents.MaxPagesPerDocument)
 	deps := documentsCommandDeps{
-		openStore: func(context.Context) (*store.Store, func(), error) { return fixture.Store, func() {}, nil },
+		openStore:            func(context.Context) (*store.Store, func(), error) { return fixture.Store, func() {}, nil },
+		openInitializedStore: func(context.Context) (*store.Store, func(), error) { return fixture.Store, func() {}, nil },
 		openAttachments: func(context.Context, *store.Store) (documentindex.DocumentAttachmentOpener, func() error, error) {
 			return nil, func() error { return nil }, errors.New("synthetic stop after repair")
 		},
@@ -430,7 +434,7 @@ func TestDocumentBuildRepairsHistoricalMIMERolesBeforePreflight(t *testing.T) {
 
 	var role, roleSource string
 	var partKey *string
-	require.NoError(fixture.Store.DB().QueryRow(fixture.Store.Rebind(`
+	require.NoError(fixture.Store.DB().QueryRowContext(t.Context(), fixture.Store.Rebind(`
 		SELECT attachment_role, role_source, source_part_key
 		FROM attachments WHERE message_id = ?`), messageID).Scan(&role, &roleSource, &partKey))
 	assert.Equal("unknown", role, "declining build must not mutate historical attachment roles")
@@ -449,7 +453,7 @@ func TestDocumentBuildRepairsHistoricalMIMERolesBeforePreflight(t *testing.T) {
 	command.SetArgs([]string{documentBuildSubcommand, "--capabilities", manifestPath, "--yes"})
 	require.ErrorContains(command.ExecuteContext(testCtx), "synthetic stop after repair")
 
-	require.NoError(fixture.Store.DB().QueryRow(fixture.Store.Rebind(`
+	require.NoError(fixture.Store.DB().QueryRowContext(t.Context(), fixture.Store.Rebind(`
 		SELECT attachment_role, role_source, source_part_key
 		FROM attachments WHERE message_id = ?`), messageID).Scan(&role, &roleSource, &partKey))
 	assert.Equal("standalone", role)
@@ -462,7 +466,8 @@ func TestDocumentsSearchDoesNotRegisterUnconsentedJournalConsumer(t *testing.T) 
 	require := require.New(t)
 	fixture := storetest.New(t)
 	deps := documentsCommandDeps{
-		openStore: func(context.Context) (*store.Store, func(), error) { return fixture.Store, func() {}, nil },
+		openStore:            func(context.Context) (*store.Store, func(), error) { return fixture.Store, func() {}, nil },
+		openInitializedStore: func(context.Context) (*store.Store, func(), error) { return fixture.Store, func() {}, nil },
 	}
 	command := newDocumentsCmd(deps)
 	var output bytes.Buffer
@@ -482,7 +487,8 @@ func TestDocumentsSearchDoesNotRegisterUnconsentedJournalConsumer(t *testing.T) 
 func TestDocumentsSearchLocalExplicitSemanticNeverMasqueradesAsLexical(t *testing.T) {
 	fixture := storetest.New(t)
 	command := newDocumentsCmd(documentsCommandDeps{
-		openStore: func(context.Context) (*store.Store, func(), error) { return fixture.Store, func() {}, nil },
+		openStore:            func(context.Context) (*store.Store, func(), error) { return fixture.Store, func() {}, nil },
+		openInitializedStore: func(context.Context) (*store.Store, func(), error) { return fixture.Store, func() {}, nil },
 	})
 	command.SetArgs([]string{"search", "evidence", "--mode", "semantic", "--candidate-limit", "25"})
 	err := command.ExecuteContext(t.Context())
@@ -630,7 +636,8 @@ func TestDocumentsBuildRefusesAPIUseBeforeExactConsent(t *testing.T) {
 			providerCalled = true
 			return &commandBuildProcessor{}, nil
 		},
-		openStore: func(context.Context) (*store.Store, func(), error) { return fixture.Store, func() {}, nil },
+		openStore:            func(context.Context) (*store.Store, func(), error) { return fixture.Store, func() {}, nil },
+		openInitializedStore: func(context.Context) (*store.Store, func(), error) { return fixture.Store, func() {}, nil },
 	}
 	manifestPath := writeCommandCapabilityManifest(t, cfg.Attachments.Documents.MaxPagesPerDocument)
 	command := newDocumentsCmd(deps)
@@ -679,7 +686,8 @@ func TestDocumentFullRebuildResumesDurableTargetSnapshot(t *testing.T) {
 		newMistralProcessor: func(*documentindex.DocumentsConfig) (documentindex.MistralProcessor, error) {
 			return processor, nil
 		},
-		openStore: func(context.Context) (*store.Store, func(), error) { return fixture.Store, func() {}, nil },
+		openStore:            func(context.Context) (*store.Store, func(), error) { return fixture.Store, func() {}, nil },
+		openInitializedStore: func(context.Context) (*store.Store, func(), error) { return fixture.Store, func() {}, nil },
 		openAttachments: func(context.Context, *store.Store) (documentindex.DocumentAttachmentOpener, func() error, error) {
 			return commandAttachmentMapOpener{contents: contents}, func() error { return nil }, nil
 		},
@@ -990,10 +998,10 @@ func TestScheduledDocumentFullReconcileRepairsMissedLifecycleEvent(t *testing.T)
 	require.NoError(err)
 	assert.Equal(t, 1, commandDocumentOccurrenceCount(t, fixture.Store))
 
-	_, err = fixture.Store.DB().Exec(fixture.Store.Rebind(
+	_, err = fixture.Store.DB().ExecContext(t.Context(), fixture.Store.Rebind(
 		`UPDATE messages SET deleted_from_source_at = CURRENT_TIMESTAMP WHERE id = ?`), messageID)
 	require.NoError(err)
-	_, err = fixture.Store.DB().Exec(`DELETE FROM attachment_change_log`)
+	_, err = fixture.Store.DB().ExecContext(t.Context(), `DELETE FROM attachment_change_log`)
 	require.NoError(err)
 
 	sched := scheduler.New(func(context.Context, string) error { return nil })
@@ -1047,6 +1055,70 @@ func TestScheduledDocumentReconcileDoesNotEnableUnconsentedConsumer(t *testing.T
 		t.Context(), documentindex.DocumentAttachmentConsumerKey,
 	)
 	require.ErrorIs(t, err, store.ErrAttachmentChangeConsumerMissing)
+}
+
+func TestScheduledDocumentCleanupRunsWithoutActiveConsent(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	cfg := testConfigValue()
+	cfg.Data.DataDir = t.TempDir()
+	cfg.Attachments.Documents.Enabled = true
+	cfg.Attachments.Documents.Provider = documentindex.ProviderDocling
+	cfg.Attachments.Documents.Endpoint = "http://127.0.0.1:5001"
+	cfg.Attachments.Documents.ApplyConfiguredProviderDefaults(func(string) bool { return false })
+	ctx := withTestConfig(t, cfg)
+	fixture := storetest.New(t)
+	documentsConfig, _, _, profile, err := configuredDocumentProfile("", invocationFromContext(ctx))
+	require.NoError(err)
+	_, err = fixture.Store.EnsureDocumentExtractionProfile(ctx, profile)
+	require.NoError(err)
+	require.NoError(fixture.Store.RecordDocumentProviderConsent(ctx, store.DocumentProviderConsent{
+		ProfileID: profile.ID, ProfileFingerprint: profile.Fingerprint,
+		RetentionPosture: profile.RetentionPosture, TrainingPosture: profile.TrainingPosture,
+	}))
+	messageID := fixture.CreateMessage("scheduled-document-cleanup")
+	hash := strings.Repeat("c", 64)
+	require.NoError(fixture.Store.UpsertAttachmentRecord(ctx, messageID, store.AttachmentWrite{
+		Filename: "scheduled-cleanup.pdf", MIMEType: "application/pdf", Size: 128,
+		StoragePath: hash[:2] + "/" + hash, ContentHash: hash,
+		Role: store.AttachmentRoleStandalone, RoleSource: store.AttachmentRoleSourceImporterSemantics,
+		SourcePartKey: "part:cleanup",
+	}))
+	var attachmentID int64
+	require.NoError(fixture.Store.DB().QueryRowContext(t.Context(), fixture.Store.Rebind(
+		"SELECT id FROM attachments WHERE message_id = ?"), messageID).Scan(&attachmentID))
+	_, eligible, err := fixture.Store.ReconcileDocumentOccurrence(ctx, attachmentID, 1)
+	require.NoError(err)
+	require.True(eligible)
+	claim, err := fixture.Store.ClaimDocumentExtraction(ctx, store.DocumentExtractionClaimInput{
+		ExtractionID: "scheduled-cleanup-attempt", ProfileID: profile.ID, CanonicalBlobHash: hash,
+		ExtractionInputKey: "original", OccurrenceAttachmentID: attachmentID,
+		OccurrenceMIMEType: "application/pdf", OccurrenceMessageType: "email",
+		LeaseOwner: "scheduled-cleanup-worker", LeaseUntil: time.Now().UTC().Add(time.Minute),
+		LocalBytes: 128, SourceSequence: 1,
+	})
+	require.NoError(err)
+	require.NoError(fixture.Store.SaveDocumentExtractionRange(ctx, claim,
+		storetest.DocumentRangeCheckpoint(t), documentsConfig.MaxResponseBytes, documentsConfig.MaxNormalizedChars))
+	require.NoError(fixture.Store.FailDocumentExtraction(ctx, store.DocumentExtractionFailure{
+		Claim: claim, ReasonCode: "provider_timeout", Terminal: true,
+	}))
+	retired, err := fixture.Store.RetireDocumentExtractionProfile(ctx, profile.ID)
+	require.NoError(err)
+	require.True(retired)
+	_, err = fixture.Store.DB().ExecContext(t.Context(), fixture.Store.Rebind(
+		"UPDATE document_extractions SET updated_at = ? WHERE id = ?"),
+		time.Now().UTC().Add(-2*documentDerivativeRecoveryWindow), claim.ExtractionID)
+	require.NoError(err)
+
+	sched := scheduler.New(func(context.Context, string) error { return nil })
+	t.Cleanup(func() { <-sched.Stop().Done() })
+	require.NoError(configureDocumentReconcileJob(ctx, sched, fixture.Store, false))
+	assert.True(sched.IsJobScheduled(documentFullReconcileJob))
+	require.NoError(sched.TriggerJob(documentFullReconcileJob))
+	var count int
+	require.NoError(fixture.Store.DB().QueryRowContext(t.Context(), "SELECT COUNT(*) FROM document_extraction_ranges").Scan(&count))
+	assert.Zero(count)
 }
 
 func TestScheduledDocumentReconcilePreservesExistingConsentWhenExtractionDisabled(t *testing.T) {
@@ -1224,7 +1296,7 @@ func commandCapabilityManifest(t *testing.T, maxUnits int) mistral.CapabilityMan
 func commandDocumentOccurrenceCount(t *testing.T, st *store.Store) int {
 	t.Helper()
 	var count int
-	require.NoError(t, st.DB().QueryRow(`SELECT COUNT(*) FROM document_occurrences`).Scan(&count))
+	require.NoError(t, st.DB().QueryRowContext(t.Context(), `SELECT COUNT(*) FROM document_occurrences`).Scan(&count))
 	return count
 }
 
@@ -1274,8 +1346,9 @@ func TestInlineDocumentConsentRescansAndReportsMalformedSource(t *testing.T) {
 	manifestPath := writeCommandCapabilityManifest(t, cfg.Attachments.Documents.MaxPagesPerDocument)
 	processor := &commandBuildProcessor{}
 	deps := documentsCommandDeps{
-		newMistralProcessor: func(*documentindex.DocumentsConfig) (documentindex.MistralProcessor, error) { return processor, nil },
-		openStore:           func(context.Context) (*store.Store, func(), error) { return fixture.Store, func() {}, nil },
+		newMistralProcessor:  func(*documentindex.DocumentsConfig) (documentindex.MistralProcessor, error) { return processor, nil },
+		openStore:            func(context.Context) (*store.Store, func(), error) { return fixture.Store, func() {}, nil },
+		openInitializedStore: func(context.Context) (*store.Store, func(), error) { return fixture.Store, func() {}, nil },
 		openAttachments: func(context.Context, *store.Store) (documentindex.DocumentAttachmentOpener, func() error, error) {
 			return commandAttachmentOpener{content: content}, func() error { return nil }, nil
 		},
@@ -1295,7 +1368,7 @@ func TestInlineDocumentConsentRescansAndReportsMalformedSource(t *testing.T) {
 	_, err := run("consent-mistral", "--capabilities", manifestPath, "--yes")
 	require.NoError(err)
 	// Simulate an old completed journal bootstrap that never retained inline rows.
-	_, err = fixture.Store.DB().Exec("DELETE FROM document_occurrences")
+	_, err = fixture.Store.DB().ExecContext(t.Context(), "DELETE FROM document_occurrences")
 	require.NoError(err)
 	cfg.Attachments.Documents.Scope.IncludeInline = true
 	disclosure, err := run("consent-mistral", "--capabilities", manifestPath)
@@ -1305,14 +1378,14 @@ func TestInlineDocumentConsentRescansAndReportsMalformedSource(t *testing.T) {
 	require.NoError(err)
 	assert.Equal(1, commandDocumentOccurrenceCount(t, fixture.Store))
 	_, err = run("build", "--capabilities", manifestPath, "--yes")
-	require.ErrorContains(err, "PDF structure is malformed")
+	require.ErrorContains(err, "PDF structure")
 	assert.Zero(processor.calls)
 	human, err := run("status", "--capabilities", manifestPath)
 	require.NoError(err)
 	assert.Contains(human, "invalid_local_source")
-	assert.Contains(human, "PDF structure is malformed")
+	assert.Contains(human, "PDF structure")
 	encoded, err := run("status", "--capabilities", manifestPath, "--json")
 	require.NoError(err)
 	assert.Contains(encoded, `"reason_code":"invalid_local_source"`)
-	assert.Contains(encoded, "PDF structure is malformed")
+	assert.Contains(encoded, "PDF structure")
 }

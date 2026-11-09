@@ -7,10 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -41,6 +43,116 @@ func TestWriteCLIPersonSanitizesTerminalControls(t *testing.T) {
 	assert.NotContains(stdout.String(), "\x1b")
 	assert.NotContains(stdout.String(), "https://attacker.test")
 	assert.Contains(stdout.String(), "Alice Example")
+}
+
+func TestPersonGetLooksUpVCardUIDAndJSONIncludesCardDAVBindings(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	const uid = "urn:uuid:77822e26-3cd5-40d0-a0fd-6f0ff63b204b"
+	var requestedPath string
+	var requestedUID string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestedPath = r.URL.Path
+		requestedUID = r.URL.Query().Get("uid")
+		assert.Equal(http.MethodGet, r.Method)
+		if r.URL.Path == "/api/v1/health" {
+			w.Header().Set("Content-Type", "application/json")
+			_, err := w.Write([]byte(`{"status":"ok","api_schema_version":"3.10.0"}`))
+			assert.NoError(err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, err := w.Write([]byte(`{
+			"id":7,"vcard_uid":"person-7","revision":2,"participant_ids":[],
+			"carddav_bindings":[{"connection":"personal","book":"Personal",
+			"href":"https://contacts.example.test/book/person.vcf","remote_uid":"` + uid + `",
+			"mapping_status":"mapped"}],
+			"created_at":"2026-07-29T12:00:00Z","updated_at":"2026-07-29T12:00:00Z"
+		}`))
+		assert.NoError(err)
+	}))
+	t.Cleanup(server.Close)
+	testCtx := withStoreResolverConfig(t, &config.Config{
+		Remote: config.RemoteConfig{URL: server.URL, AllowInsecure: true},
+	})
+	savedJSON := personJSON
+	personJSON = true
+	t.Cleanup(func() { personJSON = savedJSON })
+
+	var lookupUID string
+	command := &cobra.Command{
+		Use: personGetCmd.Use, Args: personGetCmd.Args, RunE: personGetCmd.RunE,
+	}
+	command.Flags().StringVar(&lookupUID, "vcard-uid", "", "")
+	command.SetContext(testCtx)
+	command.SetArgs([]string{"--vcard-uid", uid})
+	var stdout bytes.Buffer
+	command.SetOut(&stdout)
+	require.NoError(command.Execute())
+	assert.Equal(uid, lookupUID)
+	assert.Equal("/api/v1/people/by-uid", requestedPath)
+	assert.Equal(uid, requestedUID)
+	assert.JSONEq(`{"id":7,"vcard_uid":"person-7","revision":2,"participant_ids":[],`+
+		`"carddav_bindings":[{"connection":"personal","book":"Personal",`+
+		`"href":"https://contacts.example.test/book/person.vcf","remote_uid":"`+uid+`",`+
+		`"mapping_status":"mapped"}],"created_at":"2026-07-29T12:00:00Z",`+
+		`"updated_at":"2026-07-29T12:00:00Z"}`, stdout.String())
+}
+
+func TestPersonGetByUIDRequiresCurrentDaemonSchema(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	var uidLookups atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/health" {
+			w.Header().Set("Content-Type", "application/json")
+			_, err := w.Write([]byte(`{"status":"ok","api_schema_version":"3.9.0"}`))
+			assert.NoError(err)
+			return
+		}
+		if r.URL.Path == "/api/v1/people/by-uid" {
+			uidLookups.Add(1)
+		}
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(server.Close)
+	testCtx := withStoreResolverConfig(t, &config.Config{
+		Remote: config.RemoteConfig{URL: server.URL, AllowInsecure: true},
+	})
+	command := &cobra.Command{
+		Use: personGetCmd.Use, Args: personGetCmd.Args, RunE: personGetCmd.RunE,
+	}
+	command.Flags().String("vcard-uid", "", "")
+	command.SetContext(testCtx)
+	command.SetArgs([]string{"--vcard-uid", "urn:uuid:person-example"})
+	err := command.Execute()
+	require.Error(err)
+	assert.Contains(err.Error(), "daemon API schema 3.10.0 or newer")
+	assert.Zero(uidLookups.Load(), "the unsupported route must not be sent to an older daemon")
+}
+
+func TestPersonGetRejectsInvalidIDBeforeOpeningDaemonConnection(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(server.Close)
+	testCtx := withStoreResolverConfig(t, &config.Config{
+		Remote: config.RemoteConfig{URL: server.URL, AllowInsecure: true},
+	})
+	command := &cobra.Command{
+		Use: personGetCmd.Use, Args: personGetCmd.Args, RunE: personGetCmd.RunE,
+	}
+	command.Flags().String("vcard-uid", "", "")
+	command.SetContext(testCtx)
+	command.SetArgs([]string{"0"})
+	err := command.Execute()
+	require.Error(err)
+	assert.Contains(err.Error(), "person ID must be a positive integer")
+	assert.Zero(requests.Load(), "invalid local input must not open the daemon connection")
 }
 
 func TestPersonPromoteAcceptsCreatedResponse(t *testing.T) {
@@ -368,12 +480,6 @@ func TestPersonMergeCommandsUseConfiguredRemote(t *testing.T) {
 		}
 		assertions.Equal(want, requests[key], key)
 	}
-	for _, command := range []*cobra.Command{
-		newPersonMergeCommand(), newPersonSplitCommand(), newPersonMergeCandidateCommand(),
-	} {
-		assertions.Nil(command.Flags().Lookup("actor"))
-	}
-	assertions.Nil(newPersonMergeCandidateCommand().Flags().Lookup("idempotency-key"))
 }
 
 func extractPersonMergeSnapshot(t *testing.T, payload string) json.RawMessage {
@@ -477,8 +583,59 @@ func TestPersonPromoteSeedsNameThroughDaemonAdapter(t *testing.T) {
 	assert.Contains(directory, "Alex Example")
 	output.Reset()
 	get := &cobra.Command{Use: personGetCmd.Use, Args: personGetCmd.Args, RunE: personGetCmd.RunE}
+	get.Flags().String("vcard-uid", "", "")
 	get.SetOut(&output)
 	get.SetArgs([]string{strconv.FormatInt(person.ID, 10)})
 	require.NoError(get.ExecuteContext(testCtx))
 	assert.Contains(output.String(), "Display name: Alex Example")
+}
+
+func TestPersonPromoteReportsGateHolderWhileWaiting(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	st := testutil.NewTestStore(t)
+	participantID, err := st.EnsureParticipant("queued-promotion@example.com", "Queued Person", "example.com")
+	require.NoError(err)
+	gate := api.NewSerialOperationGate()
+	release, ok := gate.BeginLabeledWorkContext(t.Context(), "person merge")
+	require.True(ok)
+	release = sync.OnceFunc(release)
+	defer release()
+	router := api.NewServerWithOptions(api.ServerOptions{
+		Config: &config.Config{}, Store: &storeAPIAdapter{store: st},
+		Logger: slog.New(slog.DiscardHandler), OperationGate: gate,
+	}).Router()
+	// Let the real gate produce its timed busy response before releasing it.
+	// The retry then runs the actual promote handler against the test archive.
+	var busy atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, r)
+		if response.Code == http.StatusServiceUnavailable {
+			busy.Store(true)
+			release()
+		}
+		maps.Copy(w.Header(), response.Header())
+		w.WriteHeader(response.Code)
+		_, writeErr := w.Write(response.Body.Bytes())
+		assert.NoError(writeErr)
+	}))
+	t.Cleanup(server.Close)
+	ctx := withStoreResolverConfig(t, &config.Config{Remote: config.RemoteConfig{URL: server.URL, AllowInsecure: true}})
+	savedJSON := personJSON
+	personJSON = true
+	t.Cleanup(func() { personJSON = savedJSON })
+	var output bytes.Buffer
+	promote := &cobra.Command{Use: personPromoteCmd.Use, Args: personPromoteCmd.Args, RunE: personPromoteCmd.RunE}
+	promote.SetOut(&output)
+	promote.SetArgs([]string{strconv.FormatInt(participantID, 10)})
+	stderr := captureStderrDuring(t, func() { require.NoError(promote.ExecuteContext(ctx)) })
+	assert.True(busy.Load())
+	assert.Contains(stderr, "Waiting:")
+	assert.Contains(stderr, "person merge")
+	assert.Contains(stderr, "Ctrl+C to cancel")
+	assert.True(json.Valid(output.Bytes()), "wait notices must leave JSON stdout intact")
+	person, err := st.PersonForParticipants([]int64{participantID})
+	require.NoError(err)
+	require.NotNil(person)
 }

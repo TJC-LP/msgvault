@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"testing"
 	"time"
 
 	"go.kenn.io/msgvault/internal/personenrichment"
@@ -16,6 +17,14 @@ var ParseDBTime = parseDBTime
 // test can open a second independent handle to the same isolated database.
 func DBPathForTest(s *Store) string {
 	return s.dbPath
+}
+
+var pgTestStore func(*testing.T) *Store
+
+// SetPGTestStoreForTest lets package store_test provide testutil's clone fixture,
+// which internal tests can't import because testutil imports store.
+func SetPGTestStoreForTest(f func(*testing.T) *Store) {
+	pgTestStore = f
 }
 
 // MessagesTableColumns returns the live column names of the messages table on
@@ -137,6 +146,13 @@ func (s *Store) SetAttributeSeedReadHookForTest(fn func(slug string)) func() {
 	return func() { s.attributeSeedReadHook = nil }
 }
 
+// SetOrganizationProfileRootReadHookForTest installs a hook between the profile
+// root read and its child reads. Returns a restore func that clears the hook.
+func (s *Store) SetOrganizationProfileRootReadHookForTest(fn func()) func() {
+	s.organizationProfileRootReadHook = fn
+	return func() { s.organizationProfileRootReadHook = nil }
+}
+
 // SetAttachmentRoleRepairPreparedHookForTest installs a hook after historical
 // MIME evidence has been prepared but before the repair transaction begins.
 // Tests use it to reproduce a concurrent resync that changes attachment bytes.
@@ -205,7 +221,7 @@ func (s *Store) SetIMAPLabelRepairPerMessageHookForTest(fn func(messageID int64)
 func ReconcileMessageLabelsTxContextForTest(
 	ctx context.Context, s *Store, messageID int64, labelIDs []int64, replace bool,
 ) error {
-	return s.withTx(func(tx *loggedTx) error {
+	return s.withTxContext(ctx, func(tx *loggedTx) error {
 		_, err := s.reconcileMessageLabelsTxContext(ctx, tx, messageID, labelIDs, replace)
 		return err
 	})
@@ -230,6 +246,13 @@ func (s *Store) SetIdentityMatchReviewAfterDecisionHookForTest(fn func()) func()
 func (s *Store) SetPersonOperationBeforeIdentityLockHookForTest(fn func()) func() {
 	s.personOperationBeforeIdentityLockHook = fn
 	return func() { s.personOperationBeforeIdentityLockHook = nil }
+}
+
+// SetSourceMergeAfterJournalCheckHookForTest pauses a merge after its initial
+// idempotency lookup and before it acquires source execution locks.
+func (s *Store) SetSourceMergeAfterJournalCheckHookForTest(fn func()) func() {
+	s.sourceMergeAfterJournalCheckHook = fn
+	return func() { s.sourceMergeAfterJournalCheckHook = nil }
 }
 
 // SetPersonMatchBlockingBeforeLockHookForTest runs fn after scoring candidate
@@ -340,9 +363,29 @@ func (s *Store) SetCardDAVPublicationReviewBeforePersonLockHookForTest(fn func()
 	s.cardDAVReviewPersonLockHook = fn
 }
 
+// RefreshSourceMessageAttributionForTest is the full-refresh oracle for targeted attribution.
+func RefreshSourceMessageAttributionForTest(s *Store, sourceID int64) error {
+	return s.withTxContext(context.Background(), func(tx *loggedTx) error {
+		return refreshSourceMessageAttributionContext(context.Background(), tx, sourceID)
+	})
+}
+
 // Owner-address SQL builders, exported for their isolation test.
 var (
 	OwnerEmailMatch      = ownerEmailMatch
 	OwnerIdentifierMatch = ownerIdentifierMatch
 	SenderOwnerFallback  = senderOwnerFallback
 )
+
+// TierOptionsAsOf reads person tier counts as of a fixed date, not today.
+func TierOptionsAsOf(options PersonTierOptions, asOf time.Time) PersonTierOptions {
+	options.asOf = asOf
+	return options
+}
+
+// SetPersonTierRowPage sets the tier read page size and returns the restore func.
+func SetPersonTierRowPage(n int) func() {
+	old := personTierRowPage
+	personTierRowPage = n
+	return func() { personTierRowPage = old }
+}

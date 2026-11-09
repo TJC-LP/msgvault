@@ -4,11 +4,11 @@
 
 export type SearchMessagesParams = {
   /**
-   * Search query
+   * Search query; fts accepts standalone pipe-separated OR alternatives; other modes read pipes as text
    */
   q: string;
   /**
-   * Search mode: fts, vector, or hybrid. conversation_id applies in every mode; other structured filter parameters require vector or hybrid
+   * Search mode: fts, vector, or hybrid. fts accepts standalone pipe-separated OR alternatives; other modes read pipes as text. conversation_id applies in every mode; other structured filter parameters require vector or hybrid
    */
   mode?: string;
   /**
@@ -71,6 +71,10 @@ export type SearchMessagesParams = {
    * Exact case-insensitive RFC 2919 List-Id filter (vector or hybrid mode only)
    */
   list_id?: string;
+  /**
+   * JSON list of account scopes that intersect (vector or hybrid mode only)
+   */
+  account_scopes?: string;
   /**
    * Calendar period in YYYY, YYYY-MM, or YYYY-MM-DD format (vector or hybrid mode only)
    */

@@ -18,6 +18,7 @@ var (
 	noDefaultIdentityAddO365 bool
 	o365Graph                bool
 	o365As                   string
+	o365SignIn               string
 )
 
 func newAddO365Cmd() *cobra.Command {
@@ -38,6 +39,10 @@ func newAddO365Cmd() *cobra.Command {
 // before proxying, so the daemon subprocess never opens a browser or waits
 // on human consent while holding the operation gate.
 func preflightAddO365Authorize(cmd *cobra.Command, email string) error {
+	mailWrite, err := o365MailWrite(cmd)
+	if err != nil {
+		return err
+	}
 	state := invocationFromCommand(cmd)
 	if state == nil || state.cfg == nil {
 		return errors.New("configuration is unavailable")
@@ -53,7 +58,7 @@ func preflightAddO365Authorize(cmd *cobra.Command, email string) error {
 	if err := validateO365As(); err != nil {
 		return err
 	}
-	if err := authorizeO365(cmd, email); err != nil {
+	if err := authorizeO365(cmd, email, mailWrite); err != nil {
 		return err
 	}
 	if err := cmd.Flags().Set(oauthPreflightedFlag, "true"); err != nil {
@@ -79,7 +84,8 @@ With --graph, the account syncs through the Microsoft Graph mail API instead
 of IMAP. Use it when IMAP is turned off for the mailbox. It needs the Mail.Read
 permission on the app registration. The first delete-staged for the account
 asks for Mail.ReadWrite, which the app registration must also list. A Graph
-account is a separate account: if the mailbox is also synced over IMAP, the
+account can request it during sign-in with --mail-write for category editing.
+The Graph account is separate: if the mailbox is also synced over IMAP, the
 vault holds two copies, and 'msgvault dedup --collection' hides the extra ones.
 
 With --graph and --as, the account is a shared or delegated mailbox that the
@@ -92,6 +98,7 @@ Examples:
   msgvault add-o365 user@outlook.com
   msgvault add-o365 user@outlook.com --headless
   msgvault add-o365 user@company.com --tenant my-tenant-id
+  msgvault add-o365 user@company.com --sign-in jdoe@company.onmicrosoft.com
   msgvault add-o365 user@company.com --graph
   msgvault add-o365 team@company.com --graph --as user@company.com`,
 		Args: cobra.ExactArgs(1),
@@ -105,11 +112,22 @@ Examples:
 	cmd.Flags().BoolVar(&o365Graph, "graph", false, "sync through the Microsoft Graph mail API instead of IMAP")
 	cmd.Flags().StringVar(&o365As, "as", "",
 		"with --graph: sign in as this user and sync <email> as a shared or delegated mailbox")
+	cmd.Flags().StringVar(&o365SignIn, "sign-in", "",
+		"Microsoft sign-in name and browser login hint when it differs from the mailbox address (IMAP only)")
+	cmd.MarkFlagsMutuallyExclusive("graph", "sign-in")
+	cmd.Flags().Bool("mail-write", false, "With --graph, authorize category editing and remote deletion")
+	// Category editing and deletion are not supported for a shared or
+	// delegated mailbox, so its sign-in never asks for write access.
+	cmd.MarkFlagsMutuallyExclusive("as", "mail-write")
 	registerOAuthPreflightedFlag(cmd)
 	return cmd
 }
 
 func runAddO365Local(cmd *cobra.Command, args []string) error {
+	mailWrite, err := o365MailWrite(cmd)
+	if err != nil {
+		return err
+	}
 	state := invocationFromCommand(cmd)
 	if state == nil || state.cfg == nil {
 		return errors.New("configuration is unavailable")
@@ -125,7 +143,7 @@ func runAddO365Local(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	if o365Graph {
-		return runAddO365GraphLocal(cmd, email)
+		return runAddO365GraphLocal(cmd, email, mailWrite)
 	}
 
 	msMgr := microsoft.NewManager(
@@ -141,7 +159,7 @@ func runAddO365Local(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	if !preflighted {
-		if err := authorizeO365(cmd, email); err != nil {
+		if err := authorizeO365(cmd, email, mailWrite); err != nil {
 			return err
 		}
 	}
@@ -162,7 +180,7 @@ func runAddO365Local(cmd *cobra.Command, args []string) error {
 		AuthMethod: imapclient.AuthXOAuth2,
 	}
 
-	s, cleanup, err := openWritableStoreAndInitForIngestInvocation(state)
+	s, cleanup, err := openWritableStoreAndInitForIngestInvocation(cmd.Context(), state)
 	if err != nil {
 		return err
 	}
@@ -190,7 +208,7 @@ func runAddO365Local(cmd *cobra.Command, args []string) error {
 	}
 
 	if source != nil {
-		if err := s.UpdateSourceIdentifier(source.ID, identifier); err != nil {
+		if err := s.UpdateSourceIdentifier(cmd.Context(), source.ID, identifier); err != nil {
 			return fmt.Errorf("update source identifier: %w", err)
 		}
 	} else {
@@ -203,22 +221,22 @@ func runAddO365Local(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("serialize config: %w", err)
 	}
-	if err := s.UpdateSourceSyncConfig(source.ID, cfgJSON); err != nil {
+	if err := s.UpdateSourceSyncConfig(cmd.Context(), source.ID, cfgJSON); err != nil {
 		return fmt.Errorf("store config: %w", err)
 	}
-	if err := s.UpdateSourceDisplayName(source.ID, email); err != nil {
+	if err := updateSourceDisplayNameForRegistration(s, source.ID, email, state.logger); err != nil {
 		return fmt.Errorf("set display name: %w", err)
 	}
 
 	// Auto-default-identity must run BEFORE the legacy migration
 	// retry — see comment in account_identity.go.
-	if err := setDefaultIdentityOptOut(cmd, s, source, noDefaultIdentityAddO365); err != nil {
+	if err := setDefaultIdentityOptOut(cmd.Context(), cmd, s, source, noDefaultIdentityAddO365); err != nil {
 		return err
 	}
 	if !noDefaultIdentityAddO365 {
-		confirmDefaultIdentity(cmd.OutOrStdout(), s, source.ID, email, email, "account-identifier", state.logger)
+		confirmDefaultIdentity(cmd.Context(), cmd.OutOrStdout(), s, source.ID, email, email, "account-identifier", state.logger)
 	}
-	if err := runPostSourceCreateMigrationsForInvocation(s, state); err != nil {
+	if err := runPostSourceCreateMigrationsForInvocation(cmd.Context(), s, state); err != nil {
 		return fmt.Errorf("post-source-create migrations: %w", err)
 	}
 
@@ -232,9 +250,20 @@ func runAddO365Local(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+func o365MailWrite(cmd *cobra.Command) (bool, error) {
+	write, err := cmd.Flags().GetBool("mail-write")
+	if err != nil {
+		return false, fmt.Errorf("read --mail-write flag: %w", err)
+	}
+	if write && !o365Graph {
+		return false, errors.New("--mail-write requires --graph")
+	}
+	return write, nil
+}
+
 // authorizeO365 runs the Microsoft sign-in for the account kind: Graph mail
 // with --graph, IMAP otherwise.
-func authorizeO365(cmd *cobra.Command, email string) error {
+func authorizeO365(cmd *cobra.Command, email string, mailWrite bool) error {
 	state := invocationFromCommand(cmd)
 	if state == nil || state.cfg == nil {
 		return errors.New("configuration is unavailable")
@@ -254,6 +283,9 @@ func authorizeO365(cmd *cobra.Command, email string) error {
 		err = mgr.AuthorizeAs(cmd.Context(), strings.TrimSpace(o365As), email)
 	} else if o365Graph {
 		mgr := microsoft.NewGraphMailManager(cfg.Microsoft.ClientID, tenant, redirect, cfg.TokensDir(), logger)
+		if mailWrite {
+			mgr = microsoft.NewGraphMailWriteManager(cfg.Microsoft.ClientID, tenant, redirect, cfg.TokensDir(), logger)
+		}
 		if o365Headless {
 			mgr.UseDeviceCode()
 		}
@@ -262,6 +294,9 @@ func authorizeO365(cmd *cobra.Command, email string) error {
 		mgr := microsoft.NewManager(cfg.Microsoft.ClientID, tenant, redirect, cfg.TokensDir(), logger)
 		if o365Headless {
 			mgr.UseDeviceCode()
+		}
+		if o365SignIn != "" {
+			mgr.UseSignInName(o365SignIn)
 		}
 		err = mgr.Authorize(cmd.Context(), email)
 	}
@@ -273,7 +308,7 @@ func authorizeO365(cmd *cobra.Command, email string) error {
 
 // runAddO365GraphLocal creates an msmail source, the Graph mail counterpart of
 // the IMAP source that add-o365 makes by default.
-func runAddO365GraphLocal(cmd *cobra.Command, email string) error {
+func runAddO365GraphLocal(cmd *cobra.Command, email string, mailWrite bool) error {
 	state := invocationFromCommand(cmd)
 	if state == nil || state.cfg == nil {
 		return errors.New("configuration is unavailable")
@@ -283,12 +318,12 @@ func runAddO365GraphLocal(cmd *cobra.Command, email string) error {
 		return err
 	}
 	if !preflighted {
-		if err := authorizeO365(cmd, email); err != nil {
+		if err := authorizeO365(cmd, email, mailWrite); err != nil {
 			return err
 		}
 	}
 
-	s, cleanup, err := openWritableStoreAndInitForIngestInvocation(state)
+	s, cleanup, err := openWritableStoreAndInitForIngestInvocation(cmd.Context(), state)
 	if err != nil {
 		return err
 	}
@@ -298,7 +333,7 @@ func runAddO365GraphLocal(cmd *cobra.Command, email string) error {
 	if err != nil {
 		return fmt.Errorf("create source: %w", err)
 	}
-	if err := s.UpdateSourceDisplayName(source.ID, email); err != nil {
+	if err := updateSourceDisplayNameForRegistration(s, source.ID, email, state.logger); err != nil {
 		return fmt.Errorf("set display name: %w", err)
 	}
 	// Re-adding without --as turns a shared mailbox source back into the
@@ -311,16 +346,16 @@ func runAddO365GraphLocal(cmd *cobra.Command, email string) error {
 	if err != nil {
 		return fmt.Errorf("serialize config: %w", err)
 	}
-	if err := s.UpdateSourceSyncConfig(source.ID, string(cfgJSON)); err != nil {
+	if err := s.UpdateSourceSyncConfig(cmd.Context(), source.ID, string(cfgJSON)); err != nil {
 		return fmt.Errorf("store config: %w", err)
 	}
-	if err := setDefaultIdentityOptOut(cmd, s, source, noDefaultIdentityAddO365); err != nil {
+	if err := setDefaultIdentityOptOut(cmd.Context(), cmd, s, source, noDefaultIdentityAddO365); err != nil {
 		return err
 	}
 	if !noDefaultIdentityAddO365 {
-		confirmDefaultIdentity(cmd.OutOrStdout(), s, source.ID, email, email, "account-identifier", state.logger)
+		confirmDefaultIdentity(cmd.Context(), cmd.OutOrStdout(), s, source.ID, email, email, "account-identifier", state.logger)
 	}
-	if err := runPostSourceCreateMigrationsForInvocation(s, state); err != nil {
+	if err := runPostSourceCreateMigrationsForInvocation(cmd.Context(), s, state); err != nil {
 		return fmt.Errorf("post-source-create migrations: %w", err)
 	}
 

@@ -32,16 +32,17 @@ func Available() bool { return false }
 // can reference sqlitevec.Options without a compile error; the struct is
 // never populated at runtime when the PG code path is taken.
 type Options struct {
-	Path            string
-	MainPath        string
-	Dimension       int
-	MainDB          *sql.DB
-	BuildScope      vector.BuildScope
-	ReadOnly        bool
-	ANNWorkCeiling  int
-	ANNOversample   int
-	ANNNProbe       int
-	AcceleratorMode string
+	Path             string
+	MainPath         string
+	Dimension        int
+	MainDB           *sql.DB
+	BuildScope       vector.BuildScope
+	ReadOnly         bool
+	MetadataReadOnly bool
+	ANNWorkCeiling   int
+	ANNOversample    int
+	ANNNProbe        int
+	AcceleratorMode  string
 }
 
 // Backend is the stub backend type for builds without sqlite_vec.
@@ -66,6 +67,9 @@ func (b *Backend) DB() *sql.DB { return nil }
 
 // Close is a no-op stub.
 func (b *Backend) Close() error { return nil }
+
+// WithBuildScope returns the unavailable backend placeholder.
+func (b *Backend) WithBuildScope(vector.BuildScope) vector.Backend { return b }
 
 // CreateGeneration is a stub that always returns ErrNotBuilt.
 func (b *Backend) CreateGeneration(_ context.Context, _ string, _ int, _ string) (vector.GenerationID, error) {
@@ -135,4 +139,8 @@ func (b *Backend) EmbeddedMessageCount(_ context.Context, _ vector.GenerationID)
 // ScoreMessageChunks is a stub that always returns ErrNotBuilt.
 func (b *Backend) ScoreMessageChunks(_ context.Context, _ vector.GenerationID, _ int64, _ []float32) ([]vector.ChunkHit, error) {
 	return nil, ErrNotBuilt
+}
+
+func (b *Backend) EmbeddingCheckpoints() vector.EmbeddingCheckpoints {
+	return vector.EmbeddingCheckpoints{}
 }

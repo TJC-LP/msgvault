@@ -178,14 +178,15 @@ func (c CandidateClassification) Validate() error {
 type CardDAVAccountRequestProvider string
 
 const (
-	Empty  CardDAVAccountRequestProvider = ""
-	Google CardDAVAccountRequestProvider = "google"
+	Empty     CardDAVAccountRequestProvider = ""
+	Google    CardDAVAccountRequestProvider = "google"
+	Microsoft CardDAVAccountRequestProvider = "microsoft"
 )
 
 // Validate checks if the CardDAVAccountRequestProvider value is valid
 func (c CardDAVAccountRequestProvider) Validate() error {
 	switch c {
-	case Empty, Google:
+	case Empty, Google, Microsoft:
 		return nil
 	default:
 		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid CardDAVAccountRequestProvider value, got: %v", c))
@@ -439,21 +440,23 @@ func (c CardDAVResolveRequestChoice) Validate() error {
 type CardDAVRunResponseErrorCode string
 
 const (
-	AuthenticationFailed        CardDAVRunResponseErrorCode = "authentication_failed"
-	Cancelled                   CardDAVRunResponseErrorCode = "cancelled"
-	DaemonRestarted             CardDAVRunResponseErrorCode = "daemon_restarted"
-	GoogleAuthorizationRequired CardDAVRunResponseErrorCode = "google_authorization_required"
-	RetryAfter                  CardDAVRunResponseErrorCode = "retry_after"
-	SafetyLimit                 CardDAVRunResponseErrorCode = "safety_limit"
-	SyncFailed                  CardDAVRunResponseErrorCode = "sync_failed"
-	UnsafeErrorRedacted         CardDAVRunResponseErrorCode = "unsafe_error_redacted"
-	UpstreamFailed              CardDAVRunResponseErrorCode = "upstream_failed"
+	AuthenticationFailed           CardDAVRunResponseErrorCode = "authentication_failed"
+	Cancelled                      CardDAVRunResponseErrorCode = "cancelled"
+	DaemonRestarted                CardDAVRunResponseErrorCode = "daemon_restarted"
+	GoogleAuthorizationRequired    CardDAVRunResponseErrorCode = "google_authorization_required"
+	MicrosoftAuthorizationRequired CardDAVRunResponseErrorCode = "microsoft_authorization_required"
+	MicrosoftContactTooLarge       CardDAVRunResponseErrorCode = "microsoft_contact_too_large"
+	RetryAfter                     CardDAVRunResponseErrorCode = "retry_after"
+	SafetyLimit                    CardDAVRunResponseErrorCode = "safety_limit"
+	SyncFailed                     CardDAVRunResponseErrorCode = "sync_failed"
+	UnsafeErrorRedacted            CardDAVRunResponseErrorCode = "unsafe_error_redacted"
+	UpstreamFailed                 CardDAVRunResponseErrorCode = "upstream_failed"
 )
 
 // Validate checks if the CardDAVRunResponseErrorCode value is valid
 func (c CardDAVRunResponseErrorCode) Validate() error {
 	switch c {
-	case AuthenticationFailed, Cancelled, DaemonRestarted, GoogleAuthorizationRequired, RetryAfter, SafetyLimit, SyncFailed, UnsafeErrorRedacted, UpstreamFailed:
+	case AuthenticationFailed, Cancelled, DaemonRestarted, GoogleAuthorizationRequired, MicrosoftAuthorizationRequired, MicrosoftContactTooLarge, RetryAfter, SafetyLimit, SyncFailed, UnsafeErrorRedacted, UpstreamFailed:
 		return nil
 	default:
 		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid CardDAVRunResponseErrorCode value, got: %v", c))
@@ -500,18 +503,19 @@ func (c CardDAVRunResponseTrigger) Validate() error {
 type CardDAVStatusResponseRepairReason string
 
 const (
-	AccountMissing                                               CardDAVStatusResponseRepairReason = "account_missing"
-	CardDAVStatusResponseRepairReasonGoogleAuthorizationRequired CardDAVStatusResponseRepairReason = "google_authorization_required"
-	CredentialMismatch                                           CardDAVStatusResponseRepairReason = "credential_mismatch"
-	CredentialMissing                                            CardDAVStatusResponseRepairReason = "credential_missing"
-	CredentialUnavailable                                        CardDAVStatusResponseRepairReason = "credential_unavailable"
-	RuntimeUnavailable                                           CardDAVStatusResponseRepairReason = "runtime_unavailable"
+	AccountMissing                                                  CardDAVStatusResponseRepairReason = "account_missing"
+	CardDAVStatusResponseRepairReasonGoogleAuthorizationRequired    CardDAVStatusResponseRepairReason = "google_authorization_required"
+	CardDAVStatusResponseRepairReasonMicrosoftAuthorizationRequired CardDAVStatusResponseRepairReason = "microsoft_authorization_required"
+	CredentialMismatch                                              CardDAVStatusResponseRepairReason = "credential_mismatch"
+	CredentialMissing                                               CardDAVStatusResponseRepairReason = "credential_missing"
+	CredentialUnavailable                                           CardDAVStatusResponseRepairReason = "credential_unavailable"
+	RuntimeUnavailable                                              CardDAVStatusResponseRepairReason = "runtime_unavailable"
 )
 
 // Validate checks if the CardDAVStatusResponseRepairReason value is valid
 func (c CardDAVStatusResponseRepairReason) Validate() error {
 	switch c {
-	case AccountMissing, CardDAVStatusResponseRepairReasonGoogleAuthorizationRequired, CredentialMismatch, CredentialMissing, CredentialUnavailable, RuntimeUnavailable:
+	case AccountMissing, CardDAVStatusResponseRepairReasonGoogleAuthorizationRequired, CardDAVStatusResponseRepairReasonMicrosoftAuthorizationRequired, CredentialMismatch, CredentialMissing, CredentialUnavailable, RuntimeUnavailable:
 		return nil
 	default:
 		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid CardDAVStatusResponseRepairReason value, got: %v", c))
@@ -644,6 +648,25 @@ func (d DiscoverEventType) Validate() error {
 	}
 }
 
+type DocbankAttachmentStatusState string
+
+const (
+	ConsentOff                          DocbankAttachmentStatusState = "consent_off"
+	DocbankAttachmentStatusStateRunning DocbankAttachmentStatusState = "running"
+	DocbankDisabled                     DocbankAttachmentStatusState = "docbank_disabled"
+	WorkerUnavailable                   DocbankAttachmentStatusState = "worker_unavailable"
+)
+
+// Validate checks if the DocbankAttachmentStatusState value is valid
+func (d DocbankAttachmentStatusState) Validate() error {
+	switch d {
+	case ConsentOff, DocbankAttachmentStatusStateRunning, DocbankDisabled, WorkerUnavailable:
+		return nil
+	default:
+		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid DocbankAttachmentStatusState value, got: %v", d))
+	}
+}
+
 type EmploymentBodySource string
 
 const (
@@ -689,11 +712,13 @@ func (e ExploreCacheUnavailableResponseReadiness) Validate() error {
 type ExploreFilterDimension string
 
 const (
+	ExploreFilterDimensionAccount     ExploreFilterDimension = "account"
 	ExploreFilterDimensionAfter       ExploreFilterDimension = "after"
 	ExploreFilterDimensionBefore      ExploreFilterDimension = "before"
 	ExploreFilterDimensionDeletion    ExploreFilterDimension = "deletion"
 	ExploreFilterDimensionDomain      ExploreFilterDimension = "domain"
 	ExploreFilterDimensionIdentity    ExploreFilterDimension = "identity"
+	ExploreFilterDimensionKind        ExploreFilterDimension = "kind"
 	ExploreFilterDimensionMailingList ExploreFilterDimension = "mailing_list"
 	ExploreFilterDimensionMessageType ExploreFilterDimension = "message_type"
 	ExploreFilterDimensionParticipant ExploreFilterDimension = "participant"
@@ -703,7 +728,7 @@ const (
 // Validate checks if the ExploreFilterDimension value is valid
 func (e ExploreFilterDimension) Validate() error {
 	switch e {
-	case ExploreFilterDimensionAfter, ExploreFilterDimensionBefore, ExploreFilterDimensionDeletion, ExploreFilterDimensionDomain, ExploreFilterDimensionIdentity, ExploreFilterDimensionMailingList, ExploreFilterDimensionMessageType, ExploreFilterDimensionParticipant, ExploreFilterDimensionSource:
+	case ExploreFilterDimensionAccount, ExploreFilterDimensionAfter, ExploreFilterDimensionBefore, ExploreFilterDimensionDeletion, ExploreFilterDimensionDomain, ExploreFilterDimensionIdentity, ExploreFilterDimensionKind, ExploreFilterDimensionMailingList, ExploreFilterDimensionMessageType, ExploreFilterDimensionParticipant, ExploreFilterDimensionSource:
 		return nil
 	default:
 		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid ExploreFilterDimension value, got: %v", e))
@@ -713,6 +738,7 @@ func (e ExploreFilterDimension) Validate() error {
 type ExploreGroupDimension string
 
 const (
+	ExploreGroupDimensionDay         ExploreGroupDimension = "day"
 	ExploreGroupDimensionDomain      ExploreGroupDimension = "domain"
 	ExploreGroupDimensionKind        ExploreGroupDimension = "kind"
 	ExploreGroupDimensionMailingList ExploreGroupDimension = "mailing_list"
@@ -726,10 +752,30 @@ const (
 // Validate checks if the ExploreGroupDimension value is valid
 func (e ExploreGroupDimension) Validate() error {
 	switch e {
-	case ExploreGroupDimensionDomain, ExploreGroupDimensionKind, ExploreGroupDimensionMailingList, ExploreGroupDimensionMessageType, ExploreGroupDimensionMonth, ExploreGroupDimensionParticipant, ExploreGroupDimensionSource, ExploreGroupDimensionYear:
+	case ExploreGroupDimensionDay, ExploreGroupDimensionDomain, ExploreGroupDimensionKind, ExploreGroupDimensionMailingList, ExploreGroupDimensionMessageType, ExploreGroupDimensionMonth, ExploreGroupDimensionParticipant, ExploreGroupDimensionSource, ExploreGroupDimensionYear:
 		return nil
 	default:
 		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid ExploreGroupDimension value, got: %v", e))
+	}
+}
+
+type ExploreGroupRowLevel string
+
+const (
+	ExploreGroupRowLevelFirstQuartile  ExploreGroupRowLevel = "FIRST_QUARTILE"
+	ExploreGroupRowLevelFourthQuartile ExploreGroupRowLevel = "FOURTH_QUARTILE"
+	ExploreGroupRowLevelNone           ExploreGroupRowLevel = "NONE"
+	ExploreGroupRowLevelSecondQuartile ExploreGroupRowLevel = "SECOND_QUARTILE"
+	ExploreGroupRowLevelThirdQuartile  ExploreGroupRowLevel = "THIRD_QUARTILE"
+)
+
+// Validate checks if the ExploreGroupRowLevel value is valid
+func (e ExploreGroupRowLevel) Validate() error {
+	switch e {
+	case ExploreGroupRowLevelFirstQuartile, ExploreGroupRowLevelFourthQuartile, ExploreGroupRowLevelNone, ExploreGroupRowLevelSecondQuartile, ExploreGroupRowLevelThirdQuartile:
+		return nil
+	default:
+		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid ExploreGroupRowLevel value, got: %v", e))
 	}
 }
 
@@ -785,6 +831,7 @@ func (e ExploreGroupsHTTPRequestPresentation) Validate() error {
 	}
 }
 
+// ExploreGroupsHTTPRequestSearchMode Search mode; pipe OR is full_text only
 type ExploreGroupsHTTPRequestSearchMode string
 
 const (
@@ -821,6 +868,7 @@ func (e ExploreHTTPRequestPresentation) Validate() error {
 	}
 }
 
+// ExploreHTTPRequestSearchMode Search mode; pipe OR is full_text only
 type ExploreHTTPRequestSearchMode string
 
 const (
@@ -923,6 +971,89 @@ func (f FileSearchRowContentState) Validate() error {
 		return nil
 	default:
 		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid FileSearchRowContentState value, got: %v", f))
+	}
+}
+
+type FileSuggestionHTTPRequestMimeFamilies string
+
+const (
+	FileSuggestionHTTPRequestMimeFamiliesArchive  FileSuggestionHTTPRequestMimeFamilies = "archive"
+	FileSuggestionHTTPRequestMimeFamiliesAudio    FileSuggestionHTTPRequestMimeFamilies = "audio"
+	FileSuggestionHTTPRequestMimeFamiliesDocument FileSuggestionHTTPRequestMimeFamilies = "document"
+	FileSuggestionHTTPRequestMimeFamiliesImage    FileSuggestionHTTPRequestMimeFamilies = "image"
+	FileSuggestionHTTPRequestMimeFamiliesOther    FileSuggestionHTTPRequestMimeFamilies = "other"
+	FileSuggestionHTTPRequestMimeFamiliesPdf      FileSuggestionHTTPRequestMimeFamilies = "pdf"
+	FileSuggestionHTTPRequestMimeFamiliesText     FileSuggestionHTTPRequestMimeFamilies = "text"
+	FileSuggestionHTTPRequestMimeFamiliesVideo    FileSuggestionHTTPRequestMimeFamilies = "video"
+)
+
+// Validate checks if the FileSuggestionHTTPRequestMimeFamilies value is valid
+func (f FileSuggestionHTTPRequestMimeFamilies) Validate() error {
+	switch f {
+	case FileSuggestionHTTPRequestMimeFamiliesArchive, FileSuggestionHTTPRequestMimeFamiliesAudio, FileSuggestionHTTPRequestMimeFamiliesDocument, FileSuggestionHTTPRequestMimeFamiliesImage, FileSuggestionHTTPRequestMimeFamiliesOther, FileSuggestionHTTPRequestMimeFamiliesPdf, FileSuggestionHTTPRequestMimeFamiliesText, FileSuggestionHTTPRequestMimeFamiliesVideo:
+		return nil
+	default:
+		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid FileSuggestionHTTPRequestMimeFamilies value, got: %v", f))
+	}
+}
+
+type FileSuggestionRowContentState string
+
+const (
+	FileSuggestionRowContentStateLocalContent FileSuggestionRowContentState = "local_content"
+	FileSuggestionRowContentStateMetadataOnly FileSuggestionRowContentState = "metadata_only"
+	FileSuggestionRowContentStateMissingBlob  FileSuggestionRowContentState = "missing_blob"
+	FileSuggestionRowContentStateURLOnly      FileSuggestionRowContentState = "url_only"
+)
+
+// Validate checks if the FileSuggestionRowContentState value is valid
+func (f FileSuggestionRowContentState) Validate() error {
+	switch f {
+	case FileSuggestionRowContentStateLocalContent, FileSuggestionRowContentStateMetadataOnly, FileSuggestionRowContentStateMissingBlob, FileSuggestionRowContentStateURLOnly:
+		return nil
+	default:
+		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid FileSuggestionRowContentState value, got: %v", f))
+	}
+}
+
+type FileSuggestionRowFilenameMatch string
+
+const (
+	FileSuggestionRowFilenameMatchExact  FileSuggestionRowFilenameMatch = "exact"
+	FileSuggestionRowFilenameMatchPrefix FileSuggestionRowFilenameMatch = "prefix"
+	FileSuggestionRowFilenameMatchTypo   FileSuggestionRowFilenameMatch = "typo"
+)
+
+// Validate checks if the FileSuggestionRowFilenameMatch value is valid
+func (f FileSuggestionRowFilenameMatch) Validate() error {
+	switch f {
+	case FileSuggestionRowFilenameMatchExact, FileSuggestionRowFilenameMatchPrefix, FileSuggestionRowFilenameMatchTypo:
+		return nil
+	default:
+		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid FileSuggestionRowFilenameMatch value, got: %v", f))
+	}
+}
+
+type FileSuggestionRowMimeFamily string
+
+const (
+	FileSuggestionRowMimeFamilyArchive  FileSuggestionRowMimeFamily = "archive"
+	FileSuggestionRowMimeFamilyAudio    FileSuggestionRowMimeFamily = "audio"
+	FileSuggestionRowMimeFamilyDocument FileSuggestionRowMimeFamily = "document"
+	FileSuggestionRowMimeFamilyImage    FileSuggestionRowMimeFamily = "image"
+	FileSuggestionRowMimeFamilyOther    FileSuggestionRowMimeFamily = "other"
+	FileSuggestionRowMimeFamilyPdf      FileSuggestionRowMimeFamily = "pdf"
+	FileSuggestionRowMimeFamilyText     FileSuggestionRowMimeFamily = "text"
+	FileSuggestionRowMimeFamilyVideo    FileSuggestionRowMimeFamily = "video"
+)
+
+// Validate checks if the FileSuggestionRowMimeFamily value is valid
+func (f FileSuggestionRowMimeFamily) Validate() error {
+	switch f {
+	case FileSuggestionRowMimeFamilyArchive, FileSuggestionRowMimeFamilyAudio, FileSuggestionRowMimeFamilyDocument, FileSuggestionRowMimeFamilyImage, FileSuggestionRowMimeFamilyOther, FileSuggestionRowMimeFamilyPdf, FileSuggestionRowMimeFamilyText, FileSuggestionRowMimeFamilyVideo:
+		return nil
+	default:
+		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid FileSuggestionRowMimeFamily value, got: %v", f))
 	}
 }
 
@@ -1031,6 +1162,94 @@ func (i ImportJobResponseStatus) Validate() error {
 	}
 }
 
+type LocalEmbeddingsStatusPhase string
+
+const (
+	Downloading LocalEmbeddingsStatusPhase = "downloading"
+	Idle        LocalEmbeddingsStatusPhase = "idle"
+	Indexing    LocalEmbeddingsStatusPhase = "indexing"
+)
+
+// Validate checks if the LocalEmbeddingsStatusPhase value is valid
+func (l LocalEmbeddingsStatusPhase) Validate() error {
+	switch l {
+	case Downloading, Idle, Indexing:
+		return nil
+	default:
+		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid LocalEmbeddingsStatusPhase value, got: %v", l))
+	}
+}
+
+type LoopDecisionResponseState string
+
+const (
+	Done    LoopDecisionResponseState = "done"
+	Open    LoopDecisionResponseState = "open"
+	Snoozed LoopDecisionResponseState = "snoozed"
+)
+
+// Validate checks if the LoopDecisionResponseState value is valid
+func (l LoopDecisionResponseState) Validate() error {
+	switch l {
+	case Done, Open, Snoozed:
+		return nil
+	default:
+		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid LoopDecisionResponseState value, got: %v", l))
+	}
+}
+
+type LoopItemChannel string
+
+const (
+	Chat  LoopItemChannel = "chat"
+	Email LoopItemChannel = "email"
+)
+
+// Validate checks if the LoopItemChannel value is valid
+func (l LoopItemChannel) Validate() error {
+	switch l {
+	case Chat, Email:
+		return nil
+	default:
+		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid LoopItemChannel value, got: %v", l))
+	}
+}
+
+// LoopItemKind reply_owed waits on you; awaiting_reply waits on them
+type LoopItemKind string
+
+const (
+	AwaitingReply LoopItemKind = "awaiting_reply"
+	ReplyOwed     LoopItemKind = "reply_owed"
+)
+
+// Validate checks if the LoopItemKind value is valid
+func (l LoopItemKind) Validate() error {
+	switch l {
+	case AwaitingReply, ReplyOwed:
+		return nil
+	default:
+		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid LoopItemKind value, got: %v", l))
+	}
+}
+
+type MediaSearchResultOrigin string
+
+const (
+	MediaSearchResultOriginGenerated MediaSearchResultOrigin = "generated"
+	MediaSearchResultOriginSupplied  MediaSearchResultOrigin = "supplied"
+)
+
+// Validate checks if the MediaSearchResultOrigin value is valid
+func (m MediaSearchResultOrigin) Validate() error {
+	switch m {
+	case MediaSearchResultOriginGenerated, MediaSearchResultOriginSupplied:
+		return nil
+	default:
+		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid MediaSearchResultOrigin value, got: %v", m))
+	}
+}
+
 type MeetingActionsRequestStatus string
 
 const (
@@ -1102,6 +1321,139 @@ func (m MeetingScopeRequestDeletion) Validate() error {
 	}
 }
 
+type MessageRecordingState string
+
+const (
+	MessageRecordingStateFailed       MessageRecordingState = "failed"
+	MessageRecordingStateMediaMissing MessageRecordingState = "media_missing"
+	MessageRecordingStateMissing      MessageRecordingState = "missing"
+	MessageRecordingStateProcessing   MessageRecordingState = "processing"
+	MessageRecordingStateReady        MessageRecordingState = "ready"
+	MessageRecordingStateUnavailable  MessageRecordingState = "unavailable"
+	MessageRecordingStateUnsupported  MessageRecordingState = "unsupported"
+)
+
+// Validate checks if the MessageRecordingState value is valid
+func (m MessageRecordingState) Validate() error {
+	switch m {
+	case MessageRecordingStateFailed, MessageRecordingStateMediaMissing, MessageRecordingStateMissing, MessageRecordingStateProcessing, MessageRecordingStateReady, MessageRecordingStateUnavailable, MessageRecordingStateUnsupported:
+		return nil
+	default:
+		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid MessageRecordingState value, got: %v", m))
+	}
+}
+
+type MessageTranscriptOrigin string
+
+const (
+	MessageTranscriptOriginGenerated MessageTranscriptOrigin = "generated"
+	MessageTranscriptOriginSupplied  MessageTranscriptOrigin = "supplied"
+)
+
+// Validate checks if the MessageTranscriptOrigin value is valid
+func (m MessageTranscriptOrigin) Validate() error {
+	switch m {
+	case MessageTranscriptOriginGenerated, MessageTranscriptOriginSupplied:
+		return nil
+	default:
+		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid MessageTranscriptOrigin value, got: %v", m))
+	}
+}
+
+type MessagingRouteStatus string
+
+const (
+	ArchiveVerified MessagingRouteStatus = "archive_verified"
+	GroupContext    MessagingRouteStatus = "group_context"
+	MergedContainer MessagingRouteStatus = "merged_container"
+	Unresolved      MessagingRouteStatus = "unresolved"
+)
+
+// Validate checks if the MessagingRouteStatus value is valid
+func (m MessagingRouteStatus) Validate() error {
+	switch m {
+	case ArchiveVerified, GroupContext, MergedContainer, Unresolved:
+		return nil
+	default:
+		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid MessagingRouteStatus value, got: %v", m))
+	}
+}
+
+type MuesliRemoteMeetingContactsState string
+
+const (
+	Complete                                MuesliRemoteMeetingContactsState = "complete"
+	MuesliRemoteMeetingContactsStatePartial MuesliRemoteMeetingContactsState = "partial"
+	Off                                     MuesliRemoteMeetingContactsState = "off"
+	Unavailable                             MuesliRemoteMeetingContactsState = "unavailable"
+)
+
+// Validate checks if the MuesliRemoteMeetingContactsState value is valid
+func (m MuesliRemoteMeetingContactsState) Validate() error {
+	switch m {
+	case Complete, MuesliRemoteMeetingContactsStatePartial, Off, Unavailable:
+		return nil
+	default:
+		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid MuesliRemoteMeetingContactsState value, got: %v", m))
+	}
+}
+
+type MuesliRemoteParticipantResolution string
+
+const (
+	CarriedForward                         MuesliRemoteParticipantResolution = "carried_forward"
+	MuesliRemoteParticipantResolutionEmpty MuesliRemoteParticipantResolution = ""
+	Resolved                               MuesliRemoteParticipantResolution = "resolved"
+)
+
+// Validate checks if the MuesliRemoteParticipantResolution value is valid
+func (m MuesliRemoteParticipantResolution) Validate() error {
+	switch m {
+	case CarriedForward, MuesliRemoteParticipantResolutionEmpty, Resolved:
+		return nil
+	default:
+		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid MuesliRemoteParticipantResolution value, got: %v", m))
+	}
+}
+
+type MuesliRemoteRequestAction string
+
+const (
+	Refresh  MuesliRemoteRequestAction = "refresh"
+	Register MuesliRemoteRequestAction = "register"
+	Upsert   MuesliRemoteRequestAction = "upsert"
+)
+
+// Validate checks if the MuesliRemoteRequestAction value is valid
+func (m MuesliRemoteRequestAction) Validate() error {
+	switch m {
+	case Refresh, Register, Upsert:
+		return nil
+	default:
+		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid MuesliRemoteRequestAction value, got: %v", m))
+	}
+}
+
+type MuesliRemoteResultStatus string
+
+const (
+	Created    MuesliRemoteResultStatus = "created"
+	Refreshed  MuesliRemoteResultStatus = "refreshed"
+	Registered MuesliRemoteResultStatus = "registered"
+	Unchanged  MuesliRemoteResultStatus = "unchanged"
+	Updated    MuesliRemoteResultStatus = "updated"
+)
+
+// Validate checks if the MuesliRemoteResultStatus value is valid
+func (m MuesliRemoteResultStatus) Validate() error {
+	switch m {
+	case Created, Refreshed, Registered, Unchanged, Updated:
+		return nil
+	default:
+		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid MuesliRemoteResultStatus value, got: %v", m))
+	}
+}
+
 type NetworkEdgeKind string
 
 const (
@@ -1139,14 +1491,14 @@ func (n NetworkNodeKind) Validate() error {
 type OperationLaneStatusHistoryAvailability string
 
 const (
-	Available   OperationLaneStatusHistoryAvailability = "available"
-	Unavailable OperationLaneStatusHistoryAvailability = "unavailable"
+	Available                                         OperationLaneStatusHistoryAvailability = "available"
+	OperationLaneStatusHistoryAvailabilityUnavailable OperationLaneStatusHistoryAvailability = "unavailable"
 )
 
 // Validate checks if the OperationLaneStatusHistoryAvailability value is valid
 func (o OperationLaneStatusHistoryAvailability) Validate() error {
 	switch o {
-	case Available, Unavailable:
+	case Available, OperationLaneStatusHistoryAvailabilityUnavailable:
 		return nil
 	default:
 		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid OperationLaneStatusHistoryAvailability value, got: %v", o))
@@ -1241,11 +1593,12 @@ const (
 	Added                               OperationPublicCounterName = "added"
 	Attempted                           OperationPublicCounterName = "attempted"
 	Books                               OperationPublicCounterName = "books"
-	Created                             OperationPublicCounterName = "created"
 	IdentityRejected                    OperationPublicCounterName = "identity_rejected"
 	ItemErrors                          OperationPublicCounterName = "item_errors"
+	OperationPublicCounterNameCreated   OperationPublicCounterName = "created"
 	OperationPublicCounterNameFailed    OperationPublicCounterName = "failed"
 	OperationPublicCounterNameSucceeded OperationPublicCounterName = "succeeded"
+	OperationPublicCounterNameUpdated   OperationPublicCounterName = "updated"
 	Processed                           OperationPublicCounterName = "processed"
 	ProjectedWrites                     OperationPublicCounterName = "projected_writes"
 	Removed                             OperationPublicCounterName = "removed"
@@ -1254,13 +1607,12 @@ const (
 	Started                             OperationPublicCounterName = "started"
 	Suppressed                          OperationPublicCounterName = "suppressed"
 	Truncated                           OperationPublicCounterName = "truncated"
-	Updated                             OperationPublicCounterName = "updated"
 )
 
 // Validate checks if the OperationPublicCounterName value is valid
 func (o OperationPublicCounterName) Validate() error {
 	switch o {
-	case Added, Attempted, Books, Created, IdentityRejected, ItemErrors, OperationPublicCounterNameFailed, OperationPublicCounterNameSucceeded, Processed, ProjectedWrites, Removed, Requested, Skipped, Started, Suppressed, Truncated, Updated:
+	case Added, Attempted, Books, IdentityRejected, ItemErrors, OperationPublicCounterNameCreated, OperationPublicCounterNameFailed, OperationPublicCounterNameSucceeded, OperationPublicCounterNameUpdated, Processed, ProjectedWrites, Removed, Requested, Skipped, Started, Suppressed, Truncated:
 		return nil
 	default:
 		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid OperationPublicCounterName value, got: %v", o))
@@ -1293,44 +1645,46 @@ func (o OperationPublicCounterUnit) Validate() error {
 type OperationPublicErrorCode string
 
 const (
-	ArchiveGap                                          OperationPublicErrorCode = "archive_gap"
-	Budget                                              OperationPublicErrorCode = "budget"
-	CarddavSyncFailed                                   OperationPublicErrorCode = "carddav_sync_failed"
-	Internal                                            OperationPublicErrorCode = "internal"
-	InvalidOutput                                       OperationPublicErrorCode = "invalid_output"
-	InvocationArchiveDrift                              OperationPublicErrorCode = "invocation_archive_drift"
-	InvocationAuthenticationFailed                      OperationPublicErrorCode = "invocation_authentication_failed"
-	InvocationCancelled                                 OperationPublicErrorCode = "invocation_cancelled"
-	InvocationDaemonRestarted                           OperationPublicErrorCode = "invocation_daemon_restarted"
-	InvocationInternal                                  OperationPublicErrorCode = "invocation_internal"
-	InvocationInvalidOutput                             OperationPublicErrorCode = "invocation_invalid_output"
-	InvocationRateLimited                               OperationPublicErrorCode = "invocation_rate_limited"
-	InvocationSafetyLimit                               OperationPublicErrorCode = "invocation_safety_limit"
-	InvocationTimeout                                   OperationPublicErrorCode = "invocation_timeout"
-	InvocationUnsafeErrorRedacted                       OperationPublicErrorCode = "invocation_unsafe_error_redacted"
-	InvocationUpstreamFailed                            OperationPublicErrorCode = "invocation_upstream_failed"
-	LeaseLost                                           OperationPublicErrorCode = "lease_lost"
-	OperationPublicErrorCodeAuthenticationFailed        OperationPublicErrorCode = "authentication_failed"
-	OperationPublicErrorCodeCancelled                   OperationPublicErrorCode = "cancelled"
-	OperationPublicErrorCodeDaemonRestarted             OperationPublicErrorCode = "daemon_restarted"
-	OperationPublicErrorCodeGoogleAuthorizationRequired OperationPublicErrorCode = "google_authorization_required"
-	OperationPublicErrorCodeRetryAfter                  OperationPublicErrorCode = "retry_after"
-	OperationPublicErrorCodeSafetyLimit                 OperationPublicErrorCode = "safety_limit"
-	OperationPublicErrorCodeSyncFailed                  OperationPublicErrorCode = "sync_failed"
-	OperationPublicErrorCodeUnsafeErrorRedacted         OperationPublicErrorCode = "unsafe_error_redacted"
-	OperationPublicErrorCodeUpstreamFailed              OperationPublicErrorCode = "upstream_failed"
-	PersonSweepFailed                                   OperationPublicErrorCode = "person_sweep_failed"
-	Policy                                              OperationPublicErrorCode = "policy"
-	ProviderHTTP                                        OperationPublicErrorCode = "provider_http"
-	RateLimited                                         OperationPublicErrorCode = "rate_limited"
-	SourceSyncFailed                                    OperationPublicErrorCode = "source_sync_failed"
-	Timeout                                             OperationPublicErrorCode = "timeout"
+	ArchiveGap                                             OperationPublicErrorCode = "archive_gap"
+	Budget                                                 OperationPublicErrorCode = "budget"
+	CarddavSyncFailed                                      OperationPublicErrorCode = "carddav_sync_failed"
+	Internal                                               OperationPublicErrorCode = "internal"
+	InvalidOutput                                          OperationPublicErrorCode = "invalid_output"
+	InvocationArchiveDrift                                 OperationPublicErrorCode = "invocation_archive_drift"
+	InvocationAuthenticationFailed                         OperationPublicErrorCode = "invocation_authentication_failed"
+	InvocationCancelled                                    OperationPublicErrorCode = "invocation_cancelled"
+	InvocationDaemonRestarted                              OperationPublicErrorCode = "invocation_daemon_restarted"
+	InvocationInternal                                     OperationPublicErrorCode = "invocation_internal"
+	InvocationInvalidOutput                                OperationPublicErrorCode = "invocation_invalid_output"
+	InvocationRateLimited                                  OperationPublicErrorCode = "invocation_rate_limited"
+	InvocationSafetyLimit                                  OperationPublicErrorCode = "invocation_safety_limit"
+	InvocationTimeout                                      OperationPublicErrorCode = "invocation_timeout"
+	InvocationUnsafeErrorRedacted                          OperationPublicErrorCode = "invocation_unsafe_error_redacted"
+	InvocationUpstreamFailed                               OperationPublicErrorCode = "invocation_upstream_failed"
+	LeaseLost                                              OperationPublicErrorCode = "lease_lost"
+	OperationPublicErrorCodeAuthenticationFailed           OperationPublicErrorCode = "authentication_failed"
+	OperationPublicErrorCodeCancelled                      OperationPublicErrorCode = "cancelled"
+	OperationPublicErrorCodeDaemonRestarted                OperationPublicErrorCode = "daemon_restarted"
+	OperationPublicErrorCodeGoogleAuthorizationRequired    OperationPublicErrorCode = "google_authorization_required"
+	OperationPublicErrorCodeMicrosoftAuthorizationRequired OperationPublicErrorCode = "microsoft_authorization_required"
+	OperationPublicErrorCodeMicrosoftContactTooLarge       OperationPublicErrorCode = "microsoft_contact_too_large"
+	OperationPublicErrorCodeRetryAfter                     OperationPublicErrorCode = "retry_after"
+	OperationPublicErrorCodeSafetyLimit                    OperationPublicErrorCode = "safety_limit"
+	OperationPublicErrorCodeSyncFailed                     OperationPublicErrorCode = "sync_failed"
+	OperationPublicErrorCodeUnsafeErrorRedacted            OperationPublicErrorCode = "unsafe_error_redacted"
+	OperationPublicErrorCodeUpstreamFailed                 OperationPublicErrorCode = "upstream_failed"
+	PersonSweepFailed                                      OperationPublicErrorCode = "person_sweep_failed"
+	Policy                                                 OperationPublicErrorCode = "policy"
+	ProviderHTTP                                           OperationPublicErrorCode = "provider_http"
+	RateLimited                                            OperationPublicErrorCode = "rate_limited"
+	SourceSyncFailed                                       OperationPublicErrorCode = "source_sync_failed"
+	Timeout                                                OperationPublicErrorCode = "timeout"
 )
 
 // Validate checks if the OperationPublicErrorCode value is valid
 func (o OperationPublicErrorCode) Validate() error {
 	switch o {
-	case ArchiveGap, Budget, CarddavSyncFailed, Internal, InvalidOutput, InvocationArchiveDrift, InvocationAuthenticationFailed, InvocationCancelled, InvocationDaemonRestarted, InvocationInternal, InvocationInvalidOutput, InvocationRateLimited, InvocationSafetyLimit, InvocationTimeout, InvocationUnsafeErrorRedacted, InvocationUpstreamFailed, LeaseLost, OperationPublicErrorCodeAuthenticationFailed, OperationPublicErrorCodeCancelled, OperationPublicErrorCodeDaemonRestarted, OperationPublicErrorCodeGoogleAuthorizationRequired, OperationPublicErrorCodeRetryAfter, OperationPublicErrorCodeSafetyLimit, OperationPublicErrorCodeSyncFailed, OperationPublicErrorCodeUnsafeErrorRedacted, OperationPublicErrorCodeUpstreamFailed, PersonSweepFailed, Policy, ProviderHTTP, RateLimited, SourceSyncFailed, Timeout:
+	case ArchiveGap, Budget, CarddavSyncFailed, Internal, InvalidOutput, InvocationArchiveDrift, InvocationAuthenticationFailed, InvocationCancelled, InvocationDaemonRestarted, InvocationInternal, InvocationInvalidOutput, InvocationRateLimited, InvocationSafetyLimit, InvocationTimeout, InvocationUnsafeErrorRedacted, InvocationUpstreamFailed, LeaseLost, OperationPublicErrorCodeAuthenticationFailed, OperationPublicErrorCodeCancelled, OperationPublicErrorCodeDaemonRestarted, OperationPublicErrorCodeGoogleAuthorizationRequired, OperationPublicErrorCodeMicrosoftAuthorizationRequired, OperationPublicErrorCodeMicrosoftContactTooLarge, OperationPublicErrorCodeRetryAfter, OperationPublicErrorCodeSafetyLimit, OperationPublicErrorCodeSyncFailed, OperationPublicErrorCodeUnsafeErrorRedacted, OperationPublicErrorCodeUpstreamFailed, PersonSweepFailed, Policy, ProviderHTTP, RateLimited, SourceSyncFailed, Timeout:
 		return nil
 	default:
 		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid OperationPublicErrorCode value, got: %v", o))
@@ -1409,13 +1763,14 @@ const (
 	OperationRunDetailStatePartial   OperationRunDetailState = "partial"
 	OperationRunDetailStateRunning   OperationRunDetailState = "running"
 	OperationRunDetailStateSucceeded OperationRunDetailState = "succeeded"
+	Paused                           OperationRunDetailState = "paused"
 	Queued                           OperationRunDetailState = "queued"
 )
 
 // Validate checks if the OperationRunDetailState value is valid
 func (o OperationRunDetailState) Validate() error {
 	switch o {
-	case OperationRunDetailStateCancelled, OperationRunDetailStateFailed, OperationRunDetailStatePartial, OperationRunDetailStateRunning, OperationRunDetailStateSucceeded, Queued:
+	case OperationRunDetailStateCancelled, OperationRunDetailStateFailed, OperationRunDetailStatePartial, OperationRunDetailStateRunning, OperationRunDetailStateSucceeded, Paused, Queued:
 		return nil
 	default:
 		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid OperationRunDetailState value, got: %v", o))
@@ -1507,6 +1862,7 @@ const (
 	OperationRunSummaryStateCancelled OperationRunSummaryState = "cancelled"
 	OperationRunSummaryStateFailed    OperationRunSummaryState = "failed"
 	OperationRunSummaryStatePartial   OperationRunSummaryState = "partial"
+	OperationRunSummaryStatePaused    OperationRunSummaryState = "paused"
 	OperationRunSummaryStateQueued    OperationRunSummaryState = "queued"
 	OperationRunSummaryStateRunning   OperationRunSummaryState = "running"
 	OperationRunSummaryStateSucceeded OperationRunSummaryState = "succeeded"
@@ -1515,7 +1871,7 @@ const (
 // Validate checks if the OperationRunSummaryState value is valid
 func (o OperationRunSummaryState) Validate() error {
 	switch o {
-	case OperationRunSummaryStateCancelled, OperationRunSummaryStateFailed, OperationRunSummaryStatePartial, OperationRunSummaryStateQueued, OperationRunSummaryStateRunning, OperationRunSummaryStateSucceeded:
+	case OperationRunSummaryStateCancelled, OperationRunSummaryStateFailed, OperationRunSummaryStatePartial, OperationRunSummaryStatePaused, OperationRunSummaryStateQueued, OperationRunSummaryStateRunning, OperationRunSummaryStateSucceeded:
 		return nil
 	default:
 		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid OperationRunSummaryState value, got: %v", o))
@@ -1651,22 +2007,22 @@ func (o OrganizationCategoryBodySource) Validate() error {
 type OrganizationContactPointBodyContactKind string
 
 const (
-	Calendar     OrganizationContactPointBodyContactKind = "calendar"
-	ContactURI   OrganizationContactPointBodyContactKind = "contact_uri"
-	Email        OrganizationContactPointBodyContactKind = "email"
-	Impp         OrganizationContactPointBodyContactKind = "impp"
-	Language     OrganizationContactPointBodyContactKind = "language"
-	OrgDirectory OrganizationContactPointBodyContactKind = "org_directory"
-	Phone        OrganizationContactPointBodyContactKind = "phone"
-	Social       OrganizationContactPointBodyContactKind = "social"
-	URL          OrganizationContactPointBodyContactKind = "url"
-	Username     OrganizationContactPointBodyContactKind = "username"
+	Calendar                                     OrganizationContactPointBodyContactKind = "calendar"
+	ContactURI                                   OrganizationContactPointBodyContactKind = "contact_uri"
+	Impp                                         OrganizationContactPointBodyContactKind = "impp"
+	Language                                     OrganizationContactPointBodyContactKind = "language"
+	OrgDirectory                                 OrganizationContactPointBodyContactKind = "org_directory"
+	OrganizationContactPointBodyContactKindEmail OrganizationContactPointBodyContactKind = "email"
+	Phone                                        OrganizationContactPointBodyContactKind = "phone"
+	Social                                       OrganizationContactPointBodyContactKind = "social"
+	URL                                          OrganizationContactPointBodyContactKind = "url"
+	Username                                     OrganizationContactPointBodyContactKind = "username"
 )
 
 // Validate checks if the OrganizationContactPointBodyContactKind value is valid
 func (o OrganizationContactPointBodyContactKind) Validate() error {
 	switch o {
-	case Calendar, ContactURI, Email, Impp, Language, OrgDirectory, Phone, Social, URL, Username:
+	case Calendar, ContactURI, Impp, Language, OrgDirectory, OrganizationContactPointBodyContactKindEmail, Phone, Social, URL, Username:
 		return nil
 	default:
 		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid OrganizationContactPointBodyContactKind value, got: %v", o))
@@ -1992,6 +2348,107 @@ func (p PersonFileSearchRowContentState) Validate() error {
 	}
 }
 
+type PersonFileSuggestionHTTPRequestDirections string
+
+const (
+	PersonFileSuggestionHTTPRequestDirectionsFromPerson PersonFileSuggestionHTTPRequestDirections = "from_person"
+	PersonFileSuggestionHTTPRequestDirectionsGroup      PersonFileSuggestionHTTPRequestDirections = "group"
+	PersonFileSuggestionHTTPRequestDirectionsToPerson   PersonFileSuggestionHTTPRequestDirections = "to_person"
+)
+
+// Validate checks if the PersonFileSuggestionHTTPRequestDirections value is valid
+func (p PersonFileSuggestionHTTPRequestDirections) Validate() error {
+	switch p {
+	case PersonFileSuggestionHTTPRequestDirectionsFromPerson, PersonFileSuggestionHTTPRequestDirectionsGroup, PersonFileSuggestionHTTPRequestDirectionsToPerson:
+		return nil
+	default:
+		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid PersonFileSuggestionHTTPRequestDirections value, got: %v", p))
+	}
+}
+
+type PersonFileSuggestionHTTPRequestMimeFamilies string
+
+const (
+	PersonFileSuggestionHTTPRequestMimeFamiliesArchive  PersonFileSuggestionHTTPRequestMimeFamilies = "archive"
+	PersonFileSuggestionHTTPRequestMimeFamiliesAudio    PersonFileSuggestionHTTPRequestMimeFamilies = "audio"
+	PersonFileSuggestionHTTPRequestMimeFamiliesDocument PersonFileSuggestionHTTPRequestMimeFamilies = "document"
+	PersonFileSuggestionHTTPRequestMimeFamiliesImage    PersonFileSuggestionHTTPRequestMimeFamilies = "image"
+	PersonFileSuggestionHTTPRequestMimeFamiliesOther    PersonFileSuggestionHTTPRequestMimeFamilies = "other"
+	PersonFileSuggestionHTTPRequestMimeFamiliesPdf      PersonFileSuggestionHTTPRequestMimeFamilies = "pdf"
+	PersonFileSuggestionHTTPRequestMimeFamiliesText     PersonFileSuggestionHTTPRequestMimeFamilies = "text"
+	PersonFileSuggestionHTTPRequestMimeFamiliesVideo    PersonFileSuggestionHTTPRequestMimeFamilies = "video"
+)
+
+// Validate checks if the PersonFileSuggestionHTTPRequestMimeFamilies value is valid
+func (p PersonFileSuggestionHTTPRequestMimeFamilies) Validate() error {
+	switch p {
+	case PersonFileSuggestionHTTPRequestMimeFamiliesArchive, PersonFileSuggestionHTTPRequestMimeFamiliesAudio, PersonFileSuggestionHTTPRequestMimeFamiliesDocument, PersonFileSuggestionHTTPRequestMimeFamiliesImage, PersonFileSuggestionHTTPRequestMimeFamiliesOther, PersonFileSuggestionHTTPRequestMimeFamiliesPdf, PersonFileSuggestionHTTPRequestMimeFamiliesText, PersonFileSuggestionHTTPRequestMimeFamiliesVideo:
+		return nil
+	default:
+		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid PersonFileSuggestionHTTPRequestMimeFamilies value, got: %v", p))
+	}
+}
+
+type PersonFileSuggestionRowContentState string
+
+const (
+	PersonFileSuggestionRowContentStateLocalContent PersonFileSuggestionRowContentState = "local_content"
+	PersonFileSuggestionRowContentStateMetadataOnly PersonFileSuggestionRowContentState = "metadata_only"
+	PersonFileSuggestionRowContentStateMissingBlob  PersonFileSuggestionRowContentState = "missing_blob"
+	PersonFileSuggestionRowContentStateURLOnly      PersonFileSuggestionRowContentState = "url_only"
+)
+
+// Validate checks if the PersonFileSuggestionRowContentState value is valid
+func (p PersonFileSuggestionRowContentState) Validate() error {
+	switch p {
+	case PersonFileSuggestionRowContentStateLocalContent, PersonFileSuggestionRowContentStateMetadataOnly, PersonFileSuggestionRowContentStateMissingBlob, PersonFileSuggestionRowContentStateURLOnly:
+		return nil
+	default:
+		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid PersonFileSuggestionRowContentState value, got: %v", p))
+	}
+}
+
+type PersonFileSuggestionRowFilenameMatch string
+
+const (
+	PersonFileSuggestionRowFilenameMatchExact  PersonFileSuggestionRowFilenameMatch = "exact"
+	PersonFileSuggestionRowFilenameMatchPrefix PersonFileSuggestionRowFilenameMatch = "prefix"
+	PersonFileSuggestionRowFilenameMatchTypo   PersonFileSuggestionRowFilenameMatch = "typo"
+)
+
+// Validate checks if the PersonFileSuggestionRowFilenameMatch value is valid
+func (p PersonFileSuggestionRowFilenameMatch) Validate() error {
+	switch p {
+	case PersonFileSuggestionRowFilenameMatchExact, PersonFileSuggestionRowFilenameMatchPrefix, PersonFileSuggestionRowFilenameMatchTypo:
+		return nil
+	default:
+		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid PersonFileSuggestionRowFilenameMatch value, got: %v", p))
+	}
+}
+
+type PersonFileSuggestionRowMimeFamily string
+
+const (
+	PersonFileSuggestionRowMimeFamilyArchive  PersonFileSuggestionRowMimeFamily = "archive"
+	PersonFileSuggestionRowMimeFamilyAudio    PersonFileSuggestionRowMimeFamily = "audio"
+	PersonFileSuggestionRowMimeFamilyDocument PersonFileSuggestionRowMimeFamily = "document"
+	PersonFileSuggestionRowMimeFamilyImage    PersonFileSuggestionRowMimeFamily = "image"
+	PersonFileSuggestionRowMimeFamilyOther    PersonFileSuggestionRowMimeFamily = "other"
+	PersonFileSuggestionRowMimeFamilyPdf      PersonFileSuggestionRowMimeFamily = "pdf"
+	PersonFileSuggestionRowMimeFamilyText     PersonFileSuggestionRowMimeFamily = "text"
+	PersonFileSuggestionRowMimeFamilyVideo    PersonFileSuggestionRowMimeFamily = "video"
+)
+
+// Validate checks if the PersonFileSuggestionRowMimeFamily value is valid
+func (p PersonFileSuggestionRowMimeFamily) Validate() error {
+	switch p {
+	case PersonFileSuggestionRowMimeFamilyArchive, PersonFileSuggestionRowMimeFamilyAudio, PersonFileSuggestionRowMimeFamilyDocument, PersonFileSuggestionRowMimeFamilyImage, PersonFileSuggestionRowMimeFamilyOther, PersonFileSuggestionRowMimeFamilyPdf, PersonFileSuggestionRowMimeFamilyText, PersonFileSuggestionRowMimeFamilyVideo:
+		return nil
+	default:
+		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid PersonFileSuggestionRowMimeFamily value, got: %v", p))
+	}
+}
+
 type PersonMergeResultCacheState string
 
 const (
@@ -2064,6 +2521,24 @@ func (p ProvenanceRoles) Validate() error {
 	}
 }
 
+type ReferenceKind string
+
+const (
+	DocbankRendition ReferenceKind = "docbank_rendition"
+	DocumentChunk    ReferenceKind = "document_chunk"
+	Message          ReferenceKind = "message"
+)
+
+// Validate checks if the ReferenceKind value is valid
+func (r ReferenceKind) Validate() error {
+	switch r {
+	case DocbankRendition, DocumentChunk, Message:
+		return nil
+	default:
+		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid ReferenceKind value, got: %v", r))
+	}
+}
+
 type RelationshipCalendarDayLevel string
 
 const (
@@ -2122,11 +2597,13 @@ func (r RunSavedViewResponseResultKind) Validate() error {
 type SavedViewFilterField string
 
 const (
+	SavedViewFilterFieldAccount       SavedViewFilterField = "account"
 	SavedViewFilterFieldAfter         SavedViewFilterField = "after"
 	SavedViewFilterFieldBefore        SavedViewFilterField = "before"
 	SavedViewFilterFieldDeletion      SavedViewFilterField = "deletion"
 	SavedViewFilterFieldDomain        SavedViewFilterField = "domain"
 	SavedViewFilterFieldIdentity      SavedViewFilterField = "identity"
+	SavedViewFilterFieldKind          SavedViewFilterField = "kind"
 	SavedViewFilterFieldMailingList   SavedViewFilterField = "mailing_list"
 	SavedViewFilterFieldMessageType   SavedViewFilterField = "message_type"
 	SavedViewFilterFieldParticipant   SavedViewFilterField = "participant"
@@ -2138,7 +2615,7 @@ const (
 // Validate checks if the SavedViewFilterField value is valid
 func (s SavedViewFilterField) Validate() error {
 	switch s {
-	case SavedViewFilterFieldAfter, SavedViewFilterFieldBefore, SavedViewFilterFieldDeletion, SavedViewFilterFieldDomain, SavedViewFilterFieldIdentity, SavedViewFilterFieldMailingList, SavedViewFilterFieldMessageType, SavedViewFilterFieldParticipant, SavedViewFilterFieldParticipantID, SavedViewFilterFieldSource, SavedViewFilterFieldSourceID:
+	case SavedViewFilterFieldAccount, SavedViewFilterFieldAfter, SavedViewFilterFieldBefore, SavedViewFilterFieldDeletion, SavedViewFilterFieldDomain, SavedViewFilterFieldIdentity, SavedViewFilterFieldKind, SavedViewFilterFieldMailingList, SavedViewFilterFieldMessageType, SavedViewFilterFieldParticipant, SavedViewFilterFieldParticipantID, SavedViewFilterFieldSource, SavedViewFilterFieldSourceID:
 		return nil
 	default:
 		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid SavedViewFilterField value, got: %v", s))
@@ -2348,10 +2825,29 @@ func (s SecretSettingUpdateAction) Validate() error {
 	}
 }
 
+type SelectorKind string
+
+const (
+	SelectorKindDocbankRendition SelectorKind = "docbank_rendition"
+	SelectorKindDocumentChunk    SelectorKind = "document_chunk"
+	SelectorKindMessage          SelectorKind = "message"
+)
+
+// Validate checks if the SelectorKind value is valid
+func (s SelectorKind) Validate() error {
+	switch s {
+	case SelectorKindDocbankRendition, SelectorKindDocumentChunk, SelectorKindMessage:
+		return nil
+	default:
+		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid SelectorKind value, got: %v", s))
+	}
+}
+
 type SessionStatusAuthMode string
 
 const (
 	APIKey    SessionStatusAuthMode = "api_key"
+	Caller    SessionStatusAuthMode = "caller"
 	Delegated SessionStatusAuthMode = "delegated"
 	Loopback  SessionStatusAuthMode = "loopback"
 	Required  SessionStatusAuthMode = "required"
@@ -2361,7 +2857,7 @@ const (
 // Validate checks if the SessionStatusAuthMode value is valid
 func (s SessionStatusAuthMode) Validate() error {
 	switch s {
-	case APIKey, Delegated, Loopback, Required, Session:
+	case APIKey, Caller, Delegated, Loopback, Required, Session:
 		return nil
 	default:
 		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid SessionStatusAuthMode value, got: %v", s))
@@ -2517,6 +3013,24 @@ func (t TaskIntegrationStatusResponseState) Validate() error {
 	}
 }
 
+// TelemetryEventResponseStatus queued when accepted, including suppressed daily screen_viewed and message_opened duplicates or invalid screen names; disabled when telemetry is off
+type TelemetryEventResponseStatus string
+
+const (
+	TelemetryEventResponseStatusDisabled TelemetryEventResponseStatus = "disabled"
+	TelemetryEventResponseStatusQueued   TelemetryEventResponseStatus = "queued"
+)
+
+// Validate checks if the TelemetryEventResponseStatus value is valid
+func (t TelemetryEventResponseStatus) Validate() error {
+	switch t {
+	case TelemetryEventResponseStatusDisabled, TelemetryEventResponseStatusQueued:
+		return nil
+	default:
+		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid TelemetryEventResponseStatus value, got: %v", t))
+	}
+}
+
 type ListOperationRunsQueryKind string
 
 const (
@@ -2567,6 +3081,7 @@ const (
 	ListOperationRunsQueryStateCancelled ListOperationRunsQueryState = "cancelled"
 	ListOperationRunsQueryStateFailed    ListOperationRunsQueryState = "failed"
 	ListOperationRunsQueryStatePartial   ListOperationRunsQueryState = "partial"
+	ListOperationRunsQueryStatePaused    ListOperationRunsQueryState = "paused"
 	ListOperationRunsQueryStateQueued    ListOperationRunsQueryState = "queued"
 	ListOperationRunsQueryStateRunning   ListOperationRunsQueryState = "running"
 	ListOperationRunsQueryStateSucceeded ListOperationRunsQueryState = "succeeded"
@@ -2575,7 +3090,7 @@ const (
 // Validate checks if the ListOperationRunsQueryState value is valid
 func (l ListOperationRunsQueryState) Validate() error {
 	switch l {
-	case ListOperationRunsQueryStateCancelled, ListOperationRunsQueryStateFailed, ListOperationRunsQueryStatePartial, ListOperationRunsQueryStateQueued, ListOperationRunsQueryStateRunning, ListOperationRunsQueryStateSucceeded:
+	case ListOperationRunsQueryStateCancelled, ListOperationRunsQueryStateFailed, ListOperationRunsQueryStatePartial, ListOperationRunsQueryStatePaused, ListOperationRunsQueryStateQueued, ListOperationRunsQueryStateRunning, ListOperationRunsQueryStateSucceeded:
 		return nil
 	default:
 		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid ListOperationRunsQueryState value, got: %v", l))

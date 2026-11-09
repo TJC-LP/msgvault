@@ -94,7 +94,7 @@ func (s *Store) RepairHistoricalAttachmentRolesBatch(
 		if decodeErr != nil {
 			continue
 		}
-		messageUpdates, err := s.prepareAttachmentRoleRepair(messageID, raw)
+		messageUpdates, err := s.prepareAttachmentRoleRepair(ctx, messageID, raw)
 		if err != nil {
 			return AttachmentRoleRepairProgress{}, err
 		}
@@ -131,6 +131,10 @@ func (s *Store) RepairHistoricalAttachmentRolesBatch(
 				  AND attachment_role = 'unknown'
 				  AND source_part_key IS NULL
 				  AND content_hash = ?
+				  AND NOT EXISTS (
+					SELECT 1 FROM source_merge_preserved_attachments spa
+					WHERE spa.attachment_id = attachments.id
+				  )
 				  AND NOT EXISTS (
 					SELECT 1 FROM attachments keyed
 					WHERE keyed.message_id = ? AND keyed.source_part_key = ?
@@ -199,6 +203,10 @@ func mergeDuplicateAttachmentRoleRepair(
 		  AND attachment_role = 'unknown'
 		  AND source_part_key IS NULL
 		  AND content_hash = ?
+		  AND NOT EXISTS (
+			SELECT 1 FROM source_merge_preserved_attachments spa
+			WHERE spa.attachment_id = attachments.id
+		  )
 	`, update.attachmentID, update.messageID, update.contentHash)
 	if err != nil {
 		return false, err
@@ -237,6 +245,10 @@ func (s *Store) nextAttachmentRoleRepairMessageIDs(
 		  AND EXISTS (
 			SELECT 1 FROM attachments a
 			WHERE a.message_id = m.id AND a.attachment_role = 'unknown'
+			  AND NOT EXISTS (
+				SELECT 1 FROM source_merge_preserved_attachments spa
+				WHERE spa.attachment_id = a.id
+			  )
 		  )
 		ORDER BY m.id
 		LIMIT ?
@@ -318,7 +330,7 @@ func decodeMessageRawBounded(
 	return data, bytesRead, nil
 }
 
-func (s *Store) prepareAttachmentRoleRepair(messageID int64, raw []byte) ([]attachmentRoleRepairUpdate, error) {
+func (s *Store) prepareAttachmentRoleRepair(ctx context.Context, messageID int64, raw []byte) ([]attachmentRoleRepairUpdate, error) {
 	if len(raw) == 0 {
 		return nil, nil
 	}
@@ -331,10 +343,14 @@ func (s *Store) prepareAttachmentRoleRepair(messageID int64, raw []byte) ([]atta
 		id          int64
 		contentHash string
 	}
-	rows, err := s.db.Query(`
+	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, COALESCE(content_hash, '')
 		FROM attachments
 		WHERE message_id = ? AND attachment_role = 'unknown'
+		  AND NOT EXISTS (
+			SELECT 1 FROM source_merge_preserved_attachments spa
+			WHERE spa.attachment_id = attachments.id
+		  )
 	`, messageID)
 	if err != nil {
 		return nil, err
@@ -355,37 +371,9 @@ func (s *Store) prepareAttachmentRoleRepair(messageID int64, raw []byte) ([]atta
 		return nil, err
 	}
 
-	// Enmime can expose the same physical part through both Attachments and
-	// Inlines. PartKey is the source identity, so collapse that duplicate while
-	// preserving the stricter inline evidence. A key with conflicting bytes is
-	// corrupt/ambiguous and is excluded entirely.
-	partsByKey := make(map[string]internalmime.Attachment, len(parsed.Attachments))
-	conflictedKeys := make(map[string]struct{})
+	partsByHash := make(map[string][]internalmime.Attachment, len(parsed.Attachments))
 	for _, part := range parsed.Attachments {
 		if part.PartKey == "" {
-			continue
-		}
-		previous, exists := partsByKey[part.PartKey]
-		if !exists {
-			partsByKey[part.PartKey] = part
-			continue
-		}
-		if previous.ContentHash != part.ContentHash {
-			conflictedKeys[part.PartKey] = struct{}{}
-			continue
-		}
-		if part.IsInline || part.Disposition == "inline" || part.ContentID != "" {
-			previous.IsInline = true
-			previous.Disposition = "inline"
-			if previous.ContentID == "" {
-				previous.ContentID = part.ContentID
-			}
-			partsByKey[part.PartKey] = previous
-		}
-	}
-	partsByHash := make(map[string][]internalmime.Attachment, len(partsByKey))
-	for partKey, part := range partsByKey {
-		if _, conflicted := conflictedKeys[partKey]; conflicted {
 			continue
 		}
 		partsByHash[part.ContentHash] = append(partsByHash[part.ContentHash], part)

@@ -1,12 +1,10 @@
 <script lang="ts">
-  import { onDestroy, onMount, untrack } from 'svelte';
-  import { Button, Checkbox, SelectDropdown, TextInput } from '@kenn-io/kit-ui';
+  import { Button, Checkbox, RadioGroup, SelectDropdown, TextInput } from '@kenn-io/kit-ui';
   import type { APIClient } from '../../api/client';
   import type { PeopleInferencePresetCreateRequest } from '../../api/generated/models';
   import { credentialStatus, PeopleInferenceController } from '../../settings/people-inference-controller.svelte';
 
-  let { client }: { client: APIClient } = $props();
-  const controller = new PeopleInferenceController(untrack(() => client));
+  let { client, controller }: { client: APIClient; controller: PeopleInferenceController } = $props();
   let provider = $state<PeopleInferencePresetCreateRequest['preset_id']>('openai');
   let name = $state('');
   let model = $state('');
@@ -19,9 +17,6 @@
   let retentionPosture = $state('');
   let trainingPosture = $state('');
   let removeConfirmationName = $state('');
-
-  onMount(() => { void controller.load(); });
-  onDestroy(() => controller.destroy());
 
   async function createProfile(): Promise<void> {
     const stableName = name.trim();
@@ -66,7 +61,7 @@
 <section class="people-inference" aria-label="People sweep settings">
   <header>
     <h2>People sweep</h2>
-    <p>Choose the provider used for people sweep and briefs. A synthetic check and your consent are required before use.</p>
+    <p>A synthetic check and your consent are required before use.</p>
     <Button disabled={controller.loading || controller.busy} onclick={() => void controller.load()} label="Reload people sweep settings" />
   </header>
 
@@ -79,7 +74,7 @@
     {#if controller.status.pending_restart}
       <p role="status">Restart the daemon to use the saved people sweep profile. The running daemon still uses {controller.status.running_name || 'no profile'}.</p>
     {/if}
-    <div>
+    <div class="state">
       <p><strong>Configured:</strong> {controller.status.configured_name || 'None'} ({controller.status.configured_enabled ? 'enabled' : 'disabled'})</p>
       <p><strong>Running:</strong> {controller.status.running_name || 'None'} ({controller.status.running_enabled ? 'enabled' : 'disabled'})</p>
       {#if controller.status.configured_enabled}
@@ -87,37 +82,32 @@
       {/if}
     </div>
 
-    {#if controller.status.stored_credentials_supported}
-      <form class="form" onsubmit={(event) => { event.preventDefault(); void createProfile(); }}>
-        <h3>Add a profile</h3>
-        <SelectDropdown title="Provider" value={provider} disabled={controller.busy}
-          options={[{ value: 'openai', label: 'OpenAI Platform' }, { value: 'openrouter', label: 'OpenRouter' }, { value: 'venice', label: 'Venice' }]}
-          onchange={(value) => { provider = value as typeof provider; key = ''; }} />
-        <label>Profile name<TextInput bind:value={name} required autocomplete="off" disabled={controller.busy} block /></label>
-        <label>Model ID<TextInput bind:value={model} required autocomplete="off" block /></label>
-        <label>API key<TextInput type="password" bind:value={key} autocomplete="new-password" required block /></label>
-        <fieldset>
-          <legend>Archive source classes</legend>
-          <Checkbox label="Conversation text" checked={allowedSources.includes('conversation_text')} onchange={(checked) => setSource('conversation_text', checked)} />
-          <Checkbox label="Meeting text" checked={allowedSources.includes('meeting_text')} onchange={(checked) => setSource('meeting_text', checked)} />
-          <Checkbox label="Document text" checked={allowedSources.includes('document_text')} onchange={(checked) => setSource('document_text', checked)} />
-        </fieldset>
-        <label>Archive data since (YYYY-MM-DD)<TextInput bind:value={sourceSince} placeholder="YYYY-MM-DD" required block /></label>
-        <label>Archive data until (optional, YYYY-MM-DD)<TextInput bind:value={sourceUntil} placeholder="YYYY-MM-DD" block /></label>
-        <fieldset>
-          <legend>Sensitive archive content</legend>
-          <label><input type="radio" name="sensitive-content" value="allow" bind:group={sensitiveChoice} required /> Allow sensitive content</label>
-          <label><input type="radio" name="sensitive-content" value="exclude" bind:group={sensitiveChoice} /> Exclude sensitive content</label>
-          <p>Real sweeps send archive text to this provider. Excluding sensitive content permits only the synthetic check.</p>
-        </fieldset>
-        <label>Retention statement<TextInput bind:value={retentionPosture} required autocomplete="off" block /></label>
-        <label>Training statement<TextInput bind:value={trainingPosture} required autocomplete="off" block /></label>
-        <Button type="submit" disabled={controller.busy} label="Create profile" />
-      </form>
-    {:else}
-      <p>Stored provider keys are unavailable on this platform. Configure an environment credential with
-        <code>msgvault person provider add</code> and <code>--credential-env</code> on the daemon host, then reload these settings.</p>
-    {/if}
+    <form class="form" onsubmit={(event) => { event.preventDefault(); void createProfile(); }}>
+      <h3>Add a profile</h3>
+      <SelectDropdown title="Provider" value={provider} disabled={controller.busy}
+        options={[{ value: 'openai', label: 'OpenAI Platform' }, { value: 'openrouter', label: 'OpenRouter' }, { value: 'venice', label: 'Venice' }]}
+        onchange={(value) => { provider = value as typeof provider; key = ''; }} />
+      <label>Profile name<TextInput bind:value={name} required autocomplete="off" disabled={controller.busy} block /></label>
+      <label>Model ID<TextInput bind:value={model} required autocomplete="off" block /></label>
+      <label>API key<TextInput type="password" bind:value={key} autocomplete="new-password" required block /></label>
+      <fieldset>
+        <legend>Archive source classes</legend>
+        <Checkbox label="Conversation text" checked={allowedSources.includes('conversation_text')} onchange={(checked) => setSource('conversation_text', checked)} />
+        <Checkbox label="Meeting text" checked={allowedSources.includes('meeting_text')} onchange={(checked) => setSource('meeting_text', checked)} />
+        <Checkbox label="Document text" checked={allowedSources.includes('document_text')} onchange={(checked) => setSource('document_text', checked)} />
+      </fieldset>
+      <label>Archive data since (YYYY-MM-DD)<TextInput bind:value={sourceSince} placeholder="YYYY-MM-DD" required block /></label>
+      <label>Archive data until (optional, YYYY-MM-DD)<TextInput bind:value={sourceUntil} placeholder="YYYY-MM-DD" block /></label>
+      <div class="disclosure-policy">
+        <RadioGroup legend="Sensitive archive content" name="sensitive-content" required
+          value={sensitiveChoice} onchange={(value) => sensitiveChoice = value ?? ''}
+          options={[{ value: 'allow', label: 'Allow sensitive content' }, { value: 'exclude', label: 'Exclude sensitive content' }]} />
+        <p>Real sweeps send archive text to this provider. Excluding sensitive content permits only the synthetic check.</p>
+      </div>
+      <label>Retention statement<TextInput bind:value={retentionPosture} required autocomplete="off" block /></label>
+      <label>Training statement<TextInput bind:value={trainingPosture} required autocomplete="off" block /></label>
+      <Button type="submit" disabled={controller.busy} label="Create profile" />
+    </form>
 
     {#if controller.status.profiles.length}
       <div class="profile">
@@ -134,7 +124,7 @@
             <div><dt>Last check</dt><dd>{profile.checked ? 'Checked for this profile' : 'Not checked'}</dd></div>
             <div><dt>Consent</dt><dd>{profile.consent_active ? 'Granted for this profile' : 'Not granted'}</dd></div>
           </dl>
-          {#if controller.status.stored_credentials_supported && profile.protocol !== 'codex_app_server' && profile.credential_source !== 'env'}
+          {#if profile.protocol !== 'codex_app_server' && profile.credential_source !== 'env'}
             <form class="replacement-key" onsubmit={(event) => { event.preventDefault(); void saveReplacementKey(); }}>
               <label>Replacement API key<TextInput type="password" bind:value={replacementKey} autocomplete="new-password" required block /></label>
               <Button type="submit" disabled={controller.busy} label="Save API key" />
@@ -151,7 +141,7 @@
             {/if}
           </div>
           {#if controller.status.profiles.length < 2}
-            <p>Add another profile before removing this one.</p>
+            <p class="note">Add another profile before removing this one.</p>
           {/if}
           {#if removeConfirmationName === controller.selectedName}
             <div>
@@ -185,18 +175,25 @@
 </section>
 
 <style>
-  .people-inference { display: grid; gap: var(--space-5); min-width: 0; overflow-wrap: anywhere; }
-  header p { color: var(--text-muted); margin-block: var(--space-2); }
-  .form, .profile, .disclosure, .replacement-key { display: grid; gap: var(--space-3); min-width: 0; }
-  .form, .profile { border: 1px solid var(--border-muted); border-radius: var(--radius-md); padding: var(--space-4); }
-  label { display: grid; gap: var(--space-1); min-width: 0; }
-  label:has(input[type='radio']) { display: flex; align-items: center; }
-  fieldset { display: grid; gap: var(--space-2); min-width: 0; border: 1px solid var(--border-muted); }
-  fieldset p { margin: 0; }
-  dl { display: grid; gap: var(--space-2); margin: 0; }
-  dl div { display: grid; grid-template-columns: 6rem minmax(0, 1fr); gap: var(--space-2); }
+  /* Matches the Settings form: small labels, 6px inside a field, 16px between fields. */
+  .people-inference { display: grid; gap: var(--space-7); min-width: 0; overflow-wrap: anywhere; }
+  p { margin: 0; }
+  h2, h3, h4 { margin: 0; font-size: var(--font-size-md); font-weight: var(--font-weight-semibold); }
+  h4 { font-size: var(--font-size-sm); }
+  header { display: grid; justify-items: start; gap: var(--control-gap); }
+  header p { color: var(--text-muted); font-size: var(--font-size-xs); }
+  .state { display: grid; justify-items: start; gap: var(--space-2); font-size: var(--font-size-sm); }
+  .form, .profile, .disclosure, .replacement-key { display: grid; gap: var(--section-gap); min-width: 0; }
+  .form, .profile { border: 1px solid var(--border-muted); border-radius: var(--radius-md); padding: var(--pane-pad-x); }
+  label { display: grid; gap: var(--control-gap); min-width: 0; color: var(--text-secondary); font-size: var(--font-size-xs); }
+  fieldset, .disclosure-policy { display: grid; gap: var(--space-3); min-width: 0; margin: 0; padding: 0; border: 0; }
+  legend { margin-bottom: var(--control-gap); padding: 0; color: var(--text-secondary); font-size: var(--font-size-xs); }
+  .disclosure-policy p { color: var(--text-muted); font-size: var(--font-size-2xs); }
+  dl { display: grid; gap: var(--space-2); margin: 0; font-size: var(--font-size-sm); }
+  dl div { display: grid; grid-template-columns: 6rem minmax(0, 1fr); gap: var(--space-3); }
   dt { color: var(--text-muted); }
   dd { margin: 0; }
-  .actions { display: flex; flex-wrap: wrap; gap: var(--space-2); }
+  .actions { display: flex; flex-wrap: wrap; gap: var(--control-gap); }
+  .note { color: var(--text-muted); font-size: var(--font-size-xs); }
   .error { color: var(--danger); }
 </style>

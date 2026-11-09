@@ -97,7 +97,7 @@ func (a *storeAPIAdapter) runCLIForwardDraft(
 	}
 	target, from, _, err := a.resolveDraftTarget(
 		ctx, &intent.MessageID, intent.Account, intent.SourceID, intent.SourceIDSet,
-		intent.From, nil,
+		intent.From, nil, false,
 	)
 	if err != nil {
 		return err
@@ -159,7 +159,7 @@ func (a *storeAPIAdapter) readForwardAttachments(
 	problems := make([]draftForwardProblem, 0)
 	used := make([]bool, len(refs))
 	boundHashes := make(map[string]bool, len(refs))
-	for _, part := range msgmime.DistinctAttachments(parsed.Attachments) {
+	for _, part := range parsed.Attachments {
 		attachment := imaplib.ForwardAttachment{
 			Filename: part.Filename, ContentType: part.ContentType, ContentID: part.ContentID,
 			Disposition: part.Disposition, IsInline: part.IsInline, Content: part.Content,

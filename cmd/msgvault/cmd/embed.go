@@ -28,7 +28,7 @@ const (
 
 var embeddingsCmd = &cobra.Command{
 	Use:   embeddingsCommandName,
-	Short: "Manage vector embeddings",
+	Short: "Manage message vector embeddings",
 }
 
 var embeddingsBuildCmd = newEmbeddingsBuildCmd("build")
@@ -72,7 +72,7 @@ var embedCmd = newEmbeddingsBuildCmd("build-embeddings")
 func newEmbeddingsBuildCmd(use string) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   use,
-		Short: "Build or update the vector embedding index (incremental by default; --full-rebuild for a new generation)",
+		Short: "Build or update the message vector index",
 		Long: `Build or update the vector embedding index for hybrid search.
 Writes vectors to the co-located vectors.db. In the default incremental
 mode, the command embeds any messages still needing embedding for the
@@ -80,8 +80,8 @@ active generation. With --full-rebuild, it creates a new building
 generation, embeds the entire corpus, and (on a clean completion)
 atomically activates it.
 
-Requires [vector] to be enabled in config.toml and [vector.embeddings]
-to point at a running OpenAI-compatible endpoint.`,
+Requires [vector] to be enabled and [vector.embeddings] to configure an
+OpenAI-compatible endpoint or local_only = true for the shared local server.`,
 		RunE: runEmbeddingsBuild,
 	}
 	cmd.Flags().BoolVar(&embedFullRebuild, "full-rebuild", false, "Create a new generation and rebuild from scratch")
@@ -111,7 +111,7 @@ func runEmbeddingsBuildLocal(cmd *cobra.Command) error {
 	if !cfg.Vector.Enabled {
 		return errors.New("vector search not enabled; add [vector] enabled=true to config.toml first")
 	}
-	if cfg.Vector.Embeddings.Endpoint == "" || cfg.Vector.Embeddings.Model == "" {
+	if (!cfg.Vector.Embeddings.LocalOnly && cfg.Vector.Embeddings.Endpoint == "") || cfg.Vector.Embeddings.Model == "" {
 		return errors.New("[vector.embeddings] endpoint and model are required")
 	}
 	return runEmbed(cmd)
@@ -140,7 +140,7 @@ func embeddingsForwardEnv(state *invocation) map[string]string {
 	}
 	cfg := state.cfg
 	name := cfg.Vector.Embeddings.APIKeyEnv
-	if name == "" {
+	if cfg.Vector.Embeddings.LocalOnly || name == "" {
 		return nil
 	}
 	value := os.Getenv(name)

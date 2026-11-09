@@ -1,5 +1,5 @@
 ---
-last_edited: "2026-10-02"
+last_edited: "2026-10-08"
 title: Choose a Source
 description: Find the right sync or import path for mail, chat, meetings, calendars, and contacts.
 ---
@@ -37,20 +37,24 @@ also a separate opt-in because downloading an image can activate email tracking.
 | Slackdump export | [Slackdump import](../usage/slack.md) | Local directory or ZIP; no Slack token needed |
 | Microsoft Teams | [Teams sync](../usage/teams.md) | Chats, self-chat, channels, replies, and available media |
 | Discord | [Discord sync](../usage/discord.md) | Bot-accessible guild channels, threads, and forums; personal DMs are outside this integration |
+| Chatwoot | [Chatwoot sync](chatwoot.md) | Shared inboxes, contact and employee messages, media, and linked call meetings |
 | Beeper Desktop | [Beeper sync](../usage/beeper.md) | History and media exposed by the running local Beeper API |
-| WhatsApp, iMessage, iMazing CSV, Google Voice, Messenger | [Text message imports](../usage/text-messages.md) | Supported backups or exports, with your identity supplied where required |
+| Inline | [Inline sync](../usage/inline.md) | All accessible chats, including hidden, archived, and child threads; optional exact chat filter; requires a complete catalog from the connected backend |
+| Matrix | [Matrix sync](../usage/matrix.md) | Joined-room history on any homeserver, with encrypted messages recovered from the account's key backup |
+| WhatsApp, iMessage, iMazing CSV, Google Voice, Messenger, Telegram | [Text message imports](../usage/text-messages.md) | Supported backups or exports, with your identity supplied where required |
 | SMS Backup & Restore | [Android SMS and call logs](../usage/text-messages.md) | Local XML/ZIP or scheduled imports from a configured Drive folder |
 
-Chat media has size and room-participant limits. A message can be archived
+Some chat providers apply size and room-participant limits to media. A message can be archived
 without all its media. Review [media policy](../configuration.md#media-policy)
-before a large sync and use the provider's backfill command to retry eligible
-missing downloads.
+before a large sync. Providers with a backfill command use it to retry eligible
+missing downloads. [Chatwoot](chatwoot.md) retries recent `--no-media` downloads
+through normal sync; use `--full` after raising a size cap or to retry older quiet files.
 
 ## Meetings, calendars, and contacts
 
 | Your source | Start here | What it adds |
 |---|---|---|
-| Granola, Plaud, Circleback, Notion AI Meeting Notes, or Muesli | [Meeting notes and transcripts](../usage/meetings.md) | Searchable notes, context exports, recorded actions, and meeting-time coverage |
+| Omi, Granola, Plaud, Pocket, Circleback, Notion AI Meeting Notes, Muesli, Twilio calls, or Twenty call recordings | [Meeting notes and transcripts](../usage/meetings.md) | Searchable notes, context exports, recorded actions, and meeting-time coverage |
 | Another meeting capture tool | [Meeting import workflow](../usage/meetings.md#import-from-any-meeting-source) | Provider-neutral ingestion keyed by source and external meeting ID |
 | Google Calendar | [Calendar sync](../usage/calendar.md) | Events, organizers, attendees, recurrence, and cancellation state |
 | CardDAV address book | [CardDAV contacts](../usage/people-carddav.md) | Imported contacts and explicit publication of curated profiles |

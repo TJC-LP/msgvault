@@ -1,7 +1,6 @@
 package slack
 
 import (
-	"context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -19,17 +18,19 @@ func testClient(t *testing.T, f *fakeSlack) *Client {
 }
 
 func TestClientRetriesOn429(t *testing.T) {
+	t.Parallel()
 	f := newFakeSlack(t)
 	f.rateLimit429s = 2
 	c := testClient(t, f)
 
-	auth, err := c.AuthTest(context.Background())
+	auth, err := c.AuthTest(t.Context())
 	require.NoError(t, err, "429s with Retry-After must be retried, not surfaced")
 	assert.Equal(t, "T01", auth.TeamID)
 	assert.Equal(t, "UME", auth.UserID)
 }
 
 func TestClientErrorMapping(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name     string
 		apiError string
@@ -53,15 +54,17 @@ func TestClientErrorMapping(t *testing.T) {
 }
 
 func TestClientRejectsUnallowlistedMethods(t *testing.T) {
+	t.Parallel()
 	f := newFakeSlack(t)
 	c := testClient(t, f)
 
-	err := c.call(context.Background(), "chat.postMessage", nil, nil)
+	err := c.call(t.Context(), "chat.postMessage", nil, nil)
 	require.ErrorContains(t, err, "not allowlisted",
 		"the client must refuse methods outside its read-only allowlist before any request is made")
 }
 
 func TestSearchMessagesPageDecodesChannelIDs(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -89,7 +92,7 @@ func TestSearchMessagesPageDecodesChannelIDs(t *testing.T) {
 	client := NewClient(srv.URL, "xoxp-test")
 	client.disableRateLimits()
 
-	page, err := client.SearchMessagesPage(context.Background(), "threads:replies", 1)
+	page, err := client.SearchMessagesPage(t.Context(), "threads:replies", 1)
 	require.NoError(err)
 	require.Len(page.Matches, 2)
 	assert.Equal("C_REAL", page.Matches[0].ChannelID)
@@ -98,6 +101,7 @@ func TestSearchMessagesPageDecodesChannelIDs(t *testing.T) {
 }
 
 func TestClientPagination(t *testing.T) {
+	t.Parallel()
 	f := newFakeSlack(t)
 	f.users = []map[string]any{
 		{"id": "U1"}, {"id": "U2"}, {"id": "U3"}, {"id": "U4"}, {"id": "U5"},
@@ -105,7 +109,7 @@ func TestClientPagination(t *testing.T) {
 	c := testClient(t, f) // fake pageSize is 3: forces two pages
 
 	var ids []string
-	require.NoError(t, c.AllUsers(context.Background(), func(u User) error {
+	require.NoError(t, c.AllUsers(t.Context(), func(u User) error {
 		ids = append(ids, u.ID)
 		return nil
 	}))
@@ -113,6 +117,7 @@ func TestClientPagination(t *testing.T) {
 }
 
 func TestClientRejectsHasMoreWithoutNextCursor(t *testing.T) {
+	t.Parallel()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, err := w.Write([]byte(`{
@@ -127,14 +132,15 @@ func TestClientRejectsHasMoreWithoutNextCursor(t *testing.T) {
 	client := NewClient(srv.URL, "xoxp-test")
 	client.disableRateLimits()
 
-	_, err := client.HistoryPage(context.Background(), HistoryParams{ChannelID: "C01"})
+	_, err := client.HistoryPage(t.Context(), HistoryParams{ChannelID: "C01"})
 	require.ErrorContains(t, err, "has_more without next_cursor")
 
-	_, err = client.RepliesPage(context.Background(), "C01", "123.000100", "", "")
+	_, err = client.RepliesPage(t.Context(), "C01", "123.000100", "", "")
 	require.ErrorContains(t, err, "has_more without next_cursor")
 }
 
 func TestClientRejectsRepeatedNextCursor(t *testing.T) {
+	t.Parallel()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, err := w.Write([]byte(`{
@@ -149,9 +155,9 @@ func TestClientRejectsRepeatedNextCursor(t *testing.T) {
 	client := NewClient(srv.URL, "xoxp-test")
 	client.disableRateLimits()
 
-	_, err := client.HistoryPage(context.Background(), HistoryParams{ChannelID: "C01", Cursor: "same"})
+	_, err := client.HistoryPage(t.Context(), HistoryParams{ChannelID: "C01", Cursor: "same"})
 	require.ErrorContains(t, err, "repeated next_cursor")
 
-	_, err = client.RepliesPage(context.Background(), "C01", "123.000100", "same", "")
+	_, err = client.RepliesPage(t.Context(), "C01", "123.000100", "same", "")
 	require.ErrorContains(t, err, "repeated next_cursor")
 }

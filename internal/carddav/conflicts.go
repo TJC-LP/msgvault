@@ -1,12 +1,14 @@
 package carddav
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"time"
 
 	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/vcard"
 )
 
 type ResolutionChoice string
@@ -297,27 +299,46 @@ func (s *Service) prepareMappingConflict(
 	if conflictErr != nil && !errors.Is(conflictErr, store.ErrCardDAVConflictNotFound) {
 		return store.CardDAVConflictCapture{}, false, conflictErr
 	}
+	remoteChanged := remoteTombstone || remote.SemanticHash != mapping.RemoteSemanticHash
+	if !unresolved && !remoteChanged {
+		return store.CardDAVConflictCapture{}, false, nil
+	}
 	localTombstone := mapping.PersonID == nil || (existingConflict != nil && existingConflict.LocalTombstone)
 	localHash := mapping.LocalHash
 	var localBody []byte
+	if mapping.PersonID != nil && !localTombstone {
+		snapshot, err := s.store.LoadPersonVCardSnapshotContext(ctx, *mapping.PersonID)
+		if err != nil {
+			return store.CardDAVConflictCapture{}, false, err
+		}
+		localHash = snapshot.Fingerprint
+	}
+	localChanged := localTombstone || localHash != mapping.LocalHash
+	unsafe := false
+	if !unresolved && !localChanged && remoteChanged && !remoteTombstone {
+		var err error
+		unsafe, err = s.store.CardDAVRemoteUpdateNeedsConflictContext(ctx, book.ID, mapping.Href, *remote)
+		if err != nil {
+			return store.CardDAVConflictCapture{}, false, err
+		}
+	}
+	if !unresolved && !unsafe && (!localChanged || !remoteChanged) {
+		return store.CardDAVConflictCapture{}, false, nil
+	}
+	if !unresolved && localTombstone && remoteTombstone {
+		return store.CardDAVConflictCapture{}, false, nil
+	}
+	var localEnvelope vcard.ResourceEnvelope
 	if mapping.PersonID != nil && !localTombstone {
 		person, err := s.store.GetPersonContext(ctx, *mapping.PersonID)
 		if err != nil {
 			return store.CardDAVConflictCapture{}, false, err
 		}
-		body, hash, err := s.renderPublicationCard(ctx, *person, book, &mapping)
+		localEnvelope, localHash, err = s.renderPublicationEnvelope(ctx, *person, book, &mapping)
 		if err != nil {
 			return store.CardDAVConflictCapture{}, false, err
 		}
-		localBody, localHash = body, hash
-	}
-	localChanged := localTombstone || localHash != mapping.LocalHash
-	remoteChanged := remoteTombstone || remote.SemanticHash != mapping.RemoteSemanticHash
-	if !unresolved && (!localChanged || !remoteChanged) {
-		return store.CardDAVConflictCapture{}, false, nil
-	}
-	if !unresolved && localTombstone && remoteTombstone {
-		return store.CardDAVConflictCapture{}, false, nil
+		localBody = localEnvelope.StoredBody
 	}
 	if !unresolved && !localTombstone && !remoteTombstone {
 		localSemanticHash, err := SemanticHash(localBody)
@@ -325,7 +346,12 @@ func (s *Service) prepareMappingConflict(
 			return store.CardDAVConflictCapture{}, false, err
 		}
 		if localSemanticHash == remote.SemanticHash {
+			metadata, err := vcard.MarshalResourceMetadata(localEnvelope)
+			if err != nil {
+				return store.CardDAVConflictCapture{}, false, err
+			}
 			remote.EquivalentLocalHash = localHash
+			remote.EquivalentLocalBody, remote.EquivalentLocalMetadata = localBody, metadata
 			return store.CardDAVConflictCapture{}, false, nil
 		}
 	}
@@ -438,11 +464,15 @@ func (s *Service) resolveConflictKeepLocal(
 	if err != nil {
 		return err
 	}
+	metadata, err := s.conflictLocalEnvelopeMetadata(operationCtx, conflict)
+	if err != nil {
+		return err
+	}
 	prepared, err := s.store.PrepareCardDAVConflictLocalContext(operationCtx,
 		store.CardDAVConflictLocalPlan{
 			ConflictID: conflict.ID, ExpectedMappingRevision: conflict.MappingRevision, ExpectedPersonID: conflictGuardPersonID(operationCtx),
 			RemoteETag: remote.RemoteETag, RemoteTombstone: tombstone,
-			OutgoingSemanticHash: semanticHash,
+			OutgoingSemanticHash: semanticHash, OutgoingEnvelopeMetadata: metadata,
 		})
 	if err != nil {
 		return err
@@ -452,6 +482,26 @@ func (s *Service) resolveConflictKeepLocal(
 	}
 	_, err = s.store.SweepResolvedCardDAVConflictsContext(operationCtx, time.Now())
 	return err
+}
+
+// conflictLocalEnvelopeMetadata renders the publication envelope again so an
+// unreviewed keep_local records which card lines it owns, as a publish does.
+func (s *Service) conflictLocalEnvelopeMetadata(ctx context.Context, conflict *store.CardDAVConflict) ([]byte, error) {
+	if len(conflict.LocalEnvelopeMetadata) > 0 {
+		return nil, nil
+	}
+	source, err := s.store.LoadCardDAVConflictReviewSourceContext(ctx, conflict.ID)
+	if err != nil {
+		return nil, err
+	}
+	envelope, err := s.preparePublicationEnvelope(source)
+	if err != nil {
+		return nil, err
+	}
+	if !bytes.Equal(envelope.StoredBody, conflict.LocalBody) {
+		return nil, nil
+	}
+	return vcard.MarshalResourceMetadata(envelope)
 }
 
 func conflictGuardPersonID(ctx context.Context) int64 {

@@ -1,7 +1,6 @@
 package store_test
 
 import (
-	"context"
 	"strings"
 	"testing"
 
@@ -27,18 +26,6 @@ func personTextDefinition(slug string) store.AttributeDefinitionInput {
 		IsAudited:   true,
 		IsDeletable: true,
 	}
-}
-
-func TestAttributeDescriptionAcceptsExactly280UnicodeRunes(t *testing.T) {
-	st := testutil.NewTestStore(t)
-	description := strings.Repeat("🙂", 280)
-	input := personTextDefinition("maximum_description")
-	input.Description = &description
-
-	created, err := st.CreateAttributeDefinitionContext(t.Context(), input)
-	require.NoError(t, err)
-	require.NotNil(t, created.Description)
-	assert.Equal(t, description, *created.Description)
 }
 
 func TestAttributeDescriptionCreateAcceptsMoreThan280UnicodeRunes(t *testing.T) {
@@ -101,7 +88,7 @@ func onlyTestDefinitions(
 
 func TestCreateAttributeDefinitionRejectsInvalidVocabularies(t *testing.T) {
 	st := testutil.NewTestStore(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	tests := []struct {
 		name    string
@@ -267,7 +254,7 @@ func TestCreateAttributeDefinitionRejectsSelectTypesWithoutCanonicalChoices(
 	t *testing.T,
 ) {
 	st := testutil.NewTestStore(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	tests := []struct {
 		name      string
@@ -308,7 +295,7 @@ func TestCreateAttributeDefinitionRejectsSelectTypesWithoutCanonicalChoices(
 
 func TestCreateAttributeDefinitionCanonicalizesChoicesForValueType(t *testing.T) {
 	st := testutil.NewTestStore(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	tests := []struct {
 		name      string
@@ -378,7 +365,7 @@ func TestCreateAttributeDefinitionRejectsInvalidAndDuplicateCanonicalChoices(
 	t *testing.T,
 ) {
 	st := testutil.NewTestStore(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	tests := []struct {
 		name      string
@@ -446,7 +433,7 @@ func TestCreateAttributeDefinitionStoresANovelUserDefinition(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
 	st := testutil.NewTestStore(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	input := personTextDefinition("favorite_tea")
 	input.FieldType = store.AttributeFieldSelect
@@ -534,7 +521,7 @@ func TestCreateAttributeDefinitionAllowsOrganizationObjectTypeWithoutAValuePath(
 	assert := assert.New(t)
 	require := require.New(t)
 	st := testutil.NewTestStore(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	input := personTextDefinition("industry")
 	input.UniversalID = "test-org-industry"
@@ -559,7 +546,7 @@ func TestCreateAttributeDefinitionAllowsOrganizationObjectTypeWithoutAValuePath(
 
 func TestCreateAttributeDefinitionRejectsDuplicateSlugAndUniversalID(t *testing.T) {
 	st := testutil.NewTestStore(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	_, err := st.CreateAttributeDefinitionContext(ctx, personTextDefinition("nickname_note"))
 	require.NoError(t, err)
@@ -579,7 +566,7 @@ func TestCreateAttributeDefinitionDerivesUniqueSlug(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
 	st := testutil.NewTestStore(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	first := personTextDefinition("unused")
 	first.Slug = ""
@@ -624,7 +611,7 @@ func TestCreateAttributeDefinitionDerivesUniqueSlug(t *testing.T) {
 
 func TestCreateAttributeDefinitionKeepsExplicitSlug(t *testing.T) {
 	st := testutil.NewTestStore(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	first := personTextDefinition("favorite_color")
 	first.Label = "Favorite color"
@@ -638,21 +625,11 @@ func TestCreateAttributeDefinitionKeepsExplicitSlug(t *testing.T) {
 	require.ErrorIs(t, err, store.ErrAttributeDefinitionSlugConflict)
 }
 
-func TestValidateAttributeDefinitionInputDerivesOmittedSlug(t *testing.T) {
-	input := personTextDefinition("unused")
-	input.Slug = ""
-	input.Label = "Favorite café"
-
-	validated, err := store.ValidateAttributeDefinitionInput(input)
-	require.NoError(t, err)
-	assert.Equal(t, "favorite_caf", validated.Slug)
-}
-
 func TestUpdateAttributeDefinitionRenamesLabelAndKeepsIdentity(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
 	st := testutil.NewTestStore(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	created, err := st.CreateAttributeDefinitionContext(
 		ctx, personTextDefinition("cadence_note"))
@@ -689,7 +666,7 @@ func TestUpdateAttributeDefinitionRenamesLabelAndKeepsIdentity(t *testing.T) {
 func TestDeleteAttributeDefinitionRefusesUndeletableAndAllowsUnused(t *testing.T) {
 	require := require.New(t)
 	st := testutil.NewTestStore(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	protected := personTextDefinition("protected_note")
 	protected.IsDeletable = false
@@ -713,7 +690,7 @@ func TestListAttributeDefinitionsOrdersByDisplayOrderAndHidesInactiveByDefault(t
 	assert := assert.New(t)
 	require := require.New(t)
 	st := testutil.NewTestStore(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	first := personTextDefinition("zzz_first")
 	first.DisplayOrder = 1

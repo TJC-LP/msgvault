@@ -1,14 +1,22 @@
 <script lang="ts">
-  import { Button } from '@kenn-io/kit-ui';
+  import ChevronUp from '@lucide/svelte/icons/chevron-up';
+  import { isEmailMessageType } from '../../explore/models';
+  import MessageMenu from './MessageMenu.svelte';
+  import PersonLink from './PersonLink.svelte';
+  import MessageTasks from '../tasks/MessageTasks.svelte';
+  import MeetingActions from '../meetings/MeetingActions.svelte';
+  import type { MeetingRef } from '../../api/generated/models';
 
   import type { APIClient } from '../../api/client';
   import type { ArchiveMessageDetail, MessageViewMode } from '../../archive/types';
   import IdentityAvatar from '../common/IdentityAvatar.svelte';
   import ContentFrame from './ContentFrame.svelte';
+  import MessageRecordings from './MessageRecordings.svelte';
 
   interface Props {
     message: ArchiveMessageDetail;
     expanded: boolean;
+    showTaskSetup?: boolean;
     /** The thread's current anchor — announced via aria-current and used by
      * the thread to scroll the card into view. */
     anchor?: boolean;
@@ -21,11 +29,15 @@
     onToggle?: (id: number) => void;
     onViewModeChange?: (id: number, mode: MessageViewMode) => void;
     client?: APIClient;
+    onOpenPerson?: (participantID: number) => void;
+    onOpenSettings?: () => void;
+    onOpenMeeting?: (meeting: MeetingRef) => void;
   }
 
   let {
     message,
     expanded,
+    showTaskSetup = true,
     anchor = false,
     viewMode = 'html',
     sanitizationFailed = false,
@@ -33,10 +45,14 @@
     bodyError = '',
     onToggle,
     onViewModeChange,
+    onOpenPerson = undefined,
+    onOpenSettings = undefined,
+    onOpenMeeting = undefined,
     client = undefined
   }: Props = $props();
 
-  let menuOpen = $state(false);
+  let tasksRefresh = $state(0);
+  let menuError = $state('');
 
   const hasRenderableHTML = $derived(
     typeof message.bodyHtml === 'string' && message.bodyHtml.trim() !== '' && !sanitizationFailed
@@ -49,10 +65,6 @@
     return new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' }).format(parsed);
   }
 
-  function selectMode(mode: MessageViewMode): void {
-    menuOpen = false;
-    onViewModeChange?.(message.id, mode);
-  }
 </script>
 
 {#if expanded}
@@ -64,37 +76,25 @@
   >
     <div class="card-header">
       <IdentityAvatar label={message.sender || '?'} size={24} />
-      <button
-        type="button"
-        class="collapse-target"
-        aria-label={`Collapse message ${message.id} from ${message.sender || 'unknown sender'}`}
-        aria-expanded="true"
-        onclick={() => onToggle?.(message.id)}
-      >
+      <div class="header-content">
         <span class="header-line">
-          <strong class="sender">{message.sender || 'Unknown sender'}</strong>
+          <strong class="sender"><PersonLink name={message.sender || 'Unknown sender'} participantID={message.senderParticipantID} {onOpenPerson} /></strong>
           <time datetime={message.sentAt} data-mono>{formatDate(message.sentAt)}</time>
         </span>
         {#if message.recipients.length > 0}
-          <span class="recipients" data-mono>to {message.recipients.join(', ')}</span>
+          <span class="recipients">to {#if message.recipientParticipants}{#each message.recipientParticipants as recipient, index}{#if index > 0}, {/if}<PersonLink name={recipient.display} participantID={recipient.participantID} {onOpenPerson} />{/each}{:else}{message.recipients.join(', ')}{/if}</span>
         {/if}
-        {#if message.subject}
-          <span class="subject">{message.subject}</span>
-        {/if}
-      </button>
-      {#if hasRenderableHTML}
-        <details class="card-menu" bind:open={menuOpen}>
-          <summary aria-label={`Message ${message.id} display options`}>⋯</summary>
-          <div class="menu-sheet kit-popover-card">
-            {#if viewMode === 'html'}
-              <Button class="menu-action" size="sm" surface="soft" label="Show plain text" onclick={() => selectMode('text')} />
-            {:else}
-              <Button class="menu-action" size="sm" surface="soft" label="Show formatted HTML" onclick={() => selectMode('html')} />
-            {/if}
-          </div>
-        </details>
-      {/if}
+        <button type="button" class="collapse-target" aria-label={`Collapse message ${message.id} from ${message.sender || 'unknown sender'}`} aria-expanded="true" onclick={() => onToggle?.(message.id)}>{#if message.subject}{message.subject}{:else}<ChevronUp size={16} aria-hidden="true" />{/if}</button>
+      </div>
+      <MessageMenu {client} {message} {hasRenderableHTML} {viewMode} {onViewModeChange} {onOpenSettings} onTaskDialogClose={() => tasksRefresh++} onError={(error) => menuError = error} />
     </div>
+
+    {#if message.relatedMessageId}
+      <a class="related-message" href={`/messages/${message.relatedMessageId}`}>
+        {message.messageType === 'meeting_transcript' ? 'Open conversation' : 'Open meeting'}
+      </a>
+    {/if}
+    {#if menuError}<p class="sanitize-notice" role="alert">{menuError}</p>{/if}
 
     {#if sanitizationFailed}
       <p class="sanitize-notice" role="alert">Could not render HTML formatting. Showing plain text.</p>
@@ -118,6 +118,29 @@
         {/if}
       </section>
     </div>
+
+    {#if client}
+      {#if message.messageType === 'meeting_transcript'}<MeetingActions compact {client} request={{ scope: { message_ids: [message.id] }, limit: 200 }} {onOpenMeeting} />{/if}
+      <MessageTasks {client} messageId={message.id} title={message.subject} email={isEmailMessageType(message.messageType ?? '')} refresh={tasksRefresh} showSetup={showTaskSetup} onsettings={onOpenSettings} />
+    {/if}
+    {#if message.attachments.length > 0}
+      <ul class="attachments" aria-label="Attachments">
+        {#each message.attachments as attachment (attachment.id)}
+          <li>
+            {#if attachment.stored}
+              <a href={`/api/v1/files/${attachment.id}/content`} download={attachment.filename}>
+                {attachment.filename || '(unnamed file)'}
+              </a>
+            {:else}
+              <span>{attachment.filename || '(unnamed file)'} (not downloaded)</span>
+            {/if}
+          </li>
+        {/each}
+      </ul>
+    {/if}
+    {#if client && message.attachments.length > 0}
+      <MessageRecordings {client} {message} messageId={message.id} />
+    {/if}
   </article>
 {:else}
   <button
@@ -146,7 +169,7 @@
     width: 100%;
     align-items: center;
     gap: var(--space-4);
-    padding: var(--space-3) var(--space-4);
+    padding: var(--space-3) var(--pane-pad-x);
     border: 0;
     border-bottom: 1px solid var(--border-muted);
     background: none;
@@ -159,12 +182,6 @@
 
   .message-card--collapsed:hover {
     background: var(--bg-surface-hover);
-  }
-
-  /* The thread anchor carries the same 2px accent inset bar as every other
-   * selected row in the app. */
-  .message-card--expanded[aria-current='true'] {
-    box-shadow: inset 2px 0 0 var(--accent-blue);
   }
 
   .body-reveal {
@@ -223,12 +240,19 @@
     white-space: nowrap;
   }
 
+  .related-message {
+    display: inline-block;
+    margin: var(--space-3) var(--pane-pad-x) 0;
+  }
+
   .card-header {
     display: flex;
     align-items: flex-start;
     gap: var(--space-3);
-    padding: var(--space-3) var(--space-4) 0;
+    padding: var(--space-3) var(--pane-pad-x) 0;
   }
+
+  .header-content { display: grid; min-width: 0; flex: 1; gap: 2px; }
 
   .collapse-target {
     display: grid;
@@ -259,8 +283,7 @@
     white-space: nowrap;
   }
 
-  .recipients,
-  .subject {
+  .recipients {
     overflow: hidden;
     color: var(--text-muted);
     font-size: var(--font-size-xs);
@@ -268,53 +291,9 @@
     white-space: nowrap;
   }
 
-  .subject {
-    color: var(--text-secondary);
-  }
-
-  .card-menu {
-    position: relative;
-    flex: none;
-  }
-
-  .card-menu summary {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 24px;
-    height: 24px;
-    border-radius: var(--radius-sm);
-    color: var(--text-muted);
-    cursor: pointer;
-    list-style: none;
-  }
-
-  .card-menu summary::-webkit-details-marker {
-    display: none;
-  }
-
-  .card-menu summary:hover {
-    background: var(--bg-surface-hover);
-    color: var(--text-primary);
-  }
-
-  .menu-sheet {
-    position: absolute;
-    z-index: var(--z-popover);
-    top: 26px;
-    right: 0;
-    min-width: 160px;
-    padding: var(--space-2);
-  }
-
-  .menu-sheet :global(.menu-action) {
-    display: flex;
-    width: 100%;
-    justify-content: flex-start;
-  }
 
   .sanitize-notice {
-    margin: var(--space-2) var(--space-4) 0;
+    margin: var(--space-2) var(--pane-pad-x) 0;
     color: var(--text-secondary);
     font-size: var(--font-size-xs);
   }
@@ -326,7 +305,14 @@
   }
 
   .card-body {
-    padding: var(--space-3) var(--space-4) var(--space-4);
+    padding: var(--space-3) var(--pane-pad-x) var(--space-4);
+  }
+
+  .attachments {
+    margin: 0;
+    padding: 0 var(--pane-pad-x) var(--space-4);
+    font-size: var(--font-size-sm);
+    list-style: none;
   }
 
   /* Plain text renders on the theme surface with theme text, in the same

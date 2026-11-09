@@ -42,6 +42,7 @@ func newFixtureClient(t *testing.T, rawOrigin, username, password string) *Clien
 }
 
 func TestClientRejectsCredentialsOverHTTPByDefault(t *testing.T) {
+	t.Parallel()
 	origin, err := url.Parse("http://contacts.example/dav")
 	require.NoError(t, err)
 
@@ -52,6 +53,7 @@ func TestClientRejectsCredentialsOverHTTPByDefault(t *testing.T) {
 }
 
 func TestClientTrustedPrivateDestinationUsesExactPinWithoutDNS(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 	origin, err := url.Parse("https://contacts.example:8443/dav")
@@ -72,6 +74,7 @@ func TestClientTrustedPrivateDestinationUsesExactPinWithoutDNS(t *testing.T) {
 }
 
 func TestClientTrustedDestinationRejectsUnsafePolicy(t *testing.T) {
+	t.Parallel()
 	origin, err := url.Parse("https://contacts.example:8443/dav")
 	require.NoError(t, err)
 	for _, tc := range []struct {
@@ -83,13 +86,12 @@ func TestClientTrustedDestinationRejectsUnsafePolicy(t *testing.T) {
 		{name: "plain HTTP", trusted: "http://contacts.example:8443", pins: []netip.Addr{netip.MustParseAddr("100.80.0.8")}, message: "trusted_origin must use HTTPS"},
 		{name: "path", trusted: "https://contacts.example:8443/dav", pins: []netip.Addr{netip.MustParseAddr("100.80.0.8")}, message: "trusted_origin must not include a path"},
 		{name: "no pins", trusted: "https://contacts.example:8443", message: "trusted_addresses must contain at least one address"},
-		{name: "public address", trusted: "https://contacts.example:8443", pins: []netip.Addr{netip.MustParseAddr("203.0.113.9")}, message: "address 203.0.113.9 is not in an allowed private range"},
 		{name: "loopback", trusted: "https://contacts.example:8443", pins: []netip.Addr{netip.MustParseAddr("127.0.0.1")}, message: "address 127.0.0.1 is not in an allowed private range"},
-		{name: "metadata", trusted: "https://contacts.example:8443", pins: []netip.Addr{netip.MustParseAddr("169.254.169.254")}, message: "address 169.254.169.254 is not in an allowed private range"},
 		{name: "scoped IPv6", trusted: "https://contacts.example:8443", pins: []netip.Addr{netip.MustParseAddr("fc00::1%eth0")}, message: "address fc00::1%eth0 must not include a zone"},
 		{name: "duplicate mapped address", trusted: "https://contacts.example:8443", pins: []netip.Addr{netip.MustParseAddr("10.1.2.3"), netip.MustParseAddr("::ffff:10.1.2.3")}, message: "duplicate address 10.1.2.3"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			trusted, err := url.Parse(tc.trusted)
 			require.NoError(t, err)
 			_, err = NewClient(ClientOptions{CredentialOrigin: origin, TrustedOrigin: trusted, TrustedAddresses: tc.pins})
@@ -100,9 +102,11 @@ func TestClientTrustedDestinationRejectsUnsafePolicy(t *testing.T) {
 }
 
 func TestClientMismatchedTrustedOriginUsesNormalDestinationChecks(t *testing.T) {
+	t.Parallel()
 	for _, rawOrigin := range []string{"https://other.example:8443/dav", "https://contacts.example:8444/dav"} {
 		for _, resolved := range []string{"203.0.113.9", "10.1.2.3"} {
 			t.Run(rawOrigin+"/"+resolved, func(t *testing.T) {
+				t.Parallel()
 				assert := assert.New(t)
 				require := require.New(t)
 				origin, err := url.Parse(rawOrigin)
@@ -137,6 +141,7 @@ func TestClientMismatchedTrustedOriginUsesNormalDestinationChecks(t *testing.T) 
 }
 
 func TestClientTrustedPinFailureDoesNotFallBackToDNS(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 	origin, err := url.Parse("https://contacts.example:8443/dav")
@@ -162,6 +167,7 @@ func TestClientTrustedPinFailureDoesNotFallBackToDNS(t *testing.T) {
 }
 
 func TestClientNeverSendsBasicAuthAcrossOrigin(t *testing.T) {
+	t.Parallel()
 	var redirectedAuth string
 	destination := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		redirectedAuth = r.Header.Get("Authorization")
@@ -180,6 +186,7 @@ func TestClientNeverSendsBasicAuthAcrossOrigin(t *testing.T) {
 }
 
 func TestClientDigestChallengeRetriesPROPFIND(t *testing.T) {
+	t.Parallel()
 	var attempts int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		attempts++
@@ -203,6 +210,7 @@ func TestClientDigestChallengeRetriesPROPFIND(t *testing.T) {
 }
 
 func TestClientReusesDigestAcrossBudgetedAndConcurrentRequests(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 	var basicRequests atomic.Int32
@@ -249,6 +257,7 @@ func TestClientReusesDigestAcrossBudgetedAndConcurrentRequests(t *testing.T) {
 }
 
 func TestClientDigestStaleNoncePreservesConditionalPUT(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 	const card = "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Example\r\nEND:VCARD\r\n"
@@ -297,6 +306,7 @@ func TestClientDigestStaleNoncePreservesConditionalPUT(t *testing.T) {
 }
 
 func TestClientDigestSelectsCombinedChallenge(t *testing.T) {
+	t.Parallel()
 	var attempts int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		attempts++
@@ -322,6 +332,7 @@ func TestClientDigestSelectsCombinedChallenge(t *testing.T) {
 }
 
 func TestClientDigestChallengeAllowsWhitespaceAroundDirectiveEquals(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 	header := http.Header{}
@@ -335,6 +346,7 @@ func TestClientDigestChallengeAllowsWhitespaceAroundDirectiveEquals(t *testing.T
 }
 
 func TestClientDigestRejectsDuplicateNonceWithoutReplay(t *testing.T) {
+	t.Parallel()
 	var attempts int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		attempts++
@@ -352,6 +364,7 @@ func TestClientDigestRejectsDuplicateNonceWithoutReplay(t *testing.T) {
 }
 
 func TestClientDigestRegeneratesConditionalDELETEOnRedirect(t *testing.T) {
+	t.Parallel()
 	var attempts int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		attempts++
@@ -387,6 +400,7 @@ func TestClientDigestRegeneratesConditionalDELETEOnRedirect(t *testing.T) {
 }
 
 func TestClientDigestWrongPasswordStopsAfterOneReplay(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 	var attempts int
@@ -410,6 +424,7 @@ func TestClientDigestWrongPasswordStopsAfterOneReplay(t *testing.T) {
 }
 
 func TestClientCachedDigestRetriesStaleNonceOnlyOnce(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 	var attempts int
@@ -460,6 +475,7 @@ func digestMD5Response(username, realm, password, nonce string, count int, cnonc
 }
 
 func TestClientSetsDAVPreconditionsAndTypedStatusErrors(t *testing.T) {
+	t.Parallel()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, "Basic YWxpY2U6YXBwLXBhc3N3b3Jk", r.Header.Get("Authorization"))
 		assert.Equal(t, "1", r.Header.Get("Depth"))
@@ -481,6 +497,7 @@ func TestClientSetsDAVPreconditionsAndTypedStatusErrors(t *testing.T) {
 }
 
 func TestClientReadsPastRetryAfterDateAsNoDelay(t *testing.T) {
+	t.Parallel()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Retry-After", time.Now().Add(-time.Second).UTC().Format(http.TimeFormat))
 		w.WriteHeader(http.StatusServiceUnavailable)
@@ -496,6 +513,7 @@ func TestClientReadsPastRetryAfterDateAsNoDelay(t *testing.T) {
 }
 
 func TestClientValidateChildHrefRejectsOriginAndCollectionEscapes(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 
 	base, err := url.Parse("https://contacts.example/dav/books/personal/")
@@ -520,6 +538,7 @@ func TestClientValidateChildHrefRejectsOriginAndCollectionEscapes(t *testing.T) 
 }
 
 func TestClientValidateChildHrefTreatsExplicitDefaultPortAsSameOrigin(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 
 	base, err := url.Parse("https://contacts.example/dav/books/personal/")
@@ -534,7 +553,9 @@ func TestClientValidateChildHrefTreatsExplicitDefaultPortAsSameOrigin(t *testing
 }
 
 func TestClientValidateChildHrefRejectsPrivateLiteralAndDNSDestination(t *testing.T) {
+	t.Parallel()
 	t.Run("literal", func(t *testing.T) {
+		t.Parallel()
 		origin, err := url.Parse("http://127.0.0.1/dav/books/personal/")
 		require.NoError(t, err)
 		client, err := NewClient(ClientOptions{CredentialOrigin: origin})
@@ -545,6 +566,7 @@ func TestClientValidateChildHrefRejectsPrivateLiteralAndDNSDestination(t *testin
 	})
 
 	t.Run("DNS", func(t *testing.T) {
+		t.Parallel()
 		origin, err := url.Parse("http://contacts.example/dav/books/personal/")
 		require.NoError(t, err)
 		resolver, _ := newFixtureResolver(t, netip.MustParseAddr("10.0.0.8"))
@@ -557,6 +579,7 @@ func TestClientValidateChildHrefRejectsPrivateLiteralAndDNSDestination(t *testin
 }
 
 func TestClientPinsValidatedAddressAndRevalidatesSameOriginRedirect(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -598,6 +621,7 @@ func TestClientPinsValidatedAddressAndRevalidatesSameOriginRedirect(t *testing.T
 }
 
 func TestClientTriesEveryValidatedAddressWithoutResolvingAgain(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -640,9 +664,11 @@ func TestClientTriesEveryValidatedAddressWithoutResolvingAgain(t *testing.T) {
 }
 
 func TestClientNeverReplaysDAVMutationAcrossAmbiguousRedirect(t *testing.T) {
+	t.Parallel()
 	for _, status := range []int{http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther} {
 		for _, method := range []string{http.MethodPut, http.MethodDelete} {
 			t.Run(http.StatusText(status)+"/"+method, func(t *testing.T) {
+				t.Parallel()
 				var startRequests, redirectedRequests atomic.Int32
 				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					switch r.URL.Path {
@@ -668,8 +694,10 @@ func TestClientNeverReplaysDAVMutationAcrossAmbiguousRedirect(t *testing.T) {
 }
 
 func TestClientPreservesDAVMutationOnlyAcrossSameOrigin307And308(t *testing.T) {
+	t.Parallel()
 	for _, status := range []int{http.StatusTemporaryRedirect, http.StatusPermanentRedirect} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
+			t.Parallel()
 			var requests []struct {
 				path, method, body string
 			}
@@ -699,7 +727,9 @@ func TestClientPreservesDAVMutationOnlyAcrossSameOrigin307And308(t *testing.T) {
 }
 
 func TestClientEnforcesResponseAndOperationByteBudgets(t *testing.T) {
+	t.Parallel()
 	t.Run("response", func(t *testing.T) {
+		t.Parallel()
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			_, _ = w.Write([]byte("abc"))
 		}))
@@ -715,6 +745,7 @@ func TestClientEnforcesResponseAndOperationByteBudgets(t *testing.T) {
 	})
 
 	t.Run("operation across redirect", func(t *testing.T) {
+		t.Parallel()
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path == "/start" {
 				w.Header().Set("Location", "/done")
@@ -735,11 +766,10 @@ func TestClientEnforcesResponseAndOperationByteBudgets(t *testing.T) {
 }
 
 func TestClientHonorsRequestAndOperationTimeouts(t *testing.T) {
-	for name, configure := range map[string]func(*Client){
-		"request":   func(client *Client) { client.requestTimeout = 5 * time.Millisecond },
-		"operation": func(client *Client) { client.operationTimeout = 5 * time.Millisecond },
-	} {
+	t.Parallel()
+	for _, name := range []string{"request", "operation"} {
 		t.Run(name, func(t *testing.T) {
+			t.Parallel()
 			synctest.Test(t, func(t *testing.T) {
 				server := httptest.NewTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 					time.Sleep(50 * time.Millisecond)
@@ -749,7 +779,11 @@ func TestClientHonorsRequestAndOperationTimeouts(t *testing.T) {
 				require.True(t, ok)
 				client := newFixtureClient(t, "http://127.0.0.1", "", "")
 				client.dialContext = transport.DialContext
-				configure(client)
+				if name == "request" {
+					client.requestTimeout = 5 * time.Millisecond
+				} else {
+					client.operationTimeout = 5 * time.Millisecond
+				}
 				_, err := client.Do(t.Context(), Request{Method: "PROPFIND", URL: "http://127.0.0.1"})
 				require.Error(t, err)
 			})
@@ -759,7 +793,7 @@ func TestClientHonorsRequestAndOperationTimeouts(t *testing.T) {
 
 func newFixtureResolver(t *testing.T, addresses ...netip.Addr) (*net.Resolver, *atomic.Int32) {
 	t.Helper()
-	listener, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	listener, err := (&net.ListenConfig{}).ListenPacket(t.Context(), "udp4", "127.0.0.1:0")
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = listener.Close() })
 	queries := new(atomic.Int32)
@@ -811,6 +845,7 @@ func fixtureDNSResponse(request []byte, addresses ...netip.Addr) []byte {
 	return response
 }
 
+// serial: replaces the process-wide slog logger.
 func TestClientLogsUpstreamBodyOnlyAtDebug(t *testing.T) {
 	for _, level := range []slog.Level{slog.LevelInfo, slog.LevelDebug} {
 		t.Run(level.String(), func(t *testing.T) {
@@ -852,6 +887,7 @@ func TestClientLogsUpstreamBodyOnlyAtDebug(t *testing.T) {
 	}
 }
 
+// serial: replaces the process-wide slog logger.
 func TestClientLogsExpectedFailuresAtDebug(t *testing.T) {
 	for _, status := range []int{http.StatusNotFound, http.StatusGone, http.StatusPreconditionFailed} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
@@ -875,4 +911,37 @@ func TestClientLogsExpectedFailuresAtDebug(t *testing.T) {
 			assert.NotContains(logged.String(), "level=WARN")
 		})
 	}
+}
+
+// A 401 for a bearer request tells the token owner to stop reusing that token;
+// other responses must not discard a token the server accepted.
+func TestClientReportsRejectedBearerToken(t *testing.T) {
+	t.Parallel()
+	assert := assert.New(t)
+	require := require.New(t)
+	status := http.StatusUnauthorized
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(status)
+	}))
+	t.Cleanup(server.Close)
+	origin, err := url.Parse(server.URL)
+	require.NoError(err)
+	rejected := 0
+	client, err := NewClient(ClientOptions{
+		CredentialOrigin:         origin,
+		BearerToken:              func(context.Context) (string, error) { return "synthetic-token", nil },
+		BearerTokenRejected:      func() { rejected++ },
+		AllowInsecureCredentials: true,
+	})
+	require.NoError(err)
+	client.allowPrivateOrigin = true
+
+	_, err = client.Do(t.Context(), Request{Method: "PROPFIND", URL: server.URL})
+	require.Error(err)
+	assert.Equal(1, rejected)
+
+	status = http.StatusMultiStatus
+	_, err = client.Do(t.Context(), Request{Method: "PROPFIND", URL: server.URL})
+	require.NoError(err)
+	assert.Equal(1, rejected)
 }

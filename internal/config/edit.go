@@ -17,7 +17,7 @@ import (
 	"sync"
 
 	"github.com/BurntSushi/toml"
-	"github.com/robfig/cron/v3"
+	"go.kenn.io/msgvault/internal/cronexpr"
 )
 
 var (
@@ -30,6 +30,8 @@ var (
 	// ErrUnsafeConfigTarget indicates a dangling, non-regular, or
 	// ownership-unsafe symlink target.
 	ErrUnsafeConfigTarget = errors.New("unsafe config target")
+	// errConfigSymlinkTargetMissing marks a symlink whose target a save would create.
+	errConfigSymlinkTargetMissing = errors.New("config symlink target does not exist")
 	// ErrInvalidConfigCandidate indicates that edited bytes were produced but
 	// the complete candidate does not satisfy the config schema or invariants.
 	ErrInvalidConfigCandidate = errors.New("invalid config candidate")
@@ -43,10 +45,11 @@ var (
 	ErrAtomicReplaceUnsupported = errors.New("conditional atomic config replacement is unsupported")
 )
 
-// Edit is one targeted TOML assignment. Key is a dotted table/key path.
+// Edit sets or removes one TOML assignment. Key is a dotted table/key path.
 type Edit struct {
-	Key   string
-	Value any
+	Key    string
+	Value  any
+	Remove bool
 }
 
 // TableEdit inserts or removes one exact TOML table. Insertions refuse an
@@ -234,32 +237,39 @@ func EditConfigTables(path, ifMatch string, edits []TableEdit) (ConfigFile, erro
 // one retained snapshot without publishing it. Callers use this before an
 // irreversible side effect; EditConfigTables repeats the plan under ETag.
 func ValidateConfigTableEdits(snapshot ConfigFile, edits []TableEdit) error {
+	_, err := PreviewConfigTableEdits(snapshot, edits)
+	return err
+}
+
+// PreviewConfigTableEdits validates table edits and returns the candidate without publishing it.
+func PreviewConfigTableEdits(snapshot ConfigFile, edits []TableEdit) (ConfigFile, error) {
 	if snapshot.LogicalPath == "" || snapshot.Path == "" || snapshot.ETag != configETag(snapshot.Content) {
-		return errors.New("config edit snapshot is invalid")
+		return ConfigFile{}, errors.New("config edit snapshot is invalid")
 	}
 	candidate, err := applyTableEdits(snapshot.Content, edits)
 	if err != nil {
-		return err
+		return ConfigFile{}, err
 	}
 	mode := snapshot.Mode.Perm()
 	if !snapshot.Exists {
 		mode = 0o600
 	}
-	loaded, err := LoadConfigFile(ConfigFile{
+	candidateFile := ConfigFile{
 		LogicalPath: snapshot.LogicalPath,
 		Path:        snapshot.Path,
 		Content:     candidate,
 		ETag:        configETag(candidate),
 		Mode:        mode,
 		Exists:      true,
-	}, "")
+	}
+	loaded, err := LoadConfigFile(candidateFile, "")
 	if err != nil {
-		return fmt.Errorf("%w: %w", ErrInvalidConfigCandidate, err)
+		return ConfigFile{}, fmt.Errorf("%w: %w", ErrInvalidConfigCandidate, err)
 	}
 	if err := validateEditableCandidate(loaded); err != nil {
-		return fmt.Errorf("%w: %w", ErrInvalidConfigCandidate, err)
+		return ConfigFile{}, fmt.Errorf("%w: %w", ErrInvalidConfigCandidate, err)
 	}
-	return nil
+	return candidateFile, nil
 }
 
 // RestoreConfigFile restores before only while the live target is the exact
@@ -890,12 +900,14 @@ func validateEditableCandidate(cfg *Config) error {
 			return fmt.Errorf("vector config: %w", err)
 		}
 	}
-	parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
 	schedules := map[string]string{
 		"vector.embed.schedule.cron":      cfg.Vector.Embed.Schedule.Cron,
 		"vector.multimodal.schedule.cron": cfg.Vector.Multimodal.Schedule.Cron,
 		"beeper.schedule":                 cfg.Beeper.Schedule,
+		"matrix.schedule":                 cfg.Matrix.Schedule,
 		"slack.schedule":                  cfg.Slack.Schedule,
+		"inline.schedule":                 cfg.Inline.Schedule,
+		"imessage.schedule":               cfg.IMessage.Schedule,
 	}
 	for index, account := range cfg.Accounts {
 		schedules[fmt.Sprintf("accounts[%d].schedule", index)] = account.Schedule
@@ -903,8 +915,14 @@ func validateEditableCandidate(cfg *Config) error {
 	for index, source := range cfg.SynctechSMS.Sources {
 		schedules[fmt.Sprintf("synctech_sms.sources[%d].schedule", index)] = source.Schedule
 	}
+	for index, source := range cfg.WhatsAppApple {
+		schedules[fmt.Sprintf("whatsapp_apple[%d].schedule", index)] = source.Schedule
+	}
 	for index, source := range cfg.GCal {
 		schedules[fmt.Sprintf("gcal[%d].schedule", index)] = source.Schedule
+	}
+	for index, source := range cfg.Omi {
+		schedules[fmt.Sprintf("omi[%d].schedule", index)] = source.Schedule
 	}
 	for index, source := range cfg.Granola {
 		schedules[fmt.Sprintf("granola[%d].schedule", index)] = source.Schedule
@@ -912,20 +930,29 @@ func validateEditableCandidate(cfg *Config) error {
 	for index, source := range cfg.Plaud {
 		schedules[fmt.Sprintf("plaud[%d].schedule", index)] = source.Schedule
 	}
+	for index, source := range cfg.Pocket {
+		schedules[fmt.Sprintf("pocket[%d].schedule", index)] = source.Schedule
+	}
 	for index, source := range cfg.Circleback {
 		schedules[fmt.Sprintf("circleback[%d].schedule", index)] = source.Schedule
 	}
 	for index, source := range cfg.NotionMeetings {
 		schedules[fmt.Sprintf("notion_meetings[%d].schedule", index)] = source.Schedule
 	}
+	for index, source := range cfg.Twilio {
+		schedules[fmt.Sprintf("twilio[%d].schedule", index)] = source.Schedule
+	}
 	for index, source := range cfg.Muesli {
 		schedules[fmt.Sprintf("muesli[%d].schedule", index)] = source.Schedule
+	}
+	for index, source := range cfg.Twenty {
+		schedules[fmt.Sprintf("twenty[%d].schedule", index)] = source.Schedule
 	}
 	for key, expression := range schedules {
 		if expression == "" {
 			continue
 		}
-		if _, err := parser.Parse(expression); err != nil {
+		if _, err := cronexpr.Parser.Parse(expression); err != nil {
 			return fmt.Errorf("invalid %s %q: %w", key, expression, err)
 		}
 	}
@@ -947,7 +974,7 @@ func resolveConfigTargetWithOwner(path string, owner func(fs.FileInfo) (uint64, 
 	info, err := os.Lstat(absolute)
 	if errors.Is(err, fs.ErrNotExist) {
 		if requestedSymlink {
-			return "", 0, false, fmt.Errorf("%w: config symlink target does not exist", ErrUnsafeConfigTarget)
+			return "", 0, false, fmt.Errorf("%w: %w", ErrUnsafeConfigTarget, errConfigSymlinkTargetMissing)
 		}
 		return absolute, 0o600, false, nil
 	}
@@ -1076,11 +1103,15 @@ func applyTargetedEdits(content []byte, edits []Edit) ([]byte, error) {
 		if lastDot := strings.LastIndex(edit.Key, "."); lastDot >= 0 {
 			section, key = edit.Key[:lastDot], edit.Key[lastDot+1:]
 		}
-		value, err := encodeTOMLValue(edit.Value)
+		value := ""
+		var err error
+		if !edit.Remove {
+			value, err = encodeTOMLValue(edit.Value)
+		}
 		if err != nil {
 			return nil, fmt.Errorf("encode %s: %w", edit.Key, err)
 		}
-		lines, err = editTOMLLines(lines, section, key, value)
+		lines, err = editTOMLLines(lines, section, key, value, edit.Remove)
 		if err != nil {
 			return nil, err
 		}
@@ -1573,7 +1604,9 @@ func joinTOMLLines(lines []tomlLine) []byte {
 	return []byte(out.String())
 }
 
-func editTOMLLines(lines []tomlLine, section, key, value string) ([]tomlLine, error) {
+// editTOMLLines replaces or inserts section.key = value, or deletes the
+// assignment when remove is set. Removing an absent key changes nothing.
+func editTOMLLines(lines []tomlLine, section, key, value string, remove bool) ([]tomlLine, error) {
 	target := strings.Split(section+"."+key, ".")
 	currentTable := []string(nil)
 	type insertionTarget struct {
@@ -1620,6 +1653,13 @@ func editTOMLLines(lines []tomlLine, section, key, value string) ([]tomlLine, er
 		return nil, fmt.Errorf("%w: %s.%s", ErrAmbiguousConfigTarget, section, key)
 	}
 	if len(matches) == 1 {
+		if remove {
+			end, _, _, err := assignmentSpan(lines, matches[0])
+			if err != nil {
+				return nil, err
+			}
+			return append(lines[:matches[0]], lines[end+1:]...), nil
+		}
 		updated, err := replaceTOMLAssignment(lines, matches[0], value)
 		if err != nil {
 			return nil, fmt.Errorf("edit %s.%s: %w", section, key, err)
@@ -1627,6 +1667,9 @@ func editTOMLLines(lines []tomlLine, section, key, value string) ([]tomlLine, er
 		return updated, nil
 	}
 
+	if remove {
+		return lines, nil
+	}
 	eol := preferredEOL(lines)
 	hadFinalEOL := len(lines) == 0 || lines[len(lines)-1].eol != ""
 	if len(candidates) > 0 {

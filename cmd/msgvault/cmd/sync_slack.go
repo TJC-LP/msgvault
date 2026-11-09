@@ -64,12 +64,12 @@ Examples:
 			if len(args) > 0 {
 				flagTeam = args[0]
 			}
-			s, cleanup, err := openWritableStoreAndInitForIngestInvocation(state)
+			s, cleanup, err := openWritableStoreAndInitForIngestInvocation(cmd.Context(), state)
 			if err != nil {
 				return err
 			}
 			defer cleanup()
-			sources, err := resolveSlackSyncSources(s, flagTeam)
+			sources, err := resolveSlackSyncSources(cmd.Context(), s, flagTeam)
 			if err != nil {
 				return err
 			}
@@ -173,6 +173,9 @@ func printSlackSummary(cmd *cobra.Command, teamID string, sum *slack.ImportSumma
 	if sum.Errors > 0 {
 		_, _ = fmt.Fprintf(cmd.OutOrStdout(), ", %d errors", sum.Errors)
 	}
+	if sum.FirstMediaError != "" {
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(), ", first media error: %s", textutil.SanitizeTerminal(sum.FirstMediaError))
+	}
 	_, _ = fmt.Fprintln(cmd.OutOrStdout())
 }
 
@@ -184,8 +187,8 @@ func splitSlackIdentifier(identifier string) (teamID, userID string, ok bool) {
 
 // resolveSlackSyncSources returns the slack sources to sync: the one for the
 // given team ID, or all registered workspaces.
-func resolveSlackSyncSources(s *store.Store, flagTeam string) ([]*store.Source, error) {
-	sources, err := s.ListSources(sourceTypeSlack)
+func resolveSlackSyncSources(ctx context.Context, s *store.Store, flagTeam string) ([]*store.Source, error) {
+	sources, err := s.ListSourcesContext(ctx, sourceTypeSlack)
 	if err != nil {
 		return nil, fmt.Errorf("list slack sources: %w", err)
 	}
@@ -193,18 +196,26 @@ func resolveSlackSyncSources(s *store.Store, flagTeam string) ([]*store.Source, 
 		if len(sources) == 0 {
 			return nil, errors.New("no Slack workspaces registered (run 'add-slack' first)")
 		}
-		return sources, nil
+		active := activeSyncSources(sources)
+		if len(active) == 0 {
+			return nil, fmt.Errorf("no active Slack workspaces registered: %w", store.ErrSourceRetired)
+		}
+		return active, nil
 	}
-	var out []*store.Source
+	var matched []*store.Source
 	for _, src := range sources {
 		if teamID, _, ok := splitSlackIdentifier(src.Identifier); ok && teamID == flagTeam {
-			out = append(out, src)
+			matched = append(matched, src)
 		}
 	}
-	if len(out) == 0 {
-		return nil, fmt.Errorf("slack workspace %q is not registered (run 'add-slack' first)", flagTeam)
+	active := activeSyncSources(matched)
+	if len(active) > 0 {
+		return active, nil
 	}
-	return out, nil
+	if len(matched) > 0 {
+		return nil, fmt.Errorf("slack workspace %q is retired: %w", flagTeam, store.ErrSourceRetired)
+	}
+	return nil, fmt.Errorf("slack workspace %q is not registered (run 'add-slack' first)", flagTeam)
 }
 
 // slackSyncExit resolves sync-slack's exit error from the run's parts. An
@@ -251,7 +262,7 @@ func runConfiguredSlackSync(ctx context.Context, s *store.Store) error {
 		return errors.New("configuration is unavailable")
 	}
 	cfg := state.cfg
-	sources, err := resolveSlackSyncSources(s, "")
+	sources, err := resolveSlackSyncSources(ctx, s, "")
 	if err != nil {
 		return err
 	}
@@ -330,6 +341,7 @@ func runScheduledSlackAttempts(
 			break
 		}
 		started, err := attempt(src)
+		_ = recordSyncAttempt(ctx, sourceTypeSlack, src.Identifier, err)
 		attempted = attempted || started
 		if err != nil {
 			errs = append(errs, err)

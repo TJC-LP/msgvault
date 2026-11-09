@@ -12,13 +12,18 @@ const (
 	sourceTypeMSMail         = msmail.SourceType
 	sourceTypeCalendar       = "gcal"
 	sourceTypeBeeper         = "beeper"
+	sourceTypeMatrix         = "matrix"
 	sourceTypeSlack          = "slack"
+	sourceTypeInline         = "inline"
 	sourceTypeSlackdump      = "slackdump"
 	sourceTypeGranola        = "granola"
 	sourceTypeCircleback     = "circleback"
 	sourceTypePlaud          = "plaud"
 	sourceTypeNotionMeetings = "notion_meetings"
+	sourceTypeTwilio         = "twilio"
 	sourceTypeMuesli         = "muesli"
+	sourceTypeTwenty         = "twenty"
+	sourceTypeAppleMessages  = "apple_messages"
 )
 
 // Analytics dataset / SQLite table names: the Parquet subdirectory under

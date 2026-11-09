@@ -8,7 +8,7 @@ export type GetTotalStatsParams = {
    */
   source_ids?: number[];
   /**
-   * Search query
+   * Search query; full text accepts standalone pipe-separated OR alternatives
    */
   search_query?: string;
   /**
@@ -19,6 +19,10 @@ export type GetTotalStatsParams = {
    * Aggregate view type for grouping
    */
   group_by?: string;
+  /**
+   * JSON list of account scopes that intersect, for structured clients
+   */
+  account_scopes?: string;
   /**
    * Sender email/address filter
    */

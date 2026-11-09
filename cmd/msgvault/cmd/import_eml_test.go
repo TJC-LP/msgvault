@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"context"
 	"errors"
 	"io"
 	"os"
@@ -13,13 +12,13 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/importer"
-	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/testutil"
 )
 
 func TestImportEMLCommandRequiresIdentifier(t *testing.T) {
 	t.Setenv(daemonCLISubprocessEnv, strconv.Itoa(os.Getppid()))
 	cmd := newImportEMLCommand()
-	cmd.SetContext(testInvocationContext(context.Background(), config.NewDefaultConfig(), invocationOptions{}))
+	cmd.SetContext(testInvocationContext(t.Context(), config.NewDefaultConfig(), invocationOptions{}))
 	cmd.SetArgs([]string{t.TempDir()})
 
 	err := cmd.Execute()
@@ -45,10 +44,8 @@ func TestImportEMLCommandRefreshesCacheAfterPostMigrationFailure(t *testing.T) {
 	testCtx := withStoreResolverConfig(t, testCfg)
 	t.Setenv(daemonCLISubprocessEnv, strconv.Itoa(os.Getppid()))
 
-	st, err := store.Open(testCfg.DatabaseDSN())
-	require.NoError(err)
-	require.NoError(st.InitSchema())
-	_, err = st.DB().Exec(`
+	st := testutil.NewSQLiteTestStoreAt(t, testCfg.DatabaseDSN())
+	_, err := st.DB().ExecContext(t.Context(), `
 		CREATE TRIGGER fail_legacy_identity
 		BEFORE INSERT ON account_identities
 		WHEN NEW.source_signal = 'config_migration'
@@ -92,14 +89,11 @@ func TestRunEMLPostImportMigrationsConfirmsIdentityAfterHardErrors(t *testing.T)
 	testCfg.Identity.Addresses = []string{"legacy@example.com"}
 	testCtx := withStoreResolverConfig(t, testCfg)
 
-	st, err := store.Open(testCfg.DatabaseDSN())
-	require.NoError(err, "open store")
-	t.Cleanup(func() { _ = st.Close() })
-	require.NoError(st.InitSchema(), "init schema")
+	st := testutil.NewSQLiteTestStoreAt(t, testCfg.DatabaseDSN())
 	src, err := st.GetOrCreateSource("eml", "archive@example.com")
 	require.NoError(err, "create source")
 
-	err = runEMLPostImportMigrations(io.Discard, st, &importer.EMLImportSummary{
+	err = runEMLPostImportMigrations(t.Context(), io.Discard, st, &importer.EMLImportSummary{
 		SourceID:   src.ID,
 		HardErrors: true,
 	}, importEMLFlags{
@@ -122,14 +116,11 @@ func TestRunEMLPostImportMigrationsSkipsDefaultIdentityForNonEmailSource(t *test
 	testCtx := withStoreResolverConfig(t, testCfg)
 	_ = testCtx
 
-	st, err := store.Open(testCfg.DatabaseDSN())
-	require.NoError(err, "open store")
-	t.Cleanup(func() { _ = st.Close() })
-	require.NoError(st.InitSchema(), "init schema")
+	st := testutil.NewSQLiteTestStoreAt(t, testCfg.DatabaseDSN())
 	src, err := st.GetOrCreateSource("whatsapp", "+15550001111")
 	require.NoError(err, "create source")
 
-	err = runEMLPostImportMigrations(io.Discard, st, &importer.EMLImportSummary{
+	err = runEMLPostImportMigrations(t.Context(), io.Discard, st, &importer.EMLImportSummary{
 		SourceID: src.ID,
 	}, importEMLFlags{
 		identifier: "+15550001111",

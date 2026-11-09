@@ -12,7 +12,6 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/mattn/go-sqlite3"
 	"go.kenn.io/msgvault/internal/sqliteutil"
 )
 
@@ -210,7 +209,7 @@ func (d *SQLiteDialect) proveQuiescentInstant(
 func (d *SQLiteDialect) probeQuiescentInstant(
 	ctx context.Context, conn *sql.Conn,
 ) (time.Time, bool, error) {
-	restore, err := d.useProbeBusyTimeout(ctx, conn)
+	restore, err := d.narrowBusyTimeout(ctx, conn, sqliteQuiescentProbeTimeout, "change-feed watermark probe")
 	if err != nil {
 		return time.Time{}, false, err
 	}
@@ -246,14 +245,14 @@ func (d *SQLiteDialect) probeQuiescentInstant(
 	return stamp, true, nil
 }
 
-// useProbeBusyTimeout narrows this connection's busy timeout to the probe's,
+// narrowBusyTimeout narrows this connection's busy timeout to limit,
 // returning a function that puts the connection's own value back. The
-// connection returns to the pool afterwards, so leaving the probe's timeout on
+// connection returns to the pool afterwards, so leaving the short timeout on
 // it would silently shorten every unrelated statement that later borrows it.
-func (d *SQLiteDialect) useProbeBusyTimeout(ctx context.Context, conn *sql.Conn) (func(), error) {
+func (d *SQLiteDialect) narrowBusyTimeout(ctx context.Context, conn *sql.Conn, limit time.Duration, purpose string) (func(), error) {
 	var configured int64
 	if err := conn.QueryRowContext(ctx, "PRAGMA busy_timeout").Scan(&configured); err != nil {
-		return nil, fmt.Errorf("read busy timeout for change-feed watermark probe: %w", err)
+		return nil, fmt.Errorf("read busy timeout for %s: %w", purpose, err)
 	}
 	set := func(c context.Context, ms int64) error {
 		_, err := conn.ExecContext(c, fmt.Sprintf("PRAGMA busy_timeout = %d", ms))
@@ -261,8 +260,8 @@ func (d *SQLiteDialect) useProbeBusyTimeout(ctx context.Context, conn *sql.Conn)
 	}
 	// Narrow, never widen: a store configured to give up on a busy database
 	// sooner than this means it, and the probe has a safe fallback either way.
-	if err := set(ctx, min(configured, sqliteQuiescentProbeTimeout.Milliseconds())); err != nil {
-		return nil, fmt.Errorf("set busy timeout for change-feed watermark probe: %w", err)
+	if err := set(ctx, min(configured, limit.Milliseconds())); err != nil {
+		return nil, fmt.Errorf("set busy timeout for %s: %w", purpose, err)
 	}
 	return func() {
 		// WithoutCancel: the connection must be handed back with its own
@@ -280,9 +279,9 @@ func (d *SQLiteDialect) useProbeBusyTimeout(ctx context.Context, conn *sql.Conn)
 			// database after the probe's timeout rather than the configured
 			// one, and a "database is locked" from an unrelated query is
 			// otherwise unexplainable.
-			slog.Warn("change-feed watermark probe could not restore the connection's busy timeout",
+			slog.Warn(purpose+" could not restore the connection's busy timeout",
 				slog.Int64("configured_ms", configured),
-				slog.Int64("left_at_ms", min(configured, sqliteQuiescentProbeTimeout.Milliseconds())),
+				slog.Int64("left_at_ms", min(configured, limit.Milliseconds())),
 				slog.Any("error", err))
 		}
 	}, nil
@@ -451,11 +450,20 @@ func (d *SQLiteDialect) FTSMatches(q querier, doc FTSDoc) (bool, error) {
 // docs-site search ranking page ("Where Ordering Can Diverge") and
 // TestFTSRank_KnownDivergence for the expected-behavior pin and
 // rationale.
-func (d *SQLiteDialect) FTSSearchClause() (join, where, orderBy string, orderArgCount int) {
+func (d *SQLiteDialect) FTSSearchClause(rowIDs bool) (join, where, orderBy string, orderArgCount int) {
+	where = "messages_fts MATCH ?"
+	if rowIDs {
+		where = SQLiteFTSRowIDCondition(where)
+	}
 	return "JOIN messages_fts ON messages_fts.rowid = m.id",
-		"messages_fts MATCH ?",
+		where,
 		"bm25(messages_fts, 1.0, 10.0, 1.0, 4.0, 1.0, 1.0)",
 		0
+}
+
+// SQLiteFTSRowIDCondition matches messages through the FTS index without an outer join.
+func SQLiteFTSRowIDCondition(condition string) string {
+	return "m.id IN (SELECT rowid FROM messages_fts WHERE " + condition + ")"
 }
 
 // FTSDeleteSQL returns the SQL to delete a message's FTS5 entry.
@@ -479,26 +487,33 @@ func (d *SQLiteDialect) InvalidateFTSForMessage(q querier, messageID int64) erro
 // FTSBackfillBatchSQL returns the SQL to backfill FTS5 for a range of message IDs.
 // Parameters: fromID(?), toID(?)
 func (d *SQLiteDialect) FTSBackfillBatchSQL() string {
+	envelope := storedFTSEnvelopeSQL("GROUP_CONCAT")
 	return `INSERT OR REPLACE INTO messages_fts (rowid, message_id, subject, body, from_addr, to_addr, cc_addr)
-		SELECT m.id, m.id, COALESCE(m.subject, ''), COALESCE(mb.body_text, ''),
-			COALESCE(
-				CASE WHEN m.message_type != 'email' AND m.message_type IS NOT NULL AND m.message_type != ''
-				     THEN (SELECT COALESCE(p.phone_number, p.email_address) FROM participants p WHERE p.id = m.sender_id)
-				END,
-				(SELECT GROUP_CONCAT(p.email_address, ' ') FROM message_recipients mr JOIN participants p ON p.id = mr.participant_id WHERE mr.message_id = m.id AND mr.recipient_type = 'from'),
-				''
-			),
-			COALESCE((SELECT GROUP_CONCAT(p.email_address, ' ') FROM message_recipients mr JOIN participants p ON p.id = mr.participant_id WHERE mr.message_id = m.id AND mr.recipient_type = 'to'), ''),
-			COALESCE((SELECT GROUP_CONCAT(p.email_address, ' ') FROM message_recipients mr JOIN participants p ON p.id = mr.participant_id WHERE mr.message_id = m.id AND mr.recipient_type = 'cc'), '')
+		SELECT m.id, m.id, ` + envelope.subject + `, COALESCE(mb.body_text, ''), ` +
+		envelope.fromAddr + `, ` + envelope.toAddrs + `, ` + envelope.ccAddrs + `
 		FROM messages m
 		LEFT JOIN message_bodies mb ON mb.message_id = m.id
 		WHERE m.id >= ? AND m.id < ?`
 }
 
+func (d *SQLiteDialect) FTSBackfillMissingBatchSQL(ctx context.Context, db *sql.DB) (string, error) {
+	// Use indexed IDs without loading stored FTS text. columnsize=0 tables
+	// have no docsize table and use the same fallback as completeness probes.
+	var id int64
+	err := db.QueryRowContext(ctx, "SELECT id FROM messages_fts_docsize LIMIT 0").Scan(&id)
+	predicate := ` AND NOT EXISTS (SELECT 1 FROM messages_fts_docsize d WHERE d.id = m.id)`
+	if d.IsNoSuchTableError(err) {
+		predicate = ` AND NOT EXISTS (SELECT 1 FROM messages_fts f WHERE f.rowid = m.id)`
+	} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return "", fmt.Errorf("probe FTS indexed IDs: %w", err)
+	}
+	return d.FTSBackfillBatchSQL() + predicate, nil
+}
+
 // FTSAvailable probes for FTS5 by querying the virtual table.
 // Checking sqlite_master alone is insufficient: a binary built without FTS5
 // support will fail with "no such module: fts5" even if the table exists.
-func (d *SQLiteDialect) FTSAvailable(ctx context.Context, db *sql.DB) (bool, error) {
+func (d *SQLiteDialect) FTSAvailable(ctx context.Context, db SQLReader) (bool, error) {
 	var probe int
 	err := db.QueryRowContext(ctx, "SELECT 1 FROM messages_fts LIMIT 1").Scan(&probe)
 	if err != nil && ctx.Err() != nil {
@@ -516,12 +531,19 @@ const sqliteFTSNeedsBackfillVirtualSQL = `SELECT EXISTS (SELECT 1 FROM messages 
 // and fall back to the virtual table. Checking every message catches interior
 // holes left when indexing fails during sync but later messages are indexed.
 func (d *SQLiteDialect) FTSNeedsBackfill(db *sql.DB) bool {
+	needs, _ := d.FTSNeedsBackfillContext(context.Background(), db)
+	return needs
+}
+func (d *SQLiteDialect) FTSNeedsBackfillContext(ctx context.Context, db *sql.DB) (bool, error) {
 	var exists bool
-	err := db.QueryRowContext(context.Background(), sqliteFTSNeedsBackfillDocsizeSQL).Scan(&exists)
+	err := ReadDBContext(ctx, db).QueryRowContext(ctx, sqliteFTSNeedsBackfillDocsizeSQL).Scan(&exists)
 	if d.IsNoSuchTableError(err) {
-		err = db.QueryRowContext(context.Background(), sqliteFTSNeedsBackfillVirtualSQL).Scan(&exists)
+		err = ReadDBContext(ctx, db).QueryRowContext(ctx, sqliteFTSNeedsBackfillVirtualSQL).Scan(&exists)
 	}
-	return err == nil && exists
+	if err != nil {
+		return false, fmt.Errorf("probe FTS completeness: %w", err)
+	}
+	return exists, nil
 }
 
 // FTSNeedsBackfillQuick compares maximum message and indexed row IDs. The
@@ -546,11 +568,6 @@ func (d *SQLiteDialect) FTSNeedsBackfillQuick(ctx context.Context, db *sql.DB) b
 		).Scan(&ftsMax)
 	}
 	return err == nil && ftsMax < msgMax
-}
-
-// FTSClearSQL returns the SQL to clear all FTS5 data.
-func (d *SQLiteDialect) FTSClearSQL() string {
-	return "DELETE FROM messages_fts"
 }
 
 // SchemaFTS returns the embedded filename containing FTS5 virtual table DDL.
@@ -704,7 +721,7 @@ func (d *SQLiteDialect) EnsureTriggers(q querier) error {
 		`DROP TRIGGER IF EXISTS trg_embedding_changes_message_insert`,
 		`DROP TRIGGER IF EXISTS trg_embedding_changes_message_update`,
 		`CREATE TRIGGER trg_embedding_changes_message_update
-		    AFTER UPDATE OF message_type, conversation_id, subject, sent_at, received_at, internal_date, sender_id, deleted_at, deleted_from_source_at, embed_gen
+		    AFTER UPDATE OF source_id, message_type, conversation_id, subject, sent_at, received_at, internal_date, sender_id, deleted_at, deleted_from_source_at, embed_gen
 		    ON messages FOR EACH ROW
 		    WHEN (EXISTS (
 		        SELECT 1 FROM message_bodies WHERE message_id = NEW.id
@@ -722,6 +739,7 @@ func (d *SQLiteDialect) EnsureTriggers(q querier) error {
 		                )
 		            ) AND (
 		                OLD.message_type IS NOT NEW.message_type
+		                OR OLD.source_id IS NOT NEW.source_id
 		                OR OLD.conversation_id IS NOT NEW.conversation_id
 		                OR OLD.sent_at IS NOT NEW.sent_at
 		                OR OLD.received_at IS NOT NEW.received_at
@@ -738,6 +756,7 @@ func (d *SQLiteDialect) EnsureTriggers(q querier) error {
 		                OR (NEW.deleted_at IS NULL AND NEW.deleted_from_source_at IS NULL)
 		            ) AND (
 		                OLD.message_type IS NOT NEW.message_type
+		                OR OLD.source_id IS NOT NEW.source_id
 		                OR OLD.conversation_id IS NOT NEW.conversation_id
 		                OR OLD.subject IS NOT NEW.subject
 		                OR OLD.deleted_at IS NOT NEW.deleted_at
@@ -1041,7 +1060,7 @@ func (d *SQLiteDialect) EnsureTriggers(q querier) error {
 		    AFTER UPDATE OF message_id, filename, mime_type, size, content_hash,
 		        storage_path, media_type, width, height, duration_ms,
 		        source_attachment_id, attachment_metadata, attachment_role,
-		        role_source, source_part_key, content_id, encryption_version
+		        role_source, source_part_key, content_id, encryption_version, attachment_state
 		    ON attachments FOR EACH ROW
 		    WHEN EXISTS (SELECT 1 FROM attachment_change_consumers)
 		      AND (OLD.message_id IS NOT NEW.message_id
@@ -1060,7 +1079,8 @@ func (d *SQLiteDialect) EnsureTriggers(q querier) error {
 		        OR OLD.role_source IS NOT NEW.role_source
 		        OR OLD.source_part_key IS NOT NEW.source_part_key
 		        OR OLD.content_id IS NOT NEW.content_id
-		        OR OLD.encryption_version IS NOT NEW.encryption_version)
+		        OR OLD.encryption_version IS NOT NEW.encryption_version
+		        OR OLD.attachment_state IS NOT NEW.attachment_state)
 		    BEGIN
 		        INSERT INTO attachment_change_log
 		            (event_kind, old_message_id, new_message_id,
@@ -1086,11 +1106,15 @@ func (d *SQLiteDialect) EnsureTriggers(q querier) error {
 		    END`,
 		`DROP TRIGGER IF EXISTS trg_attachment_message_live_change`,
 		`CREATE TRIGGER trg_attachment_message_live_change
-		    AFTER UPDATE OF deleted_at, deleted_from_source_at ON messages FOR EACH ROW
+		    AFTER UPDATE OF source_id, conversation_id, deleted_at, deleted_from_source_at ON messages FOR EACH ROW
 		    WHEN EXISTS (SELECT 1 FROM attachment_change_consumers)
-		      AND ((OLD.deleted_at IS NULL AND OLD.deleted_from_source_at IS NULL)
-		           IS NOT
-		           (NEW.deleted_at IS NULL AND NEW.deleted_from_source_at IS NULL))
+		      AND (((OLD.deleted_at IS NULL AND OLD.deleted_from_source_at IS NULL)
+		            IS NOT
+		            (NEW.deleted_at IS NULL AND NEW.deleted_from_source_at IS NULL))
+		        OR ((OLD.deleted_at IS NULL AND OLD.deleted_from_source_at IS NULL)
+		            AND (NEW.deleted_at IS NULL AND NEW.deleted_from_source_at IS NULL)
+		            AND (OLD.source_id IS NOT NEW.source_id
+		              OR OLD.conversation_id IS NOT NEW.conversation_id)))
 		    BEGIN
 		        INSERT INTO attachment_change_log
 		            (event_kind, old_message_id, new_message_id,
@@ -1099,8 +1123,12 @@ func (d *SQLiteDialect) EnsureTriggers(q querier) error {
 		             old_source_part_key, new_source_part_key,
 		             old_role, new_role)
 		        SELECT
-		            CASE WHEN NEW.deleted_at IS NULL AND NEW.deleted_from_source_at IS NULL
-		                 THEN 'message_live_enter' ELSE 'message_live_exit' END,
+		            CASE WHEN (OLD.deleted_at IS NULL AND OLD.deleted_from_source_at IS NULL)
+		                       IS NOT
+		                       (NEW.deleted_at IS NULL AND NEW.deleted_from_source_at IS NULL)
+		                 THEN CASE WHEN NEW.deleted_at IS NULL AND NEW.deleted_from_source_at IS NULL
+		                           THEN 'message_live_enter' ELSE 'message_live_exit' END
+		                 ELSE 'attachment_update' END,
 		            CASE WHEN OLD.deleted_at IS NULL AND OLD.deleted_from_source_at IS NULL
 		                 THEN OLD.id END,
 		            CASE WHEN NEW.deleted_at IS NULL AND NEW.deleted_from_source_at IS NULL
@@ -1805,6 +1833,33 @@ func (d *SQLiteDialect) EnsureActivityProjectionTriggers(q querier) error {
 		             revision = activity_projection_queue.revision + 1,
 		             queued_at = CURRENT_TIMESTAMP;
 		     END`,
+		`DROP TRIGGER IF EXISTS trg_activity_queue_conversation_people_insert`,
+		`CREATE TRIGGER trg_activity_queue_conversation_people_insert
+		     AFTER INSERT ON conversation_participants FOR EACH ROW
+		     BEGIN
+		         INSERT INTO activity_projection_conversation_queue (conversation_id)
+		         VALUES (NEW.conversation_id)
+		         ON CONFLICT(conversation_id) DO UPDATE SET after_message_id = 0;
+		     END`,
+		`DROP TRIGGER IF EXISTS trg_activity_queue_conversation_people_update`,
+		`CREATE TRIGGER trg_activity_queue_conversation_people_update
+		     AFTER UPDATE ON conversation_participants FOR EACH ROW
+		     BEGIN
+		         INSERT INTO activity_projection_conversation_queue (conversation_id)
+		         VALUES (OLD.conversation_id)
+		         ON CONFLICT(conversation_id) DO UPDATE SET after_message_id = 0;
+		         INSERT INTO activity_projection_conversation_queue (conversation_id)
+		         VALUES (NEW.conversation_id)
+		         ON CONFLICT(conversation_id) DO UPDATE SET after_message_id = 0;
+		     END`,
+		`DROP TRIGGER IF EXISTS trg_activity_queue_conversation_people_delete`,
+		`CREATE TRIGGER trg_activity_queue_conversation_people_delete
+		     AFTER DELETE ON conversation_participants FOR EACH ROW
+		     BEGIN
+		         INSERT INTO activity_projection_conversation_queue (conversation_id)
+		         VALUES (OLD.conversation_id)
+		         ON CONFLICT(conversation_id) DO UPDATE SET after_message_id = 0;
+		     END`,
 		`DROP TRIGGER IF EXISTS trg_activity_queue_conversation_type_update`,
 		`CREATE TRIGGER trg_activity_queue_conversation_type_update
 		     AFTER UPDATE OF conversation_type ON conversations FOR EACH ROW
@@ -1942,6 +1997,8 @@ func (d *SQLiteDialect) contentChangedAtDefaultStamps(q querier) (bool, error) {
 // silences these when the column already exists (idempotent migrations).
 func (d *SQLiteDialect) LegacyColumnMigrations() []ColumnMigration {
 	return []ColumnMigration{
+		{`ALTER TABLE carddav_resources ADD COLUMN owns_display_name BOOLEAN NOT NULL DEFAULT FALSE`, "carddav_resources.owns_display_name"},
+		{`ALTER TABLE carddav_resources ADD COLUMN locally_published BOOLEAN NOT NULL DEFAULT FALSE`, "carddav_resources.locally_published"},
 		{`ALTER TABLE person_match_judgment_cursor ADD COLUMN started_at_zero BOOLEAN NOT NULL DEFAULT FALSE`, "person_match_judgment_cursor.started_at_zero"},
 		{`ALTER TABLE carddav_publications ADD COLUMN outgoing_envelope_metadata BLOB`, "carddav_publications.outgoing_envelope_metadata"},
 		{`ALTER TABLE carddav_publications ADD COLUMN approved_body_sha256 TEXT`, "carddav_publications.approved_body_sha256"},
@@ -1973,6 +2030,11 @@ func (d *SQLiteDialect) LegacyColumnMigrations() []ColumnMigration {
 		{`ALTER TABLE imap_folder_state ADD COLUMN highest_modseq TEXT NOT NULL DEFAULT '0'`, "imap_folder_state.highest_modseq"},
 		{`ALTER TABLE messages ADD COLUMN rfc822_message_id TEXT`, "rfc822_message_id"},
 		{`ALTER TABLE messages ADD COLUMN list_id TEXT`, "list_id"},
+		{`ALTER TABLE messages ADD COLUMN hidden_text_present BOOLEAN NOT NULL DEFAULT 0`, "hidden_text_present"},
+		{`ALTER TABLE messages ADD COLUMN account_address TEXT`, "account_address"},
+		{`ALTER TABLE messages ADD COLUMN account_path TEXT`, "account_path"},
+		{`ALTER TABLE messages ADD COLUMN email_linkage_outcome TEXT`, "email_linkage_outcome"},
+		{`ALTER TABLE messages ADD COLUMN draft_authored BOOLEAN NOT NULL DEFAULT FALSE`, "draft_authored"},
 		{`ALTER TABLE sources ADD COLUMN oauth_app TEXT`, "oauth_app"},
 		{`ALTER TABLE participants ADD COLUMN phone_number TEXT`, "phone_number"},
 		{`ALTER TABLE participants ADD COLUMN canonical_id TEXT`, "canonical_id"},
@@ -2037,6 +2099,7 @@ func (d *SQLiteDialect) LegacyColumnMigrations() []ColumnMigration {
 		{`ALTER TABLE document_extractions ADD COLUMN failure_detail TEXT`, "document_extractions.failure_detail"},
 		{`ALTER TABLE document_extractions ADD COLUMN rebuild_id TEXT REFERENCES document_extraction_rebuilds(id) ON DELETE SET NULL`, "document_extractions.rebuild_id"},
 		{`ALTER TABLE document_extractions ADD COLUMN request_count INTEGER NOT NULL DEFAULT 0 CHECK (request_count >= 0)`, "document_extractions.request_count"},
+		{`ALTER TABLE document_extractions ADD COLUMN upload_count INTEGER NOT NULL DEFAULT 0 CHECK (upload_count >= 0)`, "document_extractions.upload_count"},
 		{`ALTER TABLE document_extractions ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0 CHECK (retry_count >= 0 AND retry_count <= request_count)`, "document_extractions.retry_count"},
 		{`ALTER TABLE document_extractions ADD COLUMN provider_latency_ms INTEGER NOT NULL DEFAULT 0 CHECK (provider_latency_ms >= 0)`, "document_extractions.provider_latency_ms"},
 		{`ALTER TABLE document_extractions ADD COLUMN normalization_version INTEGER`, "document_extractions.normalization_version"},
@@ -2248,24 +2311,6 @@ func (d *SQLiteDialect) RowWriterLockSQL(table, column string) string {
 // so Store.runMaintenance issues no reset statement and SQLite's
 // transactional behavior is unchanged.
 func (d *SQLiteDialect) MaintenanceTimeoutResetSQL() string { return "" }
-
-// IsBusyError returns true for SQLITE_BUSY and SQLITE_LOCKED. Matching on
-// the result code is more robust than substring matching: BUSY surfaces as
-// "database is locked" but LOCKED surfaces as "database table is locked",
-// so a single substring cannot catch both.
-func (d *SQLiteDialect) IsBusyError(err error) bool {
-	if err == nil {
-		return false
-	}
-	if serr, ok := errors.AsType[sqlite3.Error](err); ok {
-		return serr.Code == sqlite3.ErrBusy || serr.Code == sqlite3.ErrLocked
-	}
-	var serrPtr *sqlite3.Error
-	if errors.As(err, &serrPtr) && serrPtr != nil {
-		return serrPtr.Code == sqlite3.ErrBusy || serrPtr.Code == sqlite3.ErrLocked
-	}
-	return false
-}
 
 // IsSerializationFailureError always returns false for SQLite. Only one write
 // transaction runs at a time, so a locked row can never have been changed and

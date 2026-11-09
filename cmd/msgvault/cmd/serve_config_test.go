@@ -14,6 +14,25 @@ import (
 	"go.kenn.io/msgvault/internal/config"
 )
 
+// buildNativeCLI builds the real msgvault CLI into t.TempDir() and returns its path.
+func buildNativeCLI(t *testing.T) string {
+	t.Helper()
+	repoRoot, err := filepath.Abs(filepath.Join("..", "..", ".."))
+	require.NoError(t, err)
+	binary := filepath.Join(t.TempDir(), "msgvault")
+	if runtime.GOOS == "windows" {
+		binary += ".exe"
+	}
+	// This read makes Go's test cache rerun the test when the child's inputs change.
+	_, err = os.ReadDir(filepath.Join(repoRoot, "cmd", "msgvault"))
+	require.NoError(t, err)
+	build := exec.CommandContext(t.Context(), "go", "build", "-tags", "fts5 sqlite_vec", "-o", binary, "./cmd/msgvault")
+	build.Dir = repoRoot
+	output, err := build.CombinedOutput()
+	require.NoError(t, err, "build real msgvault binary: %s", output)
+	return binary
+}
+
 func TestServeFlagsOverrideMalformedEnvironment(t *testing.T) { //nolint:paralleltest // process environment and logger
 	assert := assert.New(t)
 	require := require.New(t)
@@ -38,19 +57,9 @@ func TestServeFlagsOverrideMalformedEnvironment(t *testing.T) { //nolint:paralle
 	}
 }
 
-func TestDaemonSubprocessesPreserveEffectiveServeConfig(t *testing.T) { //nolint:paralleltest // process environment and executable resolver
+func testDaemonSubprocessesPreserveEffectiveServeConfig(t *testing.T, binary string) {
+	t.Helper()
 	requirements := require.New(t)
-	repoRoot, err := filepath.Abs(filepath.Join("..", "..", ".."))
-	requirements.NoError(err)
-	binaryName := "msgvault"
-	if runtime.GOOS == "windows" {
-		binaryName += ".exe"
-	}
-	binary := filepath.Join(t.TempDir(), binaryName)
-	build := exec.Command("go", "build", "-tags", "fts5 sqlite_vec", "-o", binary, "./cmd/msgvault")
-	build.Dir = repoRoot
-	output, err := build.CombinedOutput()
-	requirements.NoError(err, "build real msgvault binary: %s", output)
 	savedResolver := daemonCLIExecutableResolver
 	daemonCLIExecutableResolver = func() (string, error) { return binary, nil }
 	t.Cleanup(func() { daemonCLIExecutableResolver = savedResolver })
@@ -132,7 +141,7 @@ func TestServeResolvesRealLoopbackInterface(t *testing.T) {
 	require.NoError(err)
 	require.NotNil(net.ParseIP(bind))
 	assert.True(net.ParseIP(bind).IsLoopback())
-	listener, err := listenServeAPI("iface:"+name, 0)
+	listener, err := listenServeAPI(t.Context(), "iface:"+name, 0)
 	require.NoError(err)
 	t.Cleanup(func() { assert.NoError(listener.Close()) })
 	addr, ok := listener.Addr().(*net.TCPAddr)

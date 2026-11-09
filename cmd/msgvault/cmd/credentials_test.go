@@ -247,7 +247,30 @@ func TestCredentialsImportEnvironmentPreservesStoredEntries(t *testing.T) { //no
 	assert.Equal("initial-environment-key", key)
 }
 
-func TestCredentialsRejectInvalidInputsAndUnusedSweepID(t *testing.T) {
+func TestCredentialsImportEnvironmentSkipsLocalEmbeddings(t *testing.T) { //nolint:paralleltest // process environment
+	assert, require := assert.New(t), require.New(t)
+	cfg := credentialsTestConfig(t)
+	cfg.Vector.Embeddings.LocalOnly = true
+	cfg.Vector.Embeddings.APIKeyEnv = "MSGVAULT_TEST_LOCAL_EMBED_KEY"
+	cfg.Vector.Multimodal.Endpoint = "https://multimodal.example.com/v1"
+	cfg.Vector.Multimodal.APIKeyEnv = "MSGVAULT_TEST_MULTIMODAL_KEY"
+	cfg.People.Enrichment.SuppressionKeyEnv = ""
+	t.Setenv(cfg.Vector.Embeddings.APIKeyEnv, "unused-local-key")
+	t.Setenv(cfg.Vector.Multimodal.APIKeyEnv, "multimodal-key")
+
+	output, err := runCredentialsTestCommand(t, cfg, "", "import-env")
+	require.NoError(err)
+	assert.Contains(output, "Imported 1 credentials; kept 0 existing credentials")
+	snapshot, err := providercredentials.Read(cfg.TokensDir())
+	require.NoError(err)
+	assert.False(snapshot.Stored(providercredentials.VectorEmbeddingsID))
+	require.True(snapshot.Stored(providercredentials.VectorMultimodalID))
+	key, _, err := snapshot.Resolve(providercredentials.VectorMultimodalID, cfg.Vector.Multimodal.Endpoint, "", os.LookupEnv)
+	require.NoError(err)
+	assert.Equal("multimodal-key", key)
+}
+
+func TestCredentialsRejectInvalidInputsAndPeopleProviderID(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
 		name, input string
@@ -256,7 +279,7 @@ func TestCredentialsRejectInvalidInputsAndUnusedSweepID(t *testing.T) {
 		{"missing input", "", []string{"set", providercredentials.VectorEmbeddingsID}},
 		{"empty input", " \n", []string{"set", providercredentials.VectorEmbeddingsID, "--stdin"}},
 		{"oversized input", strings.Repeat("x", 65537), []string{"set", providercredentials.VectorEmbeddingsID, "--stdin"}},
-		{"unused sweep store", "key", []string{"set", providercredentials.PeopleSweepID, "--stdin", "--endpoint", "https://provider.example.test"}},
+		{"people provider key", "key", []string{"set", providercredentials.PeopleProviderID("remote"), "--stdin", "--endpoint", "https://provider.example.test"}},
 		{"suppression endpoint", "key", []string{"set", providercredentials.PersonEnrichmentSuppressionID, "--stdin", "--endpoint", "https://provider.example.test"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -269,4 +292,11 @@ func TestCredentialsRejectInvalidInputsAndUnusedSweepID(t *testing.T) {
 			assert.False(t, snapshot.Stored(providercredentials.VectorEmbeddingsID))
 		})
 	}
+}
+
+func TestCredentialsLocalEmbeddingsRejectsProviderKeys(t *testing.T) {
+	cfg := credentialsTestConfig(t)
+	cfg.Vector.Embeddings.LocalOnly = true
+	_, err := runCredentialsTestCommand(t, cfg, "synthetic-key", "set", providercredentials.VectorEmbeddingsID, "--stdin", "--endpoint", "https://api.openai.com/v1")
+	require.ErrorContains(t, err, "local embeddings do not use provider credentials")
 }

@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"bytes"
-	"context"
 	"io"
 	"path/filepath"
 	"strings"
@@ -12,6 +11,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/testutil"
 )
 
 func saveMessengerState(t *testing.T) func() {
@@ -71,7 +71,7 @@ func TestImportMessenger_JSON_EndToEnd(t *testing.T) {
 		"--me", "test.user@facebook.messenger",
 		fixture,
 	})
-	require.NoError(rootCmd.ExecuteContext(context.Background()), "import-messenger")
+	require.NoError(rootCmd.ExecuteContext(t.Context()), "import-messenger")
 	assert.Contains(stdout.String(), "Import complete", "stdout missing Import complete")
 
 	st, err := store.Open(filepath.Join(tmp, "msgvault.db"))
@@ -79,9 +79,9 @@ func TestImportMessenger_JSON_EndToEnd(t *testing.T) {
 	t.Cleanup(func() { _ = st.Close() })
 
 	var n int
-	require.NoError(st.DB().QueryRow("SELECT COUNT(*) FROM messages WHERE message_type='fbmessenger'").Scan(&n))
+	require.NoError(st.DB().QueryRowContext(t.Context(), "SELECT COUNT(*) FROM messages WHERE message_type='fbmessenger'").Scan(&n))
 	assert.Equal(4, n, "messages")
-	require.NoError(st.DB().QueryRow("SELECT COUNT(*) FROM participants WHERE email_address='test.user@facebook.messenger'").Scan(&n))
+	require.NoError(st.DB().QueryRowContext(t.Context(), "SELECT COUNT(*) FROM participants WHERE email_address='test.user@facebook.messenger'").Scan(&n))
 	assert.Equal(1, n, "self participant count")
 }
 
@@ -105,17 +105,17 @@ func TestImportMessenger_HTML_EndToEnd(t *testing.T) {
 		"--me", "test.user@facebook.messenger",
 		fixture,
 	})
-	require.NoError(rootCmd.ExecuteContext(context.Background()), "import-messenger")
+	require.NoError(rootCmd.ExecuteContext(t.Context()), "import-messenger")
 	assert.Contains(stdout.String(), "Import complete", "stdout missing Import complete")
 	st, err := store.Open(filepath.Join(tmp, "msgvault.db"))
 	require.NoError(err)
 	t.Cleanup(func() { _ = st.Close() })
 
 	var n int
-	require.NoError(st.DB().QueryRow("SELECT COUNT(*) FROM messages WHERE message_type='fbmessenger'").Scan(&n))
+	require.NoError(st.DB().QueryRowContext(t.Context(), "SELECT COUNT(*) FROM messages WHERE message_type='fbmessenger'").Scan(&n))
 	assert.Equal(3, n, "messages")
 	var rawFormat string
-	require.NoError(st.DB().QueryRow("SELECT DISTINCT raw_format FROM message_raw").Scan(&rawFormat))
+	require.NoError(st.DB().QueryRowContext(t.Context(), "SELECT DISTINCT raw_format FROM message_raw").Scan(&rawFormat))
 	assert.Equal("fbmessenger_html", rawFormat, "raw_format")
 }
 
@@ -128,9 +128,7 @@ func TestImportMessengerRunsPostSourceMigrationWithoutMessengerIdentity(t *testi
 	testCfg.Identity.Addresses = []string{"legacy@example.com"}
 	testCtx := withStoreResolverConfig(t, testCfg)
 
-	st, err := store.Open(testCfg.DatabaseDSN())
-	require.NoError(err, "open seed store")
-	require.NoError(st.InitSchema(), "init seed schema")
+	st := testutil.NewSQLiteTestStoreAt(t, testCfg.DatabaseDSN())
 	emailSource, err := st.GetOrCreateSource("gmail", "mailbox@example.com")
 	require.NoError(err, "create eligible email source")
 	require.NoError(st.Close(), "close seed store")
@@ -183,7 +181,7 @@ func TestImportMessenger_MissingDir(t *testing.T) {
 		"--me", "test.user@facebook.messenger",
 		filepath.Join(tmp, "does", "not", "exist"),
 	})
-	err := rootCmd.ExecuteContext(context.Background())
+	err := rootCmd.ExecuteContext(t.Context())
 	require.Error(t, err, "expected error for missing dir")
 	msg := err.Error()
 	assert.True(t, strings.Contains(msg, "not found") || strings.Contains(msg, "no such"),

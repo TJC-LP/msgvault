@@ -7,11 +7,13 @@ import (
 	"database/sql"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/testutil"
 	"go.kenn.io/msgvault/internal/vector"
 )
 
@@ -60,7 +62,7 @@ func TestDocumentPublicationIgnoresStaleScopeSequenceSQLite(t *testing.T) {
 	assert.Equal(t, "revision-20", got.PublishedRevision)
 	assert.Equal(t, int64(20), got.SourceSequence)
 	assert.Equal(t, vector.DocumentCurrent, got.State)
-	_, err = b.DB().Exec(`UPDATE embedding_documents SET published_revision = 'tampered'
+	_, err = b.DB().ExecContext(t.Context(), `UPDATE embedding_documents SET published_revision = 'tampered'
 		WHERE generation_id = ? AND document_key = ?`, int64(gen), newer.Key)
 	require.NoError(t, err)
 	require.NoError(t, publisher.PublishScope(ctx, gen, scope, 20,
@@ -105,9 +107,9 @@ func TestDocumentPublicationPreservesMatchingVectorsSQLite(t *testing.T) {
 	require.NoError(t, b.PublishScope(ctx, gen, scope, 2,
 		[]vector.DocumentPublication{first, second}, []vector.Chunk{documentChunk(92, 0.3)}))
 	var firstVectors, secondVectors int
-	require.NoError(t, b.DB().QueryRow(`SELECT COUNT(*) FROM embeddings
+	require.NoError(t, b.DB().QueryRowContext(t.Context(), `SELECT COUNT(*) FROM embeddings
 		WHERE generation_id = ? AND message_id = ?`, int64(gen), 91).Scan(&firstVectors))
-	require.NoError(t, b.DB().QueryRow(`SELECT COUNT(*) FROM embeddings
+	require.NoError(t, b.DB().QueryRowContext(t.Context(), `SELECT COUNT(*) FROM embeddings
 		WHERE generation_id = ? AND message_id = ?`, int64(gen), 92).Scan(&secondVectors))
 	assert.Equal(t, 1, firstVectors)
 	assert.Equal(t, 1, secondVectors)
@@ -139,7 +141,7 @@ func TestDocumentSequenceFenceSQLite(t *testing.T) {
 	assert.Equal(t, "revision-a", got.PublishedRevision)
 	assert.Equal(t, int64(3), got.SourceSequence)
 	var vectorRows int
-	require.NoError(t, b.DB().QueryRow(`SELECT COUNT(*) FROM embeddings
+	require.NoError(t, b.DB().QueryRowContext(t.Context(), `SELECT COUNT(*) FROM embeddings
 		WHERE generation_id = ? AND message_id = 91`, int64(gen)).Scan(&vectorRows))
 	assert.Equal(t, 1, vectorRows, "a fence-only publication must preserve vectors")
 
@@ -403,9 +405,10 @@ func TestDocumentPaginationAndWatermarksSQLite(t *testing.T) {
 }
 
 func TestDocumentJournalDisablesAfterLastContextualGenerationSQLite(t *testing.T) {
+	testutil.SkipIfPostgres(t, "SQLite fixtures require SQLite")
 	dir := t.TempDir()
 	mainPath := filepath.Join(dir, "main.db")
-	st, err := store.OpenForTest(mainPath)
+	st, err := store.OpenForTest(t.Context(), mainPath)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 	require.NoError(t, st.InitSchema())
@@ -419,7 +422,7 @@ func TestDocumentJournalDisablesAfterLastContextualGenerationSQLite(t *testing.T
 	seedJournal := func() {
 		t.Helper()
 		require.NoError(t, st.EnableEmbeddingChangeJournal(t.Context()))
-		_, seedErr := st.DB().Exec(`
+		_, seedErr := st.DB().ExecContext(t.Context(), `
 			UPDATE embedding_change_clock SET sequence = sequence + 1 WHERE singleton = 1;
 			INSERT INTO embedding_changes (sequence, kind)
 			SELECT sequence, 'message_update' FROM embedding_change_clock WHERE singleton = 1;`)
@@ -429,9 +432,10 @@ func TestDocumentJournalDisablesAfterLastContextualGenerationSQLite(t *testing.T
 		t.Helper()
 		var enabled bool
 		var rows int
-		require.NoError(t, st.DB().QueryRow(
+		require.NoError(t, st.DB().QueryRowContext(
+			t.Context(),
 			`SELECT enabled FROM embedding_change_clock WHERE singleton = 1`).Scan(&enabled))
-		require.NoError(t, st.DB().QueryRow(`SELECT COUNT(*) FROM embedding_changes`).Scan(&rows))
+		require.NoError(t, st.DB().QueryRowContext(t.Context(), `SELECT COUNT(*) FROM embedding_changes`).Scan(&rows))
 		assert.False(t, enabled)
 		assert.Zero(t, rows)
 	}
@@ -439,9 +443,10 @@ func TestDocumentJournalDisablesAfterLastContextualGenerationSQLite(t *testing.T
 		t.Helper()
 		var enabled bool
 		var rows int
-		require.NoError(t, st.DB().QueryRow(
+		require.NoError(t, st.DB().QueryRowContext(
+			t.Context(),
 			`SELECT enabled FROM embedding_change_clock WHERE singleton = 1`).Scan(&enabled))
-		require.NoError(t, st.DB().QueryRow(`SELECT COUNT(*) FROM embedding_changes`).Scan(&rows))
+		require.NoError(t, st.DB().QueryRowContext(t.Context(), `SELECT COUNT(*) FROM embedding_changes`).Scan(&rows))
 		assert.True(t, enabled)
 		assert.Equal(t, 1, rows)
 	}
@@ -466,12 +471,64 @@ func TestDocumentJournalDisablesAfterLastContextualGenerationSQLite(t *testing.T
 	assertDisabledAndEmpty()
 }
 
+func TestDocumentJournalCleanupWaitsForWriterSQLite(t *testing.T) {
+	testutil.SkipIfPostgres(t, "SQLite fixtures require SQLite")
+	require := require.New(t)
+	assert := assert.New(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+	dir := t.TempDir()
+	mainPath := filepath.Join(dir, "main.db")
+	st, err := store.OpenForTest(t.Context(), mainPath)
+	require.NoError(err)
+	t.Cleanup(func() { _ = st.Close() })
+	require.NoError(st.InitSchema())
+	b, err := Open(ctx, Options{
+		Path: filepath.Join(dir, "vectors.db"), MainPath: mainPath,
+		MainDB: st.DB(), Dimension: 768,
+	})
+	require.NoError(err)
+	t.Cleanup(func() { _ = b.Close() })
+	require.NoError(st.EnableEmbeddingChangeJournal(ctx))
+	writer, err := st.DB().BeginTx(ctx, nil)
+	require.NoError(err)
+	defer func() { _ = writer.Rollback() }()
+	_, err = writer.ExecContext(ctx, `
+		UPDATE embedding_change_clock SET sequence = sequence + 1 WHERE singleton = 1;
+		INSERT INTO embedding_changes (sequence, kind)
+		SELECT sequence, 'message_update' FROM embedding_change_clock WHERE singleton = 1;`)
+	require.NoError(err)
+	done := make(chan error, 1)
+	go func() { done <- b.CleanupDocumentJournalIfUnused(ctx) }()
+	select {
+	case err := <-done:
+		require.NoError(err, "cleanup must wait for the concurrent writer")
+		require.FailNow("cleanup completed while the writer still held the journal lock")
+	case <-time.After(time.Second):
+	}
+	require.NoError(writer.Commit())
+	select {
+	case err := <-done:
+		require.NoError(err)
+	case <-ctx.Done():
+		require.NoError(ctx.Err(), "cleanup must finish after the writer commits")
+	}
+	var enabled bool
+	var rows int
+	require.NoError(st.DB().QueryRowContext(ctx,
+		`SELECT enabled FROM embedding_change_clock WHERE singleton = 1`).Scan(&enabled))
+	require.NoError(st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM embedding_changes`).Scan(&rows))
+	assert.False(enabled)
+	assert.Zero(rows, "cleanup includes journal entries committed by the concurrent writer")
+}
+
 func TestDocumentJournalCleanupFailureDoesNotMaskLifecycleSQLite(t *testing.T) {
+	testutil.SkipIfPostgres(t, "SQLite fixtures require SQLite")
 	assert := assert.New(t)
 	require := require.New(t)
 	dir := t.TempDir()
 	mainPath := filepath.Join(dir, "main.db")
-	st, err := store.OpenForTest(mainPath)
+	st, err := store.OpenForTest(t.Context(), mainPath)
 	require.NoError(err)
 	t.Cleanup(func() { _ = st.Close() })
 	require.NoError(st.InitSchema())
@@ -484,7 +541,7 @@ func TestDocumentJournalCleanupFailureDoesNotMaskLifecycleSQLite(t *testing.T) {
 
 	installCleanupFailure := func() {
 		t.Helper()
-		_, triggerErr := st.DB().Exec(`
+		_, triggerErr := st.DB().ExecContext(t.Context(), `
 			CREATE TRIGGER fail_contextual_journal_cleanup
 			BEFORE UPDATE OF sequence ON embedding_change_clock
 			WHEN NEW.sequence = OLD.sequence
@@ -495,13 +552,13 @@ func TestDocumentJournalCleanupFailureDoesNotMaskLifecycleSQLite(t *testing.T) {
 	}
 	removeCleanupFailure := func() {
 		t.Helper()
-		_, triggerErr := st.DB().Exec(`DROP TRIGGER fail_contextual_journal_cleanup`)
+		_, triggerErr := st.DB().ExecContext(t.Context(), `DROP TRIGGER fail_contextual_journal_cleanup`)
 		require.NoError(triggerErr)
 	}
 	seedJournal := func() {
 		t.Helper()
 		require.NoError(st.EnableEmbeddingChangeJournal(t.Context()))
-		_, seedErr := st.DB().Exec(`
+		_, seedErr := st.DB().ExecContext(t.Context(), `
 			UPDATE embedding_change_clock SET sequence = sequence + 1 WHERE singleton = 1;
 			INSERT INTO embedding_changes (sequence, kind)
 			SELECT sequence, 'message_update' FROM embedding_change_clock WHERE singleton = 1;`)
@@ -538,7 +595,7 @@ func TestDocumentJournalCleanupFailureDoesNotMaskLifecycleSQLite(t *testing.T) {
 }
 
 func TestDocumentMigrationFreshUpgradeAndOrdinaryBasisSQLite(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	path := filepath.Join(t.TempDir(), "upgrade.db")
 	db := openTestDB(t, path)
 	t.Cleanup(func() { _ = db.Close() })
@@ -642,7 +699,7 @@ func TestDocumentMigrationFreshUpgradeAndOrdinaryBasisSQLite(t *testing.T) {
 
 func assertScoredChunkBasisSQLite(t *testing.T, b *Backend, gen vector.GenerationID, chunk vector.Chunk, want vector.SourceBasis) {
 	t.Helper()
-	hits, err := b.ScoreMessageChunks(context.Background(), gen, chunk.MessageID, chunk.Vector)
+	hits, err := b.ScoreMessageChunks(t.Context(), gen, chunk.MessageID, chunk.Vector)
 	require.NoError(t, err)
 	require.Len(t, hits, 1)
 	assert.Equal(t, want, hits[0].SourceBasis)

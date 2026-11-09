@@ -31,16 +31,15 @@ var exportEMLCmd = &cobra.Command{
 	Use:   "export-eml <id>",
 	Short: "Export a message as .eml file",
 	Long: `Export a message from the archive as a standard .eml (MIME) file.
+<id> is the "id" from 'msgvault search --json' or a provider message ID.
 
 This command retrieves the raw MIME data stored during sync and writes it
 to a file. The .eml format is compatible with most email clients.
 
 With --thread, it writes every message in the conversation that has stored
 MIME into a directory, numbered oldest first, and reports messages it had to
-skip and when the account last synced.
-
-Examples:
-  msgvault export-eml 12345
+skip and when the account last synced.`,
+	Example: `  msgvault export-eml 12345
   msgvault export-eml 12345 --output message.eml
   msgvault export-eml 18f0abc123def -o important.eml
   msgvault export-eml 18f0abc123def --thread -o thread/`,
@@ -84,8 +83,11 @@ func runExportEMLHTTP(cmd *cobra.Command, messageRef, outputPath string) error {
 	if errors.Is(err, store.ErrMessageNotFound) {
 		return fmt.Errorf("message not found: %s", messageRef)
 	}
-	if err != nil {
+	if errors.Is(err, daemonclient.ErrMessageRawNotFound) {
 		return fmt.Errorf("get raw message data: %w (message may not have raw data stored)", err)
+	}
+	if err != nil {
+		return fmt.Errorf("get raw message data: %w", err)
 	}
 	if sourceMessageID == "" {
 		sourceMessageID = messageRef

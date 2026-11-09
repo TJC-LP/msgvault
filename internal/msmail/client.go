@@ -14,7 +14,7 @@ import (
 )
 
 // GraphBaseURL is the production Graph endpoint.
-const GraphBaseURL = "https://graph.microsoft.com/v1.0"
+const GraphBaseURL = msgraph.GraphBaseURL
 
 // Client adds the mail endpoints to the shared Graph transport.
 type Client struct {
@@ -58,6 +58,7 @@ type Folder struct {
 type DeltaMessage struct {
 	ID               string    `json:"id"`
 	ReceivedDateTime time.Time `json:"receivedDateTime"`
+	Categories       *[]string `json:"categories"`
 	Removed          *struct {
 		Reason string `json:"reason"`
 	} `json:"@removed"`
@@ -104,7 +105,7 @@ func (c *Client) WellKnownFolderID(ctx context.Context, name string) (string, er
 // DeltaStartURL is the first delta request for a folder with no saved cursor.
 // It returns every message in the folder and ends with a deltaLink.
 func (c *Client) DeltaStartURL(folderID string) string {
-	return c.root + "/mailFolders/" + url.PathEscape(folderID) + "/messages/delta?$select=receivedDateTime"
+	return c.root + "/mailFolders/" + url.PathEscape(folderID) + "/messages/delta?$select=receivedDateTime,categories"
 }
 
 // DeltaPage fetches one page of a delta walk. The page carries a NextLink
@@ -126,13 +127,14 @@ func (c *Client) GetMIME(ctx context.Context, id string) ([]byte, error) {
 type MessageInfo struct {
 	ParentFolderID   string    `json:"parentFolderId"`
 	ReceivedDateTime time.Time `json:"receivedDateTime"`
+	Categories       *[]string `json:"categories"`
 }
 
 // LookupMessage returns a message's folder and receipt time. It returns
 // msgraph.ErrNotFound when the message no longer exists.
 func (c *Client) LookupMessage(ctx context.Context, id string) (MessageInfo, error) {
 	var m MessageInfo
-	err := c.GetJSON(ctx, c.root+"/messages/"+url.PathEscape(id)+"?$select=parentFolderId,receivedDateTime", &m)
+	err := c.GetJSON(ctx, c.root+"/messages/"+url.PathEscape(id)+"?$select=parentFolderId,receivedDateTime,categories", &m)
 	return m, err
 }
 

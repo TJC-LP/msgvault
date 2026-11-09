@@ -160,10 +160,14 @@ func endMediaPass(err error) error {
 
 // gated runs one Store step under the operation gate so backup freeze sees no writer.
 func (w *MediaSubmitter) gated(ctx context.Context, step func() error) error {
-	if w.gate == nil {
+	return gatedMediaStep(ctx, w.gate, step)
+}
+
+func gatedMediaStep(ctx context.Context, gate func(context.Context) (func(), bool), step func() error) error {
+	if gate == nil {
 		return step()
 	}
-	release, ok := w.gate(ctx)
+	release, ok := gate(ctx)
 	if !ok {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -208,14 +212,18 @@ func (w *MediaSubmitter) discover(ctx context.Context, archiveUID string) (Media
 	if err != nil {
 		return result, err
 	}
-	scan, err := w.store.LoadBeeperMediaScan(ctx, w.destination)
+	var scan store.BeeperMediaScan
+	err = w.gated(ctx, func() (err error) {
+		scan, err = w.store.LoadBeeperMediaScan(ctx, w.destination)
+		return err
+	})
 	if err != nil {
 		return result, err
 	}
 	before := scan
 	if !consumer.ReconciliationComplete && (created || scan.BaselineSequence != consumer.BaselineSequence) {
 		// A registration completes only after a full pass that began after it.
-		scan = store.BeeperMediaScan{DestinationKey: w.destination, BaselineSequence: consumer.BaselineSequence}
+		scan = store.BeeperMediaScan{DestinationKey: w.destination, Generation: scan.Generation, BaselineSequence: consumer.BaselineSequence}
 	}
 	if !consumer.ReconciliationComplete || !time.Now().Before(scan.NextFullScanAt) {
 		if scan.PassHighWater == 0 {
@@ -434,6 +442,96 @@ func (w *MediaSubmitter) describeCandidate(
 	return configureMediaProcessing(descriptor, "", w.asrProfile), "", nil
 }
 
+// MediaRevision returns the occurrence revision the media worker would record
+// for the attachment now, so a reader can tell when a mapping no longer matches
+// the source message's transcript, timestamp or file metadata.
+func MediaRevision(ctx context.Context, st *store.Store, attachmentID int64) (string, error) {
+	candidate, err := st.GetBeeperMediaCandidate(ctx, attachmentID)
+	if err != nil {
+		return "", err
+	}
+	if candidate.SourceType != "beeper" {
+		descriptor, err := describeStoredMedia(candidate, "")
+		return descriptor.Occurrence.Revision, err
+	}
+	raw, err := st.GetMessageRawContext(ctx, candidate.MessageID)
+	if err != nil {
+		return "", err
+	}
+	descriptor, _, err := describeMedia(raw, candidate, "")
+	return descriptor.Occurrence.Revision, err
+}
+
+// MediaRevisionUnavailable identifies source metadata that can no longer be read.
+func MediaRevisionUnavailable(err error) bool {
+	return beeperMediaRawGap(err) || errors.Is(err, errBeeperMediaRawInvalid) || errors.Is(err, errBeeperMediaNoLiveOccurrence)
+}
+
+// MediaRevisionChanged identifies changes detected while describing the current source.
+func MediaRevisionChanged(err error) bool {
+	for _, known := range []error{errBeeperMediaSourceChanged, errBeeperMediaPartMissing, errBeeperMediaPartAmbiguous, errBeeperMediaUnsupported, errBeeperMediaTranscriptInvalid, errBeeperMediaTranscriptTooLarge} {
+		if errors.Is(err, known) {
+			return true
+		}
+	}
+	return false
+}
+
+// MediaRevisions shares the worker's descriptor parsing across selected attachments.
+func MediaRevisions(ctx context.Context, st *store.Store, attachmentIDs []int64) (map[int64]string, error) {
+	revisions := make(map[int64]string, len(attachmentIDs))
+	for len(attachmentIDs) > 0 {
+		n := min(len(attachmentIDs), 500)
+		candidates, err := st.GetBeeperMediaCandidates(ctx, attachmentIDs[:n])
+		if err != nil {
+			return nil, err
+		}
+		messageIDs := []int64{}
+		seen := make(map[int64]bool)
+		for _, candidate := range candidates {
+			if candidate.SourceType == "beeper" && !seen[candidate.MessageID] {
+				seen[candidate.MessageID] = true
+				messageIDs = append(messageIDs, candidate.MessageID)
+			}
+		}
+		raws, err := st.GetMessageRawsContext(ctx, messageIDs)
+		if err != nil {
+			return nil, err
+		}
+		envelopes := make(map[int64]mediaEnvelope, len(raws))
+		for id, raw := range raws {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			envelope, err := parseMediaEnvelope(raw)
+			if err == nil {
+				envelopes[id] = envelope
+			}
+		}
+		for _, candidate := range candidates {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			var descriptor MediaDescriptor
+			if candidate.SourceType == "beeper" {
+				envelope, found := envelopes[candidate.MessageID]
+				if !found {
+					continue
+				}
+				descriptor, _, err = describeMediaEnvelope(envelope, candidate, "")
+			} else {
+				descriptor, err = describeStoredMedia(candidate, "")
+			}
+			if err == nil {
+				revisions[candidate.AttachmentID] = descriptor.Occurrence.Revision
+			}
+		}
+		attachmentIDs = attachmentIDs[n:]
+	}
+
+	return revisions, nil
+}
+
 func describeStoredMedia(
 	candidate store.BeeperMediaCandidate, archiveUID string,
 ) (MediaDescriptor, error) {
@@ -447,7 +545,7 @@ func describeStoredMedia(
 	filename, requestMIME := selectedMediaMetadata(candidate.Filename, candidate.MIMEType)
 	var message docbankmedia.Timestamp
 	if candidate.SentAt.Valid {
-		message = mediaTimestamp(jsontext.Value(mustJSON(candidate.SentAt.Time.UTC().Format(time.RFC3339Nano))))
+		message = MediaTimestamp(jsontext.Value(mustJSON(candidate.SentAt.Time.UTC().Format(time.RFC3339Nano))))
 	}
 	descriptor := MediaDescriptor{
 		Occurrence: docbankmedia.Occurrence{
@@ -553,6 +651,7 @@ func sameBeeperMediaCandidate(a, b store.BeeperMediaCandidate) bool {
 		a.ConversationID == b.ConversationID && a.SourceID == b.SourceID &&
 		a.SourceType == b.SourceType && a.SourceIdentifier == b.SourceIdentifier &&
 		a.SourceConversationID == b.SourceConversationID && a.SourceMessageID == b.SourceMessageID &&
+		a.OriginalSourceMessageID == b.OriginalSourceMessageID &&
 		a.SourceAttachmentID == b.SourceAttachmentID && a.SourcePartKey == b.SourcePartKey &&
 		a.Filename == b.Filename && a.MIMEType == b.MIMEType && a.MediaType == b.MediaType &&
 		a.Role == b.Role && a.ContentHash == b.ContentHash && a.ByteLength == b.ByteLength &&
@@ -618,14 +717,21 @@ func fallbackMediaMappingCode(
 	return mapping
 }
 
+func beeperMediaOperationTimeout(timeout time.Duration, byteLength, uploadRate int64) time.Duration {
+	if uploadRate > 0 {
+		timeout += time.Duration(byteLength/uploadRate) * time.Second
+	}
+	return timeout
+}
+
 func (w *MediaSubmitter) runOperation(
 	ctx context.Context, archiveUID string, operation store.BeeperMediaOperation,
 ) (bool, error) {
 	// Only remote and spool work runs under the step deadline, so a timed-out step can still record its retry.
 	timeout := w.actionTimeout
-	if operation.Kind == store.BeeperMediaOperationRetain && w.uploadRate > 0 {
+	if operation.Kind == store.BeeperMediaOperationRetain {
 		// Copying and uploading scale with size, so large audio gets a proportionally longer bounded deadline.
-		timeout += time.Duration(operation.ByteLength/w.uploadRate) * time.Second
+		timeout = beeperMediaOperationTimeout(timeout, operation.ByteLength, w.uploadRate)
 	}
 	actionCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -1155,21 +1261,34 @@ func mappingCandidate(mapping store.BeeperMediaMapping) store.BeeperMediaCandida
 	}
 }
 
-func describeMedia(
-	raw []byte, candidate store.BeeperMediaCandidate, archiveUID string,
-) (MediaDescriptor, string, error) {
-	if !utf8.Valid(raw) {
-		return MediaDescriptor{}, "", errBeeperMediaRawInvalid
+type mediaEnvelope struct {
+	ID          string         `json:"id"`
+	Timestamp   jsontext.Value `json:"timestamp"`
+	Attachments []Attachment   `json:"attachments"`
+}
+
+func parseMediaEnvelope(raw []byte) (mediaEnvelope, error) {
+	var envelope mediaEnvelope
+	if !utf8.Valid(raw) || json.Unmarshal(raw, &envelope) != nil {
+		return envelope, errBeeperMediaRawInvalid
 	}
-	var envelope struct {
-		ID          string         `json:"id"`
-		Timestamp   jsontext.Value `json:"timestamp"`
-		Attachments []Attachment   `json:"attachments"`
+	return envelope, nil
+}
+
+func describeMedia(raw []byte, candidate store.BeeperMediaCandidate, archiveUID string) (MediaDescriptor, string, error) {
+	envelope, err := parseMediaEnvelope(raw)
+	if err != nil {
+		return MediaDescriptor{}, "", err
 	}
-	if err := json.Unmarshal(raw, &envelope); err != nil {
-		return MediaDescriptor{}, "", errBeeperMediaRawInvalid
+	return describeMediaEnvelope(envelope, candidate, archiveUID)
+}
+
+func describeMediaEnvelope(envelope mediaEnvelope, candidate store.BeeperMediaCandidate, archiveUID string) (MediaDescriptor, string, error) {
+	messageIDMatches := envelope.ID == candidate.SourceMessageID
+	if !messageIDMatches && candidate.OriginalSourceMessageID != "" {
+		messageIDMatches = envelope.ID == candidate.OriginalSourceMessageID
 	}
-	if candidate.SourceMessageID != "" && envelope.ID != candidate.SourceMessageID {
+	if candidate.SourceMessageID != "" && !messageIDMatches {
 		return MediaDescriptor{}, "", errBeeperMediaSourceChanged
 	}
 	part := candidate.SourcePartKey
@@ -1215,7 +1334,7 @@ func describeMedia(
 	if attachment.Transcription != nil {
 		language = strings.TrimSpace(attachment.Transcription.Language)
 	}
-	timestamp := mediaTimestamp(envelope.Timestamp)
+	timestamp := MediaTimestamp(envelope.Timestamp)
 	occurrence := docbankmedia.Occurrence{
 		Ref: mediaOccurrenceRef(archiveUID, candidate.SourceType, candidate.SourceIdentifier,
 			candidate.SourceConversationID, candidate.SourceMessageID, part),
@@ -1317,7 +1436,8 @@ func selectedMediaMetadata(filename, mediaType string) (string, string) {
 	return filename, baseType
 }
 
-func mediaTimestamp(raw jsontext.Value) docbankmedia.Timestamp {
+// MediaTimestamp builds Docbank timestamp metadata from a JSON string.
+func MediaTimestamp(raw jsontext.Value) docbankmedia.Timestamp {
 	var rawTimestamp string
 	if err := json.Unmarshal(raw, &rawTimestamp); err != nil {
 		return docbankmedia.Timestamp{}

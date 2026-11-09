@@ -12,6 +12,9 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+
+	"go.kenn.io/msgvault/internal/apiprotocol"
+	"go.kenn.io/msgvault/internal/query"
 )
 
 const csrfHeaderName = "X-Csrf-Token"
@@ -49,12 +52,21 @@ func (s *Server) requestSecurityMiddleware(next http.Handler) http.Handler {
 				"Keyless loopback mutations must be same-origin; configure an API key for cross-origin access")
 			return
 		}
+		if auth.Mode == AuthModeRemoteClient {
+			publicHealth := r.URL.Path == "/health" && (r.Method == http.MethodGet || r.Method == http.MethodHead)
+			if !publicHealth && !strings.HasPrefix(r.URL.Path, "/api/v1/") {
+				writeError(w, http.StatusForbidden, "forbidden", "Operation is not available to remote clients")
+				return
+			}
+			// Set here because Huma raw handlers read the original request context.
+			r = r.WithContext(query.WithMessageByteLimit(r.Context(), remoteMessageBytes))
+		}
 		security := requestSecurity{
 			auth:   auth,
 			scheme: scheme,
 			host:   host,
 		}
-		ctx := context.WithValue(r.Context(), requestSecurityContextKey{}, security)
+		ctx := apiprotocol.WithBrowserOrigin(context.WithValue(r.Context(), requestSecurityContextKey{}, security), scheme+"://"+host)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }

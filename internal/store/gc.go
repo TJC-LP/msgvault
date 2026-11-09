@@ -193,9 +193,15 @@ func (s *Store) ExecuteGCContext(
 					conversationID, err,
 				)
 			}
+			if err := s.invalidateEmptiedConversationRouteWith(q, conversationID); err != nil {
+				return fmt.Errorf(
+					"invalidate route evidence for conversation %d after archive GC: %w",
+					conversationID, err,
+				)
+			}
 		}
 		if deleted > 0 {
-			if err := s.bumpDerivedDataRevision(tx); err != nil {
+			if err := s.bumpDerivedDataRevisionContext(ctx, tx); err != nil {
 				return fmt.Errorf("invalidate caches after archive GC: %w", err)
 			}
 		}

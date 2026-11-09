@@ -38,9 +38,15 @@ import (
 // incremental builds can update them without rescanning expanded activity.
 // Version 30 stores direct activity edges and expands conversation membership
 // from the current roster when queried.
+// Version 31 adds the message account_address and account_path projection.
+// Version 32 marks merged archive-only messages so deletion preflight counts
+// only messages that can still be deleted from their source.
+// Version 33 flags unsent messages in the relationship activity dataset.
+// Version 34 carries hidden_text_present in message rows.
+// Version 35 excludes unlinked calendar rooms from derived people and domains.
 // Schema bumps force a full rebuild before readers use an older publication,
 // so committed caches never mix shards of different shapes.
-const CacheSchemaVersion = 30
+const CacheSchemaVersion = 35
 
 // CacheSyncState is the commit marker written after a complete analytics
 // cache publication. SQLite remains authoritative; these watermarks only
@@ -55,7 +61,9 @@ type CacheSyncState struct {
 	// LastRelatedChangeSeq is the highest child-row journal entry represented
 	// by this committed publication. The journal is written transactionally
 	// with SQLite mutations and advances only after marker-last publication.
-	LastRelatedChangeSeq   int64 `json:"last_related_change_seq,omitzero"`
+	LastRelatedChangeSeq int64 `json:"last_related_change_seq,omitzero"`
+	// These interruption watermarks include failed and cancelled attempts.
+	// The field names predate resumable scheduler cancellations.
 	LastFailedSyncRunCount int64 `json:"last_failed_sync_run_count,omitzero"`
 	LastFailedSyncRunIDSum int64 `json:"last_failed_sync_run_id_sum,omitzero"`
 	IdentityRevision       int64 `json:"identity_revision,omitzero"`
@@ -101,6 +109,7 @@ type CacheSyncState struct {
 	// fields are mutable and bake into cache datasets that incremental builds
 	// otherwise never revisit; this fingerprint detects that drift.
 	ConversationTypesFingerprint string                          `json:"conversation_types_fingerprint,omitempty"`
+	UnsentFingerprint            string                          `json:"unsent_fingerprint,omitempty"`
 	Stats                        identityindex.CacheStatsSummary `json:"stats"`
 }
 

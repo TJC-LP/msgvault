@@ -1,5 +1,5 @@
 ---
-last_edited: "2026-09-25"
+last_edited: "2026-10-08"
 title: Accounts, Identities, and Collections
 description: How msgvault organizes every source into accounts, tracks which identifiers are "you," and groups accounts into collections for scoped search, stats, and deduplication.
 ---
@@ -216,9 +216,13 @@ msgvault repair-identity you@example.com
 msgvault repair-identity --type imap
 ```
 
-The default source type is Gmail. The command skips accounts whose own address
+The default source type is Gmail. Other email account types with an unconfirmed
+account address are listed with a `--type` repair hint. If you supplied an
+identifier, reuse it. The command skips accounts whose own address
 is already confirmed or is not a plain valid email address. Existing aliases
 do not prevent it from adding the primary account address.
+Activity and contacts update at the daemon's next refresh, or now with
+`msgvault activity build`.
 
 ### Select an exact source
 
@@ -301,7 +305,7 @@ collection; selections spanning sources are rejected. Deduplication remains
 available through the collection-scoped CLI commands, not through the TUI.
 
 Meetings mode uses the same key for a separate source selector. It lists
-Granola, Plaud, Circleback, Notion, and Muesli meeting sources. Changing it does
+Omi, Granola, Plaud, Circleback, Notion, Muesli, Twilio, Twenty, and Chatwoot meeting sources. Changing it does
 not replace the Email account filter.
 
 ## Command Reference

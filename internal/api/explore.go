@@ -19,7 +19,7 @@ import (
 	"time"
 
 	"github.com/danielgtaylor/huma/v2"
-	"github.com/duckdb/duckdb-go/v2"
+	"go.kenn.io/msgvault/internal/duckdbutil"
 	"go.kenn.io/msgvault/internal/explorecatalog"
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/search"
@@ -39,16 +39,18 @@ const (
 )
 
 type ExploreFilter struct {
-	Dimension string   `json:"dimension" enum:"source,participant,domain,message_type,mailing_list,after,before,deletion,identity"`
+	Dimension string   `json:"dimension" enum:"source,participant,domain,message_type,kind,mailing_list,after,before,deletion,identity,account"`
 	Values    []string `json:"values" minItems:"1"`
 }
 
 // Explore filter dimension names, matching ExploreFilter.Dimension's enum tag.
 const (
+	exploreFilterAccount     = explorecatalog.FilterAccount
 	exploreFilterSource      = explorecatalog.FilterSource
 	exploreFilterParticipant = explorecatalog.FilterParticipant
 	exploreFilterDomain      = explorecatalog.FilterDomain
 	exploreFilterMessageType = explorecatalog.FilterMessageType
+	exploreFilterKind        = explorecatalog.FilterKind
 	exploreFilterMailingList = explorecatalog.FilterMailingList
 	exploreFilterAfter       = explorecatalog.FilterAfter
 	exploreFilterBefore      = explorecatalog.FilterBefore
@@ -83,10 +85,11 @@ const (
 	ExploreGroupKind        ExploreGroupDimension = explorecatalog.GroupKind
 	ExploreGroupYear        ExploreGroupDimension = explorecatalog.GroupYear
 	ExploreGroupMonth       ExploreGroupDimension = explorecatalog.GroupMonth
+	ExploreGroupDay         ExploreGroupDimension = explorecatalog.GroupDay
 )
 
 var exploreGroupDimensions = func() []ExploreGroupDimension {
-	values := explorecatalog.GroupingDimensions()
+	values := explorecatalog.RequestGroupingDimensions()
 	dimensions := make([]ExploreGroupDimension, len(values))
 	for i, value := range values {
 		dimensions[i] = ExploreGroupDimension(value)
@@ -96,8 +99,8 @@ var exploreGroupDimensions = func() []ExploreGroupDimension {
 
 type ExploreHTTPRequest struct {
 	Filters             []ExploreFilter         `json:"filters,omitempty"`
-	Query               string                  `json:"query,omitempty"`
-	SearchMode          string                  `json:"search_mode,omitempty" enum:"full_text,semantic,hybrid"`
+	Query               string                  `json:"query,omitempty" doc:"Search query; full_text accepts standalone pipe-separated OR alternatives; other modes read pipes as text"`
+	SearchMode          string                  `json:"search_mode,omitempty" enum:"full_text,semantic,hybrid" doc:"Search mode; pipe OR is full_text only"`
 	Grouping            []ExploreGroupDimension `json:"grouping,omitempty"`
 	Presentation        string                  `json:"presentation,omitempty" enum:"table,timeline,files"`
 	Sort                []ExploreSort           `json:"sort,omitempty"`
@@ -107,6 +110,7 @@ type ExploreHTTPRequest struct {
 }
 
 type ExploreHTTPResponse struct {
+	Warnings               []string               `json:"warnings,omitempty"`
 	Rows                   []query.EntryRow       `json:"rows"`
 	TotalCount             *int64                 `json:"total_count,omitzero" nullable:"false"`
 	CacheRevision          string                 `json:"cache_revision"`
@@ -127,10 +131,12 @@ type ExploreGroupSort struct {
 }
 
 type ExploreGroupsHTTPRequest struct {
+	Timezone     string                  `json:"timezone,omitempty" doc:"IANA timezone for day grouping; defaults to UTC"`
+	SentOnly     bool                    `json:"sent_only,omitempty" doc:"Count sent messages only, excluding drafts and unsent items"`
 	Filters      []ExploreFilter         `json:"filters,omitempty"`
-	Query        string                  `json:"query,omitempty"`
-	SearchMode   string                  `json:"search_mode,omitempty" enum:"full_text,semantic,hybrid"`
-	Grouping     []ExploreGroupDimension `json:"grouping" minItems:"1" maxItems:"1"`
+	Query        string                  `json:"query,omitempty" doc:"Search query; full_text accepts standalone pipe-separated OR alternatives; other modes read pipes as text"`
+	SearchMode   string                  `json:"search_mode,omitempty" enum:"full_text,semantic,hybrid" doc:"Search mode; pipe OR is full_text only"`
+	Grouping     []ExploreGroupDimension `json:"grouping" minItems:"1" maxItems:"1" doc:"Day counts individual messages; other dimensions count entries, with chats collapsed into conversations"`
 	Presentation string                  `json:"presentation,omitempty" enum:"table"`
 	Sort         []ExploreGroupSort      `json:"sort,omitempty" maxItems:"1"`
 	Cursor       string                  `json:"cursor,omitempty"`
@@ -142,6 +148,7 @@ type ExploreGroupsHTTPRequest struct {
 }
 
 type ExploreGroupsHTTPResponse struct {
+	Warnings            []string                `json:"warnings,omitempty"`
 	Rows                []query.ExploreGroupRow `json:"rows"`
 	TotalCount          int64                   `json:"total_count"`
 	CacheRevision       string                  `json:"cache_revision"`
@@ -275,7 +282,34 @@ func (s *Server) handleExplore(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleExploreWithScope(w http.ResponseWriter, r *http.Request, scope *ExploreFilter) {
-	prepared, ok := s.prepareExploreRequest(w, r, scope)
+	var request ExploreHTTPRequest
+	if !decodeExploreJSON(w, r, &request) {
+		return
+	}
+	canonicalizeExploreRequest(&request)
+	engine := s.queryEngineForContext(r.Context())
+	explorer, _ := engine.(query.Explorer)
+	var entries query.EntryExplorer = explorer
+	reader, live := engine.(*query.LiveExploreEngine)
+	if live && (request.SearchMode == exploreSearchModeSemantic || request.SearchMode == exploreSearchModeHybrid) {
+		s.writeExploreUnavailable(r.Context(), w, query.CacheAbsent)
+		return
+	}
+	var releaseSnapshot func()
+	if live {
+		started := time.Now()
+		ctx, release, _, err := reader.BeginExploreSnapshot(r.Context())
+		addExploreTiming(w, "snapshot", time.Since(started))
+		if err != nil {
+			s.writeExploreError(r.Context(), w, err)
+			return
+		}
+		defer release()
+		releaseSnapshot = release
+		r = r.WithContext(ctx)
+		entries = reader
+	}
+	prepared, ok := s.prepareExploreRequest(w, r, request, scope)
 	if !ok {
 		return
 	}
@@ -302,6 +336,8 @@ func (s *Server) handleExploreWithScope(w http.ResponseWriter, r *http.Request, 
 	}
 	prepared.query.Search = searchSpec
 	if scope != nil {
+		prepared.query.SentOnly = true
+		prepared.query.PersonInteractionsOnly = scope.Dimension == exploreFilterParticipant
 		if err := applyIdentityScope(&prepared.query.Context, *scope); err != nil {
 			writeError(w, http.StatusConflict, "identity_scope_conflict", err.Error())
 			return
@@ -311,13 +347,12 @@ func (s *Server) handleExploreWithScope(w http.ResponseWriter, r *http.Request, 
 	if semanticPage {
 		prepared.query.Page = query.PageSpec{Limit: exploreMaxLimit}
 	}
-	explorer, ok := s.queryEngineForContext(r.Context()).(query.Explorer)
-	if !ok {
+	if entries == nil {
 		s.writeExploreUnavailable(r.Context(), w, query.CacheAbsent)
 		return
 	}
 	projectionStarted := time.Now()
-	result, err := explorer.Explore(r.Context(), prepared.query)
+	result, err := entries.Explore(r.Context(), prepared.query)
 	addExploreTiming(w, "projection", time.Since(projectionStarted))
 	if err != nil {
 		s.writeExploreError(r.Context(), w, err)
@@ -335,7 +370,7 @@ func (s *Server) handleExploreWithScope(w http.ResponseWriter, r *http.Request, 
 	if prepared.offset > 0 {
 		cursor, err := s.decodeExploreCursor(prepared.request.Cursor)
 		if err != nil || cursor.Revision != result.CacheRevision {
-			writeError(w, http.StatusConflict, "archive_revision_changed", "The committed analytical cache changed; restart pagination")
+			writeError(w, http.StatusConflict, "archive_revision_changed", "Results changed; restart pagination")
 			return
 		}
 	}
@@ -349,10 +384,23 @@ func (s *Server) handleExploreWithScope(w http.ResponseWriter, r *http.Request, 
 		writeError(w, http.StatusServiceUnavailable, "identity_matches_unavailable", "Message identity matches could not be resolved")
 		return
 	}
+	if releaseSnapshot != nil {
+		releaseSnapshot()
+	}
 	response := ExploreHTTPResponse{
 		Rows: result.Rows, CacheRevision: result.CacheRevision,
 		SearchProvenance: result.SearchProvenance, CandidateSnapshotID: snapshotID,
 		SearchDeletionScope: prepared.searchDeletionScope,
+	}
+	if prepared.request.SearchMode == exploreSearchModeFullText {
+		response.Warnings = search.LiteralORWarnings(prepared.request.Query)
+	}
+	if live {
+		warning := "Showing live archive data because the analytical cache is unavailable. Grouping, person filters, semantic search, and bulk actions need it: run msgvault build-cache --full-rebuild, then restart msgvault."
+		if s.analyticsCacheInitializingForContext(r.Context()) {
+			warning = "Showing live archive data while the analytical cache rebuilds. Grouping, person filters, semantic search, and bulk actions return when it finishes."
+		}
+		response.Warnings = append(response.Warnings, warning)
 	}
 	response.CandidatePoolSaturated = searchSpec.CandidatePoolSaturated
 	if snapshotID != "" && s.exploreState != nil {
@@ -505,8 +553,8 @@ func (s *Server) handleExploreGroups(w http.ResponseWriter, r *http.Request) {
 	}
 	groupingStarted := time.Now()
 	result, err := analyzer.ExploreGroups(r.Context(), query.ExploreGroupRequest{
-		Explore: query.ExploreRequest{Context: ctx, Search: searchSpec}, Dimension: string(dimension),
-		GroupKey: request.GroupKey, Sort: sortSpec,
+		Explore: query.ExploreRequest{Context: ctx, Search: searchSpec, SentOnly: request.SentOnly}, Dimension: string(dimension),
+		GroupKey: request.GroupKey, Timezone: request.Timezone, Sort: sortSpec,
 		Page: query.PageSpec{Limit: request.Limit, Offset: offset},
 	})
 	addExploreTiming(w, "grouping", time.Since(groupingStarted))
@@ -522,6 +570,9 @@ func (s *Server) handleExploreGroups(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	response := ExploreGroupsHTTPResponse{Rows: result.Rows, TotalCount: result.TotalCount, CacheRevision: result.CacheRevision, SearchProvenance: result.SearchProvenance, CandidateSnapshotID: snapshotID, SearchDeletionScope: searchDeletionScope}
+	if request.SearchMode == exploreSearchModeFullText {
+		response.Warnings = search.LiteralORWarnings(request.Query)
+	}
 	if next := offset + len(result.Rows); next < int(result.TotalCount) {
 		response.NextCursor = s.encodeExploreCursor(exploreCursor{
 			Offset: next, Request: requestHash, Revision: result.CacheRevision,
@@ -703,7 +754,7 @@ func (s *Server) handleExploreMatchCounts(w http.ResponseWriter, r *http.Request
 	}
 	cacheRequest := predicate.request
 	cacheRequest.Query = ""
-	canonicalQueryHash := exploreCanonicalQueryHash(predicate.request.Query)
+	canonicalQueryHash := exploreCanonicalQueryHash(predicate.request.Query, predicate.request.SearchMode)
 	cacheKey := canonicalExploreHash(cacheRequest) + "|" + canonicalQueryHash + "|" + revisionProbe.CacheRevision + "|" + searchSpec.LexicalIndexRevision + "|" + hashCanonicalValue(request.RowKeys, false)
 	if cached, found := state.getMatchCounts(cacheKey); found {
 		counts := make([]ExploreRowMatchCount, len(request.RowKeys))
@@ -738,20 +789,15 @@ func (s *Server) handleExploreMatchCounts(w http.ResponseWriter, r *http.Request
 	})
 }
 
-func exploreCanonicalQueryHash(queryText string) string {
-	parsed := search.Parse(queryText)
+func exploreCanonicalQueryHash(queryText, mode string) string {
+	parsed := search.ParseWithOR(queryText, mode == exploreSearchModeFullText)
 	if parsed.Err() != nil {
 		return ""
 	}
 	return hashCanonicalValue(canonicalParsedExploreQuery(parsed), false)
 }
 
-func (s *Server) prepareExploreRequest(w http.ResponseWriter, r *http.Request, scope *ExploreFilter) (explorePrepared, bool) {
-	var request ExploreHTTPRequest
-	if !decodeExploreJSON(w, r, &request) {
-		return explorePrepared{}, false
-	}
-	canonicalizeExploreRequest(&request)
+func (s *Server) prepareExploreRequest(w http.ResponseWriter, r *http.Request, request ExploreHTTPRequest, scope *ExploreFilter) (explorePrepared, bool) {
 	if request.Limit == 0 {
 		request.Limit = exploreDefaultLimit
 	}
@@ -1002,6 +1048,15 @@ func exploreContext(filters []ExploreFilter) (query.Context, error) {
 			return result, fmt.Errorf("filter dimension %q requires at least one value", filter.Dimension)
 		}
 		switch filter.Dimension {
+		case exploreFilterAccount:
+			if len(filter.Values) != 1 {
+				return result, errors.New("account filter requires one virtual account key or email address")
+			}
+			scope, err := exploreAccountScope(filter.Values[0])
+			if err != nil {
+				return result, err
+			}
+			result.AccountScopes = append(result.AccountScopes, scope)
 		case exploreFilterSource:
 			ids := make([]int64, len(filter.Values))
 			for i, value := range filter.Values {
@@ -1035,6 +1090,16 @@ func exploreContext(filters []ExploreFilter) (query.Context, error) {
 			}
 		case exploreFilterMessageType:
 			result.MessageTypes = append([]string(nil), filter.Values...)
+		case exploreFilterKind:
+			for _, value := range filter.Values {
+				kind := query.EntryKind(strings.ToLower(value))
+				switch kind {
+				case query.EntryEmail, query.EntryConversation, query.EntryEvent, query.EntryMeeting, query.EntryItem:
+					result.Kinds = append(result.Kinds, kind)
+				default:
+					return result, fmt.Errorf("unknown entry kind %q", value)
+				}
+			}
 		case exploreFilterMailingList:
 			values := append([]string(nil), filter.Values...)
 			if len(result.MailingLists) == 0 {
@@ -1152,7 +1217,7 @@ func validateExploreSearchDefinition(
 	if request.SearchMode == "" {
 		return nil, nil
 	}
-	parsed := search.Parse(request.Query)
+	parsed := search.ParseWithOR(request.Query, request.SearchMode == exploreSearchModeFullText)
 	if err := parsed.Err(); err != nil {
 		return nil, &exploreSearchDefinitionError{code: "invalid_query", message: err.Error()}
 	}
@@ -1437,6 +1502,7 @@ func (s *Server) resolveExploreSearch(ctx context.Context, w http.ResponseWriter
 // combined predicate can match no messages and the resolver should skip
 // the index entirely.
 func applyLexicalFilterPushdown(parsed *search.Query, filters query.Context) bool {
+	parsed.AccountScopes = append(parsed.AccountScopes, search.CloneAccountScopes(filters.AccountScopes)...)
 	if len(filters.SourceIDs) > 0 {
 		if len(parsed.AccountIDs) == 0 {
 			parsed.AccountIDs = slices.Clone(filters.SourceIDs)
@@ -1456,13 +1522,9 @@ func applyLexicalFilterPushdown(parsed *search.Query, filters query.Context) boo
 		for _, messageType := range filters.MessageTypes {
 			types = append(types, strings.ToLower(messageType))
 		}
-		if len(parsed.MessageTypes) > 0 {
-			types = slices.DeleteFunc(types, func(messageType string) bool {
-				return !slices.Contains(parsed.MessageTypes, messageType)
-			})
-			if len(types) == 0 {
-				return false
-			}
+		types, noMatches := search.IntersectValues(parsed.MessageTypes, types)
+		if noMatches {
+			return false
 		}
 		parsed.MessageTypes = types
 	}
@@ -1534,7 +1596,7 @@ func (s *Server) resolveExploreVectorSearch(ctx context.Context, w http.Response
 		}
 		active, err := vector.ResolveActiveForFingerprint(ctx, backend, expectedFingerprint)
 		if err != nil {
-			s.writeExploreVectorError(w, err)
+			s.writeExploreVectorError(ctx, w, err)
 			return query.SearchSpec{}, "", false
 		}
 		if int64(active.ID) != snapshot.Generation {
@@ -1590,7 +1652,7 @@ func (s *Server) resolveExploreVectorSearch(ctx context.Context, w http.Response
 		// same population instead of the requested (possibly unrestricted)
 		// scope. deletion:deleted never reaches here — it was rejected above.
 		lexicalSpec, _, ok = s.resolveExploreSearch(ctx, w, ExploreHTTPRequest{
-			Query: request.Query, SearchMode: exploreSearchModeFullText,
+			Query: search.Format(parsed), SearchMode: exploreSearchModeFullText,
 			Filters: withActiveDeletionFilter(request.Filters),
 		})
 		if !ok {
@@ -1629,7 +1691,7 @@ func (s *Server) resolveExploreVectorSearch(ctx context.Context, w http.Response
 		SubjectTerms: subjectTerms,
 	})
 	if err != nil {
-		s.writeExploreVectorError(w, err)
+		s.writeExploreVectorError(ctx, w, err)
 		return query.SearchSpec{}, "", false
 	}
 	addExploreTiming(w, "embedding", meta.QueryEmbeddingDuration)
@@ -1705,7 +1767,7 @@ func (s *Server) resolveEmptyVectorCandidates(
 	}
 	active, err := vector.ResolveActiveForFingerprint(ctx, backend, expectedFingerprint)
 	if err != nil {
-		s.writeExploreVectorError(w, err)
+		s.writeExploreVectorError(ctx, w, err)
 		return query.SearchSpec{}, "", false
 	}
 	generation := int64(active.ID)
@@ -1796,6 +1858,13 @@ func exploreSnapshotRequestHash(request ExploreHTTPRequest) string {
 }
 
 func canonicalParsedExploreQuery(parsed *search.Query) string {
+	return hashCanonicalValue(canonicalizeParsedExploreQuery(parsed), false)
+}
+
+func canonicalizeParsedExploreQuery(parsed *search.Query) *search.Query {
+	if parsed == nil {
+		return nil
+	}
 	canonical := *parsed
 	canonicalStrings := func(values []string) []string {
 		values = slices.Clone(values)
@@ -1815,6 +1884,10 @@ func canonicalParsedExploreQuery(parsed *search.Query) string {
 	}
 	slices.SortFunc(canonical.ListIDExactGroups, slices.Compare)
 	canonical.MessageTypes = canonicalStrings(parsed.MessageTypes)
+	canonical.Alternatives = slices.Clone(parsed.Alternatives)
+	for i, alternative := range parsed.Alternatives {
+		canonical.Alternatives[i] = canonicalizeParsedExploreQuery(alternative)
+	}
 	canonical.AccountIDs = slices.Clone(parsed.AccountIDs)
 	slices.Sort(canonical.AccountIDs)
 	canonical.AccountIDs = slices.Compact(canonical.AccountIDs)
@@ -1824,7 +1897,7 @@ func canonicalParsedExploreQuery(parsed *search.Query) string {
 	canonical.BeforeDate = nil
 	canonical.AfterDate = nil
 	canonical.UnsupportedOperators = nil
-	return hashCanonicalValue(canonical, false)
+	return &canonical
 }
 
 func (s *Server) enrichExploreSemanticRows(rows []query.EntryRow, request ExploreHTTPRequest, snapshotID string) {
@@ -1865,12 +1938,12 @@ func (s *Server) enrichExploreSemanticRows(rows []query.EntryRow, request Explor
 	})
 }
 
-func (s *Server) writeExploreVectorError(w http.ResponseWriter, err error) {
+func (s *Server) writeExploreVectorError(ctx context.Context, w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, vector.ErrNotEnabled):
 		writeError(w, http.StatusServiceUnavailable, "vector_not_enabled", "Vector search is not configured")
 	case errors.Is(err, vector.ErrIndexStale):
-		writeError(w, http.StatusServiceUnavailable, "index_stale", "The vector index does not match configured embedding settings")
+		s.writeIndexStale(ctx, w, err)
 	case errors.Is(err, vector.ErrIndexBuilding):
 		writeError(w, http.StatusServiceUnavailable, "index_building", "The vector index is still being built")
 	case errors.Is(err, vector.ErrEmbeddingTimeout):
@@ -1957,7 +2030,7 @@ func (s *Server) writeExploreError(ctx context.Context, w http.ResponseWriter, e
 		return
 	}
 	s.logger.Error("exploration failed", "error", err)
-	if resourceErr, ok := errors.AsType[*duckdb.Error](err); ok && resourceErr.Type == duckdb.ErrorTypeOutOfMemory {
+	if duckdbutil.IsOutOfMemory(err) {
 		writeError(w, http.StatusServiceUnavailable, "query_resource_exhausted",
 			"This query ran out of memory or temporary disk space. Try narrowing the results with filters. "+
 				"The person running msgvault can check available resources and increase analytics.query_memory_limit "+
@@ -1991,4 +2064,28 @@ func (s *Server) writeExploreUnavailable(
 		Error: "analytical_cache_unavailable", Message: "The committed analytical cache is unavailable",
 		Readiness: readiness, RecoveryAction: "Run msgvault build-cache --full-rebuild and retry",
 	})
+}
+
+// exploreAccountScope reads one account filter value: a virtual account key
+// from the account catalog, or an exact address matched on every source.
+func exploreAccountScope(value string) (search.AccountScope, error) {
+	if store.IsVirtualAccountKey(value) {
+		sourceID, address, unattributed, err := store.ParseVirtualAccountKey(value)
+		if err != nil {
+			return search.AccountScope{}, err
+		}
+		scope := search.AccountScope{SourceID: &sourceID, Unattributed: unattributed}
+		if !unattributed {
+			if address, err = search.ParseAccountAddress(address); err != nil {
+				return search.AccountScope{}, err
+			}
+			scope.Addresses = []string{address}
+		}
+		return scope, nil
+	}
+	address, err := search.ParseAccountAddress(value)
+	if err != nil {
+		return search.AccountScope{}, fmt.Errorf("account filter: %w", err)
+	}
+	return search.AccountScope{Addresses: []string{address}}, nil
 }

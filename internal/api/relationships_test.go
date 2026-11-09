@@ -175,12 +175,16 @@ func newRelationshipsDuckDBFixtureWithDir(t *testing.T, now time.Time) (*query.D
 			where = " WHERE false"
 		}
 		path := filepath.ToSlash(filepath.Join(dir, table.file))
-		_, err := db.Exec(fmt.Sprintf("COPY (SELECT * FROM (VALUES %s) AS t(%s)%s) TO '%s' (FORMAT PARQUET)", table.values, table.columns, where, path))
+		projection := "*"
+		if strings.HasPrefix(table.dir, "messages/") {
+			projection += ", false AS archive_only"
+		}
+		_, err := db.ExecContext(t.Context(), fmt.Sprintf("COPY (SELECT %s FROM (VALUES %s) AS t(%s)%s) TO '%s' (FORMAT PARQUET)", projection, table.values, table.columns, where, path))
 		requirementsForTest.NoError(err, "write %s", table.dir)
 	}
 
 	derived, err := identityindex.Build(
-		context.Background(),
+		t.Context(),
 		db,
 		identityindex.BuildOptions{
 			Mode:           identityindex.ModeFull,
@@ -200,7 +204,7 @@ func newRelationshipsDuckDBFixtureWithDir(t *testing.T, now time.Time) (*query.D
 	requirementsForTest.NoError(err)
 	requirementsForTest.NoError(os.WriteFile(query.CacheStatePath(analyticsDir), state, 0o600))
 
-	engine, err := query.NewDuckDBEngine(analyticsDir, "", nil)
+	engine, err := query.NewDuckDBEngine(t.Context(), analyticsDir, "", nil)
 	requirementsForTest.NoError(err)
 	t.Cleanup(func() { require.NoError(t, engine.Close()) })
 	return engine, analyticsDir
@@ -221,7 +225,7 @@ func republishRelationshipsFixture(
 	defer func() { require.NoError(t, db.Close()) }()
 
 	derived, err := identityindex.Build(
-		context.Background(),
+		t.Context(),
 		db,
 		identityindex.BuildOptions{
 			Mode:           identityindex.ModeFull,

@@ -12,6 +12,9 @@ type GetAggregatesQuery struct {
 	// ViewType Aggregate view type
 	ViewType *string `json:"view_type,omitempty"`
 
+	// AccountScopes JSON list of account scopes that intersect, for structured clients
+	AccountScopes *string `json:"account_scopes,omitempty"`
+
 	// Sort Sort field: count, size, attachment_size, or name
 	Sort *string `json:"sort,omitempty"`
 
@@ -36,7 +39,7 @@ type GetAggregatesQuery struct {
 	// HideDeleted Exclude deleted messages
 	HideDeleted *bool `json:"hide_deleted,omitempty"`
 
-	// SearchQuery Search query
+	// SearchQuery Search query; full text accepts standalone pipe-separated OR alternatives
 	SearchQuery *string `json:"search_query,omitempty"`
 
 	// After Lower date/time bound (RFC3339 or YYYY-MM-DD)
@@ -50,6 +53,9 @@ type GetSubAggregatesQuery struct {
 	// ViewType Aggregate view type
 	ViewType string `json:"view_type" validate:"required"`
 
+	// AccountScopes JSON list of account scopes that intersect, for structured clients
+	AccountScopes *string `json:"account_scopes,omitempty"`
+
 	// Sort Sort field: count, size, attachment_size, or name
 	Sort *string `json:"sort,omitempty"`
 
@@ -74,7 +80,7 @@ type GetSubAggregatesQuery struct {
 	// HideDeleted Exclude deleted messages
 	HideDeleted *bool `json:"hide_deleted,omitempty"`
 
-	// SearchQuery Search query
+	// SearchQuery Search query; full text accepts standalone pipe-separated OR alternatives
 	SearchQuery *string `json:"search_query,omitempty"`
 
 	// After Lower date/time bound (RFC3339 or YYYY-MM-DD)
@@ -132,9 +138,29 @@ type ListAttributeDefinitionsQuery struct {
 	IncludeHidden *bool `json:"include_hidden,omitempty"`
 }
 
+type ListCalendarEventsQuery struct {
+	From time.Time `json:"from" validate:"required"`
+	To   time.Time `json:"to" validate:"required"`
+}
+
+func (l ListCalendarEventsQuery) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(l))
+}
+
 type ListCardDAVBooksQuery struct {
 	// Connection Saved connection name; omit for all connections
 	Connection *string `json:"connection,omitempty"`
+}
+
+func (l ListCardDAVBooksQuery) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := runtime.ValidatePattern(l.Connection, `^[a-z][a-z0-9_-]{0,63}$`); err != nil {
+		errors = errors.Append("Connection", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
 }
 
 type ListCardDAVRunsQuery struct {
@@ -149,12 +175,40 @@ type ListCardDAVRunsQuery struct {
 }
 
 func (l ListCardDAVRunsQuery) Validate() error {
-	return runtime.ConvertValidatorError(typesValidator.Struct(l))
+	var errors runtime.ValidationErrors
+	if l.Limit != nil {
+		if err := typesValidator.Var(l.Limit, "omitempty,gte=1,lte=100"); err != nil {
+			errors = errors.Append("Limit", err)
+		}
+	}
+	if l.BeforeID != nil {
+		if err := typesValidator.Var(l.BeforeID, "omitempty,gte=1"); err != nil {
+			errors = errors.Append("BeforeID", err)
+		}
+	}
+	if err := runtime.ValidatePattern(l.Connection, `^[a-z][a-z0-9_-]{0,63}$`); err != nil {
+		errors = errors.Append("Connection", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
 }
 
 type GetCardDAVStatusQuery struct {
 	// Connection Saved connection name; omit for all connections
 	Connection *string `json:"connection,omitempty"`
+}
+
+func (g GetCardDAVStatusQuery) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := runtime.ValidatePattern(g.Connection, `^[a-z][a-z0-9_-]{0,63}$`); err != nil {
+		errors = errors.Append("Connection", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
 }
 
 type GetCLIAttachmentQuery struct {
@@ -250,7 +304,10 @@ type GetCLIMessageThreadQuery struct {
 }
 
 type SearchCLIQuery struct {
-	// Q Search query
+	// IncludeSnippet Include attachment names and bounded FTS match context
+	IncludeSnippet *bool `json:"include_snippet,omitempty"`
+
+	// Q Search query; full text accepts standalone pipe-separated OR alternatives
 	Q string `json:"q" validate:"required"`
 
 	// Limit Maximum number of rows to return
@@ -360,6 +417,21 @@ func (v VerifyCLIQuery) Validate() error {
 type ListCommunicationServicesQuery struct {
 	// IncludeInactive Include inactive catalog entries
 	IncludeInactive *bool `json:"include_inactive,omitempty"`
+}
+
+type SearchChatsQuery struct {
+	// Q Name or title tokens; OR matching, exact matches ranked first
+	Q string `json:"q" validate:"required"`
+
+	// Limit Maximum results (default 20, max 100)
+	Limit *int64 `json:"limit,omitempty" validate:"omitempty,gte=1,lte=100"`
+
+	// SourceID Restrict to one archived source
+	SourceID *int64 `json:"source_id,omitempty" validate:"omitempty,gte=1"`
+}
+
+func (s SearchChatsQuery) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(s))
 }
 
 type GetConversationQuery struct {
@@ -494,6 +566,15 @@ type GetDocumentVectorStatusQuery struct {
 	Limit *int64 `json:"limit,omitempty"`
 }
 
+type GetEmbeddingStatusQuery struct {
+	// SourceID Filter eligible/current/pending by source ID; diagnostics, throughput, job, and failures remain run-wide; ETA is null
+	SourceID *int64 `json:"source_id,omitempty" validate:"omitempty,gte=1"`
+}
+
+func (g GetEmbeddingStatusQuery) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(g))
+}
+
 type ListIdentityMatchCandidatesQuery struct {
 	// State Candidate state filter (candidate, accepted, rejected, conflict); repeat or comma-separate for multiple values
 	State *string `json:"state,omitempty"`
@@ -516,12 +597,84 @@ type ListPersonMatchJudgmentsQuery struct {
 	BeforeID *int64 `json:"before_id,omitempty"`
 }
 
+type ImportMuesliRecordingQuery struct {
+	Identifier   string `json:"identifier" validate:"required"`
+	AccountEmail string `json:"account_email" validate:"required"`
+	MessageID    int    `json:"message_id"`
+	Sha256       string `json:"sha256" validate:"required"`
+	Size         int    `json:"size"`
+	NoBuildCache *bool  `json:"no_build_cache,omitempty"`
+}
+
+func (i ImportMuesliRecordingQuery) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(i))
+}
+
+type FindKataIssuesQuery struct {
+	// MessageID Message the issues cite
+	MessageID int64 `json:"message_id"`
+
+	// AttachmentID Only issues citing this attachment of the message
+	AttachmentID *int64 `json:"attachment_id,omitempty"`
+}
+
+type GetKataIssueContextQuery struct {
+	// Offset Index of the first passage to return; pass next_offset from the previous page
+	Offset *int64 `json:"offset,omitempty"`
+}
+
 type SearchIntegrationTasksQuery struct {
 	// Q Task title search within the configured project
 	Q string `json:"q" validate:"required"`
 }
 
 func (s SearchIntegrationTasksQuery) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(s))
+}
+
+type ListLoopsQuery struct {
+	// PersonID Only loops with this person
+	PersonID *int64 `json:"person_id,omitempty"`
+
+	// Limit Maximum loops to return
+	Limit *int64 `json:"limit,omitempty" validate:"omitempty,gte=1,lte=200"`
+}
+
+func (l ListLoopsQuery) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(l))
+}
+
+type MarkLoopDoneQuery struct {
+	// QuestionMessageIds The list item's question_message_ids; only these are marked. Omit to cover every question visible now.
+	QuestionMessageIds []int64 `json:"question_message_ids,omitempty"`
+}
+
+type SnoozeLoopQuery struct {
+	// QuestionMessageIds The list item's question_message_ids; only these are marked. Omit to cover every question visible now.
+	QuestionMessageIds []int64 `json:"question_message_ids,omitempty"`
+}
+
+type SearchMediaQuery struct {
+	// Q Words to find in recordings and attachments
+	Q string `json:"q" validate:"required"`
+
+	// Mode Lexical mode; semantic and hybrid are unavailable
+	Mode *string `json:"mode,omitempty"`
+
+	// PersonID Durable person ID
+	PersonID *int64 `json:"person_id,omitempty"`
+
+	// ParticipantID Observed participant ID; selects its current Explore identity cluster; mutually exclusive with person_id
+	ParticipantID *int64 `json:"participant_id,omitempty"`
+
+	// Direction Person relation: from_person, to_person, or group
+	Direction []string `json:"direction,omitempty"`
+
+	// Limit Maximum occurrences to return, default 20, max 100
+	Limit *int64 `json:"limit,omitempty"`
+}
+
+func (s SearchMediaQuery) Validate() error {
 	return runtime.ConvertValidatorError(typesValidator.Struct(s))
 }
 
@@ -542,6 +695,9 @@ type ListChangedMessagesQuery struct {
 }
 
 type FilterMessagesQuery struct {
+	// AccountScopes JSON list of account scopes that intersect, for structured clients
+	AccountScopes *string `json:"account_scopes,omitempty"`
+
 	// Sender Sender email/address filter
 	Sender *string `json:"sender,omitempty"`
 
@@ -610,6 +766,9 @@ type FilterMessagesQuery struct {
 }
 
 type GetGmailIDsByFilterQuery struct {
+	// AccountScopes JSON list of account scopes that intersect, for structured clients
+	AccountScopes *string `json:"account_scopes,omitempty"`
+
 	// Sender Sender email/address filter
 	Sender *string `json:"sender,omitempty"`
 
@@ -682,6 +841,9 @@ type GetGmailIDsByFilterQuery struct {
 	// SearchMode Search mode: fast, deep, or aggregate; required with q
 	SearchMode *string `json:"search_mode,omitempty"`
 
+	// MaxResults Maximum results for bounded search-aware deletion resolution (max 100001)
+	MaxResults *int64 `json:"max_results,omitempty"`
+
 	// ViewType Aggregate view type; required for aggregate search
 	ViewType *string `json:"view_type,omitempty"`
 
@@ -696,6 +858,11 @@ type GetMessageInlinePartQuery struct {
 
 func (g GetMessageInlinePartQuery) Validate() error {
 	return runtime.ConvertValidatorError(typesValidator.Struct(g))
+}
+
+type GetMessageTagsQuery struct {
+	// Mailbox Exact IMAP mailbox; defaults to the current original copy or sole current membership
+	Mailbox *string `json:"mailbox,omitempty"`
 }
 
 type ListOperationRunsQuery struct {
@@ -799,9 +966,32 @@ type ListOrganizationEmploymentsQuery struct {
 	Offset *int64 `json:"offset,omitempty"`
 }
 
+type GetPersonByUIDQuery struct {
+	// UID Exact vCard UID or CardDAV resource UID
+	UID string `json:"uid" validate:"required,min=1"`
+}
+
+func (g GetPersonByUIDQuery) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(g))
+}
+
+type FindContactCandidatesQuery struct {
+	// Query Literal name tokens; all tokens must match. 1..256 UTF-8 bytes, at most 16 tokens. Wildcards are literal.
+	Query   string `json:"query" validate:"required"`
+	Limit   *int64 `json:"limit,omitempty" validate:"omitempty,gte=1,lte=100"`
+	AfterID *int64 `json:"after_id,omitempty" validate:"omitempty,gte=0"`
+}
+
+func (f FindContactCandidatesQuery) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(f))
+}
+
 type ListDirectoryPeopleQuery struct {
 	// Q Lexical query over person names, contact points, and organizations
 	Q *string `json:"q,omitempty"`
+
+	// Address Literal case-insensitive substring of current bound participant identities or curated contact points
+	Address *string `json:"address,omitempty"`
 
 	// Cursor Opaque cursor returned by the previous Directory page
 	Cursor *string `json:"cursor,omitempty"`
@@ -844,6 +1034,24 @@ func (l ListDirectoryPeopleQuery) Validate() error {
 		return nil
 	}
 	return errors
+}
+
+type GetPersonMessagingRoutesQuery struct {
+	// PersonUID Canonical or retired person UID. Tombstones return 410; unknown UIDs return 404.
+	PersonUID string `json:"person_uid" validate:"required"`
+
+	// Network Lowercase service name such as whatsapp or discord; unknown networks remain visible as unresolved.
+	Network             *string `json:"network,omitempty"`
+	SourceID            *int64  `json:"source_id,omitempty" validate:"omitempty,gte=0"`
+	Limit               *int64  `json:"limit,omitempty" validate:"omitempty,gte=1,lte=100"`
+	AfterConversationID *int64  `json:"after_conversation_id,omitempty" validate:"omitempty,gte=0"`
+	AfterContactPointID *int64  `json:"after_contact_point_id,omitempty" validate:"omitempty,gte=0"`
+	AfterObservationID  *int64  `json:"after_observation_id,omitempty" validate:"omitempty,gte=0"`
+	AfterSuggestionID   *int64  `json:"after_suggestion_id,omitempty" validate:"omitempty,gte=0"`
+}
+
+func (g GetPersonMessagingRoutesQuery) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(g))
 }
 
 type ListPersonAttributesQuery struct {
@@ -893,7 +1101,27 @@ type ListPersonActivityDaysQuery struct {
 }
 
 func (l ListPersonActivityDaysQuery) Validate() error {
-	return runtime.ConvertValidatorError(typesValidator.Struct(l))
+	var errors runtime.ValidationErrors
+	if err := runtime.ValidatePattern(l.From, `^[0-9]{4}-[0-9]{2}-[0-9]{2}$`); err != nil {
+		errors = errors.Append("From", err)
+	}
+	if err := runtime.ValidatePattern(l.To, `^[0-9]{4}-[0-9]{2}-[0-9]{2}$`); err != nil {
+		errors = errors.Append("To", err)
+	}
+	if l.Limit != nil {
+		if err := typesValidator.Var(l.Limit, "omitempty,gte=1,lte=500"); err != nil {
+			errors = errors.Append("Limit", err)
+		}
+	}
+	if l.Offset != nil {
+		if err := typesValidator.Var(l.Offset, "omitempty,gte=0"); err != nil {
+			errors = errors.Append("Offset", err)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
 }
 
 type GetPersonActivityDayQuery struct {
@@ -1037,10 +1265,10 @@ type RunArchiveQueryQuery struct {
 }
 
 type SearchMessagesQuery struct {
-	// Q Search query
+	// Q Search query; fts accepts standalone pipe-separated OR alternatives; other modes read pipes as text
 	Q string `json:"q" validate:"required"`
 
-	// Mode Search mode: fts, vector, or hybrid. conversation_id applies in every mode; other structured filter parameters require vector or hybrid
+	// Mode Search mode: fts, vector, or hybrid. fts accepts standalone pipe-separated OR alternatives; other modes read pipes as text. conversation_id applies in every mode; other structured filter parameters require vector or hybrid
 	Mode *string `json:"mode,omitempty"`
 
 	// Page One-based page number (default 1; values below 1 are clamped to 1). Non-numeric values are rejected with 400.
@@ -1088,6 +1316,9 @@ type SearchMessagesQuery struct {
 	// ListID Exact case-insensitive RFC 2919 List-Id filter (vector or hybrid mode only)
 	ListID *string `json:"list_id,omitempty"`
 
+	// AccountScopes JSON list of account scopes that intersect (vector or hybrid mode only)
+	AccountScopes *string `json:"account_scopes,omitempty"`
+
 	// TimePeriod Calendar period in YYYY, YYYY-MM, or YYYY-MM-DD format (vector or hybrid mode only)
 	TimePeriod *string `json:"time_period,omitempty"`
 
@@ -1112,11 +1343,14 @@ func (s SearchMessagesQuery) Validate() error {
 }
 
 type DeepSearchQuery struct {
-	// Q Search query
+	// Q Search query; full text accepts standalone pipe-separated OR alternatives
 	Q string `json:"q" validate:"required"`
 
 	// Scope Exact search scope: body; omit for composite full-text search
 	Scope *string `json:"scope,omitempty"`
+
+	// AccountScopes JSON list of account scopes that intersect, for structured clients
+	AccountScopes *string `json:"account_scopes,omitempty"`
 
 	// Sender Sender email/address filter; not supported when scope=body
 	Sender *string `json:"sender,omitempty"`
@@ -1190,6 +1424,12 @@ func (d DeepSearchQuery) Validate() error {
 }
 
 type SearchMessagesByDomainsQuery struct {
+	// SourceID Source account ID
+	SourceID *int64 `json:"source_id,omitempty"`
+
+	// SourceIds Source account IDs
+	SourceIds []int64 `json:"source_ids,omitempty"`
+
 	// Domains Comma-separated participant domains
 	Domains string `json:"domains" validate:"required"`
 
@@ -1211,11 +1451,14 @@ func (s SearchMessagesByDomainsQuery) Validate() error {
 }
 
 type FastSearchQuery struct {
-	// Q Search query
+	// Q Search query; full text accepts standalone pipe-separated OR alternatives
 	Q string `json:"q" validate:"required"`
 
-	// ViewType Stats grouping view type
+	// ViewType Request aggregate stats grouped by this view; omit to skip stats
 	ViewType *string `json:"view_type,omitempty"`
+
+	// AccountScopes JSON list of account scopes that intersect, for structured clients
+	AccountScopes *string `json:"account_scopes,omitempty"`
 
 	// Sender Sender email/address filter
 	Sender *string `json:"sender,omitempty"`
@@ -1298,6 +1541,9 @@ type FindSimilarMessagesQuery struct {
 	// Account Account email or configured source identifier
 	Account *string `json:"account,omitempty"`
 
+	// AccountScopes JSON list of account scopes that intersect, for structured clients
+	AccountScopes *string `json:"account_scopes,omitempty"`
+
 	// MessageType Message type filter
 	MessageType *string `json:"message_type,omitempty"`
 
@@ -1320,7 +1566,7 @@ type GetTotalStatsQuery struct {
 	// SourceIds Source IDs; repeat the parameter for multiple sources
 	SourceIds []int64 `json:"source_ids,omitempty"`
 
-	// SearchQuery Search query
+	// SearchQuery Search query; full text accepts standalone pipe-separated OR alternatives
 	SearchQuery *string `json:"search_query,omitempty"`
 
 	// SearchScope Include all message types when the search has no explicit message_type
@@ -1328,6 +1574,9 @@ type GetTotalStatsQuery struct {
 
 	// GroupBy Aggregate view type for grouping
 	GroupBy *string `json:"group_by,omitempty"`
+
+	// AccountScopes JSON list of account scopes that intersect, for structured clients
+	AccountScopes *string `json:"account_scopes,omitempty"`
 
 	// Sender Sender email/address filter
 	Sender *string `json:"sender,omitempty"`

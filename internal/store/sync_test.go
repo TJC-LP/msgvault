@@ -3,6 +3,8 @@ package store_test
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -12,6 +14,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/msgvault/internal/jobctx"
 	"go.kenn.io/msgvault/internal/operations"
 	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/testutil"
@@ -30,7 +33,7 @@ func TestScanSource_NullLastSyncAt_Valid(t *testing.T) {
 	require.NoError(err, "GetOrCreateSource")
 
 	// Retrieve it - should work fine with NULL last_sync_at
-	retrieved, err := st.GetSourceByIdentifier("null-lastsync@example.com")
+	retrieved, err := st.GetSourceByIdentifier(t.Context(), "null-lastsync@example.com")
 	require.NoError(err, "GetSourceByIdentifier")
 
 	require.NotNil(retrieved, "expected source, got nil")
@@ -50,7 +53,7 @@ func TestScanSyncRun_ZeroTime(t *testing.T) {
 
 	// Corrupt the started_at with an invalid value.
 	// go-sqlite3 normalizes this to "0001-01-01T00:00:00Z" for DATETIME columns.
-	_, err := f.Store.DB().Exec(`
+	_, err := f.Store.DB().ExecContext(t.Context(), `
 		UPDATE sync_runs SET started_at = 'invalid-timestamp' WHERE id = ?
 	`, syncID)
 	require.NoError(err, "corrupt started_at")
@@ -142,13 +145,13 @@ func TestScanSource_ZeroTime(t *testing.T) {
 
 	// Corrupt the created_at with an invalid value.
 	// go-sqlite3 normalizes this to "0001-01-01T00:00:00Z" for DATETIME columns.
-	_, err = st.DB().Exec(`
+	_, err = st.DB().ExecContext(t.Context(), `
 		UPDATE sources SET created_at = 'garbage' WHERE id = ?
 	`, source.ID)
 	require.NoError(err, "corrupt created_at")
 
 	// Should still work - the driver normalizes to zero time
-	retrieved, err := st.GetSourceByIdentifier("zerotime@example.com")
+	retrieved, err := st.GetSourceByIdentifier(t.Context(), "zerotime@example.com")
 	require.NoError(err, "GetSourceByIdentifier")
 
 	require.NotNil(retrieved, "expected source, got nil")
@@ -198,6 +201,11 @@ func TestStore_GetLatestSync(t *testing.T) {
 	require.NotNil(run, "expected sync run")
 	assert.Equal(secondID, run.ID, "ID")
 	assert.Equal(store.SyncStatusRunning, run.Status, "Status")
+
+	previous, err := f.Store.GetLatestSyncContext(t.Context(), f.Source.ID, secondID)
+	require.NoError(err, "GetLatestSyncContext excluding the running sync")
+	assert.Equal(firstID, previous.ID, "ID")
+	assert.Equal(store.SyncStatusCompleted, previous.Status, "Status")
 }
 
 func TestStore_StartSyncRejectsConcurrentRun(t *testing.T) {
@@ -234,7 +242,8 @@ func TestStore_CompleteSyncWriteFailureReleasesExecution(t *testing.T) {
 	requirements.NoError(err)
 	t.Cleanup(func() { _ = f.Store.FailSync(secondID, "test complete") })
 	var firstStatus string
-	requirements.NoError(f.Store.DB().QueryRow(
+	requirements.NoError(f.Store.DB().QueryRowContext(
+		t.Context(),
 		f.Store.Rebind(`SELECT status FROM sync_runs WHERE id = ?`), firstID,
 	).Scan(&firstStatus))
 	checks.Equal(store.SyncStatusFailed, firstStatus)
@@ -244,14 +253,14 @@ func TestStore_StartSyncRejectsConcurrentRunAcrossSQLiteStores(t *testing.T) {
 	requirements := require.New(t)
 	testutil.SkipIfPostgres(t, "exercises the cross-process SQLite file lock")
 	dbPath := filepath.Join(t.TempDir(), "archive.db")
-	first, err := store.OpenForTest(dbPath)
+	first, err := store.OpenForTest(t.Context(), dbPath)
 	requirements.NoError(err)
 	t.Cleanup(func() { _ = first.Close() })
 	requirements.NoError(first.InitSchema())
 	source, err := first.GetOrCreateSource("gmail", "lock-owner@example.com")
 	requirements.NoError(err)
 
-	second, err := store.OpenForTest(dbPath)
+	second, err := store.OpenForTest(t.Context(), dbPath)
 	requirements.NoError(err)
 	t.Cleanup(func() { _ = second.Close() })
 
@@ -276,14 +285,14 @@ func TestStore_StartSyncUsesFilesystemPathForSQLiteFileURI(t *testing.T) {
 	}
 	dsn := (&url.URL{Scheme: "file", Path: uriPath}).String()
 
-	first, err := store.OpenForTest(dsn)
+	first, err := store.OpenForTest(t.Context(), dsn)
 	requirements.NoError(err)
 	t.Cleanup(func() { _ = first.Close() })
 	requirements.NoError(first.InitSchema())
 	source, err := first.GetOrCreateSource("gmail", "uri-lock-owner@example.com")
 	requirements.NoError(err)
 
-	second, err := store.OpenForTest(dbPath)
+	second, err := store.OpenForTest(t.Context(), dbPath)
 	requirements.NoError(err)
 	t.Cleanup(func() { _ = second.Close() })
 
@@ -302,7 +311,7 @@ func TestStore_StartSyncRecoversRunWhoseOwnerClosed(t *testing.T) {
 	requirements.NoError(err)
 	_, err = first.CreateSyncOperation(source.ID, "abandoned-operation")
 	requirements.NoError(err)
-	abandonedRun, err := first.StartSyncOperation(source.ID, "abandoned-operation")
+	abandonedRun, err := first.StartSyncOperation(t.Context(), source.ID, "abandoned-operation")
 	requirements.NoError(err)
 	requirements.NoError(first.UpdateSyncCheckpoint(abandonedRun, &store.Checkpoint{
 		PageToken:         "resume-token",
@@ -311,7 +320,7 @@ func TestStore_StartSyncRecoversRunWhoseOwnerClosed(t *testing.T) {
 	}))
 	requirements.NoError(first.Close())
 
-	second, err := store.OpenForTest(store.DBPathForTest(first))
+	second, err := store.OpenForTest(t.Context(), store.DBPathForTest(first))
 	requirements.NoError(err)
 	t.Cleanup(func() { _ = second.Close() })
 	active, err := second.GetActiveSync(source.ID)
@@ -340,7 +349,7 @@ func TestStore_StartSyncRecoversRunWhoseOwnerClosed(t *testing.T) {
 func TestStore_GetActiveSyncOnReadOnlyStoreDoesNotRecover(t *testing.T) {
 	requirements := require.New(t)
 	dbPath := filepath.Join(t.TempDir(), "read-only-active.db")
-	writable, err := store.OpenForTest(dbPath)
+	writable, err := store.OpenForTest(t.Context(), dbPath)
 	requirements.NoError(err)
 	requirements.NoError(writable.InitSchema())
 	source, err := writable.GetOrCreateSource("gmail", "read-only-active@example.test")
@@ -362,7 +371,7 @@ func TestStore_SyncExecutionRetainsOwnershipAcrossRuns(t *testing.T) {
 	first := testutil.NewTestStore(t)
 	source, err := first.GetOrCreateSource("gmail", "multi-phase-owner@example.com")
 	requirements.NoError(err)
-	second, err := store.OpenForTest(store.DBPathForTest(first))
+	second, err := store.OpenForTest(t.Context(), store.DBPathForTest(first))
 	requirements.NoError(err)
 	t.Cleanup(func() { _ = second.Close() })
 
@@ -382,7 +391,7 @@ func TestStore_SyncExecutionRetainsOwnershipAcrossRuns(t *testing.T) {
 	requirements.NoError(err)
 	requirements.NoError(first.CompleteSync(catchupRun, "catchup-cursor"))
 	requirements.NoError(execution.Release())
-	requirements.NoError(first.FinishSyncOperation("multi-phase-operation", "done"))
+	requirements.NoError(first.FinishSyncOperation(t.Context(), "multi-phase-operation", "done"))
 
 	nextRun, err := second.StartSync(source.ID, "incremental")
 	requirements.NoError(err)
@@ -462,7 +471,7 @@ func TestStore_StartSyncRejectsConcurrentRunAcrossPostgresStores(t *testing.T) {
 	first := testutil.NewTestStore(t)
 	source, err := first.GetOrCreateSource("gmail", "lock-owner@example.com")
 	requirements.NoError(err)
-	second, err := store.OpenForTest(store.DBPathForTest(first))
+	second, err := store.OpenForTest(t.Context(), store.DBPathForTest(first))
 	requirements.NoError(err)
 	t.Cleanup(func() { _ = second.Close() })
 
@@ -537,13 +546,73 @@ func TestStore_FailSyncAndClearSourceCursorRejectsSupersededRunAtomically(t *tes
 	checks.Equal("expired cursor", run.ErrorMessage.String)
 }
 
+// An unavailable FTS index must not let a superseded importer report success.
+func TestScopedStoreRejectsFTSWriteWhenFTSUnavailable(t *testing.T) {
+	requirements := require.New(t)
+	f := storetest.New(t)
+	store.SetFTS5AvailableForTest(f.Store, false)
+	st := f.Store
+	messageID := f.CreateMessage("generation-fence-message")
+	otherSource, err := st.GetOrCreateSource("gmail", "other@example.com")
+	requirements.NoError(err)
+	otherConversationID, err := st.EnsureConversation(t.Context(), otherSource.ID, "other-thread", "Other Thread")
+	requirements.NoError(err)
+	otherMessageID, err := st.UpsertMessage(&store.Message{
+		ConversationID:  otherConversationID,
+		SourceID:        otherSource.ID,
+		SourceMessageID: "other-generation-message",
+		MessageType:     "email",
+	})
+	requirements.NoError(err)
+
+	oldID, err := st.StartSync(f.Source.ID, "full")
+	requirements.NoError(err)
+	stale := st.ScopedToSync(f.Source.ID, oldID)
+	requirements.NoError(st.FailSync(oldID, "worker stopped"))
+	newID, err := st.StartSync(f.Source.ID, "full")
+	requirements.NoError(err)
+	t.Cleanup(func() { _ = st.FailSync(newID, "test complete") })
+	live := st.ScopedToSync(f.Source.ID, newID)
+
+	cancelled, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	requirements.ErrorIs(stale.UpsertFTS(messageID, "", "", "", "", ""), store.ErrSyncRunSuperseded)
+	requirements.ErrorContains(live.UpsertFTS(otherMessageID, "", "", "", "", ""), "is scoped to source")
+	requirements.ErrorIs(live.UpsertFTSContext(cancelled, messageID, "", "", "", "", ""), context.Canceled)
+	requirements.NoError(st.UpsertFTS(messageID, "", "", "", "", ""))
+}
+
+// Dropping the real index must not turn a live scoped write into an error.
+func TestScopedStoreSkipsFTSWriteOnArchiveWithoutFTSIndex(t *testing.T) {
+	testutil.SkipIfPostgres(t, "drops the SQLite FTS5 table")
+	requirements := require.New(t)
+	f := storetest.New(t)
+	messageID := f.CreateMessage("generation-fence-message")
+	var dbPath string
+	requirements.NoError(f.Store.DB().QueryRowContext(t.Context(), `SELECT file FROM pragma_database_list WHERE name = 'main'`).Scan(&dbPath))
+	_, err := f.Store.DB().ExecContext(t.Context(), `DROP TABLE IF EXISTS messages_fts`)
+	requirements.NoError(err)
+	requirements.NoError(f.Store.Close())
+
+	st, err := store.OpenForTest(t.Context(), dbPath)
+	requirements.NoError(err)
+	t.Cleanup(func() { _ = st.Close() })
+	requirements.False(st.FTS5Available())
+	runID, err := st.StartSync(f.Source.ID, "full")
+	requirements.NoError(err)
+	t.Cleanup(func() { _ = st.FailSync(runID, "test complete") })
+
+	requirements.NoError(st.ScopedToSync(f.Source.ID, runID).UpsertFTS(messageID, "", "", "", "", ""))
+}
+
 func TestScopedStoreRejectsEveryImporterMutationAfterSupersession(t *testing.T) {
 	requirements := require.New(t)
 	checks := assert.New(t)
 	f := storetest.New(t)
 	messageID := f.CreateMessage("generation-fence-message")
 	var conversationID int64
-	requirements.NoError(f.Store.DB().QueryRow(f.Store.Rebind(
+	requirements.NoError(f.Store.DB().QueryRowContext(t.Context(), f.Store.Rebind(
 		`SELECT conversation_id FROM messages WHERE id = ?`), messageID,
 	).Scan(&conversationID))
 	participantID := f.EnsureParticipant("reactor@example.test", "Reactor", "example.test")
@@ -557,7 +626,7 @@ func TestScopedStoreRejectsEveryImporterMutationAfterSupersession(t *testing.T) 
 		write func() error
 	}{
 		{name: "email conversation", write: func() error {
-			_, err := stale.EnsureConversation(f.Source.ID, "stale-email-thread", "Stale")
+			_, err := stale.EnsureConversation(t.Context(), f.Source.ID, "stale-email-thread", "Stale")
 			return err
 		}},
 		{name: "conversation", write: func() error {
@@ -573,7 +642,7 @@ func TestScopedStoreRejectsEveryImporterMutationAfterSupersession(t *testing.T) 
 			})
 		}},
 		{name: "reaction", write: func() error {
-			return stale.UpsertReaction(messageID, participantID, "emoji", "stale", time.Now().UTC())
+			return stale.UpsertReaction(t.Context(), messageID, participantID, "emoji", "stale", time.Now().UTC())
 		}},
 		{name: "FTS", write: func() error {
 			return stale.UpsertFTS(messageID, "stale", "stale", "", "", "")
@@ -604,7 +673,7 @@ func TestScopedStoreRejectsEveryImporterMutationAfterSupersession(t *testing.T) 
 			return stale.SetConversationMemberCount(conversationID, 2)
 		}},
 		{name: "remove message labels", write: func() error {
-			return stale.RemoveMessageLabels(messageID, []int64{1})
+			return stale.RemoveMessageLabels(t.Context(), messageID, []int64{1})
 		}},
 		{name: "legacy reply link", write: func() error {
 			return stale.SetReplyTo(f.Source.ID, "generation-fence-message", "generation-fence-message")
@@ -619,13 +688,13 @@ func TestScopedStoreRejectsEveryImporterMutationAfterSupersession(t *testing.T) 
 			return stale.DeleteUnstoredAttachmentByMetadataContext(t.Context(), messageID, "stale", "text/plain")
 		}},
 		{name: "source import item", write: func() error {
-			return stale.UpsertSourceImportItem(store.SourceImportItem{
+			return stale.UpsertSourceImportItem(t.Context(), store.SourceImportItem{
 				SourceID: f.Source.ID, Provider: "test", ProviderID: "stale-item",
 				Name: "stale-item", Status: "imported",
 			})
 		}},
 		{name: "source last sync", write: func() error {
-			return stale.TouchSourceLastSyncAt(f.Source.ID)
+			return stale.TouchSourceLastSyncAt(t.Context(), f.Source.ID)
 		}},
 		{name: "source display name", write: func() error {
 			return stale.UpdateSourceDisplayName(f.Source.ID, "Stale Name")
@@ -637,7 +706,7 @@ func TestScopedStoreRejectsEveryImporterMutationAfterSupersession(t *testing.T) 
 		})
 	}
 	var staleEmailThreads int
-	requirements.NoError(f.Store.DB().QueryRow(f.Store.Rebind(`SELECT COUNT(*) FROM conversations
+	requirements.NoError(f.Store.DB().QueryRowContext(t.Context(), f.Store.Rebind(`SELECT COUNT(*) FROM conversations
 		WHERE source_id = ? AND source_conversation_id = 'stale-email-thread'`),
 		f.Source.ID).Scan(&staleEmailThreads))
 	checks.Zero(staleEmailThreads)
@@ -841,7 +910,7 @@ func TestStore_PendingSyncOperationReservesSource(t *testing.T) {
 	requirements.NoError(err)
 	requirements.NoError(fixture.Store.CompleteSync(runID, "complete"))
 	requirements.NoError(execution.Release())
-	requirements.NoError(fixture.Store.FinishSyncOperation(operationID, "done"))
+	requirements.NoError(fixture.Store.FinishSyncOperation(t.Context(), operationID, "done"))
 
 	nextRunID, err := fixture.Store.StartSync(fixture.Source.ID, "full")
 	requirements.NoError(err)
@@ -876,7 +945,7 @@ func TestStore_SyncOperationGroupsRunsAndPublishesFinalState(t *testing.T) {
 	require.NoError(err)
 	require.NoError(f.Store.CompleteSync(secondID, "second"))
 	require.NoError(execution.Release())
-	require.NoError(f.Store.FinishSyncOperation("operation-1", "done"))
+	require.NoError(f.Store.FinishSyncOperation(t.Context(), "operation-1", "done"))
 
 	op, err := f.Store.GetSyncOperation("operation-1")
 	require.NoError(err)
@@ -898,13 +967,13 @@ func TestStore_FinishSyncOperationPreservesFirstTerminalStatus(t *testing.T) {
 			operationID := "terminal-" + first
 			_, err := f.Store.CreateSyncOperation(f.Source.ID, operationID)
 			requirements.NoError(err)
-			requirements.NoError(f.Store.FinishSyncOperation(operationID, first))
+			requirements.NoError(f.Store.FinishSyncOperation(t.Context(), operationID, first))
 
 			second := "done"
 			if first == "done" {
 				second = store.SyncStatusFailed
 			}
-			requirements.NoError(f.Store.FinishSyncOperation(operationID, second))
+			requirements.NoError(f.Store.FinishSyncOperation(t.Context(), operationID, second))
 
 			op, err := f.Store.GetSyncOperation(operationID)
 			requirements.NoError(err)
@@ -922,9 +991,9 @@ func TestStore_FinishFailedSyncOperationFailsRunningRuns(t *testing.T) {
 
 	_, err := f.Store.CreateSyncOperation(f.Source.ID, operationID)
 	requirements.NoError(err)
-	runID, err := f.Store.StartSyncOperation(f.Source.ID, operationID)
+	runID, err := f.Store.StartSyncOperation(t.Context(), f.Source.ID, operationID)
 	requirements.NoError(err)
-	requirements.NoError(f.Store.FinishSyncOperation(operationID, store.SyncStatusFailed))
+	requirements.NoError(f.Store.FinishSyncOperation(t.Context(), operationID, store.SyncStatusFailed))
 
 	op, err := f.Store.GetSyncOperation(operationID)
 	requirements.NoError(err)
@@ -934,7 +1003,7 @@ func TestStore_FinishFailedSyncOperationFailsRunningRuns(t *testing.T) {
 	checks.Equal(store.SyncStatusFailed, op.Runs[0].Status)
 	checks.True(op.Runs[0].CompletedAt.Valid)
 	checks.Equal("sync worker exited before recording completion", op.Runs[0].ErrorMessage.String)
-	active, err := f.Store.HasAnyActiveSync()
+	active, err := f.Store.HasAnyActiveSync(t.Context())
 	requirements.NoError(err)
 	checks.False(active)
 }
@@ -967,9 +1036,9 @@ func TestStore_FailUnfinishedSyncOperationsRepairsFailedOperationRuns(t *testing
 	const operationID = "failed-operation-with-running-run"
 	_, err = first.CreateSyncOperation(source.ID, operationID)
 	requirements.NoError(err)
-	runID, err := first.StartSyncOperation(source.ID, operationID)
+	runID, err := first.StartSyncOperation(t.Context(), source.ID, operationID)
 	requirements.NoError(err)
-	_, err = first.DB().Exec(first.Rebind(`
+	_, err = first.DB().ExecContext(t.Context(), first.Rebind(`
 		UPDATE sync_operations
 		SET status = 'failed', finished_at = CURRENT_TIMESTAMP
 		WHERE id = ?
@@ -978,7 +1047,7 @@ func TestStore_FailUnfinishedSyncOperationsRepairsFailedOperationRuns(t *testing
 	dbPath := store.DBPathForTest(first)
 	requirements.NoError(first.Close())
 
-	second, err := store.OpenForTest(dbPath)
+	second, err := store.OpenForTest(t.Context(), dbPath)
 	requirements.NoError(err)
 	t.Cleanup(func() { _ = second.Close() })
 	failed, err := second.FailUnfinishedSyncOperationsContext(t.Context())
@@ -992,7 +1061,7 @@ func TestStore_FailUnfinishedSyncOperationsRepairsFailedOperationRuns(t *testing
 	checks.Equal(store.SyncStatusFailed, op.Runs[0].Status)
 	checks.True(op.Runs[0].CompletedAt.Valid)
 	checks.Equal("sync worker exited before recording completion", op.Runs[0].ErrorMessage.String)
-	active, err := second.HasAnyActiveSync()
+	active, err := second.HasAnyActiveSync(t.Context())
 	requirements.NoError(err)
 	checks.False(active)
 }
@@ -1054,7 +1123,7 @@ func TestStore_SyncRunItemsCascadeWithSyncRun(t *testing.T) {
 		ErrorMessage:    "network unavailable",
 	}), "RecordSyncRunItem")
 
-	_, err := f.Store.DB().Exec(f.Store.Rebind(`DELETE FROM sync_runs WHERE id = ?`), syncID)
+	_, err := f.Store.DB().ExecContext(t.Context(), f.Store.Rebind(`DELETE FROM sync_runs WHERE id = ?`), syncID)
 	require.NoError(err, "delete sync run")
 
 	count, err := f.Store.CountSyncRunItems(syncID, "")
@@ -1115,11 +1184,11 @@ func TestScanSource_NullRequiredTimestamp(t *testing.T) {
 	require.NoError(err, "GetOrCreateSource")
 
 	// Corrupt created_at to NULL (violates expected schema invariant)
-	_, err = st.DB().Exec(st.Rebind(`UPDATE sources SET created_at = NULL WHERE id = ?`), source.ID)
+	_, err = st.DB().ExecContext(t.Context(), st.Rebind(`UPDATE sources SET created_at = NULL WHERE id = ?`), source.ID)
 	require.NoError(err, "set created_at to NULL")
 
 	// Attempting to retrieve should fail with a clear error
-	_, err = st.GetSourceByIdentifier("nullrequired@example.com")
+	_, err = st.GetSourceByIdentifier(t.Context(), "nullrequired@example.com")
 	require.Error(err, "expected error for NULL required timestamp")
 
 	// Error should mention the field name and that it's NULL
@@ -1132,31 +1201,160 @@ func TestStore_HasAnyActiveSync(t *testing.T) {
 	assert := assert.New(t)
 	f := storetest.New(t)
 
-	running, err := f.Store.HasAnyActiveSync()
+	running, err := f.Store.HasAnyActiveSync(t.Context())
 	require.NoError(err, "HasAnyActiveSync (initial)")
 	assert.False(running, "expected no active sync on fresh DB")
 
 	syncID := f.StartSync()
 
-	running, err = f.Store.HasAnyActiveSync()
+	running, err = f.Store.HasAnyActiveSync(t.Context())
 	require.NoError(err, "HasAnyActiveSync (after StartSync)")
 	assert.True(running, "expected active sync after StartSync")
 
 	_, err = f.Store.StartSync(f.Source.ID, "full")
 	require.ErrorIs(err, store.ErrSyncAlreadyActive)
-	running, err = f.Store.HasAnyActiveSync()
+	running, err = f.Store.HasAnyActiveSync(t.Context())
 	require.NoError(err, "HasAnyActiveSync (after rejected StartSync)")
 	assert.True(running, "the original sync remains active")
 
 	// Mark the latest sync as completed.
-	_, err = f.Store.DB().Exec(
+	_, err = f.Store.DB().ExecContext(
+		t.Context(),
 		`UPDATE sync_runs SET status = 'completed' WHERE status = 'running'`,
 	)
 	require.NoError(err, "mark sync completed")
 
-	running, err = f.Store.HasAnyActiveSync()
+	running, err = f.Store.HasAnyActiveSync(t.Context())
 	require.NoError(err, "HasAnyActiveSync (after completion)")
 	assert.False(running, "expected no active sync after completion")
 
 	_ = syncID
+}
+
+func TestStore_InterruptSyncWithCheckpoint(t *testing.T) {
+	providerErr := errors.New("provider unavailable")
+	for _, tc := range []struct {
+		name       string
+		cause      error
+		err        error
+		itemErrors int64
+		wantStatus string
+	}{
+		{name: "handoff", cause: jobctx.ErrYieldedToWaiter, err: context.Canceled, wantStatus: store.SyncStatusCancelled},
+		{name: "wrapped handoff", cause: jobctx.ErrYieldedToWaiter, err: fmt.Errorf("fetch: %w", context.Canceled), wantStatus: store.SyncStatusCancelled},
+		{name: "user cancellation", cause: context.Canceled, err: context.Canceled, wantStatus: store.SyncStatusFailed},
+		{name: "provider error during handoff", cause: jobctx.ErrYieldedToWaiter, err: providerErr, wantStatus: store.SyncStatusFailed},
+		{name: "joined error during handoff", cause: jobctx.ErrYieldedToWaiter, err: errors.Join(providerErr, context.Canceled), wantStatus: store.SyncStatusFailed},
+		{name: "wrapped joined error", cause: jobctx.ErrYieldedToWaiter, err: fmt.Errorf("fetch: %w", errors.Join(providerErr, context.Canceled)), wantStatus: store.SyncStatusFailed},
+		{name: "item errors during handoff", cause: jobctx.ErrYieldedToWaiter, err: context.Canceled, itemErrors: 1, wantStatus: store.SyncStatusFailed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require := require.New(t)
+			assert := assert.New(t)
+			f := storetest.New(t)
+			id, err := f.Store.StartSync(f.Source.ID, "slack")
+			require.NoError(err)
+			ctx, cancel := context.WithCancelCause(t.Context())
+			cancel(tc.cause)
+			cp := &store.Checkpoint{PageToken: "resume-cursor", MessagesProcessed: 7, MessagesAdded: 3, ErrorsCount: tc.itemErrors}
+			require.NoError(f.Store.InterruptSyncWithCheckpoint(ctx, id, tc.err, cp))
+			run, err := f.Store.GetLatestSync(f.Source.ID)
+			require.NoError(err)
+			assert.Equal(tc.wantStatus, run.Status)
+			if tc.wantStatus == store.SyncStatusCancelled {
+				assert.Empty(run.ErrorMessage.String)
+			} else {
+				assert.Equal(tc.err.Error(), run.ErrorMessage.String)
+			}
+			assert.Equal(int64(7), run.MessagesProcessed)
+			assert.Equal(int64(3), run.MessagesAdded)
+			assert.Equal(tc.itemErrors, run.ErrorsCount)
+			resumed, err := f.Store.GetLatestCheckpointedSync(f.Source.ID)
+			require.NoError(err)
+			assert.Equal(id, resumed.ID)
+			resumed, err = f.Store.GetLatestCheckpointedSyncByType(t.Context(), f.Source.ID, "slack")
+			require.NoError(err)
+			assert.Equal("resume-cursor", resumed.CursorBefore.String)
+			_, err = f.Store.GetLatestCheckpointedSyncByType(t.Context(), f.Source.ID, "discord")
+			require.ErrorIs(err, store.ErrSyncRunNotFound)
+			// Finalization releases ownership; completing the next attempt
+			// makes even a cancelled checkpoint obsolete.
+			next, err := f.Store.StartSync(f.Source.ID, "slack")
+			require.NoError(err)
+			require.NoError(f.Store.CompleteSync(next, "finished"))
+			_, err = f.Store.GetLatestCheckpointedSync(f.Source.ID)
+			require.ErrorIs(err, store.ErrSyncRunNotFound)
+			_, err = f.Store.GetLatestCheckpointedSyncByType(t.Context(), f.Source.ID, "slack")
+			require.ErrorIs(err, store.ErrSyncRunNotFound)
+		})
+	}
+}
+
+func TestStore_ListUnresolvedSyncItemErrors(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	f := storetest.New(t)
+	other, err := f.Store.GetOrCreateSource("gmail", "other@example.com")
+	require.NoError(err)
+	firstRun := f.StartSync()
+	for _, id := range []string{"retry", "resolved", "gone", "reopened"} {
+		require.NoError(f.Store.RecordSyncRunItem(store.SyncRunItem{
+			SyncRunID: firstRun, SourceMessageID: id, Phase: "ingest",
+			Status: store.SyncRunItemStatusError, ErrorKind: "ingest_error",
+		}))
+	}
+	require.NoError(f.Store.FailSync(firstRun, "interrupted"))
+	nextRun := f.StartSync()
+	for _, item := range []store.SyncRunItem{
+		{SourceMessageID: "resolved", Phase: "fetch", Status: store.SyncRunItemStatusResolved, ErrorKind: "acquired"},
+		{SourceMessageID: "gone", Phase: "fetch", Status: store.SyncRunItemStatusSkipped, ErrorKind: "gmail_not_found"},
+		{SourceMessageID: "reopened", Phase: "fetch", Status: store.SyncRunItemStatusResolved, ErrorKind: "acquired"},
+		{SourceMessageID: "reopened", Phase: "fetch", Status: store.SyncRunItemStatusError, ErrorKind: "fetch_error"},
+		{SourceMessageID: "retry", Phase: "delete", Status: store.SyncRunItemStatusSkipped, ErrorKind: "delete_error"},
+	} {
+		item.SyncRunID = nextRun
+		require.NoError(f.Store.RecordSyncRunItem(item))
+	}
+	require.NoError(f.Store.CompleteSync(nextRun, "1000"))
+	otherRun, err := f.Store.StartSync(other.ID, "full")
+	require.NoError(err)
+	for _, item := range []store.SyncRunItem{
+		{SourceMessageID: "other-only", Phase: "fetch", Status: store.SyncRunItemStatusError, ErrorKind: "fetch_error"},
+		{SourceMessageID: "retry", Phase: "fetch", Status: store.SyncRunItemStatusResolved, ErrorKind: "acquired"},
+	} {
+		item.SyncRunID = otherRun
+		require.NoError(f.Store.RecordSyncRunItem(item))
+	}
+
+	items, err := f.Store.ListUnresolvedSyncItemErrors(t.Context(), f.Source.ID)
+	require.NoError(err)
+	require.Len(items, 2)
+	assert.Equal("retry", items[0].SourceMessageID)
+	assert.Equal("ingest_error", items[0].ErrorKind)
+	assert.Equal(firstRun, items[0].SyncRunID)
+	assert.Equal("reopened", items[1].SourceMessageID)
+	assert.Equal("fetch_error", items[1].ErrorKind)
+	assert.Equal(nextRun, items[1].SyncRunID)
+
+	boundary, err := f.Store.StartSync(f.Source.ID, "incremental")
+	require.NoError(err)
+	require.NoError(f.Store.RecordSyncRunItem(store.SyncRunItem{
+		SyncRunID: boundary, SourceMessageID: "still-failing", Phase: "fetch",
+		Status: store.SyncRunItemStatusError, ErrorKind: "fetch_error",
+	}))
+	require.NoError(f.Store.CompleteSync(boundary, "1001"))
+	full, err := f.Store.StartSync(f.Source.ID, "full")
+	require.NoError(err)
+	require.NoError(f.Store.RecordSyncRunItem(store.SyncRunItem{
+		SyncRunID: full, SourceMessageID: "later-full", Phase: "ingest",
+		Status: store.SyncRunItemStatusError, ErrorKind: "ingest_error",
+	}))
+	require.NoError(f.Store.CompleteSync(full, "1001"))
+	items, err = f.Store.ListUnresolvedSyncItemErrors(t.Context(), f.Source.ID)
+	require.NoError(err)
+	var ids []string
+	for _, item := range items {
+		ids = append(ids, item.SourceMessageID)
+	}
+	assert.ElementsMatch([]string{"still-failing", "later-full"}, ids)
 }

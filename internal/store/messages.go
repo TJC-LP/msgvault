@@ -5,12 +5,13 @@ import (
 	"bytes"
 	"compress/zlib"
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
-	"math/rand"
 	"regexp"
 	"slices"
 	"sort"
@@ -19,6 +20,7 @@ import (
 	"time"
 
 	"go.kenn.io/msgvault/internal/attachmentpolicy"
+	"go.kenn.io/msgvault/internal/emailattribution"
 	"go.kenn.io/msgvault/internal/mime"
 	"go.kenn.io/msgvault/internal/peoplesweep"
 )
@@ -91,6 +93,8 @@ type MessageDeliveryEvidence struct {
 // MessagePersistData bundles everything needed to atomically
 // persist a message and its related rows in a single transaction.
 type MessagePersistData struct {
+	// Edited records a source edit atomically with the message.
+	Edited                    bool
 	Message                   *Message
 	Conversation              *ConversationPersistData
 	Delivery                  *MessageDeliveryEvidence
@@ -105,6 +109,7 @@ type MessagePersistData struct {
 	PreserveLabels            bool
 	MIMEAttachmentReplacement *[]AttachmentWrite
 	FTS                       *FTSDoc
+	SyncRunItem               *SyncRunItem
 }
 
 // MessageIdentityGuard binds repair persistence to the exact archive row that
@@ -360,6 +365,10 @@ func (s *Store) loadGmailAuditEvidenceTx(
 		SELECT content_hash, source_part_key
 		FROM attachments
 		WHERE message_id = ? AND source_attachment_id IS NULL
+		  AND NOT EXISTS (
+			SELECT 1 FROM source_merge_preserved_attachments marker
+			WHERE marker.attachment_id = attachments.id
+		  )
 		ORDER BY id
 	`, id)
 	if err != nil {
@@ -420,6 +429,8 @@ type Message struct {
 	SenderID         sql.NullInt64
 	ReplyToMessageID sql.NullInt64
 	IsFromMe         bool
+	// IsSent is whether the message left the sender; invalid keeps the stored value.
+	IsSent sql.NullBool
 	// IdentityDerivedIsFromMe reports that IsFromMe came from a confirmed
 	// account identity rather than a source-native sent-by-me signal.
 	IdentityDerivedIsFromMe bool
@@ -449,6 +460,27 @@ type MessageWithRawMetadata struct {
 	RFC822MessageID sql.NullString
 }
 
+// MessageRelationTarget is the identity needed to authorize a provider-side
+// relation such as an edit without loading the target body.
+type MessageRelationTarget struct {
+	ConversationID int64
+	SenderID       sql.NullInt64
+}
+
+// GetMessageRelationTarget reads relation authorization fields by primary key.
+func (s *Store) GetMessageRelationTarget(ctx context.Context, messageID int64) (MessageRelationTarget, error) {
+	var target MessageRelationTarget
+	err := s.db.QueryRowContext(ctx, `
+		SELECT conversation_id, sender_id
+		FROM messages
+		WHERE id = ?
+	`, messageID).Scan(&target.ConversationID, &target.SenderID)
+	if err != nil {
+		return MessageRelationTarget{}, fmt.Errorf("get message relation target %d: %w", messageID, err)
+	}
+	return target, nil
+}
+
 // UnresolvedMessageReply is a message whose provider metadata may contain a
 // durable source reply reference but whose generic reply link is still NULL.
 // Importers decode their own metadata shape and call SetReplyTo once the
@@ -462,12 +494,17 @@ type UnresolvedMessageReply struct {
 // MessageExistsBatch checks which message IDs already exist in the database.
 // Returns a map of source_message_id -> internal message_id for existing messages.
 func (s *Store) MessageExistsBatch(sourceID int64, sourceMessageIDs []string) (map[string]int64, error) {
+	return s.MessageExistsBatchContext(context.Background(), sourceID, sourceMessageIDs)
+}
+
+// MessageExistsBatchContext honors cancellation during MessageExistsBatch.
+func (s *Store) MessageExistsBatchContext(ctx context.Context, sourceID int64, sourceMessageIDs []string) (map[string]int64, error) {
 	if len(sourceMessageIDs) == 0 {
 		return make(map[string]int64), nil
 	}
 
 	result := make(map[string]int64)
-	err := queryInChunks(s.db, sourceMessageIDs, []any{sourceID},
+	err := queryInChunksContext(ctx, s.db, sourceMessageIDs, []any{sourceID},
 		`SELECT source_message_id, id FROM messages WHERE source_id = ? AND source_message_id IN (%s)`,
 		func(rows *loggedRows) error {
 			var srcID string
@@ -491,6 +528,7 @@ type StoredMessage struct {
 	ConversationID int64
 	SenderID       sql.NullInt64
 	SourceIsFromMe sql.NullBool
+	Subject        sql.NullString
 	MessageType    string
 	SentAt         sql.NullTime
 	InternalDate   sql.NullTime
@@ -499,6 +537,27 @@ type StoredMessage struct {
 	// Raw is nil when the message has no readable raw payload in the requested
 	// format.
 	Raw []byte
+}
+
+// Matches reports whether the stored columns and raw payload equal the derived message.
+func (stored StoredMessage) Matches(message *Message, raw []byte) bool {
+	return stored.ConversationID == message.ConversationID &&
+		stored.SenderID == message.SenderID &&
+		stored.SourceIsFromMe.Valid && stored.SourceIsFromMe.Bool == message.IsFromMe &&
+		stored.MessageType == message.MessageType &&
+		sameAppleInstant(stored.SentAt, message.SentAt) &&
+		sameAppleInstant(stored.InternalDate, message.InternalDate) &&
+		stored.Snippet == message.Snippet &&
+		stored.SizeEstimate == message.SizeEstimate &&
+		bytes.Equal(stored.Raw, raw)
+}
+
+// sameAppleInstant ignores differences below the microsecond PostgreSQL keeps.
+func sameAppleInstant(stored, derived sql.NullTime) bool {
+	if stored.Valid != derived.Valid {
+		return false
+	}
+	return !stored.Valid || stored.Time.Sub(derived.Time).Abs() < time.Microsecond
 }
 
 // StoredMessagesContext returns the stored output of the given source
@@ -510,7 +569,7 @@ func (s *Store) StoredMessagesContext(
 	result := make(map[string]StoredMessage, len(sourceMessageIDs))
 	err := queryInChunksContext(ctx, s.db, sourceMessageIDs, []any{rawFormat, sourceID}, `
 		SELECT m.source_message_id, m.id, m.conversation_id, m.sender_id,
-		       m.source_is_from_me, COALESCE(m.message_type, ''), m.sent_at,
+		       m.source_is_from_me, m.subject, COALESCE(m.message_type, ''), m.sent_at,
 		       m.internal_date, m.snippet, COALESCE(m.size_estimate, 0),
 		       r.raw_data, r.compression
 		FROM messages m
@@ -523,7 +582,7 @@ func (s *Store) StoredMessagesContext(
 			var compression sql.NullString
 			if err := rows.Scan(
 				&sourceMessageID, &stored.ID, &stored.ConversationID, &stored.SenderID,
-				&stored.SourceIsFromMe, &stored.MessageType, &stored.SentAt,
+				&stored.SourceIsFromMe, &stored.Subject, &stored.MessageType, &stored.SentAt,
 				&stored.InternalDate, &stored.Snippet, &stored.SizeEstimate,
 				&raw, &compression,
 			); err != nil {
@@ -646,7 +705,14 @@ func (s *Store) MessageSourceIDsInSnowflakeInterval(
 func (s *Store) MaxMessageSourceIDInSnowflakeInterval(
 	sourceID, conversationID int64, lower, upper string,
 ) (string, error) {
-	page, err := s.MessageSourceIDsInSnowflakeIntervalPage(
+	return s.MaxMessageSourceIDInSnowflakeIntervalContext(context.Background(), sourceID, conversationID, lower, upper)
+}
+
+// MaxMessageSourceIDInSnowflakeIntervalContext honors cancellation during MaxMessageSourceIDInSnowflakeInterval.
+func (s *Store) MaxMessageSourceIDInSnowflakeIntervalContext(ctx context.Context,
+	sourceID, conversationID int64, lower, upper string,
+) (string, error) {
+	page, err := s.MessageSourceIDsInSnowflakeIntervalPageContext(ctx,
 		sourceID, conversationID, lower, upper, "", 1,
 	)
 	if err != nil || len(page) == 0 {
@@ -658,6 +724,13 @@ func (s *Store) MaxMessageSourceIDInSnowflakeInterval(
 // MessageSourceIDsInSnowflakeIntervalPage returns one descending numeric
 // keyset page from (lower, upper]. before is an optional exclusive cursor.
 func (s *Store) MessageSourceIDsInSnowflakeIntervalPage(
+	sourceID, conversationID int64, lower, upper, before string, limit int,
+) ([]string, error) {
+	return s.MessageSourceIDsInSnowflakeIntervalPageContext(context.Background(), sourceID, conversationID, lower, upper, before, limit)
+}
+
+// MessageSourceIDsInSnowflakeIntervalPageContext honors cancellation during MessageSourceIDsInSnowflakeIntervalPage.
+func (s *Store) MessageSourceIDsInSnowflakeIntervalPageContext(ctx context.Context,
 	sourceID, conversationID int64, lower, upper, before string, limit int,
 ) ([]string, error) {
 	canonicalLower, err := canonicalDecimal(lower)
@@ -707,7 +780,7 @@ func (s *Store) MessageSourceIDsInSnowflakeIntervalPage(
 	query += ` ORDER BY LENGTH(source_message_id) DESC, source_message_id DESC LIMIT ?`
 	args = append(args, limit)
 
-	rows, err := s.db.Query(query, args...)
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -757,14 +830,14 @@ func compareCanonicalDecimals(left, right string) int {
 // from one source. Importers use this instead of issuing one metadata query per
 // known item while filtering provider search pages.
 func (s *Store) MessageMetadataBatch(
-	sourceID int64, sourceMessageIDs []string,
+	ctx context.Context, sourceID int64, sourceMessageIDs []string,
 ) (map[string]MessageMetadataRecord, error) {
 	if len(sourceMessageIDs) == 0 {
 		return make(map[string]MessageMetadataRecord), nil
 	}
 
 	result := make(map[string]MessageMetadataRecord)
-	err := queryInChunks(s.db, sourceMessageIDs, []any{sourceID},
+	err := queryInChunksContext(ctx, s.db, sourceMessageIDs, []any{sourceID},
 		`SELECT source_message_id, id, metadata
 		 FROM messages
 		 WHERE source_id = ? AND source_message_id IN (%s)`,
@@ -790,8 +863,8 @@ func (s *Store) MessageMetadataBatch(
 // of probing unbounded higher IDs with one query per candidate group. The
 // result is keyed by source_message_id, holds no message bodies, and stays
 // linear in the archived messages of the source.
-func (s *Store) SourceMessageMetadata(sourceID int64) (map[string]MessageMetadataRecord, error) {
-	rows, err := s.db.Query(`
+func (s *Store) SourceMessageMetadata(ctx context.Context, sourceID int64) (map[string]MessageMetadataRecord, error) {
+	rows, err := s.db.QueryContext(ctx, `
 		SELECT m.source_message_id, m.id, m.metadata, c.source_conversation_id
 		FROM messages m
 		JOIN conversations c ON c.id = m.conversation_id
@@ -831,22 +904,41 @@ func (s *Store) ListUnresolvedMessageReplies(sourceID int64, messageType string)
 func (s *Store) ListUnresolvedMessageRepliesAfter(
 	sourceID int64, messageType string, afterID int64, limit int,
 ) ([]UnresolvedMessageReply, error) {
+	return s.ListUnresolvedMessageRepliesAfterContext(context.Background(), sourceID, messageType, afterID, limit, 0)
+}
+
+// ListUnresolvedMessageRepliesAfterContext honors cancellation during ListUnresolvedMessageRepliesAfter.
+func (s *Store) ListUnresolvedMessageRepliesAfterContext(ctx context.Context,
+	sourceID int64, messageType string, afterID int64, limit int, conversationID int64,
+) ([]UnresolvedMessageReply, error) {
 	if limit <= 0 {
 		return nil, errors.New("list unresolved message replies: limit must be positive")
 	}
-	return s.listUnresolvedMessageReplies(sourceID, messageType, afterID, limit)
+	return s.listUnresolvedMessageRepliesContext(ctx, sourceID, messageType, afterID, limit, conversationID)
 }
 
 func (s *Store) listUnresolvedMessageReplies(
 	sourceID int64, messageType string, afterID int64, limit int,
 ) ([]UnresolvedMessageReply, error) {
+	return s.listUnresolvedMessageRepliesContext(context.Background(), sourceID, messageType, afterID, limit, 0)
+}
+
+// listUnresolvedMessageRepliesContext honors cancellation during listUnresolvedMessageReplies.
+func (s *Store) listUnresolvedMessageRepliesContext(ctx context.Context,
+	sourceID int64, messageType string, afterID int64, limit int, conversationID int64,
+) ([]UnresolvedMessageReply, error) {
 	limitClause := ""
 	args := []any{sourceID, messageType, afterID}
+	conversationClause := ""
+	if conversationID != 0 {
+		conversationClause = " AND conversation_id = ?"
+		args = append(args, conversationID)
+	}
 	if limit > 0 {
 		limitClause = " LIMIT ?"
 		args = append(args, limit)
 	}
-	rows, err := s.db.Query(`
+	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, source_message_id, metadata
 		FROM messages
 		WHERE source_id = ?
@@ -855,7 +947,7 @@ func (s *Store) listUnresolvedMessageReplies(
 		  AND reply_to_message_id IS NULL
 		  AND metadata IS NOT NULL
 		  AND CAST(metadata AS TEXT) LIKE '%"referenced_message_id"%'
-		ORDER BY id`+limitClause,
+		`+conversationClause+` ORDER BY id`+limitClause,
 		args...)
 	if err != nil {
 		return nil, fmt.Errorf("list unresolved message replies: %w", err)
@@ -886,7 +978,11 @@ func (s *Store) listUnresolvedMessageReplies(
 // JSONB cast on PG (?::JSONB) and a bare ? on SQLite, so a JSON string binds in
 // both backends.
 func (s *Store) SetMessageMetadata(messageID int64, metadata sql.NullString) error {
-	ctx := context.Background()
+	return s.SetMessageMetadataContext(context.Background(), messageID, metadata)
+}
+
+// SetMessageMetadataContext honors cancellation during SetMessageMetadata.
+func (s *Store) SetMessageMetadataContext(ctx context.Context, messageID int64, metadata sql.NullString) error {
 	return s.withTxContext(ctx, func(tx *loggedTx) error {
 		if err := s.lockMeetingEvidenceWith(ctx, tx, messageID); err != nil {
 			return err
@@ -897,7 +993,10 @@ func (s *Store) SetMessageMetadata(messageID int64, metadata sql.NullString) err
 		if err := setMessageMetadataWith(boundQuerier{ctx: ctx, q: tx}, s.dialect, messageID, metadata); err != nil {
 			return err
 		}
-		return s.refreshMeetingProjectionWith(ctx, tx, messageID)
+		if err := s.refreshMeetingProjectionWith(ctx, tx, messageID); err != nil {
+			return err
+		}
+		return s.refreshCalendarEventProjectionWith(ctx, tx, messageID)
 	})
 }
 
@@ -919,8 +1018,13 @@ func setMessageMetadataWith(q querier, dialect Dialect, messageID int64, metadat
 // without losing the rest of the stored JSON. Returns an invalid NullString when
 // the column is NULL.
 func (s *Store) GetMessageMetadata(messageID int64) (sql.NullString, error) {
+	return s.GetMessageMetadataContext(context.Background(), messageID)
+}
+
+// GetMessageMetadataContext honors cancellation during GetMessageMetadata.
+func (s *Store) GetMessageMetadataContext(ctx context.Context, messageID int64) (sql.NullString, error) {
 	var meta sql.NullString
-	err := s.db.QueryRow(`SELECT metadata FROM messages WHERE id = ?`, messageID).Scan(&meta)
+	err := s.db.QueryRowContext(ctx, `SELECT metadata FROM messages WHERE id = ?`, messageID).Scan(&meta)
 	if err != nil {
 		return sql.NullString{}, fmt.Errorf("get message metadata (id=%d): %w", messageID, err)
 	}
@@ -931,12 +1035,17 @@ func (s *Store) GetMessageMetadata(messageID int64) (sql.NullString, error) {
 // with the given RFC822 Message-ID for this source, or 0 if
 // no match exists.
 func (s *Store) GetMessageIDByRFC822ID(
+	ctx context.Context,
 	sourceID int64, rfc822ID string,
 ) (int64, error) {
 	var id int64
-	err := s.db.QueryRow(
+	err := s.db.QueryRowContext(ctx,
 		`SELECT id FROM messages
-		 WHERE source_id = ? AND rfc822_message_id = ?`,
+		 WHERE source_id = ? AND rfc822_message_id = ?
+		   AND NOT EXISTS (
+		     SELECT 1 FROM source_merge_archive_only_messages am
+		     WHERE am.message_id = messages.id
+		   )`,
 		sourceID, rfc822ID,
 	).Scan(&id)
 	if err == sql.ErrNoRows {
@@ -945,10 +1054,44 @@ func (s *Store) GetMessageIDByRFC822ID(
 	return id, err
 }
 
+// RejectArchiveOnlyDeletionTargetsContext prevents a staged provider deletion
+// from treating a namespaced history ID as a current provider ID after source
+// merge. Unknown IDs are left to the provider's normal not-found handling.
+func (s *Store) RejectArchiveOnlyDeletionTargetsContext(
+	ctx context.Context, sourceID int64, sourceMessageIDs []string,
+) error {
+	if sourceID <= 0 || len(sourceMessageIDs) == 0 {
+		return nil
+	}
+	found := false
+	err := queryInChunksContext(ctx, s.db, sourceMessageIDs, []any{sourceID}, `
+		SELECT m.source_message_id
+		FROM messages m
+		WHERE m.source_id = ? AND m.source_message_id IN (%s)
+		  AND EXISTS (
+		    SELECT 1 FROM source_merge_archive_only_messages am
+		    WHERE am.message_id = m.id
+		  )`, func(rows *loggedRows) error {
+		var ignored string
+		if err := rows.Scan(&ignored); err != nil {
+			return err
+		}
+		found = true
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("check deletion targets against source merge history: %w", err)
+	}
+	if found {
+		return ErrArchiveOnlyDeletionTarget
+	}
+	return nil
+}
+
 // GetMessageSourceID returns the provider-specific identifier for a message.
-func (s *Store) GetMessageSourceID(messageID int64) (string, error) {
+func (s *Store) GetMessageSourceID(ctx context.Context, messageID int64) (string, error) {
 	var sourceMessageID string
-	err := s.db.QueryRow(
+	err := s.db.QueryRowContext(ctx,
 		`SELECT source_message_id FROM messages WHERE id = ?`,
 		messageID,
 	).Scan(&sourceMessageID)
@@ -958,6 +1101,7 @@ func (s *Store) GetMessageSourceID(messageID int64) (string, error) {
 // RekeyMessageSourceID changes a provider-specific identifier only while it
 // still has the value observed by the caller.
 func (s *Store) RekeyMessageSourceID(
+	ctx context.Context,
 	messageID int64,
 	expectedSourceMessageID, newSourceMessageID string,
 ) (bool, error) {
@@ -981,10 +1125,10 @@ func (s *Store) RekeyMessageSourceID(
 		return nil
 	}
 	if s.syncGeneration == nil {
-		err := write(s.db)
+		err := write(boundQuerier{ctx: ctx, q: s.db})
 		return rekeyed, err
 	}
-	err := s.withTx(func(tx *loggedTx) error { return write(tx) })
+	err := s.withTxContext(ctx, func(tx *loggedTx) error { return write(boundQuerier{ctx: ctx, q: tx}) })
 	return rekeyed, err
 }
 
@@ -993,10 +1137,12 @@ func (s *Store) RekeyMessageSourceID(
 // This ensures future syncs recognize the message under its new
 // mailbox|uid key and don't re-download it.
 func (s *Store) UpdateMessageOnDedup(
+	ctx context.Context,
 	messageID int64, newSourceMessageID string,
 	labelIDs []int64,
 ) (bool, error) {
 	return s.updateMessageOnDedup(
+		ctx,
 		messageID, newSourceMessageID, labelIDs, true)
 }
 
@@ -1004,24 +1150,28 @@ func (s *Store) UpdateMessageOnDedup(
 // merges newly observed labels. It is used when the new ID is authoritative
 // but the scan did not observe every mailbox membership.
 func (s *Store) UpdateMessageOnPartialDedup(
+	ctx context.Context,
 	messageID int64, newSourceMessageID string,
 	labelIDs []int64,
 ) (bool, error) {
 	return s.updateMessageOnDedup(
+		ctx,
 		messageID, newSourceMessageID, labelIDs, false)
 }
 
 func (s *Store) updateMessageOnDedup(
+	ctx context.Context,
 	messageID int64, newSourceMessageID string,
 	labelIDs []int64, replaceLabels bool,
 ) (bool, error) {
 	var changed bool
-	err := s.withTx(func(tx *loggedTx) error {
-		if err := s.requireSyncMessageSourceTx(tx, messageID); err != nil {
+	err := s.withMessageAttributionTxContext(ctx, messageID, func(tx *loggedTx) error {
+		if err := s.requireSyncMessageSourceTx(boundQuerier{ctx: ctx, q: tx}, messageID); err != nil {
 			return err
 		}
 		var currentSourceMessageID string
-		if err := tx.QueryRow(
+		if err := tx.QueryRowContext(
+			ctx,
 			`SELECT source_message_id FROM messages WHERE id = ?`,
 			messageID,
 		).Scan(&currentSourceMessageID); err != nil {
@@ -1030,7 +1180,8 @@ func (s *Store) updateMessageOnDedup(
 
 		sourceIDChanged := currentSourceMessageID != newSourceMessageID
 		if sourceIDChanged {
-			if _, err := tx.Exec(
+			if _, err := tx.ExecContext(
+				ctx,
 				`UPDATE messages SET source_message_id = ?
 				 WHERE id = ?`,
 				newSourceMessageID, messageID,
@@ -1039,7 +1190,8 @@ func (s *Store) updateMessageOnDedup(
 			}
 		}
 
-		labelsChanged, err := s.reconcileMessageLabelsTx(
+		labelsChanged, err := s.reconcileMessageLabelsTxContext(
+			ctx,
 			tx, messageID, labelIDs, replaceLabels)
 		if err != nil {
 			return err
@@ -1056,16 +1208,17 @@ func (s *Store) updateMessageOnDedup(
 // MigrateSourceMessageID rewrites a legacy source_message_id to a new value
 // for one conversation. If the new ID already exists, dependents are repointed
 // and the legacy row is removed so future imports converge on the new key.
-func (s *Store) MigrateSourceMessageID(sourceID, conversationID int64, legacySourceMessageID, newSourceMessageID string) error {
+func (s *Store) MigrateSourceMessageID(ctx context.Context, sourceID, conversationID int64, legacySourceMessageID, newSourceMessageID string) error {
 	if legacySourceMessageID == "" || legacySourceMessageID == newSourceMessageID {
 		return nil
 	}
 	if err := s.requireSyncSource(sourceID); err != nil {
 		return err
 	}
-	return s.withTx(func(tx *loggedTx) error {
+	return s.withTxContext(ctx, func(tx *loggedTx) error {
 		var newID int64
-		err := tx.QueryRow(
+		err := tx.QueryRowContext(
+			ctx,
 			`SELECT id FROM messages WHERE source_id = ? AND source_message_id = ?`,
 			sourceID, newSourceMessageID,
 		).Scan(&newID)
@@ -1073,7 +1226,8 @@ func (s *Store) MigrateSourceMessageID(sourceID, conversationID int64, legacySou
 			return fmt.Errorf("find migrated message id: %w", err)
 		}
 		if err == nil {
-			if _, err = tx.Exec(
+			if _, err = tx.ExecContext(
+				ctx,
 				`UPDATE messages SET deleted_from_source_at = NULL WHERE id = ?`,
 				newID,
 			); err != nil {
@@ -1081,7 +1235,8 @@ func (s *Store) MigrateSourceMessageID(sourceID, conversationID int64, legacySou
 			}
 
 			var legacyID int64
-			legacyErr := tx.QueryRow(
+			legacyErr := tx.QueryRowContext(
+				ctx,
 				`SELECT id FROM messages
 				 WHERE source_id = ? AND conversation_id = ? AND source_message_id = ?`,
 				sourceID, conversationID, legacySourceMessageID,
@@ -1090,16 +1245,21 @@ func (s *Store) MigrateSourceMessageID(sourceID, conversationID int64, legacySou
 				return fmt.Errorf("find legacy message id: %w", legacyErr)
 			}
 			if legacyErr == nil {
-				if _, err = tx.Exec(
+				if _, err = tx.ExecContext(
+					ctx,
 					`UPDATE messages SET reply_to_message_id = ?
 					 WHERE reply_to_message_id = ?`,
 					newID, legacyID,
 				); err != nil {
 					return fmt.Errorf("repoint legacy replies: %w", err)
 				}
+				if err := s.copyLoopDecisionTx(ctx, tx, legacyID, newID); err != nil {
+					return fmt.Errorf("transfer legacy loop decision: %w", err)
+				}
 			}
 
-			_, err = tx.Exec(
+			_, err = tx.ExecContext(
+				ctx,
 				`DELETE FROM messages
 				 WHERE source_id = ? AND conversation_id = ? AND source_message_id = ?`,
 				sourceID, conversationID, legacySourceMessageID,
@@ -1110,7 +1270,8 @@ func (s *Store) MigrateSourceMessageID(sourceID, conversationID int64, legacySou
 			return nil
 		}
 
-		_, err = tx.Exec(
+		_, err = tx.ExecContext(
+			ctx,
 			`UPDATE messages
 			 SET source_message_id = ?, deleted_from_source_at = NULL
 			 WHERE source_id = ? AND conversation_id = ? AND source_message_id = ?`,
@@ -1127,12 +1288,17 @@ func (s *Store) MigrateSourceMessageID(sourceID, conversationID int64, legacySou
 // and have raw MIME data stored.
 // Returns a map of source_message_id -> internal message_id.
 func (s *Store) MessageExistsWithRawBatch(sourceID int64, sourceMessageIDs []string) (map[string]int64, error) {
+	return s.MessageExistsWithRawBatchContext(context.Background(), sourceID, sourceMessageIDs)
+}
+
+// MessageExistsWithRawBatchContext honors cancellation during MessageExistsWithRawBatch.
+func (s *Store) MessageExistsWithRawBatchContext(ctx context.Context, sourceID int64, sourceMessageIDs []string) (map[string]int64, error) {
 	if len(sourceMessageIDs) == 0 {
 		return make(map[string]int64), nil
 	}
 
 	result := make(map[string]int64)
-	err := queryInChunks(s.db, sourceMessageIDs, []any{sourceID},
+	err := queryInChunksContext(ctx, s.db, sourceMessageIDs, []any{sourceID},
 		`SELECT m.source_message_id, m.id
 		 FROM messages m
 		 JOIN message_raw mr ON mr.message_id = m.id
@@ -1155,7 +1321,7 @@ func (s *Store) MessageExistsWithRawBatch(sourceID int64, sourceMessageIDs []str
 // MessageMetadataWithRawBatch returns identity metadata for messages that
 // already have raw MIME stored.
 func (s *Store) MessageMetadataWithRawBatch(
-	sourceID int64,
+	ctx context.Context, sourceID int64,
 	sourceMessageIDs []string,
 ) (map[string]MessageWithRawMetadata, error) {
 	result := make(map[string]MessageWithRawMetadata)
@@ -1163,7 +1329,8 @@ func (s *Store) MessageMetadataWithRawBatch(
 		return result, nil
 	}
 
-	err := queryInChunks(
+	err := queryInChunksContext(
+		ctx,
 		s.db,
 		sourceMessageIDs,
 		[]any{sourceID},
@@ -1198,20 +1365,20 @@ func (s *Store) MessageMetadataWithRawBatch(
 // on every conversations UPDATE, so a per-message no-op upsert would requeue
 // the whole thread once per synced message — quadratic queue churn on a large
 // thread.
-func (s *Store) EnsureConversation(sourceID int64, sourceConversationID, title string) (int64, error) {
+func (s *Store) EnsureConversation(ctx context.Context, sourceID int64, sourceConversationID, title string) (int64, error) {
 	if err := s.requireSyncSource(sourceID); err != nil {
 		return 0, err
 	}
 	if s.syncGeneration != nil {
 		var id int64
-		err := s.withTx(func(tx *loggedTx) error {
+		err := s.withTxContext(ctx, func(tx *loggedTx) error {
 			var err error
-			id, err = ensureConversation(tx, s.dialect, sourceID, sourceConversationID, title)
+			id, err = ensureConversation(boundQuerier{ctx: ctx, q: tx}, s.dialect, sourceID, sourceConversationID, title)
 			return err
 		})
 		return id, err
 	}
-	return ensureConversation(s.db, s.dialect, sourceID, sourceConversationID, title)
+	return ensureConversation(boundQuerier{ctx: ctx, q: s.db}, s.dialect, sourceID, sourceConversationID, title)
 }
 
 func ensureConversation(
@@ -1263,12 +1430,12 @@ func upsertMessageSQL(now string) string {
 		reply_to_message_id,
 		is_from_me, source_is_from_me, identity_is_from_me,
 		subject, snippet, size_estimate,
-		has_attachments, attachment_count, archived_at, last_modified
+		has_attachments, attachment_count, archived_at, last_modified, is_sent
 	)
 	SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
 	       (source_is_from_me OR identity_is_from_me),
 	       source_is_from_me, identity_is_from_me,
-	       ?, ?, ?, ?, ?, %[1]s, %[1]s
+	       ?, ?, ?, ?, ?, %[1]s, %[1]s, COALESCE(CAST(? AS BOOLEAN), TRUE)
 	FROM attribution
 	WHERE TRUE
 	ON CONFLICT(source_id, source_message_id) DO UPDATE SET
@@ -1293,21 +1460,26 @@ func upsertMessageSQL(now string) string {
 		snippet = excluded.snippet,
 		size_estimate = excluded.size_estimate,
 		has_attachments = CASE WHEN ? THEN messages.has_attachments ELSE excluded.has_attachments END,
-		attachment_count = CASE WHEN ? THEN messages.attachment_count ELSE excluded.attachment_count END`, now)
+		attachment_count = CASE WHEN ? THEN messages.attachment_count ELSE excluded.attachment_count END,
+		is_sent = COALESCE(CAST(? AS BOOLEAN), messages.is_sent)`, now)
 }
 
 // UpsertMessage inserts or updates a message.
 // Existing nonempty RFC Message-IDs are preserved.
 func (s *Store) UpsertMessage(msg *Message) (int64, error) {
+	return s.UpsertMessageContext(context.Background(), msg)
+}
+
+// UpsertMessageContext honors cancellation during UpsertMessage.
+func (s *Store) UpsertMessageContext(ctx context.Context, msg *Message) (int64, error) {
 	if msg == nil {
 		return 0, errors.New("upsert message requires a message")
 	}
 	if err := s.requireSyncSource(msg.SourceID); err != nil {
 		return 0, err
 	}
-	ctx := context.Background()
 	var id int64
-	err := s.withTxContext(ctx, func(tx *loggedTx) error {
+	err := s.withAttributionTxContext(ctx, attributionLockForMessage(msg.SourceID, msg.MessageType), func(tx *loggedTx) error {
 		q := boundQuerier{ctx: ctx, q: tx}
 		if s.dialect.DriverName() != postgresDriverName {
 			// Reserve the writer before upsertMessageWith reads prior journal state.
@@ -1320,7 +1492,13 @@ func (s *Store) UpsertMessage(msg *Message) (int64, error) {
 		if err != nil {
 			return err
 		}
-		return s.refreshMeetingProjectionWith(ctx, tx, id)
+		if err := s.refreshMeetingProjectionWith(ctx, tx, id); err != nil {
+			return err
+		}
+		if err := s.refreshCalendarEventProjectionWith(ctx, tx, id); err != nil {
+			return err
+		}
+		return s.refreshAccountAttributionAfterWriteTx(ctx, tx, id, deliveryInput{})
 	})
 	return id, err
 }
@@ -1378,8 +1556,8 @@ func upsertMessageWith(q querier, d Dialect, msg *Message) (int64, error) {
 		msg.SentAt, msg.ReceivedAt, msg.InternalDate, msg.SenderID,
 		msg.ReplyToMessageID,
 		msg.Subject, msg.Snippet, msg.SizeEstimate,
-		msg.HasAttachments, msg.AttachmentCount,
-		msg.PreserveAttachmentStats, msg.PreserveAttachmentStats,
+		msg.HasAttachments, msg.AttachmentCount, msg.IsSent,
+		msg.PreserveAttachmentStats, msg.PreserveAttachmentStats, msg.IsSent,
 	}
 
 	// Use RETURNING to avoid an extra SELECT per message when supported.
@@ -1418,6 +1596,9 @@ func upsertMessageWith(q querier, d Dialect, msg *Message) (int64, error) {
 	// (which has already advanced an existing row) and with archives that still
 	// carry the old INSERT trigger during migration.
 	if err := enqueueActivityProjectionMessage(q, d, id); err != nil {
+		return 0, err
+	}
+	if err := enqueueChatMembers(q, msg.ConversationID); err != nil {
 		return 0, err
 	}
 	if journalCandidate && !prior.found && d.DriverName() != postgresDriverName {
@@ -1512,6 +1693,14 @@ func nullTimeEqual(left, right sql.NullTime) bool {
 	return left.Valid == right.Valid && (!left.Valid || left.Time.Equal(right.Time))
 }
 
+func requeueActivityProjectionSQL(selectIDs string) string {
+	return `INSERT INTO activity_projection_queue (message_id, revision, queued_at)
+		` + selectIDs + `
+		ON CONFLICT(message_id) DO UPDATE SET
+			revision = activity_projection_queue.revision + 1,
+			queued_at = CURRENT_TIMESTAMP`
+}
+
 func enqueueActivityProjectionMessage(q querier, d Dialect, messageID int64) error {
 	statement := d.InsertOrIgnore(`
 		INSERT OR IGNORE INTO activity_projection_queue
@@ -1525,16 +1714,29 @@ func enqueueActivityProjectionMessage(q querier, d Dialect, messageID int64) err
 
 // UpsertMessageBody stores the body text and HTML for a message in the separate message_bodies table.
 func (s *Store) UpsertMessageBody(messageID int64, bodyText, bodyHTML sql.NullString) error {
-	if s.syncGeneration != nil {
-		return s.withTx(func(tx *loggedTx) error {
-			if err := s.requireSyncMessageSourceTx(tx, messageID); err != nil {
+	return s.UpsertMessageBodyContext(context.Background(), messageID, bodyText, bodyHTML)
+}
+
+// UpsertMessageBodyContext honors cancellation during UpsertMessageBody. The
+// body write and its search and embedding invalidation commit together, so a
+// cancelled call cannot leave a new body marked as already embedded.
+func (s *Store) UpsertMessageBodyContext(ctx context.Context, messageID int64, bodyText, bodyHTML sql.NullString) error {
+	return s.withTxContext(ctx, func(tx *loggedTx) error {
+		// Lock before reading the prior body: SQLite cannot upgrade a deferred
+		// WAL reader after another commit, and on PostgreSQL a concurrent
+		// message write could change the body between this comparison and
+		// the write, leaving the search document stale.
+		if err := s.lockMeetingEvidenceWith(ctx, tx, messageID); err != nil {
+			return fmt.Errorf("lock message body write: %w", err)
+		}
+		q := boundQuerier{ctx: ctx, q: tx}
+		if s.syncGeneration != nil {
+			if err := s.requireSyncMessageSourceTx(q, messageID); err != nil {
 				return err
 			}
-			return upsertMessageBody(tx, s.dialect, s.fts5Available,
-				messageID, bodyText, bodyHTML)
-		})
-	}
-	return upsertMessageBody(s.db, s.dialect, s.fts5Available, messageID, bodyText, bodyHTML)
+		}
+		return upsertMessageBody(q, s.dialect, s.fts5Available, messageID, bodyText, bodyHTML)
+	})
 }
 
 func upsertMessageBody(
@@ -1549,8 +1751,7 @@ func upsertMessageBody(
 		return err
 	}
 	if textChanged && ftsAvailable {
-		// Invalidate first. UpsertMessageBody is also used outside a wider
-		// transaction; if the body write then fails, a missing index entry is
+		// Invalidate before the body write: a missing index entry is
 		// recoverable by backfill, while a stale entry could produce a false hit.
 		if err := dialect.InvalidateFTSForMessage(q, messageID); err != nil {
 			return fmt.Errorf("invalidate message FTS document: %w", err)
@@ -1565,6 +1766,11 @@ func upsertMessageBody(
 	`, messageID, bodyText, bodyHTML)
 	if err != nil {
 		return err
+	}
+	hiddenTextPresent := bodyHTML.Valid && mime.HTMLHasHiddenText(bodyHTML.String)
+	if _, err := q.Exec(`UPDATE messages SET hidden_text_present = ? WHERE id = ? AND hidden_text_present <> ?`,
+		hiddenTextPresent, messageID, hiddenTextPresent); err != nil {
+		return fmt.Errorf("update message hidden text flag: %w", err)
 	}
 	if !embeddingChanged {
 		return nil
@@ -1659,6 +1865,21 @@ func (s *Store) GetMessageRawContext(ctx context.Context, messageID int64) ([]by
 	return decodeMessageRaw(compressed, compression)
 }
 
+// GetMessageRawsContext decodes each selected raw message once; missing or invalid data is omitted.
+func (s *Store) GetMessageRawsContext(ctx context.Context, ids []int64) (map[int64][]byte, error) {
+	result := make(map[int64][]byte, len(ids))
+	err := s.StreamMessageRawContext(ctx, ids, func(id int64, compressed []byte, compression string) {
+		raw, err := decodeMessageRaw(compressed, sql.NullString{String: compression, Valid: compression != ""})
+		if err == nil {
+			result[id] = raw
+		}
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
 // GetMessageBodyAndRawContext reads one message's body and MIME in the same
 // snapshot, so callers can authorize the sender of the content they return.
 func (s *Store) GetMessageBodyAndRawContext(ctx context.Context, messageID int64) (string, []byte, error) {
@@ -1679,9 +1900,9 @@ func (s *Store) GetMessageBodyAndRawContext(ctx context.Context, messageID int64
 
 // GetMessageBodyText returns the archived plain-text body for one message.
 // A message without a body returns an empty string.
-func (s *Store) GetMessageBodyText(messageID int64) (string, error) {
+func (s *Store) GetMessageBodyText(ctx context.Context, messageID int64) (string, error) {
 	var body sql.NullString
-	err := s.db.QueryRow(`
+	err := s.db.QueryRowContext(ctx, `
 		SELECT body_text FROM message_bodies WHERE message_id = ?
 	`, messageID).Scan(&body)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -1713,9 +1934,9 @@ func decodeMessageRaw(compressed []byte, compression sql.NullString) ([]byte, er
 }
 
 // GetMessageIsFromMe returns the baked account-attribution flag for a message.
-func (s *Store) GetMessageIsFromMe(messageID int64) (bool, error) {
+func (s *Store) GetMessageIsFromMe(ctx context.Context, messageID int64) (bool, error) {
 	var isFromMe bool
-	err := s.db.QueryRow(`
+	err := s.db.QueryRowContext(ctx, `
 		SELECT COALESCE(is_from_me, FALSE)
 		FROM messages
 		WHERE id = ?
@@ -1762,6 +1983,8 @@ func senderOwnerFallback(senderExpr, sourceExpr string) string {
 	)`
 }
 
+const usableFromEnvelope = `mr.recipient_type = 'from' AND mr.email_address IS NOT NULL AND TRIM(mr.email_address) <> ''`
+
 // messageIdentityAttributionMatch derives identity_is_from_me for one
 // messages row. A non-empty 'from' envelope snapshot is authoritative: the
 // sender's current participant aliases cannot reclassify that message after a
@@ -1783,9 +2006,7 @@ var messageIdentityAttributionMatch = fmt.Sprintf(`(
 	    SELECT 1
 	    FROM message_recipients mr
 	    WHERE mr.message_id = messages.id
-	      AND mr.recipient_type = 'from'
-	      AND mr.email_address IS NOT NULL
-	      AND TRIM(mr.email_address) <> ''
+	      AND `+usableFromEnvelope+`
 	  )
 	  AND (%s)
 	)
@@ -1793,29 +2014,25 @@ var messageIdentityAttributionMatch = fmt.Sprintf(`(
 
 const messageSourceAttribution = `COALESCE(source_is_from_me, FALSE)`
 
+// The scope predicate selects the rows; every refresh applies the same ownership rules.
+var messageAttributionUpdate = fmt.Sprintf(`
+	UPDATE messages
+	SET identity_is_from_me = %[2]s,
+	    is_from_me = (%[1]s OR %[2]s)
+	WHERE %%s
+	  AND (
+	    identity_is_from_me <> %[2]s
+	    OR is_from_me IS NULL
+	    OR is_from_me <> (%[1]s OR %[2]s)
+	  )
+`, messageSourceAttribution, messageIdentityAttributionMatch)
+
 func refreshSourceMessageAttributionContext(
 	ctx context.Context,
 	q contextQuerier,
 	sourceID int64,
-	excludeSourceMessageID string,
 ) error {
-	// InitSchema assigns source provenance to every legacy row once. Runtime
-	// identity changes therefore only need to update the derived and effective
-	// values, and the change predicate avoids firing last_modified triggers for
-	// messages whose attribution already agrees with the current identity set.
-	_, err := q.ExecContext(ctx, fmt.Sprintf(`
-		UPDATE messages
-		SET identity_is_from_me = %[2]s,
-		    is_from_me = (%[1]s OR %[2]s)
-		WHERE source_id = ?
-		  AND (? = '' OR source_message_id <> ?)
-		  AND (
-		    identity_is_from_me <> %[2]s
-		    OR is_from_me IS NULL
-		    OR is_from_me <> (%[1]s OR %[2]s)
-		  )
-	`, messageSourceAttribution, messageIdentityAttributionMatch),
-		sourceID, excludeSourceMessageID, excludeSourceMessageID)
+	_, err := q.ExecContext(ctx, fmt.Sprintf(messageAttributionUpdate, `source_id = ?`), sourceID)
 	if err != nil {
 		return fmt.Errorf("refresh source message attribution: %w", err)
 	}
@@ -1842,19 +2059,66 @@ func refreshParticipantMessageAttributionContext(
 	for i, participantID := range ids {
 		args[i] = participantID
 	}
-	_, err := q.ExecContext(ctx, fmt.Sprintf(`
-		UPDATE messages
-		SET identity_is_from_me = %[2]s,
-		    is_from_me = (%[1]s OR %[2]s)
-		WHERE sender_id IN (`+placeholders+`)
-		  AND (
-		    identity_is_from_me <> %[2]s
-		    OR is_from_me IS NULL
-		    OR is_from_me <> (%[1]s OR %[2]s)
-		  )
-	`, messageSourceAttribution, messageIdentityAttributionMatch), args...)
+	_, err := q.ExecContext(ctx, fmt.Sprintf(messageAttributionUpdate, `sender_id IN (`+placeholders+`)`), args...)
 	if err != nil {
 		return fmt.Errorf("refresh participant message attribution: %w", err)
+	}
+	return nil
+}
+
+const identityEnvelopeSelection = `
+	SELECT mr.message_id FROM message_recipients mr CROSS JOIN messages m
+	WHERE m.id = mr.message_id AND m.source_id = ?
+	  AND mr.recipient_type = 'from' AND LOWER(mr.email_address) IN (%s)
+`
+
+// Unary plus keeps SQLite on the sender index without statistics or with large chunks.
+const identitySenderSelection = `
+	SELECT m.id FROM messages m
+	WHERE +m.source_id = ? AND m.sender_id IN (%s)
+	  AND NOT EXISTS (
+	      SELECT 1 FROM message_recipients mr
+	      WHERE mr.message_id = m.id
+	        AND ` + usableFromEnvelope + `
+	  )
+`
+
+// Only changed addresses affect envelopes and legacy senders; other messages keep their attribution.
+func refreshIdentityMessageAttributionContext(
+	ctx context.Context,
+	tx *loggedTx,
+	sourceID int64,
+	addresses []string,
+	excludeSourceMessageID string,
+) error {
+	messageIDs := make(map[int64]struct{})
+	scanID := func(rows *loggedRows) error {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return err
+		}
+		messageIDs[id] = struct{}{}
+		return nil
+	}
+	// Database case folding must match messageIdentityAttributionMatch.
+	if err := queryInChunksWithValueExprContext(ctx, tx, addresses, []any{sourceID}, identityEnvelopeSelection, "LOWER(?)", scanID); err != nil {
+		return fmt.Errorf("resolve identity envelope messages: %w", err)
+	}
+	participants, err := participantIDsForAddressesContext(ctx, tx, addresses)
+	if err != nil {
+		return err
+	}
+	if err := queryInChunksContext(ctx, tx, participants, []any{sourceID}, identitySenderSelection, scanID); err != nil {
+		return fmt.Errorf("resolve legacy identity sender messages: %w", err)
+	}
+	ids := make([]int64, 0, len(messageIDs))
+	for id := range messageIDs {
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+	update := fmt.Sprintf(messageAttributionUpdate, `(? = '' OR source_message_id <> ?) AND id IN (%s)`)
+	if err := execInChunksContext(ctx, tx, ids, []any{excludeSourceMessageID, excludeSourceMessageID}, update); err != nil {
+		return fmt.Errorf("refresh identity message attribution: %w", err)
 	}
 	return nil
 }
@@ -1869,17 +2133,7 @@ func refreshParticipantMessageAttributionContext(
 // The change guard keeps the common agreeing case write-free, so it fires no
 // last_modified triggers.
 func refreshMessageAttributionWith(q querier, messageID int64) error {
-	_, err := q.Exec(fmt.Sprintf(`
-		UPDATE messages
-		SET identity_is_from_me = %[2]s,
-		    is_from_me = (%[1]s OR %[2]s)
-		WHERE id = ?
-		  AND (
-		    identity_is_from_me <> %[2]s
-		    OR is_from_me IS NULL
-		    OR is_from_me <> (%[1]s OR %[2]s)
-		  )
-	`, messageSourceAttribution, messageIdentityAttributionMatch), messageID)
+	_, err := q.Exec(fmt.Sprintf(messageAttributionUpdate, `id = ?`), messageID)
 	if err != nil {
 		return fmt.Errorf("refresh message attribution: %w", err)
 	}
@@ -1901,9 +2155,32 @@ func (s *Store) PersistMessageContext(ctx context.Context, data *MessagePersistD
 	if data == nil || data.Message == nil {
 		return 0, errors.New("persist message requires a message")
 	}
-	return s.persistMessageWithParticipantsContext(ctx, nil, func([]int64) *MessagePersistData {
-		return data
-	})
+	return s.persistMessageWithParticipantsTransaction(
+		ctx, attributionLockForMessage(data.Message.SourceID, data.Message.MessageType),
+		nil, nil, func([]int64) *MessagePersistData { return data }, nil,
+		func(ctx context.Context, tx *loggedTx, data *MessagePersistData, id int64) error {
+			q := boundQuerier{ctx: ctx, q: tx}
+			if data.MIMEAttachmentReplacement != nil {
+				if err := s.persistAttachmentSnapshotWith(q, id, data.MIMEAttachmentReplacement); err != nil {
+					return err
+				}
+			}
+			if data.Edited {
+				return setMessageEditedStateWith(q, id, true)
+			}
+			return nil
+		},
+	)
+}
+
+func (s *Store) persistAttachmentSnapshotWith(q querier, messageID int64, replacement *[]AttachmentWrite) error {
+	if err := s.replaceMIMEAttachmentsWith(q, messageID, replacement); err != nil {
+		return fmt.Errorf("persist attachments: %w", err)
+	}
+	if err := recomputeMessageAttachmentStatsWith(q, messageID); err != nil {
+		return fmt.Errorf("recompute attachment stats: %w", err)
+	}
+	return nil
 }
 
 // PersistMessageWithParticipantsContext resolves participants and persists the
@@ -1917,7 +2194,9 @@ func (s *Store) PersistMessageWithParticipantsContext(
 	if build == nil {
 		return 0, errors.New("persist message requires a participant builder")
 	}
-	return s.persistMessageWithParticipantsContext(ctx, participants, build)
+	// The source is known only after build runs, so this entry locks none.
+	// Meeting archives are the only caller and meeting rows are not derived.
+	return s.persistMessageWithParticipantsTransaction(ctx, attributionLock{}, nil, participants, build, nil, nil)
 }
 
 // PersistRepairMessageWithParticipantsContext atomically replaces one
@@ -1969,6 +2248,7 @@ func (s *Store) PersistRepairMessageWithParticipantsContext(
 		}
 		labelIDs, err := ensureMessageLabelRefsWith(
 			boundQuerier{ctx: ctx, q: tx}, expected.SourceID, data.LabelRefs,
+			labelFlipsTx(ctx, tx, expected.SourceID),
 		)
 		if err != nil {
 			return nil, fmt.Errorf("resolve repair message labels: %w", err)
@@ -1991,16 +2271,11 @@ func (s *Store) PersistRepairMessageWithParticipantsContext(
 			data.Message.RFC822MessageID, messageID); err != nil {
 			return fmt.Errorf("replace repair message RFC Message-ID: %w", err)
 		}
-		if err := s.replaceMIMEAttachmentsWith(q, messageID, data.MIMEAttachmentReplacement); err != nil {
-			return fmt.Errorf("replace repair message attachments: %w", err)
-		}
-		if err := recomputeMessageAttachmentStatsWith(q, messageID); err != nil {
-			return fmt.Errorf("recompute repair message attachment stats: %w", err)
-		}
-		return nil
+		return s.persistAttachmentSnapshotWith(q, messageID, data.MIMEAttachmentReplacement)
 	}
 	messageID, err := s.persistMessageWithParticipantsTransaction(
-		ctx, beforeParticipants, participants, build, prepare, afterPersist,
+		ctx, attributionLock{Sources: []int64{expected.SourceID}},
+		beforeParticipants, participants, build, prepare, afterPersist,
 	)
 	if err != nil {
 		return 0, err
@@ -2008,28 +2283,30 @@ func (s *Store) PersistRepairMessageWithParticipantsContext(
 	return messageID, nil
 }
 
-func (s *Store) persistMessageWithParticipantsContext(
-	ctx context.Context,
-	participants []ParticipantPersistData,
-	build func(participantIDs []int64) *MessagePersistData,
-) (int64, error) {
-	return s.persistMessageWithParticipantsTransaction(ctx, nil, participants, build, nil, nil)
-}
-
 type messagePersistBeforeParticipants func(context.Context, *loggedTx) error
 type messagePersistPrepare func(context.Context, *loggedTx, *MessagePersistData) (*MessagePersistData, error)
 type messagePersistAfter func(context.Context, *loggedTx, *MessagePersistData, int64) error
 
+// persistMessageWithParticipantsTransaction opens the persist transaction
+// through the attribution entry. lock names what the caller already knows
+// before the transaction; phone participants need the exclusive identity lock.
 func (s *Store) persistMessageWithParticipantsTransaction(
 	ctx context.Context,
+	lock attributionLock,
 	beforeParticipants messagePersistBeforeParticipants,
 	participants []ParticipantPersistData,
 	build func(participantIDs []int64) *MessagePersistData,
 	prepare messagePersistPrepare,
 	afterPersist messagePersistAfter,
 ) (int64, error) {
+	for _, participant := range participants {
+		if participant.EmailAddress == "" && participant.PhoneNumber != "" {
+			lock = attributionLock{Exclusive: true}
+			break
+		}
+	}
 	var messageID int64
-	err := s.withTxContext(ctx, func(tx *loggedTx) error {
+	err := s.withAttributionTxContext(ctx, lock, func(tx *loggedTx) error {
 		var err error
 		messageID, err = s.persistMessageWithParticipantsTx(
 			ctx, tx, beforeParticipants, participants, build, prepare, afterPersist,
@@ -2148,6 +2425,11 @@ func (s *Store) persistMessageWithParticipantsTx(
 	if err != nil {
 		return 0, err
 	}
+	if data.SyncRunItem != nil {
+		if err := s.recordSyncRunItemWith(ctx, tx, *data.SyncRunItem); err != nil {
+			return 0, err
+		}
+	}
 	if afterPersist != nil {
 		if err := afterPersist(ctx, tx, data, id); err != nil {
 			return 0, err
@@ -2226,6 +2508,14 @@ func (s *Store) persistMessageWith(
 		if err := upsertMessageRawWithFormat(q, messageID, data.RawMIME, rawFormat); err != nil {
 			return 0, fmt.Errorf("upsert raw: %w", err)
 		}
+		// Only email has linkage, so other message types skip the refresh's lookups.
+		if IsEmailMessageType(message.MessageType) {
+			input := emailLinkageForRaw(rawFormat, data.RawMIME)
+			input.emailChecked = true
+			if _, err := s.refreshEmailLinkageTx(ctx, tx, messageID, input); err != nil {
+				return 0, fmt.Errorf("refresh email linkage: %w", err)
+			}
+		}
 	}
 
 	for _, rs := range data.Recipients {
@@ -2245,11 +2535,26 @@ func (s *Store) persistMessageWith(
 	if err := s.refreshMeetingProjectionWith(ctx, tx, messageID); err != nil {
 		return 0, err
 	}
+	if err := s.refreshCalendarEventProjectionWith(ctx, tx, messageID); err != nil {
+		return 0, err
+	}
 
 	if !data.PreserveLabels {
 		if err := replaceMessageLabelsTx(q, messageID, data.LabelIDs); err != nil {
 			return 0, fmt.Errorf("store labels: %w", err)
 		}
+	}
+	delivery := deliveryInput{}
+	switch {
+	case len(data.RawMIME) > 0 && (data.RawFormat == "" || data.RawFormat == "mime"):
+		delivery = deliveryFromMIME(data.RawMIME)
+	case len(data.RawMIME) > 0:
+		// A non-MIME payload replaced any stored MIME, so its delivery
+		// evidence is gone.
+		delivery = deliveryInput{parsed: &emailattribution.Headers{}}
+	}
+	if err := s.refreshAccountAttributionAfterWriteTx(ctx, tx, messageID, delivery); err != nil {
+		return 0, err
 	}
 	if data.FTS != nil && s.fts5Available {
 		fts := *data.FTS
@@ -2333,6 +2638,12 @@ func ensureParticipantWith(
 	domain string,
 	onInsert func() error,
 ) (int64, error) {
+	// Keep the resolved parent alive until message persistence commits,
+	// without blocking the foreign-key checks of a concurrent chat refresh.
+	lockClause := ""
+	if dialect.DriverName() == postgresDriverName {
+		lockClause = " FOR KEY SHARE"
+	}
 	// ON CONFLICT must mirror the partial unique index on
 	// participants(email_address) WHERE email_address IS NOT NULL — both
 	// PG and SQLite require the WHERE clause on the conflict target to
@@ -2359,7 +2670,7 @@ func ensureParticipantWith(
 		}
 		var id int64
 		err = q.QueryRow(
-			`SELECT id FROM participants WHERE email_address = ?`+dialect.SelectForUpdate(),
+			`SELECT id FROM participants WHERE email_address = ?`+lockClause,
 			email,
 		).Scan(&id)
 		if err == nil {
@@ -2378,7 +2689,7 @@ func ensureParticipantWith(
 
 // EnsureParticipantsBatch gets or creates participants in batch.
 // Returns a map of email -> participant ID.
-func (s *Store) EnsureParticipantsBatch(addresses []mime.Address) (map[string]int64, error) {
+func (s *Store) EnsureParticipantsBatch(ctx context.Context, addresses []mime.Address) (map[string]int64, error) {
 	if len(addresses) == 0 {
 		return make(map[string]int64), nil
 	}
@@ -2402,9 +2713,9 @@ func (s *Store) EnsureParticipantsBatch(addresses []mime.Address) (map[string]in
 	}
 	sort.Strings(emails)
 
-	err := s.withTx(func(tx *loggedTx) error {
+	err := s.withTxContext(ctx, func(tx *loggedTx) error {
 		if err := s.lockParticipantDirectoryMutationTxContext(
-			context.Background(), tx,
+			ctx, tx,
 		); err != nil {
 			return err
 		}
@@ -2412,7 +2723,7 @@ func (s *Store) EnsureParticipantsBatch(addresses []mime.Address) (map[string]in
 		for _, email := range emails {
 			addr := unique[email]
 			id, err := ensureParticipantWith(
-				tx, s.dialect, addr.Email, addr.Name, addr.Domain,
+				boundQuerier{ctx: ctx, q: tx}, s.dialect, addr.Email, addr.Name, addr.Domain,
 				func() error {
 					inserted = true
 					return nil
@@ -2424,7 +2735,7 @@ func (s *Store) EnsureParticipantsBatch(addresses []mime.Address) (map[string]in
 			result[email] = id
 		}
 		if inserted {
-			return s.bumpParticipantDisplayNameRevision(tx)
+			return s.bumpParticipantDisplayNameRevisionContext(ctx, tx)
 		}
 		return nil
 	})
@@ -2436,27 +2747,35 @@ func (s *Store) EnsureParticipantsBatch(addresses []mime.Address) (map[string]in
 
 // ReplaceMessageRecipients replaces all recipients for a message atomically.
 func (s *Store) ReplaceMessageRecipients(messageID int64, recipientType string, participantIDs []int64, displayNames []string) error {
-	return s.withTx(func(tx *loggedTx) error {
-		if err := s.lockMessageForRecipientWrite(tx, messageID); err != nil {
+	return s.ReplaceMessageRecipientsContext(context.Background(), messageID, recipientType, participantIDs, displayNames)
+}
+
+// ReplaceMessageRecipientsContext honors cancellation during ReplaceMessageRecipients.
+func (s *Store) ReplaceMessageRecipientsContext(ctx context.Context, messageID int64, recipientType string, participantIDs []int64, displayNames []string) error {
+	return s.withMessageAttributionTxContext(ctx, messageID, func(tx *loggedTx) error {
+		if err := s.lockMessageForRecipientWrite(boundQuerier{ctx: ctx, q: tx}, messageID); err != nil {
 			return err
 		}
-		if err := s.requireSyncMessageSourceTx(tx, messageID); err != nil {
+		if err := s.requireSyncMessageSourceTx(boundQuerier{ctx: ctx, q: tx}, messageID); err != nil {
 			return err
 		}
-		if err := replaceMessageRecipientsTx(tx, messageID, RecipientSet{
+		if err := replaceMessageRecipientsTx(boundQuerier{ctx: ctx, q: tx}, messageID, RecipientSet{
 			Type:           recipientType,
 			ParticipantIDs: participantIDs,
 			DisplayNames:   displayNames,
 		}); err != nil {
 			return err
 		}
-		if recipientType != "from" {
-			return nil
+		if recipientType == "from" {
+			// 'from' rows are attribution input: the message upsert's CTE could not
+			// see the envelope rows this call just replaced, and importers on this
+			// granular path never reach persistMessageWith's final recompute.
+			if err := refreshMessageAttributionWith(boundQuerier{ctx: ctx, q: tx}, messageID); err != nil {
+				return err
+			}
 		}
-		// 'from' rows are attribution input: the message upsert's CTE could not
-		// see the envelope rows this call just replaced, and importers on this
-		// granular path never reach persistMessageWith's final recompute.
-		return refreshMessageAttributionWith(tx, messageID)
+		_, err := s.refreshAccountAttributionTx(ctx, tx, messageID, deliveryInput{})
+		return err
 	})
 }
 
@@ -2486,7 +2805,35 @@ func replaceMessageRecipientsTx(tx querier, messageID int64, rs RecipientSet) er
 	if len(rs.ParticipantIDs) == 0 {
 		return nil
 	}
+	if err := enqueueChatMembersForMessage(tx, messageID); err != nil {
+		return err
+	}
 
+	recipients := normalizedMessageRecipients(rs)
+
+	return insertInChunks(tx, chunkInsert{
+		totalRows:    len(recipients),
+		valuesPerRow: 5,
+		prefix:       "INSERT INTO message_recipients (message_id, participant_id, recipient_type, display_name, email_address) VALUES ",
+	}, func(start, end int) ([]string, []any) {
+		values := make([]string, end-start)
+		args := make([]any, 0, (end-start)*5)
+		for i := start; i < end; i++ {
+			values[i-start] = "(?, ?, ?, ?, ?)"
+			row := recipients[i]
+			args = append(args, messageID, row.participantID, rs.Type, row.displayName, nullIfEmpty(row.email))
+		}
+		return values, args
+	})
+}
+
+type messageRecipientRow struct {
+	participantID int64
+	displayName   string
+	email         string
+}
+
+func normalizedMessageRecipients(rs RecipientSet) []messageRecipientRow {
 	// Collapse duplicates within this set. The table holds at most one row
 	// per (message_id, participant_id, recipient_type, normalized envelope
 	// address) — idx_message_recipients_envelope — so an exact repeat in one
@@ -2499,9 +2846,7 @@ func replaceMessageRecipientsTx(tx querier, messageID int64, rs RecipientSet) er
 		email         string
 	}
 	seen := make(map[recipientRowKey]struct{}, len(rs.ParticipantIDs))
-	ids := make([]int64, 0, len(rs.ParticipantIDs))
-	names := make([]string, 0, len(rs.ParticipantIDs))
-	emails := make([]string, 0, len(rs.ParticipantIDs))
+	rows := make([]messageRecipientRow, 0, len(rs.ParticipantIDs))
 	for i, pid := range rs.ParticipantIDs {
 		email := ""
 		if i < len(rs.EmailAddresses) {
@@ -2512,28 +2857,47 @@ func replaceMessageRecipientsTx(tx querier, messageID int64, rs RecipientSet) er
 			continue
 		}
 		seen[key] = struct{}{}
-		ids = append(ids, pid)
 		name := ""
 		if i < len(rs.DisplayNames) {
 			name = rs.DisplayNames[i]
 		}
-		names = append(names, name)
-		emails = append(emails, email)
+		rows = append(rows, messageRecipientRow{pid, name, email})
 	}
 
-	return insertInChunks(tx, chunkInsert{
-		totalRows:    len(ids),
-		valuesPerRow: 5,
-		prefix:       "INSERT INTO message_recipients (message_id, participant_id, recipient_type, display_name, email_address) VALUES ",
-	}, func(start, end int) ([]string, []any) {
-		values := make([]string, end-start)
-		args := make([]any, 0, (end-start)*5)
-		for i := start; i < end; i++ {
-			values[i-start] = "(?, ?, ?, ?, ?)"
-			args = append(args, messageID, ids[i], rs.Type, names[i], nullIfEmpty(emails[i]))
+	return rows
+}
+
+// MessageRecipientsMatchContext compares the snapshots replaced by the supplied roles.
+func (s *Store) MessageRecipientsMatchContext(ctx context.Context, messageID int64, sets []RecipientSet) (bool, error) {
+	want := make(map[string][]messageRecipientRow, len(sets))
+	for _, set := range sets {
+		want[set.Type] = normalizedMessageRecipients(set)
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT recipient_type, participant_id, COALESCE(display_name, ''), COALESCE(email_address, '') FROM message_recipients WHERE message_id = ? ORDER BY id`, messageID)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = rows.Close() }()
+	got := make(map[string][]messageRecipientRow, len(want))
+	for rows.Next() {
+		var role string
+		var row messageRecipientRow
+		if err := rows.Scan(&role, &row.participantID, &row.displayName, &row.email); err != nil {
+			return false, err
 		}
-		return values, args
-	})
+		if _, supplied := want[role]; supplied {
+			got[role] = append(got[role], row)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	for role, expected := range want {
+		if !slices.Equal(got[role], expected) {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // Label represents a Gmail label.
@@ -2550,18 +2914,26 @@ type Label struct {
 // represents sent mail. It is deliberately independent of the display name.
 const LabelSystemRoleSent = "sent"
 
+// LabelSystemRoleDrafts identifies a label whose provider metadata confirms it
+// holds unsent drafts.
+const LabelSystemRoleDrafts = "drafts"
+
 // EnsureLabel gets or creates a label, handling renames and ID changes.
 // For batch operations prefer EnsureLabelsBatch which runs in a single
 // transaction.
 func (s *Store) EnsureLabel(
+	ctx context.Context,
 	sourceID int64,
 	sourceLabelID, name, labelType string,
 ) (int64, error) {
 	var id int64
-	err := s.withTx(func(tx *loggedTx) error {
+	err := s.withAttributionTxContext(ctx, attributionLock{Sources: []int64{sourceID}}, func(tx *loggedTx) error {
+		if err := labelFlipsTx(ctx, tx, sourceID).captureLabels([]string{sourceLabelID}, []string{name}); err != nil {
+			return err
+		}
 		var txErr error
 		id, txErr = ensureLabelWith(
-			tx, sourceID, sourceLabelID, name, labelType, nil,
+			boundQuerier{ctx: ctx, q: tx}, sourceID, sourceLabelID, name, labelType, nil,
 		)
 		return txErr
 	})
@@ -2584,6 +2956,9 @@ func ensureLabelWith(
 	sourceLabelID, name, labelType string,
 	systemRole *string,
 ) (int64, error) {
+	if err := preserveArchivedLabelName(q, sourceID, name); err != nil {
+		return 0, err
+	}
 	// Look up by canonical identifier (Gmail label ID).
 	var id int64
 	var existingName string
@@ -2674,6 +3049,37 @@ func ensureLabelWith(
 	return id, nil
 }
 
+// preserveArchivedLabelName keeps merged role evidence separate when a live
+// provider creates or renames a label to the same name. The marker, not the
+// generated name, prevents later provider snapshots from adopting the row.
+func preserveArchivedLabelName(q querier, sourceID int64, name string) error {
+	var id int64
+	err := q.QueryRow(`SELECT l.id FROM labels l
+ WHERE l.source_id = ? AND l.name = ?
+ AND EXISTS (SELECT 1 FROM source_merge_preserved_labels p WHERE p.label_id = l.id)`, sourceID, name).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("find archived label name: %w", err)
+	}
+	archiveName := fmt.Sprintf("msgvault-archive:%d:label:%d", sourceID, id)
+	for {
+		var used bool
+		if err := q.QueryRow(`SELECT EXISTS(SELECT 1 FROM labels WHERE source_id = ? AND name = ?)`, sourceID, archiveName).Scan(&used); err != nil {
+			return fmt.Errorf("check archived label name: %w", err)
+		}
+		if !used {
+			break
+		}
+		archiveName += ":archive"
+	}
+	if _, err := q.Exec(`UPDATE labels SET name = ? WHERE id = ?`, archiveName, id); err != nil {
+		return fmt.Errorf("preserve archived label name: %w", err)
+	}
+	return nil
+}
+
 func labelSystemRoleValue(systemRole string) any {
 	if systemRole == "" {
 		return nil
@@ -2753,12 +3159,13 @@ func IsSystemLabel(sourceLabelID string) bool {
 // a two-phase rename to handle cross-renames safely (e.g. L1:Foo→Bar
 // and L2:Bar→Foo in the same batch).
 func (s *Store) EnsureLabelsBatch(
+	ctx context.Context,
 	sourceID int64, labels map[string]LabelInfo,
 ) (map[string]int64, error) {
 	var result map[string]int64
-	err := s.withTx(func(tx *loggedTx) error {
+	err := s.withAttributionTxContext(ctx, attributionLock{Sources: []int64{sourceID}}, func(tx *loggedTx) error {
 		var err error
-		result, err = ensureLabelsBatchWith(tx, sourceID, labels)
+		result, err = ensureLabelsBatchWith(boundQuerier{ctx: ctx, q: tx}, sourceID, labels, labelFlipsTx(ctx, tx, sourceID))
 		return err
 	})
 	if err != nil {
@@ -2767,9 +3174,20 @@ func (s *Store) EnsureLabelsBatch(
 	return result, nil
 }
 
+// ensureLabelsBatchWith captures the outbound evidence of every label it can
+// touch into flips, which the attribution entry applies before commit.
 func ensureLabelsBatchWith(
-	q querier, sourceID int64, labels map[string]LabelInfo,
+	q querier, sourceID int64, labels map[string]LabelInfo, flips *labelOutboundFlips,
 ) (map[string]int64, error) {
+	sourceLabelIDs := make([]string, 0, len(labels))
+	names := make([]string, 0, len(labels))
+	for sourceLabelID, info := range labels {
+		sourceLabelIDs = append(sourceLabelIDs, sourceLabelID)
+		names = append(names, info.Name)
+	}
+	if err := flips.captureLabels(sourceLabelIDs, names); err != nil {
+		return nil, err
+	}
 	result := make(map[string]int64, len(labels))
 	// Phase 1: Move all renamed labels to temporary names so that cross-renames
 	// do not merge labels that are both present in this snapshot.
@@ -2793,7 +3211,8 @@ func ensureLabelsBatchWith(
 	}
 
 	// Phase 2: Apply final descriptors. Any remaining name conflict belongs to
-	// a label outside this snapshot and is safe for ensureLabelWith to merge.
+	// a label outside this snapshot. ensureLabelWith preserves archived roles
+	// before reconciling ordinary provider name conflicts.
 	for sourceLabelID, info := range labels {
 		id, err := ensureLabelWith(
 			q, sourceID, sourceLabelID, info.Name, info.Type, &info.SystemRole,
@@ -2807,7 +3226,7 @@ func ensureLabelsBatchWith(
 }
 
 func ensureMessageLabelRefsWith(
-	q querier, sourceID int64, refs []MessageLabelRef,
+	q querier, sourceID int64, refs []MessageLabelRef, flips *labelOutboundFlips,
 ) ([]int64, error) {
 	labels := make(map[string]LabelInfo, len(refs))
 	for _, ref := range refs {
@@ -2816,7 +3235,7 @@ func ensureMessageLabelRefsWith(
 		}
 		labels[ref.SourceLabelID] = ref.Info
 	}
-	resolved, err := ensureLabelsBatchWith(q, sourceID, labels)
+	resolved, err := ensureLabelsBatchWith(q, sourceID, labels, flips)
 	if err != nil {
 		return nil, err
 	}
@@ -2851,22 +3270,46 @@ func (s *Store) MessageLabelIDsContext(ctx context.Context, messageID int64) ([]
 	return ids, rows.Err()
 }
 
+// MessageLabelIDsBatchContext returns the label IDs assigned to each requested message.
+func (s *Store) MessageLabelIDsBatchContext(ctx context.Context, messageIDs []int64) (map[int64][]int64, error) {
+	labels := make(map[int64][]int64, len(messageIDs))
+	err := queryInChunksContext(ctx, s.db, messageIDs, nil,
+		`SELECT message_id, label_id FROM message_labels WHERE message_id IN (%s)`,
+		func(rows *loggedRows) error {
+			var messageID, labelID int64
+			if err := rows.Scan(&messageID, &labelID); err != nil {
+				return err
+			}
+			labels[messageID] = append(labels[messageID], labelID)
+			return nil
+		})
+	if err != nil {
+		return nil, fmt.Errorf("load message labels: %w", err)
+	}
+	return labels, nil
+}
+
 // ReplaceMessageLabels replaces all labels for a message atomically.
 func (s *Store) ReplaceMessageLabels(messageID int64, labelIDs []int64) error {
-	return s.withTx(func(tx *loggedTx) error {
-		return replaceMessageLabelsTx(tx, messageID, labelIDs)
+	ctx := context.Background()
+	return s.withMessageAttributionTxContext(ctx, messageID, func(tx *loggedTx) error {
+		return s.refreshAccountAttributionIfOutboundChangedTx(ctx, tx, messageID, func() error {
+			return replaceMessageLabelsTx(tx, messageID, labelIDs)
+		})
 	})
 }
 
 // ReconcileMessageLabels replaces or merges labels and reports whether the
 // persisted label set changed.
 func (s *Store) ReconcileMessageLabels(
+	ctx context.Context,
 	messageID int64, labelIDs []int64, replace bool,
 ) (bool, error) {
 	var changed bool
-	err := s.withTx(func(tx *loggedTx) error {
+	err := s.withMessageAttributionTxContext(ctx, messageID, func(tx *loggedTx) error {
 		var err error
-		changed, err = s.reconcileMessageLabelsTx(
+		changed, err = s.reconcileMessageLabelsTxContext(
+			ctx,
 			tx, messageID, labelIDs, replace)
 		return err
 	})
@@ -2876,19 +3319,9 @@ func (s *Store) ReconcileMessageLabels(
 	return changed, nil
 }
 
-func (s *Store) reconcileMessageLabelsTx(
-	tx *loggedTx, messageID int64, labelIDs []int64, replace bool,
-) (bool, error) {
-	return s.reconcileMessageLabelsTxContext(
-		context.Background(), tx, messageID, labelIDs, replace,
-	)
-}
-
-// reconcileMessageLabelsTxContext is the context-aware form of
-// reconcileMessageLabelsTx: every statement carries ctx, so a cancelled caller
-// interrupts the read and the write in flight rather than only between calls.
-// ReconcileMessageLabels and AddMessageLabels have no ctx to give, so they keep
-// reaching it through the background-context wrapper above.
+// reconcileMessageLabelsTxContext reconciles a message's labels inside tx.
+// Every statement carries ctx, so a cancelled caller interrupts the read and
+// the write in flight rather than only between calls.
 func (s *Store) reconcileMessageLabelsTxContext(
 	ctx context.Context, tx *loggedTx, messageID int64, labelIDs []int64, replace bool,
 ) (bool, error) {
@@ -2934,9 +3367,9 @@ func (s *Store) reconcileMessageLabelsTxContext(
 		if !changed {
 			return false, nil
 		}
-		if err := replaceMessageLabelsTx(
-			boundQuerier{ctx: ctx, q: tx}, messageID, labelIDs,
-		); err != nil {
+		if err := s.refreshAccountAttributionIfOutboundChangedTx(ctx, tx, messageID, func() error {
+			return replaceMessageLabelsTx(boundQuerier{ctx: ctx, q: tx}, messageID, labelIDs)
+		}); err != nil {
 			return false, err
 		}
 		return true, nil
@@ -2951,7 +3384,9 @@ func (s *Store) reconcileMessageLabelsTxContext(
 	if len(missing) == 0 {
 		return false, nil
 	}
-	if err := s.addMessageLabelsTx(boundQuerier{ctx: ctx, q: tx}, messageID, missing); err != nil {
+	if err := s.refreshAccountAttributionIfOutboundChangedTx(ctx, tx, messageID, func() error {
+		return s.addMessageLabelsTx(boundQuerier{ctx: ctx, q: tx}, messageID, missing)
+	}); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -2986,12 +3421,13 @@ func replaceMessageLabelsTx(tx querier, messageID int64, labelIDs []int64) error
 
 // AddMessageLabels adds labels to a message without removing existing ones.
 // Uses INSERT OR IGNORE to skip labels that already exist.
-func (s *Store) AddMessageLabels(messageID int64, labelIDs []int64) error {
+func (s *Store) AddMessageLabels(ctx context.Context, messageID int64, labelIDs []int64) error {
 	if len(labelIDs) == 0 {
 		return nil
 	}
-	return s.withTx(func(tx *loggedTx) error {
-		changed, err := s.reconcileMessageLabelsTx(
+	return s.withMessageAttributionTxContext(ctx, messageID, func(tx *loggedTx) error {
+		changed, err := s.reconcileMessageLabelsTxContext(
+			ctx,
 			tx, messageID, labelIDs, false,
 		)
 		if err != nil {
@@ -3000,7 +3436,7 @@ func (s *Store) AddMessageLabels(messageID int64, labelIDs []int64) error {
 		if !changed {
 			return nil
 		}
-		return s.bumpDerivedDataRevision(tx, true)
+		return s.bumpDerivedDataRevisionContext(ctx, tx, true)
 	})
 }
 
@@ -3025,32 +3461,35 @@ func (s *Store) addMessageLabelsTx(
 
 // LinkMessageLabel links a single label to a message.
 // Uses INSERT OR IGNORE — safe to call multiple times.
-func (s *Store) LinkMessageLabel(messageID, labelID int64) error {
-	return s.AddMessageLabels(messageID, []int64{labelID})
+func (s *Store) LinkMessageLabel(ctx context.Context, messageID, labelID int64) error {
+	return s.AddMessageLabels(ctx, messageID, []int64{labelID})
 }
 
 // RemoveMessageLabels removes specific labels from a message.
-func (s *Store) RemoveMessageLabels(messageID int64, labelIDs []int64) error {
+func (s *Store) RemoveMessageLabels(ctx context.Context, messageID int64, labelIDs []int64) error {
 	if len(labelIDs) == 0 {
 		return nil
 	}
-	if s.syncGeneration != nil {
-		return s.withTx(func(tx *loggedTx) error {
-			if err := s.requireSyncMessageSourceTx(tx, messageID); err != nil {
-				return err
-			}
-			return execInChunks(tx, labelIDs, []any{messageID},
+	return s.withMessageAttributionTxContext(ctx, messageID, func(tx *loggedTx) error {
+		if err := s.requireSyncMessageSourceTx(boundQuerier{ctx: ctx, q: tx}, messageID); err != nil {
+			return err
+		}
+		return s.refreshAccountAttributionIfOutboundChangedTx(ctx, tx, messageID, func() error {
+			return execInChunksContext(ctx, tx, labelIDs, []any{messageID},
 				`DELETE FROM message_labels WHERE message_id = ? AND label_id IN (%s)`)
 		})
-	}
-	return execInChunks(s.db, labelIDs, []any{messageID},
-		`DELETE FROM message_labels WHERE message_id = ? AND label_id IN (%s)`)
+	})
 }
 
 // SetReplyTo links a channel reply to its parent by resolving the parent's
 // source_message_id to its internal messages.id within the same source.
 func (s *Store) SetReplyTo(sourceID int64, childSourceMessageID, parentSourceMessageID string) error {
-	return s.withSyncSourceWriteContext(context.Background(), sourceID, func(q querier) error {
+	return s.SetReplyToContext(context.Background(), sourceID, childSourceMessageID, parentSourceMessageID)
+}
+
+// SetReplyToContext honors cancellation during SetReplyTo.
+func (s *Store) SetReplyToContext(ctx context.Context, sourceID int64, childSourceMessageID, parentSourceMessageID string) error {
+	return s.withSyncSourceWriteContext(ctx, sourceID, func(q querier) error {
 		_, err := q.Exec(`
 			UPDATE messages SET reply_to_message_id =
 			  (SELECT id FROM messages WHERE source_id = ? AND source_message_id = ?)
@@ -3064,10 +3503,65 @@ func (s *Store) SetReplyTo(sourceID int64, childSourceMessageID, parentSourceMes
 // does not write is_edited, so importers that observe an edit flag call this
 // after upserting.
 func (s *Store) SetMessageEdited(messageID int64) error {
-	return s.withSyncMessageWriteContext(context.Background(), messageID, func(q querier) error {
-		_, err := q.Exec(`UPDATE messages SET is_edited = TRUE WHERE id = ?`, messageID)
+	return s.SetMessageEditedContext(context.Background(), messageID)
+}
+
+// SetMessageEditedContext honors cancellation during SetMessageEdited.
+func (s *Store) SetMessageEditedContext(ctx context.Context, messageID int64) error {
+	return s.SetMessageEditedStateContext(ctx, messageID, true)
+}
+
+// SetMessageSizeEstimate replaces a message's size estimate after an importer
+// changes its displayed text, such as when applying a provider edit.
+func (s *Store) SetMessageSizeEstimate(ctx context.Context, messageID, sizeEstimate int64) error {
+	return s.withSyncMessageWriteContext(ctx, messageID, func(q querier) error {
+		_, err := q.Exec(`UPDATE messages SET size_estimate = ? WHERE id = ?`, sizeEstimate, messageID)
 		return err
 	})
+}
+
+// ReplaceMessageTextContext replaces a message's displayed text after a
+// provider edit or the redaction of one. The text, size, edited flag and
+// metadata commit together, so the metadata always names the edit shown.
+func (s *Store) ReplaceMessageTextContext(ctx context.Context, messageID int64, body, snippet string, edited bool, metadata sql.NullString) error {
+	return s.withTxContext(ctx, func(tx *loggedTx) error {
+		if err := s.lockMeetingEvidenceWith(ctx, tx, messageID); err != nil {
+			return err
+		}
+		q := boundQuerier{ctx: ctx, q: tx}
+		if err := s.requireSyncMessageSourceTx(q, messageID); err != nil {
+			return err
+		}
+		if err := s.updateMessageDerivedText(q, messageID, sql.NullString{String: body, Valid: body != ""}, sql.NullString{},
+			sql.NullString{String: snippet, Valid: snippet != ""}, FTSDoc{MessageID: messageID, Body: body}, s.dialect.FTSUpsert); err != nil {
+			return err
+		}
+		if _, err := q.Exec(`UPDATE messages SET size_estimate = ?, is_edited = ? WHERE id = ?`, int64(len(body)), edited, messageID); err != nil {
+			return err
+		}
+		if err := setMessageMetadataWith(q, s.dialect, messageID, metadata); err != nil {
+			return err
+		}
+		return s.refreshMeetingProjectionWith(ctx, tx, messageID)
+	})
+}
+
+// SetMessageEditedState records whether the source's currently selected
+// message version is an edit.
+func (s *Store) SetMessageEditedState(messageID int64, edited bool) error {
+	return s.SetMessageEditedStateContext(context.Background(), messageID, edited)
+}
+
+// SetMessageEditedStateContext honors cancellation during SetMessageEditedState.
+func (s *Store) SetMessageEditedStateContext(ctx context.Context, messageID int64, edited bool) error {
+	return s.withSyncMessageWriteContext(ctx, messageID, func(q querier) error {
+		return setMessageEditedStateWith(q, messageID, edited)
+	})
+}
+
+func setMessageEditedStateWith(q querier, messageID int64, edited bool) error {
+	_, err := q.Exec(`UPDATE messages SET is_edited = ? WHERE id = ?`, edited, messageID)
+	return err
 }
 
 // SetMessageReplyContext links a message to the message it replies to while
@@ -3098,10 +3592,15 @@ func (s *Store) ClearMessageRepliesContext(ctx context.Context, sourceID int64, 
 
 // MarkMessageDeleted marks a message as deleted from the source.
 func (s *Store) MarkMessageDeleted(sourceID int64, sourceMessageID string) error {
+	return s.MarkMessageDeletedContext(context.Background(), sourceID, sourceMessageID)
+}
+
+// MarkMessageDeletedContext honors cancellation during MarkMessageDeleted.
+func (s *Store) MarkMessageDeletedContext(ctx context.Context, sourceID int64, sourceMessageID string) error {
 	if err := s.requireSyncSource(sourceID); err != nil {
 		return err
 	}
-	write := func(q chunkQuerier) error {
+	write := func(q querier) error {
 		_, err := q.Exec(fmt.Sprintf(`
 			UPDATE messages
 			SET deleted_from_source_at = %s
@@ -3110,14 +3609,19 @@ func (s *Store) MarkMessageDeleted(sourceID int64, sourceMessageID string) error
 		return err
 	}
 	if s.syncGeneration == nil {
-		return write(s.db)
+		return write(boundQuerier{ctx: ctx, q: s.db})
 	}
-	return s.withTx(func(tx *loggedTx) error { return write(tx) })
+	return s.withTxContext(ctx, func(tx *loggedTx) error { return write(boundQuerier{ctx: ctx, q: tx}) })
 }
 
 // ClearMessageDeletedFromSource clears the upstream tombstone when a message
 // reappears during a provider repair scan.
 func (s *Store) ClearMessageDeletedFromSource(sourceID int64, sourceMessageID string) error {
+	return s.ClearMessageDeletedFromSourceContext(context.Background(), sourceID, sourceMessageID)
+}
+
+// ClearMessageDeletedFromSourceContext honors cancellation during ClearMessageDeletedFromSource.
+func (s *Store) ClearMessageDeletedFromSourceContext(ctx context.Context, sourceID int64, sourceMessageID string) error {
 	if err := s.requireSyncSource(sourceID); err != nil {
 		return err
 	}
@@ -3130,13 +3634,13 @@ func (s *Store) ClearMessageDeletedFromSource(sourceID int64, sourceMessageID st
 		return err
 	}
 	if s.syncGeneration == nil {
-		return write(s.db)
+		return write(boundQuerier{ctx: ctx, q: s.db})
 	}
-	return s.withTx(func(tx *loggedTx) error { return write(tx) })
+	return s.withTxContext(ctx, func(tx *loggedTx) error { return write(boundQuerier{ctx: ctx, q: tx}) })
 }
 
 // MarkMessagesDeletedBatch marks multiple messages as deleted from the source in a single transaction.
-func (s *Store) MarkMessagesDeletedBatch(sourceID int64, sourceMessageIDs []string) error {
+func (s *Store) MarkMessagesDeletedBatch(ctx context.Context, sourceID int64, sourceMessageIDs []string) error {
 	if len(sourceMessageIDs) == 0 {
 		return nil
 	}
@@ -3144,13 +3648,13 @@ func (s *Store) MarkMessagesDeletedBatch(sourceID int64, sourceMessageIDs []stri
 		return err
 	}
 	write := func(q chunkQuerier) error {
-		return execInChunks(q, sourceMessageIDs, []any{sourceID},
+		return execInChunksContext(ctx, q, sourceMessageIDs, []any{sourceID},
 			fmt.Sprintf(`UPDATE messages SET deleted_from_source_at = %s WHERE source_id = ? AND source_message_id IN (%%s) AND deleted_from_source_at IS NULL`, s.dialect.Now()))
 	}
 	if s.syncGeneration == nil {
 		return write(s.db)
 	}
-	return s.withTx(func(tx *loggedTx) error { return write(tx) })
+	return s.withTxContext(ctx, func(tx *loggedTx) error { return write(tx) })
 }
 
 // ReconcileSourceMessageSnapshot tombstones locally live messages that are
@@ -3175,6 +3679,10 @@ func (s *Store) ReconcileSourceMessageSnapshot(
 			WHERE source_id = ?
 			  AND deleted_at IS NULL
 			  AND deleted_from_source_at IS NULL
+			  AND NOT EXISTS (
+			    SELECT 1 FROM source_merge_archive_only_messages am
+			    WHERE am.message_id = messages.id
+			  )
 		`, sourceID)
 		if err != nil {
 			return fmt.Errorf("reconcile source message snapshot: list live messages: %w", err)
@@ -3214,6 +3722,11 @@ func (s *Store) ReconcileSourceMessageSnapshot(
 // in bounded batches and commits all tombstones atomically. Any late reader or
 // update failure rolls back earlier batches.
 func (s *Store) MarkMessagesDeletedFromReader(sourceID int64, reader io.Reader, batchSize int) error {
+	return s.MarkMessagesDeletedFromReaderContext(context.Background(), sourceID, reader, batchSize)
+}
+
+// MarkMessagesDeletedFromReaderContext honors cancellation during MarkMessagesDeletedFromReader.
+func (s *Store) MarkMessagesDeletedFromReaderContext(ctx context.Context, sourceID int64, reader io.Reader, batchSize int) error {
 	if reader == nil {
 		return errors.New("mark messages deleted from reader: nil reader")
 	}
@@ -3223,13 +3736,13 @@ func (s *Store) MarkMessagesDeletedFromReader(sourceID int64, reader io.Reader, 
 	if err := s.requireSyncSource(sourceID); err != nil {
 		return err
 	}
-	return s.withTx(func(tx *loggedTx) error {
+	return s.withTxContext(ctx, func(tx *loggedTx) error {
 		batch := make([]string, 0, batchSize)
 		flush := func() error {
 			if len(batch) == 0 {
 				return nil
 			}
-			if err := execInChunks(tx, batch, []any{sourceID},
+			if err := execInChunksContext(ctx, tx, batch, []any{sourceID},
 				fmt.Sprintf(`UPDATE messages SET deleted_from_source_at = %s WHERE source_id = ? AND source_message_id IN (%%s) AND deleted_from_source_at IS NULL`, s.dialect.Now())); err != nil {
 				return err
 			}
@@ -3268,21 +3781,21 @@ func (s *Store) MarkMessagesDeletedFromReader(sourceID int64, reader io.Reader, 
 // This compatibility entry point is intentionally unscoped. New deletion
 // execution resolves a manifest source and uses
 // MarkMessageDeletedBySourceMessageID instead.
-func (s *Store) MarkMessageDeletedByGmailID(permanent bool, gmailID string) error {
-	return s.MarkMessageDeletedBySourceMessageID(0, permanent, gmailID)
+func (s *Store) MarkMessageDeletedByGmailID(ctx context.Context, permanent bool, gmailID string) error {
+	return s.MarkMessageDeletedBySourceMessageID(ctx, 0, permanent, gmailID)
 }
 
 // MarkMessageDeletedBySourceMessageID marks only the message belonging to
 // sourceID. A zero sourceID retains the legacy unscoped behavior for version-1
 // deletion manifests.
-func (s *Store) MarkMessageDeletedBySourceMessageID(sourceID int64, _ bool, gmailID string) error {
+func (s *Store) MarkMessageDeletedBySourceMessageID(ctx context.Context, sourceID int64, _ bool, gmailID string) error {
 	sourceClause := ""
 	args := []any{gmailID}
 	if sourceID > 0 {
 		sourceClause = " AND source_id = ?"
 		args = append(args, sourceID)
 	}
-	_, err := s.db.Exec(fmt.Sprintf(`
+	_, err := s.db.ExecContext(ctx, fmt.Sprintf(`
 		UPDATE messages
 		SET deleted_from_source_at = %s
 		WHERE source_message_id = ?%s AND deleted_from_source_at IS NULL
@@ -3300,13 +3813,13 @@ func (s *Store) MarkMessageDeletedBySourceMessageID(sourceID int64, _ bool, gmai
 //
 // This compatibility entry point is intentionally unscoped. New deletion
 // execution uses MarkMessagesDeletedBySourceMessageIDBatch.
-func (s *Store) MarkMessagesDeletedByGmailIDBatch(gmailIDs []string) error {
-	return s.MarkMessagesDeletedBySourceMessageIDBatch(0, gmailIDs)
+func (s *Store) MarkMessagesDeletedByGmailIDBatch(ctx context.Context, gmailIDs []string) error {
+	return s.MarkMessagesDeletedBySourceMessageIDBatch(ctx, 0, gmailIDs)
 }
 
 // MarkMessagesDeletedBySourceMessageIDBatch scopes batch archive marking to
 // sourceID. A zero sourceID preserves legacy version-1 behavior.
-func (s *Store) MarkMessagesDeletedBySourceMessageIDBatch(sourceID int64, gmailIDs []string) error {
+func (s *Store) MarkMessagesDeletedBySourceMessageIDBatch(ctx context.Context, sourceID int64, gmailIDs []string) error {
 	if len(gmailIDs) == 0 {
 		return nil
 	}
@@ -3334,13 +3847,13 @@ func (s *Store) MarkMessagesDeletedBySourceMessageIDBatch(sourceID int64, gmailI
 			`UPDATE messages SET deleted_from_source_at = %s WHERE source_message_id IN (%s)%s AND deleted_from_source_at IS NULL`,
 			s.dialect.Now(), strings.Join(placeholders, ","), sourceClause)
 
-		if _, err := s.db.Exec(query, args...); err != nil {
+		if _, err := s.db.ExecContext(ctx, query, args...); err != nil {
 			if firstErr == nil {
 				firstErr = err
 			}
 			// Fall back to individual updates for this chunk
 			for _, id := range chunk {
-				s.MarkMessageDeletedBySourceMessageID(sourceID, false, id) //nolint:errcheck,gosec // best-effort
+				s.MarkMessageDeletedBySourceMessageID(ctx, sourceID, false, id) //nolint:errcheck,gosec // best-effort
 			}
 		}
 	}
@@ -3407,92 +3920,39 @@ func (s *Store) CountMessagesPerMailbox(sourceID int64) (map[string]int64, error
 }
 
 // GetRandomMessageIDs returns a random sample of message IDs for a source.
-// Uses reservoir sampling with random offsets for O(limit) performance on large tables,
-// falling back to ORDER BY RANDOM() for small tables where the overhead isn't significant.
 func (s *Store) GetRandomMessageIDs(sourceID int64, limit int) ([]int64, error) {
 	live := LiveMessagesWhere("", true)
-	// Get total count first
-	var total int64
-	err := s.db.QueryRow(fmt.Sprintf(`
-		SELECT COUNT(*) FROM messages
+	rows, err := s.db.Query(fmt.Sprintf(`
+		SELECT id FROM messages
 		WHERE source_id = ? AND %s
-	`, live), sourceID).Scan(&total)
+		ORDER BY RANDOM()
+		LIMIT ?
+	`, live), sourceID, limit)
 	if err != nil {
 		return nil, err
 	}
+	defer func() { _ = rows.Close() }()
 
-	if total == 0 {
-		return nil, nil
-	}
-
-	// For small tables or when limit >= total, use simple ORDER BY RANDOM()
-	// The threshold of 10000 balances query overhead vs. scan cost
-	if total < 10000 || int64(limit) >= total {
-		rows, err := s.db.Query(fmt.Sprintf(`
-			SELECT id FROM messages
-			WHERE source_id = ? AND %s
-			ORDER BY RANDOM()
-			LIMIT ?
-		`, live), sourceID, limit)
-		if err != nil {
-			return nil, err
-		}
-		defer func() { _ = rows.Close() }()
-
-		var ids []int64
-		for rows.Next() {
-			var id int64
-			if err := rows.Scan(&id); err != nil {
-				return nil, err
-			}
-			ids = append(ids, id)
-		}
-		return ids, rows.Err()
-	}
-
-	// For large tables, use random offset sampling
-	// This is O(limit) instead of O(n) for ORDER BY RANDOM()
-	// Generate random offsets in Go for dialect portability (SQLite vs Postgres)
-	// Use explicitly seeded RNG for true randomness across process runs.
-	// math/rand is fine — this picks rows for sampling, not authentication.
-	rng := rand.New(rand.NewSource(time.Now().UnixNano())) //nolint:gosec // sampling RNG, not security
-
-	ids := make([]int64, 0, limit)
-	seen := make(map[int64]bool)
-
-	for len(ids) < limit {
-		// Generate random offset in Go (portable across SQLite/Postgres)
-		offset := rng.Int63n(total)
-
+	var ids []int64
+	for rows.Next() {
 		var id int64
-		err := s.db.QueryRow(fmt.Sprintf(`
-			SELECT id FROM messages
-			WHERE source_id = ? AND %s
-			ORDER BY id
-			LIMIT 1 OFFSET ?
-		`, live), sourceID, offset).Scan(&id)
-		if err != nil {
-			if err == sql.ErrNoRows {
-				continue // Race condition with deletions, retry
-			}
+		if err := rows.Scan(&id); err != nil {
 			return nil, err
 		}
-
-		if !seen[id] {
-			seen[id] = true
-			ids = append(ids, id)
-		}
+		ids = append(ids, id)
 	}
-
-	return ids, nil
+	return ids, rows.Err()
 }
 
 // UpsertFTS inserts or updates the FTS index for a message.
-// No-op if FTS is not available.
+// Indexing is a no-op if FTS is not available, but sync-scoped views still
+// enforce the generation fence and message ownership before skipping the write.
 func (s *Store) UpsertFTS(messageID int64, subject, bodyText, fromAddr, toAddrs, ccAddrs string) error {
-	if !s.fts5Available {
-		return nil
-	}
+	return s.UpsertFTSContext(context.Background(), messageID, subject, bodyText, fromAddr, toAddrs, ccAddrs)
+}
+
+// UpsertFTSContext honors cancellation during UpsertFTS.
+func (s *Store) UpsertFTSContext(ctx context.Context, messageID int64, subject, bodyText, fromAddr, toAddrs, ccAddrs string) error {
 	doc := FTSDoc{
 		MessageID: messageID,
 		Subject:   subject,
@@ -3501,28 +3961,47 @@ func (s *Store) UpsertFTS(messageID int64, subject, bodyText, fromAddr, toAddrs,
 		ToAddrs:   toAddrs,
 		CcAddrs:   ccAddrs,
 	}
-	if s.syncGeneration != nil {
-		return s.withTx(func(tx *loggedTx) error {
-			if err := s.requireSyncMessageSourceTx(tx, messageID); err != nil {
-				return err
-			}
-			return s.dialect.FTSUpsert(tx, doc)
-		})
-	}
-	return s.dialect.FTSUpsert(s.db, doc)
+	return s.withSyncMessageWriteContext(ctx, messageID, func(q querier) error {
+		if !s.fts5Available {
+			return nil
+		}
+		return s.dialect.FTSUpsert(q, doc)
+	})
 }
 
-// BackfillFTS populates the FTS table from existing message data.
+// IndexStoredMessageContext fills or refreshes a message's search entry from stored
+// rows. Unchanged entries are left alone, and unavailable FTS is a no-op.
+func (s *Store) IndexStoredMessageContext(ctx context.Context, messageID int64) error {
+	return s.withSyncMessageWriteContext(ctx, messageID, func(q querier) error {
+		if !s.fts5Available {
+			return nil
+		}
+		row, err := s.loadDerivedEmailText(q, messageID)
+		if err != nil {
+			return fmt.Errorf("load stored message for search: %w", err)
+		}
+		row.fts.Body = row.body
+		matches, err := s.dialect.FTSMatches(q, row.fts)
+		if err != nil {
+			return fmt.Errorf("compare stored search entry: %w", err)
+		}
+		if matches {
+			return nil
+		}
+		return s.dialect.FTSUpsert(q, row.fts)
+	})
+}
+
+// BackfillFTS fills missing search entries from existing message data on SQLite.
+// PostgreSQL also refreshes entries with an old indexing version.
 // Processes in batches to avoid blocking for minutes on large archives.
 // The progress callback (if non-nil) is called after each batch with
 // (position in ID range, total ID range). Each batch is committed
 // independently so partial progress is preserved if interrupted.
 // Returns the number of rows inserted. No-op if FTS5 is not available.
 //
-// BackfillFTS clears FTS rows with DELETE before inserting. If the FTS5
-// shadow tables are themselves malformed, that DELETE will either fail or
-// leave corruption in place — callers recovering from shadow-table
-// corruption should use RebuildFTS instead.
+// Existing entries remain searchable while missing entries are filled. Callers
+// recovering from malformed FTS5 shadow tables should use RebuildFTS instead.
 func (s *Store) BackfillFTS(progress func(done, total int64)) (int64, error) {
 	return s.BackfillFTSContext(context.Background(), progress)
 }
@@ -3544,21 +4023,15 @@ func (s *Store) BackfillFTSContext(
 		return 0, nil
 	}
 
-	// runMaintenance disables the pool-wide 30s statement_timeout for the
-	// clear: FTSClearSQL is a full-table tsvector rewrite that exceeds 30s on
-	// a large archive (finding S1). No-op timeout reset on SQLite.
-	if err := s.runMaintenance(ctx, func(ctx context.Context, tx *loggedTx) error {
-		_, err := tx.ExecContext(ctx, s.dialect.FTSClearSQL())
-		return err
-	}); err != nil {
-		return 0, fmt.Errorf("clear FTS: %w", err)
+	batchSQL, err := s.dialect.FTSBackfillMissingBatchSQL(ctx, s.db.DB)
+	if err != nil {
+		return 0, err
 	}
-
-	return s.backfillFTSRangeContext(ctx, minID, maxID, progress)
+	return s.backfillFTSRangeContext(ctx, batchSQL, minID, maxID, progress)
 }
 
 // RebuildFTS fully recreates the FTS index from the underlying message
-// tables. Unlike BackfillFTS (DELETE + INSERT), this drops and recreates
+// tables. Unlike BackfillFTS, this drops and recreates
 // the FTS table itself so malformed FTS5 shadow tables are fully replaced.
 //
 // Ignores the cached fts5Available flag: a corrupt shadow table causes the
@@ -3576,8 +4049,8 @@ func (s *Store) RebuildFTSContext(
 ) (int64, error) {
 	// runMaintenance disables the pool-wide 30s statement_timeout for the
 	// schema teardown/rebuild. On PG, FTSRebuildSchema runs a full-table
-	// `UPDATE messages SET search_fts = NULL` (identical cost to the hatched
-	// FTSClearSQL) plus a GIN rebuild over a populated table — both can exceed
+	// `UPDATE messages SET search_fts = NULL` plus a GIN rebuild over a
+	// populated table — both can exceed
 	// 30s on a large archive and would cancel the rebuild-fts recovery command
 	// with SQLSTATE 57014 (finding S1). On SQLite the reset SQL is "" so this
 	// is an ordinary transaction around the DROP/CREATE of messages_fts.
@@ -3596,7 +4069,7 @@ func (s *Store) RebuildFTSContext(
 		return 0, nil
 	}
 
-	indexed, err := s.backfillFTSRangeContext(ctx, minID, maxID, progress)
+	indexed, err := s.backfillFTSRangeContext(ctx, s.dialect.FTSBackfillBatchSQL(), minID, maxID, progress)
 	if err != nil {
 		return indexed, err
 	}
@@ -3617,12 +4090,12 @@ func (s *Store) messageIDRangeContext(ctx context.Context) (int64, int64, error)
 	return minID, maxID, nil
 }
 
-// backfillFTSRange inserts FTS rows for all messages with id in [minID, maxID],
-// in batches. Shared between BackfillFTS (DELETE+fill) and RebuildFTS
-// (DROP+CREATE+fill). Each batch is committed independently so partial
-// progress is preserved if interrupted.
+// backfillFTSRangeContext indexes messages with id in [minID, maxID] in batches
+// using the supplied full or missing-only query. Each batch is committed
+// independently so partial progress is preserved if interrupted.
 func (s *Store) backfillFTSRangeContext(
 	ctx context.Context,
+	batchSQL string,
 	minID, maxID int64,
 	progress func(done, total int64),
 ) (int64, error) {
@@ -3633,19 +4106,19 @@ func (s *Store) backfillFTSRangeContext(
 
 	for cursor <= maxID {
 		batchEnd := cursor + batchSize
-		n, err := s.backfillFTSBatchContext(ctx, cursor, batchEnd)
+		n, err := s.backfillFTSBatchContext(ctx, batchSQL, cursor, batchEnd)
 		if err != nil {
 			// Only the specific PG tsvector-overflow error (a single
 			// pathological row whose body exceeds PostgreSQL's tsvector
 			// limit) is recoverable by retrying the batch row by row and
 			// skipping the offending row(s). EVERY OTHER error (dead
 			// connection, a non-size SQLSTATE, etc.) is systemic — it would
-			// hit every row and silently clear-then-skip the whole archive —
+			// hit every row and silently skip the whole archive —
 			// so it must ABORT and propagate, not be masked as success.
 			if !s.dialect.IsFTSValueTooLargeError(err) {
 				return indexed, err
 			}
-			n, err = s.backfillFTSRowByRowContext(ctx, cursor, batchEnd)
+			n, err = s.backfillFTSRowByRowContext(ctx, batchSQL, cursor, batchEnd)
 			if err != nil {
 				return indexed, err
 			}
@@ -3678,11 +4151,12 @@ func (s *Store) backfillFTSRangeContext(
 // SQLite), so the PG-syntax empty-tsvector literal is safe.
 func (s *Store) backfillFTSRowByRowContext(
 	ctx context.Context,
+	batchSQL string,
 	fromID, toID int64,
 ) (int64, error) {
 	var indexed int64
 	for id := fromID; id < toID; id++ {
-		n, err := s.backfillFTSBatchContext(ctx, id, id+1)
+		n, err := s.backfillFTSBatchContext(ctx, batchSQL, id, id+1)
 		if err != nil {
 			if !s.dialect.IsFTSValueTooLargeError(err) {
 				return indexed, err
@@ -3693,10 +4167,7 @@ func (s *Store) backfillFTSRowByRowContext(
 			slog.Warn("skipping message in FTS backfill",
 				slog.Int64("message_id", id),
 				slog.Any("error", err))
-			if _, uerr := s.db.ExecContext(ctx,
-				`UPDATE messages SET search_fts = ''::tsvector, indexing_version = ? WHERE id = ?`,
-				CurrentFTSIndexingVersion, id,
-			); uerr != nil {
+			if uerr := markFTSMessageUnsearchable(boundQuerier{ctx: ctx, q: s.db}, id); uerr != nil {
 				return indexed, fmt.Errorf("mark FTS-overflow row %d terminal: %w", id, uerr)
 			}
 			continue
@@ -3723,6 +4194,7 @@ func (s *Store) backfillFTSRowByRowContext(
 // semantics. No-op timeout reset on SQLite.
 func (s *Store) backfillFTSBatchContext(
 	ctx context.Context,
+	batchSQL string,
 	fromID, toID int64,
 ) (int64, error) {
 	if s.backfillFTSBatchErrHook != nil {
@@ -3732,7 +4204,7 @@ func (s *Store) backfillFTSBatchContext(
 	}
 	var affected int64
 	err := s.runMaintenance(ctx, func(ctx context.Context, tx *loggedTx) error {
-		result, err := tx.ExecContext(ctx, s.dialect.FTSBackfillBatchSQL(), fromID, toID)
+		result, err := tx.ExecContext(ctx, batchSQL, fromID, toID)
 		if err != nil {
 			return err
 		}
@@ -3744,6 +4216,7 @@ func (s *Store) backfillFTSBatchContext(
 
 const latestConversationPreviewSubquery = `(SELECT snippet FROM messages
 	WHERE conversation_id = conversations.id
+	  AND deleted_at IS NULL
 	ORDER BY COALESCE(sent_at, received_at, internal_date) DESC, id DESC
 	LIMIT 1)`
 
@@ -3820,6 +4293,7 @@ func (s *Store) recomputeConversationStatsWith(q querier, whereClause string, ar
 			message_count = (
 				SELECT COUNT(*) FROM messages
 				WHERE conversation_id = conversations.id
+				  AND deleted_at IS NULL
 			),
 			participant_count = (
 				SELECT COUNT(*) FROM conversation_participants
@@ -3829,6 +4303,7 @@ func (s *Store) recomputeConversationStatsWith(q querier, whereClause string, ar
 				SELECT MAX(COALESCE(sent_at, received_at, internal_date))
 				FROM messages
 				WHERE conversation_id = conversations.id
+				  AND deleted_at IS NULL
 			),
 			last_message_preview = %s
 		WHERE %s
@@ -3842,8 +4317,8 @@ func (s *Store) recomputeConversationStatsWith(q querier, whereClause string, ar
 // RecomputeConversationPreviewIfMatches refreshes one denormalized preview
 // from current message state only if it still equals expected. It returns
 // whether the guarded row was updated.
-func (s *Store) RecomputeConversationPreviewIfMatches(conversationID int64, expected string) (bool, error) {
-	result, err := s.db.Exec(s.Rebind(fmt.Sprintf(`UPDATE conversations
+func (s *Store) RecomputeConversationPreviewIfMatches(ctx context.Context, conversationID int64, expected string) (bool, error) {
+	result, err := s.db.ExecContext(ctx, s.Rebind(fmt.Sprintf(`UPDATE conversations
 		SET last_message_preview = %s
 		WHERE id = ? AND last_message_preview = ?`, latestConversationPreviewSubquery)),
 		conversationID, expected)
@@ -3865,7 +4340,9 @@ func (s *Store) ForEachTeamsHostedContentBody(sourceID int64, fn func(messageID 
 		SELECT mb.message_id, mb.body_html
 		FROM message_bodies mb
 		JOIN messages m ON m.id = mb.message_id
-		WHERE m.source_id = ? AND mb.body_html LIKE '%hostedContents%'
+		WHERE m.source_id = ?
+		  AND NOT EXISTS (SELECT 1 FROM source_merge_archive_only_messages am WHERE am.message_id = m.id)
+		  AND mb.body_html LIKE '%hostedContents%'
 	`, sourceID, fn)
 }
 
@@ -3880,6 +4357,7 @@ func (s *Store) ForEachTeamsHostedContentBody(sourceID int64, fn func(messageID 
 // instead of re-fetching everything or repeatedly walking unchanged
 // exclusions.
 func (s *Store) ForEachTeamsIncompleteHostedContentBody(
+	ctx context.Context,
 	sourceID int64,
 	policy attachmentpolicy.Policy,
 	fn func(messageID int64, bodyHTML string) error,
@@ -3891,21 +4369,25 @@ func (s *Store) ForEachTeamsIncompleteHostedContentBody(
 	}
 	var buf []bodyRow
 
-	rows, err := s.db.Query(`
+	rows, err := s.db.QueryContext(ctx, `
 		SELECT mb.message_id, mb.body_html,
 		       (SELECT COUNT(*) FROM attachments a
 		        WHERE a.message_id = mb.message_id
+		          AND NOT EXISTS (SELECT 1 FROM source_merge_preserved_attachments spa WHERE spa.attachment_id = a.id)
 		          AND a.storage_path NOT LIKE 'http%' AND a.storage_path != ''
 		          AND a.content_hash != ''),
 		       EXISTS (
 		         SELECT 1 FROM attachments a
 		         WHERE a.message_id = mb.message_id
+		           AND NOT EXISTS (SELECT 1 FROM source_merge_preserved_attachments spa WHERE spa.attachment_id = a.id)
 		           AND a.source_attachment_id LIKE 'teams:inline:%'
 		           AND COALESCE(a.content_hash, '') = ''
 		       )
 		FROM message_bodies mb
 		JOIN messages m ON m.id = mb.message_id
-		WHERE m.source_id = ? AND mb.body_html LIKE '%hostedContents%'
+		WHERE m.source_id = ?
+		  AND NOT EXISTS (SELECT 1 FROM source_merge_archive_only_messages am WHERE am.message_id = m.id)
+		  AND mb.body_html LIKE '%hostedContents%'
 	`, sourceID)
 	if err != nil {
 		return err
@@ -3935,7 +4417,7 @@ func (s *Store) ForEachTeamsIncompleteHostedContentBody(
 		return err
 	}
 	for _, r := range buf {
-		refs, err := s.MessageTeamsInlineAttachments(r.id)
+		refs, err := s.MessageTeamsInlineAttachments(ctx, r.id)
 		if err != nil {
 			return err
 		}
@@ -3955,7 +4437,7 @@ func (s *Store) ForEachTeamsIncompleteHostedContentBody(
 				continue
 			}
 			if !membershipLoaded {
-				membership, err = s.AttachmentConversationMembership(r.id)
+				membership, err = s.AttachmentConversationMembershipContext(ctx, r.id)
 				if err != nil {
 					return err
 				}
@@ -4055,19 +4537,41 @@ func (s *Store) forEachHostedContentBody(query string, sourceID int64, fn func(m
 // a non-empty title — preserves the prior behavior of not blanking out
 // stored titles when re-syncs pass an empty value.
 func (s *Store) EnsureConversationWithType(sourceID int64, sourceConversationID, conversationType, title string) (int64, error) {
+	return s.EnsureConversationWithTypeContext(context.Background(), sourceID, sourceConversationID, conversationType, title)
+}
+
+// EnsureConversationWithTypeContext honors cancellation during EnsureConversationWithType.
+func (s *Store) EnsureConversationWithTypeContext(ctx context.Context, sourceID int64, sourceConversationID, conversationType, title string) (int64, error) {
 	if err := s.requireSyncSource(sourceID); err != nil {
 		return 0, err
 	}
 	if s.syncGeneration != nil {
 		var id int64
-		err := s.withTx(func(tx *loggedTx) error {
+		err := s.withTxContext(ctx, func(tx *loggedTx) error {
 			var err error
-			id, err = ensureConversationWithType(tx, s.dialect, sourceID, sourceConversationID, conversationType, title)
+			id, err = ensureConversationWithType(boundQuerier{ctx: ctx, q: tx}, s.dialect, sourceID, sourceConversationID, conversationType, title)
 			return err
 		})
 		return id, err
 	}
-	return ensureConversationWithType(s.db, s.dialect, sourceID, sourceConversationID, conversationType, title)
+	return ensureConversationWithType(boundQuerier{ctx: ctx, q: s.db}, s.dialect, sourceID, sourceConversationID, conversationType, title)
+}
+
+// SetConversationTitle applies an explicit provider title, including removal.
+func (s *Store) SetConversationTitle(ctx context.Context, sourceID, conversationID int64, title string) error {
+	if err := s.requireSyncSource(sourceID); err != nil {
+		return err
+	}
+	write := func(q querier) error {
+		_, err := q.Exec(fmt.Sprintf(`UPDATE conversations SET title = ?, updated_at = %s
+			WHERE id = ? AND source_id = ? AND COALESCE(title, '') <> ?`, s.dialect.Now()),
+			title, conversationID, sourceID, title)
+		return err
+	}
+	if s.syncGeneration != nil {
+		return s.withTxContext(ctx, func(tx *loggedTx) error { return write(boundQuerier{ctx: ctx, q: tx}) })
+	}
+	return write(boundQuerier{ctx: ctx, q: s.db})
 }
 
 func ensureConversationWithType(q querier, dialect Dialect, sourceID int64, sourceConversationID, conversationType, title string) (int64, error) {
@@ -4145,14 +4649,11 @@ func ensureConversationWithTypePolicy(
 // invalid phone numbers to prevent database pollution.
 // Also creates a participant_identifiers row with the given identifierType
 // (e.g., "whatsapp", "imessage", "google_voice").
-func (s *Store) EnsureParticipantByPhone(phone, displayName, identifierType string) (int64, error) {
+func (s *Store) EnsureParticipantByPhone(ctx context.Context, phone, displayName, identifierType string) (int64, error) {
 	var id int64
-	err := s.withTx(func(tx *loggedTx) error {
-		if err := s.lockIdentityMutationTx(tx); err != nil {
-			return err
-		}
+	err := s.withAttributionTxContext(ctx, attributionLock{Exclusive: true}, func(tx *loggedTx) error {
 		var err error
-		id, err = s.ensureParticipantByPhoneTx(context.Background(), tx, phone, displayName, identifierType)
+		id, err = s.ensureParticipantByPhoneTx(ctx, tx, phone, displayName, identifierType)
 		return err
 	})
 	if err != nil {
@@ -4165,10 +4666,7 @@ func (s *Store) EnsureParticipantByPhone(phone, displayName, identifierType stri
 // phone observed without a messaging service, such as a meeting attendee.
 func (s *Store) EnsurePhoneParticipantContext(ctx context.Context, phone, displayName string) (int64, error) {
 	var id int64
-	err := s.withTxContext(ctx, func(tx *loggedTx) error {
-		if err := s.lockIdentityMutationTxContext(ctx, tx); err != nil {
-			return err
-		}
+	err := s.withAttributionTxContext(ctx, attributionLock{Exclusive: true}, func(tx *loggedTx) error {
 		var err error
 		id, err = s.ensureParticipantByPhoneTx(ctx, tx, phone, displayName, PhoneIdentifierType)
 		return err
@@ -4361,34 +4859,37 @@ func (s *Store) ensureParticipantByPhoneTx(
 // deletes the old participant row. Used when an importer discovers that two
 // participant rows are the same person.
 func (s *Store) MergeParticipants(oldID, newID int64) error {
+	return s.MergeParticipantsContext(context.Background(), oldID, newID)
+}
+
+// MergeParticipantsContext honors cancellation during MergeParticipants.
+func (s *Store) MergeParticipantsContext(ctx context.Context, oldID, newID int64) error {
 	if oldID == newID || oldID == 0 || newID == 0 {
 		return nil
 	}
-	return s.withTx(func(tx *loggedTx) error {
-		// Serialize the curated binding check with promotion and link/unlink
-		// mutations before this transaction repoints any archive references.
-		if err := s.lockIdentityMutationTx(tx); err != nil {
-			return err
-		}
+	// The exclusive attribution entry takes the identity row before the sync
+	// fence, serializing the curated binding check with promotion and
+	// link/unlink mutations before this transaction repoints any references.
+	return s.withAttributionTxContext(ctx, attributionLock{Exclusive: true}, func(tx *loggedTx) error {
 		if err := s.lockParticipantDirectoryMutationTxContext(
-			context.Background(), tx,
+			ctx, tx,
 		); err != nil {
 			return err
 		}
 		if err := s.lockParticipantObservationMergeTx(
-			context.Background(), tx, oldID, newID,
+			ctx, tx, oldID, newID,
 		); err != nil {
 			return err
 		}
-		if err := s.verifyParticipantsExistTx(tx, oldID, newID); err != nil {
+		if err := s.verifyParticipantsExistTxContext(ctx, tx, oldID, newID); err != nil {
 			return err
 		}
-		edges, err := s.loadLinkEdgesTx(tx)
+		edges, err := s.loadComponentEdgesTxContext(ctx, tx, oldID, newID)
 		if err != nil {
 			return err
 		}
 		personID, unionMembers, err := s.personForClusterUnionTx(
-			context.Background(), tx, oldID, newID, edges,
+			ctx, tx, oldID, newID, edges,
 		)
 		if err != nil {
 			return err
@@ -4396,13 +4897,13 @@ func (s *Store) MergeParticipants(oldID, newID int64) error {
 		personRevisionBumped := false
 		if personID != 0 {
 			changed, err := s.mergePersonBindingsTx(
-				context.Background(), tx, personID, oldID, unionMembers)
+				ctx, tx, personID, oldID, unionMembers)
 			if err != nil {
 				return err
 			}
 			if changed {
 				if err := s.bumpPersonRevisionsTx(
-					context.Background(), tx, personID); err != nil {
+					ctx, tx, personID); err != nil {
 					return err
 				}
 				personRevisionBumped = true
@@ -4414,14 +4915,14 @@ func (s *Store) MergeParticipants(oldID, newID int64) error {
 		// Email and phone are UNIQUE, so the absorbed row must release each
 		// value before the survivor can take it.
 		var oldEmail, oldDomain, oldPhone sql.NullString
-		if err := tx.QueryRow(`SELECT NULLIF(email_address, ''), NULLIF(domain, ''), NULLIF(phone_number, '') FROM participants WHERE id = ?`, oldID).
+		if err := tx.QueryRowContext(ctx, `SELECT NULLIF(email_address, ''), NULLIF(domain, ''), NULLIF(phone_number, '') FROM participants WHERE id = ?`, oldID).
 			Scan(&oldEmail, &oldDomain, &oldPhone); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(`UPDATE participants SET email_address = NULL, phone_number = NULL WHERE id = ?`, oldID); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE participants SET email_address = NULL, phone_number = NULL WHERE id = ?`, oldID); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(`
+		if _, err := tx.ExecContext(ctx, `
 			UPDATE participants SET
 				email_address = COALESCE(NULLIF(email_address, ''), ?),
 				domain        = COALESCE(NULLIF(domain, ''), ?),
@@ -4429,19 +4930,22 @@ func (s *Store) MergeParticipants(oldID, newID int64) error {
 			WHERE id = ?`, oldEmail, oldDomain, oldPhone, newID); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(`UPDATE messages SET sender_id = ? WHERE sender_id = ?`, newID, oldID); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE messages SET sender_id = ? WHERE sender_id = ?`, newID, oldID); err != nil {
 			return err
 		}
 		// Drop old rows that would collide with an existing row of the new
 		// participant, then repoint the remainder.
-		if _, err := tx.Exec(`
+		if err := repointReactionSourceEvents(ctx, tx, oldID, newID); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `
 			DELETE FROM reactions WHERE participant_id = ? AND EXISTS (
 				SELECT 1 FROM reactions r2 WHERE r2.message_id = reactions.message_id
 				  AND r2.participant_id = ? AND r2.reaction_type = reactions.reaction_type
 				  AND r2.reaction_value = reactions.reaction_value)`, oldID, newID); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(`UPDATE reactions SET participant_id = ? WHERE participant_id = ?`, newID, oldID); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE reactions SET participant_id = ? WHERE participant_id = ?`, newID, oldID); err != nil {
 			return err
 		}
 		// Collide on the full unique key including the normalized envelope
@@ -4450,56 +4954,59 @@ func (s *Store) MergeParticipants(oldID, newID int64) error {
 		// snapshot differs from every surviving row's must survive the
 		// repoint, or the merge would destroy the immutable alias evidence
 		// identity discovery classifies from.
-		if _, err := tx.Exec(`
+		if _, err := tx.ExecContext(ctx, `
 			DELETE FROM message_recipients WHERE participant_id = ? AND EXISTS (
 				SELECT 1 FROM message_recipients m2 WHERE m2.message_id = message_recipients.message_id
 				  AND m2.participant_id = ? AND m2.recipient_type = message_recipients.recipient_type
 				  AND LOWER(COALESCE(m2.email_address, '')) = LOWER(COALESCE(message_recipients.email_address, '')))`, oldID, newID); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(`UPDATE message_recipients SET participant_id = ? WHERE participant_id = ?`, newID, oldID); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE message_recipients SET participant_id = ? WHERE participant_id = ?`, newID, oldID); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(`
+		if _, err := tx.ExecContext(ctx, `
 			DELETE FROM conversation_participants WHERE participant_id = ? AND EXISTS (
 				SELECT 1 FROM conversation_participants c2 WHERE c2.conversation_id = conversation_participants.conversation_id
 				  AND c2.participant_id = ?)`, oldID, newID); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(`UPDATE conversation_participants SET participant_id = ? WHERE participant_id = ?`, newID, oldID); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE conversation_participants SET participant_id = ? WHERE participant_id = ?`, newID, oldID); err != nil {
 			return err
 		}
 		// Identifier values are globally unique, so a plain repoint suffices.
-		if _, err := tx.Exec(`UPDATE participant_identifiers SET participant_id = ? WHERE participant_id = ?`, newID, oldID); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE participant_identifiers SET participant_id = ? WHERE participant_id = ?`, newID, oldID); err != nil {
 			return err
 		}
 		if err := s.rewriteObservationsForMergeTx(
-			context.Background(), tx, oldID, newID,
+			ctx, tx, oldID, newID,
 		); err != nil {
 			return err
 		}
 		if err := s.rewriteIdentityMatchCandidatesForMergeTx(
-			context.Background(), tx, oldID, newID, edges,
+			ctx, tx, oldID, newID, edges,
 		); err != nil {
 			return err
 		}
 		// Sender and identifier repoints can add or remove identity evidence.
 		// Repair the primary-store provenance before committing the merge.
 		if err := refreshParticipantMessageAttributionContext(
-			context.Background(), tx, newID,
+			ctx, tx, newID,
 		); err != nil {
+			return err
+		}
+		if err := s.refreshAccountAttributionForParticipantsTx(ctx, tx, []int64{oldID, newID}); err != nil {
 			return err
 		}
 		// Repoint (and, if needed, restructure) any link edges referencing
 		// oldID before the delete below drops them via ON DELETE CASCADE.
-		if err := s.rewriteLinksForMerge(tx, oldID, newID); err != nil {
+		if err := s.rewriteLinksForMergeContext(ctx, tx, oldID, newID); err != nil {
 			return err
 		}
 		// Candidate and link endpoints must both reference the survivor before
 		// unsupported generated matches are withdrawn. Otherwise an owned link
 		// can evade cleanup because it still names the absorbed participant.
-		if err := s.reconcileCurrentObservationIdentityMatchesTxContext(
-			context.Background(), tx,
+		if err := s.reconcileObservationIdentityMatchesForParticipantTxContext(
+			ctx, tx, newID,
 		); err != nil {
 			return err
 		}
@@ -4509,39 +5016,39 @@ func (s *Store) MergeParticipants(oldID, newID int64) error {
 		// still lists the deleted oldID), and the refresh this triggers is
 		// cheap and idempotent, so it is not worth tracking that case
 		// separately from the link-touching one.
-		if _, err := s.bumpIdentityRevision(tx); err != nil {
+		if _, err := s.bumpIdentityRevisionContext(ctx, tx); err != nil {
 			return err
 		}
 		// Also bump the account-identity revision: the primary rows were
 		// repaired above, but existing message Parquet shards still bake the
 		// pre-merge attribution and require a full rebuild.
-		if err := s.bumpAccountIdentityRevision(tx); err != nil {
+		if err := s.bumpAccountIdentityRevisionContext(ctx, tx); err != nil {
 			return err
 		}
-		if err := s.bumpParticipantIdentifierRevision(context.Background(), tx); err != nil {
+		if err := s.bumpParticipantIdentifierRevision(ctx, tx); err != nil {
 			return err
 		}
 		if err := rewritePersonMergeParticipantLineageTx(
-			context.Background(), tx, oldID, newID,
+			ctx, tx, oldID, newID,
 		); err != nil {
 			return err
 		}
-		_, err = tx.Exec(`DELETE FROM participants WHERE id = ?`, oldID)
+		_, err = tx.ExecContext(ctx, `DELETE FROM participants WHERE id = ?`, oldID)
 		if err != nil {
 			return err
 		}
 		if personID != 0 {
 			if err := s.publishPersonIdentityScopeChangesTx(
-				context.Background(), tx, []int64{personID},
+				ctx, tx, []int64{personID},
 				peoplesweep.EvidenceEffectIdentityReassigned); err != nil {
 				return err
 			}
 			if personRevisionBumped {
 				return s.invalidatePersonEnrichmentIdentitiesAfterRevisionTx(
-					context.Background(), tx, personID)
+					ctx, tx, personID)
 			}
 			return s.invalidatePersonEnrichmentIdentitiesTx(
-				context.Background(), tx, personID)
+				ctx, tx, personID)
 		}
 		return nil
 	})
@@ -4550,7 +5057,12 @@ func (s *Store) MergeParticipants(oldID, newID int64) error {
 // ParticipantByIdentifier returns the participant an identifier points at,
 // with whether that participant carries a phone number (0 if none).
 func (s *Store) ParticipantByIdentifier(identifierType, identifierValue string) (id int64, hasPhone bool, err error) {
-	err = s.db.QueryRow(`
+	return s.ParticipantByIdentifierContext(context.Background(), identifierType, identifierValue)
+}
+
+// ParticipantByIdentifierContext honors cancellation during ParticipantByIdentifier.
+func (s *Store) ParticipantByIdentifierContext(ctx context.Context, identifierType, identifierValue string) (id int64, hasPhone bool, err error) {
+	err = s.db.QueryRowContext(ctx, `
 		SELECT p.id, COALESCE(p.phone_number, '') != ''
 		FROM participant_identifiers pi
 		JOIN participants p ON p.id = pi.participant_id
@@ -4574,6 +5086,7 @@ func (s *Store) ParticipantByIdentifier(identifierType, identifierValue string) 
 // of the same type, such as a phone value. The identity lock serializes this
 // migration with other participant-identifier writers and source cleanup.
 func (s *Store) AdoptLegacyParticipantIdentifier(
+	ctx context.Context,
 	identifierType, legacyValue, scopedValue, scopedPrefix string,
 ) (int64, error) {
 	identifierType = strings.TrimSpace(identifierType)
@@ -4588,11 +5101,11 @@ func (s *Store) AdoptLegacyParticipantIdentifier(
 	}
 
 	var adoptedID int64
-	err := s.withTx(func(tx *loggedTx) error {
+	err := s.withTxContext(ctx, func(tx *loggedTx) error {
 		// Fast path for the common case where a concurrent import already
 		// created the scoped identifier.
 		var currentID int64
-		lookupErr := tx.QueryRow(`
+		lookupErr := tx.QueryRowContext(ctx, `
 			SELECT participant_id FROM participant_identifiers
 			WHERE identifier_type = ? AND identifier_value = ?
 		`, identifierType, scopedValue).Scan(&currentID)
@@ -4606,10 +5119,10 @@ func (s *Store) AdoptLegacyParticipantIdentifier(
 		// The write path must take the identity lock before touching
 		// participant_identifiers. Re-check all rows after the lock because
 		// another identity mutation may have completed while this call waited.
-		if err := s.lockIdentityMutationTx(tx); err != nil {
+		if err := s.lockIdentityMutationTxContext(ctx, tx); err != nil {
 			return err
 		}
-		lookupErr = tx.QueryRow(`
+		lookupErr = tx.QueryRowContext(ctx, `
 			SELECT participant_id FROM participant_identifiers
 			WHERE identifier_type = ? AND identifier_value = ?
 		`, identifierType, scopedValue).Scan(&currentID)
@@ -4623,7 +5136,7 @@ func (s *Store) AdoptLegacyParticipantIdentifier(
 		var legacyID int64
 		lookup := `SELECT participant_id FROM participant_identifiers
 			WHERE identifier_type = ? AND identifier_value = ?` + s.dialect.SelectForUpdate()
-		lookupErr = tx.QueryRow(lookup, identifierType, legacyValue).Scan(&legacyID)
+		lookupErr = tx.QueryRowContext(ctx, lookup, identifierType, legacyValue).Scan(&legacyID)
 		if errors.Is(lookupErr, sql.ErrNoRows) {
 			return nil
 		}
@@ -4636,7 +5149,7 @@ func (s *Store) AdoptLegacyParticipantIdentifier(
 		// the raw value ambiguous.
 		var hasScoped bool
 		if scopedPrefix != "" {
-			if err := tx.QueryRow(`
+			if err := tx.QueryRowContext(ctx, `
 				SELECT EXISTS (
 					SELECT 1 FROM participant_identifiers
 					WHERE participant_id = ? AND identifier_type = ?
@@ -4647,24 +5160,24 @@ func (s *Store) AdoptLegacyParticipantIdentifier(
 			}
 		}
 		if hasScoped {
-			if _, err := tx.Exec(`DELETE FROM participant_identifiers
+			if _, err := tx.ExecContext(ctx, `DELETE FROM participant_identifiers
 				WHERE identifier_type = ? AND identifier_value = ?`,
 				identifierType, legacyValue); err != nil {
 				return fmt.Errorf("remove ambiguous legacy participant identifier: %w", err)
 			}
-			if err := s.bumpParticipantIdentifierRevision(context.Background(), tx); err != nil {
+			if err := s.bumpParticipantIdentifierRevision(ctx, tx); err != nil {
 				return err
 			}
 			return nil
 		}
 
-		if _, err := tx.Exec(`UPDATE participant_identifiers
+		if _, err := tx.ExecContext(ctx, `UPDATE participant_identifiers
 			SET identifier_value = ?
 			WHERE identifier_type = ? AND identifier_value = ?`,
 			scopedValue, identifierType, legacyValue); err != nil {
 			return fmt.Errorf("migrate legacy participant identifier: %w", err)
 		}
-		if err := s.bumpParticipantIdentifierRevision(context.Background(), tx); err != nil {
+		if err := s.bumpParticipantIdentifierRevision(ctx, tx); err != nil {
 			return err
 		}
 		adoptedID = legacyID
@@ -4694,32 +5207,38 @@ func (s *Store) AdoptLegacyParticipantIdentifier(
 // rebuild that re-derives committed shards. No-op calls (the common importer
 // re-run) bump nothing.
 func (s *Store) SetParticipantIdentifier(participantID int64, identifierType, identifierValue string) error {
+	return s.SetParticipantIdentifierContext(context.Background(), participantID, identifierType, identifierValue)
+}
+
+// SetParticipantIdentifierContext honors cancellation during SetParticipantIdentifier.
+func (s *Store) SetParticipantIdentifierContext(ctx context.Context, participantID int64, identifierType, identifierValue string) error {
 	identifierType = strings.TrimSpace(identifierType)
 	identifierValue = strings.TrimSpace(identifierValue)
 	if identifierType == "" || identifierValue == "" {
 		return errors.New("identifier type and value are required")
 	}
-	return s.withTx(func(tx *loggedTx) error {
-		// Fast path first, read-only: importer re-runs hit the no-op case
-		// constantly, and it must not take any write lock.
+	// Fast path first, read-only and outside any write transaction: importer
+	// re-runs hit the no-op case constantly, and it must not take any lock.
+	noop := false
+	if err := s.withTxOptionsContext(ctx, &sql.TxOptions{ReadOnly: true}, func(tx *loggedTx) error {
 		existingParticipantID, exists, err := participantIdentifierTargetTx(
-			tx, identifierType, identifierValue,
+			ctx, tx, identifierType, identifierValue,
 		)
-		if err != nil || (exists && existingParticipantID == participantID) {
-			return err
-		}
-		// The write path may bump the identity revision below (owner
-		// evidence), so the identity-mutation row lock must come BEFORE the
-		// participant_identifiers write: BeginExclusive takes that row and
-		// then LOCK TABLE participant_identifiers, and the reverse order
-		// here would deadlock against a serialized source removal. Re-check
-		// the no-op case under the lock: a concurrent call may have set the
-		// same mapping while we waited.
-		if err := s.lockIdentityMutationTx(tx); err != nil {
-			return err
-		}
-		existingParticipantID, exists, err = participantIdentifierTargetTx(
-			tx, identifierType, identifierValue,
+		noop = exists && existingParticipantID == participantID
+		return err
+	}); err != nil || noop {
+		return err
+	}
+	// The write path may bump the identity revision below (owner evidence),
+	// so the exclusive attribution entry takes the identity row BEFORE the
+	// sync fence and the participant_identifiers write: BeginExclusive takes
+	// that row and then LOCK TABLE participant_identifiers, and the reverse
+	// order would deadlock against a serialized source removal. Re-check the
+	// no-op case under the lock: a concurrent call may have set the same
+	// mapping while we waited.
+	return s.withAttributionTxContext(ctx, attributionLock{Exclusive: true}, func(tx *loggedTx) error {
+		existingParticipantID, exists, err := participantIdentifierTargetTx(
+			ctx, tx, identifierType, identifierValue,
 		)
 		if err != nil || (exists && existingParticipantID == participantID) {
 			return err
@@ -4727,13 +5246,13 @@ func (s *Store) SetParticipantIdentifier(participantID int64, identifierType, id
 		serviceSlug, scopeKind, scopeValue := participantIdentifierClassificationValues(
 			identifierType, identifierValue,
 		)
-		classificationColumns, err := s.participantIdentifierClassificationColumnsTx(context.Background(), tx)
+		classificationColumns, err := s.participantIdentifierClassificationColumnsTx(ctx, tx)
 		if err != nil {
 			return err
 		}
 		var setErr error
 		if classificationColumns {
-			_, setErr = tx.Exec(`
+			_, setErr = tx.ExecContext(ctx, `
 				INSERT INTO participant_identifiers (
 					participant_id, identifier_type, identifier_value, is_primary,
 					service_id, scope_kind, scope_value
@@ -4752,7 +5271,7 @@ func (s *Store) SetParticipantIdentifier(participantID int64, identifierType, id
 			// Cache inspection can open a legacy archive before InitSchema adds
 			// service metadata. Preserve that read/repair workflow; the v2
 			// migration classifies this row when the schema is initialized.
-			_, setErr = tx.Exec(`
+			_, setErr = tx.ExecContext(ctx, `
 				INSERT INTO participant_identifiers (
 					participant_id, identifier_type, identifier_value, is_primary
 				) VALUES (?, ?, ?, FALSE)
@@ -4763,11 +5282,11 @@ func (s *Store) SetParticipantIdentifier(participantID int64, identifierType, id
 		if setErr != nil {
 			return fmt.Errorf("set participant identifier: %w", setErr)
 		}
-		if err := s.bumpParticipantIdentifierRevision(context.Background(), tx); err != nil {
+		if err := s.bumpParticipantIdentifierRevision(ctx, tx); err != nil {
 			return err
 		}
 		var ownerEvidence bool
-		if err := tx.QueryRow(`
+		if err := tx.QueryRowContext(ctx, `
 			SELECT EXISTS (SELECT 1 FROM account_identities ai WHERE `+ownerIdentifierMatch("?", "?", "ai.address", "")+`)
 		`, identifierType, identifierValue, identifierType, identifierValue).Scan(&ownerEvidence); err != nil {
 			return fmt.Errorf("check identifier owner evidence: %w", err)
@@ -4776,14 +5295,17 @@ func (s *Store) SetParticipantIdentifier(participantID int64, identifierType, id
 			return nil
 		}
 		if err := refreshParticipantMessageAttributionContext(
-			context.Background(), tx, existingParticipantID, participantID,
+			ctx, tx, existingParticipantID, participantID,
 		); err != nil {
 			return err
 		}
-		if _, err := s.bumpIdentityRevision(tx); err != nil {
+		if err := s.refreshAccountAttributionForParticipantsTx(ctx, tx, []int64{existingParticipantID, participantID}); err != nil {
 			return err
 		}
-		return s.bumpAccountIdentityRevision(tx)
+		if _, err := s.bumpIdentityRevisionContext(ctx, tx); err != nil {
+			return err
+		}
+		return s.bumpAccountIdentityRevisionContext(ctx, tx)
 	})
 }
 
@@ -4804,17 +5326,15 @@ type ParticipantEmailRepair struct {
 // is the recovery story: the rewrite makes the address valid UTF-8, so a
 // rerun's scan can never rediscover a row whose rewrite committed without
 // its refresh, and a failed batch rolls back entirely and stays discoverable.
-func (s *Store) RepairParticipantEmailAddresses(repairs []ParticipantEmailRepair) error {
+func (s *Store) RepairParticipantEmailAddresses(ctx context.Context, repairs []ParticipantEmailRepair) error {
 	if len(repairs) == 0 {
 		return nil
 	}
-	return s.withTx(func(tx *loggedTx) error {
-		if err := s.lockIdentityMutationTx(tx); err != nil {
-			return err
-		}
+	return s.withAttributionTxContext(ctx, attributionLock{Exclusive: true}, func(tx *loggedTx) error {
 		participantIDs := make([]int64, 0, len(repairs))
 		for _, repair := range repairs {
-			result, err := tx.Exec(
+			result, err := tx.ExecContext(
+				ctx,
 				`UPDATE participants SET email_address = ? WHERE id = ?
 				 AND (email_address IS NULL OR email_address <> ?)`,
 				repair.EmailAddress, repair.ParticipantID, repair.EmailAddress,
@@ -4835,19 +5355,22 @@ func (s *Store) RepairParticipantEmailAddresses(repairs []ParticipantEmailRepair
 		for start := 0; start < len(participantIDs); start += chunkSize {
 			end := min(start+chunkSize, len(participantIDs))
 			if err := refreshParticipantMessageAttributionContext(
-				context.Background(), tx, participantIDs[start:end]...,
+				ctx, tx, participantIDs[start:end]...,
 			); err != nil {
 				return err
 			}
+			if err := s.refreshAccountAttributionForParticipantsTx(ctx, tx, participantIDs[start:end]); err != nil {
+				return err
+			}
 		}
-		if _, err := s.bumpIdentityRevision(tx); err != nil {
+		if _, err := s.bumpIdentityRevisionContext(ctx, tx); err != nil {
 			return err
 		}
-		if err := s.bumpAccountIdentityRevision(tx); err != nil {
+		if err := s.bumpAccountIdentityRevisionContext(ctx, tx); err != nil {
 			return err
 		}
 		return s.invalidateParticipantPersonEnrichmentTx(
-			context.Background(), tx, participantIDs...)
+			ctx, tx, participantIDs...)
 	})
 }
 
@@ -4872,12 +5395,12 @@ func (s *Store) participantIdentifierClassificationColumnsTx(
 // participantIdentifierTargetTx returns the participant currently owning an
 // identifier, if any, without taking any lock.
 func participantIdentifierTargetTx(
-	tx *loggedTx,
+	ctx context.Context, tx *loggedTx,
 	identifierType,
 	identifierValue string,
 ) (int64, bool, error) {
 	var existingID int64
-	err := tx.QueryRow(`
+	err := tx.QueryRowContext(ctx, `
 		SELECT participant_id FROM participant_identifiers
 		WHERE identifier_type = ? AND identifier_value = ?
 	`, identifierType, identifierValue).Scan(&existingID)
@@ -4888,6 +5411,11 @@ func participantIdentifierTargetTx(
 }
 
 func (s *Store) EnsureParticipantByIdentifier(identifierType, identifierValue, displayName string) (int64, error) {
+	return s.EnsureParticipantByIdentifierContext(context.Background(), identifierType, identifierValue, displayName)
+}
+
+// EnsureParticipantByIdentifierContext honors cancellation during EnsureParticipantByIdentifier.
+func (s *Store) EnsureParticipantByIdentifierContext(ctx context.Context, identifierType, identifierValue, displayName string) (int64, error) {
 	identifierType = strings.TrimSpace(identifierType)
 	identifierValue = strings.TrimSpace(identifierValue)
 	if identifierType == "" {
@@ -4898,30 +5426,27 @@ func (s *Store) EnsureParticipantByIdentifier(identifierType, identifierValue, d
 	}
 
 	var participantID int64
-	err := s.withTx(func(tx *loggedTx) error {
-		if err := s.lockIdentityMutationTx(tx); err != nil {
-			return err
-		}
-		err := tx.QueryRow(`
+	err := s.withAttributionTxContext(ctx, attributionLock{Exclusive: true}, func(tx *loggedTx) error {
+		err := tx.QueryRowContext(ctx, `
 			SELECT participant_id FROM participant_identifiers
 			WHERE identifier_type = ? AND identifier_value = ?
 		`, identifierType, identifierValue).Scan(&participantID)
 		if err == nil {
 			if displayName != "" {
-				result, err := tx.Exec(`
+				result, err := tx.ExecContext(ctx, `
 					UPDATE participants SET display_name = ?
 					WHERE id = ? AND (display_name IS NULL OR display_name = '')
 				`, displayName, participantID)
 				if err != nil {
 					return fmt.Errorf("backfill participant display name: %w", err)
 				}
-				changed, err := s.bumpParticipantDisplayNameRevisionIfChanged(tx, result)
+				changed, err := s.bumpParticipantDisplayNameRevisionIfChangedContext(ctx, tx, result)
 				if err != nil {
 					return err
 				}
 				if changed {
 					return s.invalidateParticipantPersonEnrichmentTx(
-						context.Background(), tx, participantID)
+						ctx, tx, participantID)
 				}
 			}
 			return nil
@@ -4931,22 +5456,22 @@ func (s *Store) EnsureParticipantByIdentifier(identifierType, identifierValue, d
 		}
 
 		now := s.dialect.Now()
-		if err := tx.QueryRow(fmt.Sprintf(`
+		if err := tx.QueryRowContext(ctx, fmt.Sprintf(`
 			INSERT INTO participants (display_name, created_at, updated_at)
 			VALUES (?, %s, %s)
 			RETURNING id
 		`, now, now), displayName).Scan(&participantID); err != nil {
 			return fmt.Errorf("insert participant: %w", err)
 		}
-		if err := s.bumpParticipantDisplayNameRevision(tx); err != nil {
+		if err := s.bumpParticipantDisplayNameRevisionContext(ctx, tx); err != nil {
 			return err
 		}
-		classificationColumns, err := s.participantIdentifierClassificationColumnsTx(context.Background(), tx)
+		classificationColumns, err := s.participantIdentifierClassificationColumnsTx(ctx, tx)
 		if err != nil {
 			return err
 		}
 		if !classificationColumns {
-			_, err = tx.Exec(`
+			_, err = tx.ExecContext(ctx, `
 				INSERT INTO participant_identifiers (
 					participant_id, identifier_type, identifier_value, display_value, is_primary
 				) VALUES (?, ?, ?, ?, TRUE)
@@ -4958,7 +5483,7 @@ func (s *Store) EnsureParticipantByIdentifier(identifierType, identifierValue, d
 			serviceSlug, scopeKind, scopeValue := participantIdentifierClassificationValues(
 				identifierType, identifierValue,
 			)
-			_, err = tx.Exec(`
+			_, err = tx.ExecContext(ctx, `
 				INSERT INTO participant_identifiers (
 					participant_id, identifier_type, identifier_value, display_value,
 					is_primary, service_id, scope_kind, scope_value
@@ -4970,7 +5495,7 @@ func (s *Store) EnsureParticipantByIdentifier(identifierType, identifierValue, d
 				return fmt.Errorf("insert participant identifier: %w", err)
 			}
 		}
-		return s.bumpParticipantIdentifierRevision(context.Background(), tx)
+		return s.bumpParticipantIdentifierRevision(ctx, tx)
 	})
 	if err != nil {
 		return 0, err
@@ -4982,35 +5507,35 @@ func (s *Store) EnsureParticipantByIdentifier(identifierType, identifierValue, d
 // participant identified by phone number. Only updates if display_name is currently
 // empty. Returns true if a participant was found and updated, false if not found
 // or name was already set. Does NOT create new participants.
-func (s *Store) UpdateParticipantDisplayNameByPhone(phone, displayName string) (bool, error) {
+func (s *Store) UpdateParticipantDisplayNameByPhone(ctx context.Context, phone, displayName string) (bool, error) {
 	if phone == "" || displayName == "" {
 		return false, nil
 	}
 
 	var updated bool
-	err := s.withTx(func(tx *loggedTx) error {
-		if err := s.lockIdentityMutationTx(tx); err != nil {
+	err := s.withTxContext(ctx, func(tx *loggedTx) error {
+		if err := s.lockIdentityMutationTxContext(ctx, tx); err != nil {
 			return err
 		}
-		participantIDs, err := s.participantIdentityUpdateIDsTx(tx,
+		participantIDs, err := s.participantIdentityUpdateIDsTx(ctx, tx,
 			`SELECT id FROM participants
 			 WHERE phone_number = ? AND (display_name IS NULL OR display_name = '')`, phone)
 		if err != nil {
 			return err
 		}
-		result, err := tx.Exec(fmt.Sprintf(`
+		result, err := tx.ExecContext(ctx, fmt.Sprintf(`
 			UPDATE participants SET display_name = ?, updated_at = %s
 			WHERE phone_number = ? AND (display_name IS NULL OR display_name = '')
 		`, s.dialect.Now()), displayName, phone)
 		if err != nil {
 			return err
 		}
-		updated, err = s.bumpParticipantDisplayNameRevisionIfChanged(tx, result)
+		updated, err = s.bumpParticipantDisplayNameRevisionIfChangedContext(ctx, tx, result)
 		if err != nil || !updated {
 			return err
 		}
 		return s.invalidateParticipantPersonEnrichmentTx(
-			context.Background(), tx, participantIDs...)
+			ctx, tx, participantIDs...)
 	})
 	if err != nil {
 		return false, err
@@ -5028,17 +5553,17 @@ func (s *Store) UpdateParticipantDisplayNameByPhone(phone, displayName string) (
 // AND the participant has an "imessage" identifier — so contact-driven
 // names from other sources (Gmail, WhatsApp, Google Voice) are preserved.
 // Returns true if a participant was updated.
-func (s *Store) UpdateImessageParticipantDisplayNameByPhone(phone, displayName string) (bool, error) {
+func (s *Store) UpdateImessageParticipantDisplayNameByPhone(ctx context.Context, phone, displayName string) (bool, error) {
 	if phone == "" || displayName == "" {
 		return false, nil
 	}
 
 	var updated bool
-	err := s.withTx(func(tx *loggedTx) error {
-		if err := s.lockIdentityMutationTx(tx); err != nil {
+	err := s.withTxContext(ctx, func(tx *loggedTx) error {
+		if err := s.lockIdentityMutationTxContext(ctx, tx); err != nil {
 			return err
 		}
-		participantIDs, err := s.participantIdentityUpdateIDsTx(tx, `SELECT id FROM participants
+		participantIDs, err := s.participantIdentityUpdateIDsTx(ctx, tx, `SELECT id FROM participants
 			WHERE phone_number = ?
 			  AND (display_name IS NULL OR display_name = '' OR display_name = phone_number)
 			  AND (display_name IS NULL OR display_name <> ?)
@@ -5050,7 +5575,7 @@ func (s *Store) UpdateImessageParticipantDisplayNameByPhone(phone, displayName s
 		if err != nil {
 			return err
 		}
-		result, err := tx.Exec(fmt.Sprintf(`
+		result, err := tx.ExecContext(ctx, fmt.Sprintf(`
 			UPDATE participants SET display_name = ?, updated_at = %s
 			WHERE phone_number = ?
 			  AND (display_name IS NULL OR display_name = '' OR display_name = phone_number)
@@ -5064,12 +5589,12 @@ func (s *Store) UpdateImessageParticipantDisplayNameByPhone(phone, displayName s
 		if err != nil {
 			return err
 		}
-		updated, err = s.bumpParticipantDisplayNameRevisionIfChanged(tx, result)
+		updated, err = s.bumpParticipantDisplayNameRevisionIfChangedContext(ctx, tx, result)
 		if err != nil || !updated {
 			return err
 		}
 		return s.invalidateParticipantPersonEnrichmentTx(
-			context.Background(), tx, participantIDs...)
+			ctx, tx, participantIDs...)
 	})
 	if err != nil {
 		return false, err
@@ -5087,20 +5612,20 @@ func (s *Store) UpdateImessageParticipantDisplayNameByPhone(phone, displayName s
 // shape, preserving named group chats from Messages.app.
 //
 // Returns the number of conversations whose title was changed.
-func (s *Store) RetitleImessageChats() (int64, error) {
-	direct, err := s.retitleImessageDirectChats()
+func (s *Store) RetitleImessageChats(ctx context.Context) (int64, error) {
+	direct, err := s.retitleImessageDirectChats(ctx)
 	if err != nil {
 		return 0, err
 	}
-	groups, err := s.retitleImessageGroupChats()
+	groups, err := s.retitleImessageGroupChats(ctx)
 	if err != nil {
 		return 0, err
 	}
 	return direct + groups, nil
 }
 
-func (s *Store) retitleImessageDirectChats() (int64, error) {
-	result, err := s.db.Exec(fmt.Sprintf(`
+func (s *Store) retitleImessageDirectChats(ctx context.Context) (int64, error) {
+	result, err := s.db.ExecContext(ctx, fmt.Sprintf(`
 		UPDATE conversations
 		SET title = (
 		    SELECT p.display_name
@@ -5144,8 +5669,8 @@ func (s *Store) retitleImessageDirectChats() (int64, error) {
 	return result.RowsAffected()
 }
 
-func (s *Store) retitleImessageGroupChats() (int64, error) {
-	rows, err := s.db.Query(`
+func (s *Store) retitleImessageGroupChats(ctx context.Context) (int64, error) {
+	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, title
 		FROM conversations
 		WHERE conversation_type = 'group_chat'
@@ -5175,7 +5700,7 @@ func (s *Store) retitleImessageGroupChats() (int64, error) {
 
 	var updated int64
 	for _, group := range groups {
-		participants, err := s.imessageTitleParticipants(group.id)
+		participants, err := s.imessageTitleParticipants(ctx, group.id)
 		if err != nil {
 			return updated, err
 		}
@@ -5192,7 +5717,7 @@ func (s *Store) retitleImessageGroupChats() (int64, error) {
 			continue
 		}
 
-		result, err := s.db.Exec(fmt.Sprintf(`
+		result, err := s.db.ExecContext(ctx, fmt.Sprintf(`
 			UPDATE conversations SET title = ?, updated_at = %s
 			WHERE id = ? AND title = ?
 		`, s.dialect.Now()), newTitle, group.id, group.title)
@@ -5214,8 +5739,8 @@ type imessageTitleParticipant struct {
 	email       string
 }
 
-func (s *Store) imessageTitleParticipants(conversationID int64) ([]imessageTitleParticipant, error) {
-	rows, err := s.db.Query(`
+func (s *Store) imessageTitleParticipants(ctx context.Context, conversationID int64) ([]imessageTitleParticipant, error) {
+	rows, err := s.db.QueryContext(ctx, `
 		SELECT
 			COALESCE(NULLIF(p.display_name, ''), ''),
 			COALESCE(NULLIF(p.phone_number, ''), ''),
@@ -5330,36 +5855,36 @@ func (p imessageTitleParticipant) hasRealDisplayName() bool {
 // display_name is currently empty. Returns true if a participant was
 // found and updated, false if not found or name was already set. Does
 // NOT create new participants. The lookup is case-insensitive.
-func (s *Store) UpdateParticipantDisplayNameByEmail(email, displayName string) (bool, error) {
+func (s *Store) UpdateParticipantDisplayNameByEmail(ctx context.Context, email, displayName string) (bool, error) {
 	if email == "" || displayName == "" {
 		return false, nil
 	}
 
 	var updated bool
-	err := s.withTx(func(tx *loggedTx) error {
-		if err := s.lockIdentityMutationTx(tx); err != nil {
+	err := s.withTxContext(ctx, func(tx *loggedTx) error {
+		if err := s.lockIdentityMutationTxContext(ctx, tx); err != nil {
 			return err
 		}
-		participantIDs, err := s.participantIdentityUpdateIDsTx(tx,
+		participantIDs, err := s.participantIdentityUpdateIDsTx(ctx, tx,
 			`SELECT id FROM participants
 			 WHERE LOWER(email_address) = LOWER(?)
 			   AND (display_name IS NULL OR display_name = '')`, email)
 		if err != nil {
 			return err
 		}
-		result, err := tx.Exec(fmt.Sprintf(`
+		result, err := tx.ExecContext(ctx, fmt.Sprintf(`
 			UPDATE participants SET display_name = ?, updated_at = %s
 			WHERE LOWER(email_address) = LOWER(?) AND (display_name IS NULL OR display_name = '')
 		`, s.dialect.Now()), displayName, email)
 		if err != nil {
 			return err
 		}
-		updated, err = s.bumpParticipantDisplayNameRevisionIfChanged(tx, result)
+		updated, err = s.bumpParticipantDisplayNameRevisionIfChangedContext(ctx, tx, result)
 		if err != nil || !updated {
 			return err
 		}
 		return s.invalidateParticipantPersonEnrichmentTx(
-			context.Background(), tx, participantIDs...)
+			ctx, tx, participantIDs...)
 	})
 	if err != nil {
 		return false, err
@@ -5368,9 +5893,10 @@ func (s *Store) UpdateParticipantDisplayNameByEmail(email, displayName string) (
 }
 
 func (s *Store) participantIdentityUpdateIDsTx(
+	ctx context.Context,
 	tx *loggedTx, query string, args ...any,
 ) ([]int64, error) {
-	rows, err := tx.Query(query+` ORDER BY id`+s.dialect.SelectForUpdate(), args...)
+	rows, err := tx.QueryContext(ctx, query+` ORDER BY id`+s.dialect.SelectForUpdate(), args...)
 	if err != nil {
 		return nil, fmt.Errorf("lock participant identity updates: %w", err)
 	}
@@ -5392,6 +5918,11 @@ func (s *Store) participantIdentityUpdateIDsTx(
 // EnsureConversationParticipant adds a participant to a conversation.
 // Uses INSERT OR IGNORE to be idempotent.
 func (s *Store) EnsureConversationParticipant(conversationID, participantID int64, role string) error {
+	return s.EnsureConversationParticipantContext(context.Background(), conversationID, participantID, role)
+}
+
+// EnsureConversationParticipantContext honors cancellation during EnsureConversationParticipant.
+func (s *Store) EnsureConversationParticipantContext(ctx context.Context, conversationID, participantID int64, role string) error {
 	write := func(q querier) error {
 		if err := s.requireSyncConversationSourceTx(q, conversationID); err != nil {
 			return err
@@ -5401,9 +5932,9 @@ func (s *Store) EnsureConversationParticipant(conversationID, participantID int6
 		return err
 	}
 	if s.syncGeneration == nil {
-		return write(s.db)
+		return write(boundQuerier{ctx: ctx, q: s.db})
 	}
-	return s.withTx(func(tx *loggedTx) error { return write(tx) })
+	return s.withTxContext(ctx, func(tx *loggedTx) error { return write(boundQuerier{ctx: ctx, q: tx}) })
 }
 
 // ConversationParticipantRef identifies one current member of a conversation.
@@ -5434,12 +5965,17 @@ func mergeConversationParticipantsWith(
 // ReplaceConversationParticipants atomically replaces a conversation's
 // membership with a complete source snapshot.
 func (s *Store) ReplaceConversationParticipants(conversationID int64, participants []ConversationParticipantRef) error {
-	return s.withTx(func(tx *loggedTx) error {
-		if err := s.requireSyncConversationSourceTx(tx, conversationID); err != nil {
+	return s.ReplaceConversationParticipantsContext(context.Background(), conversationID, participants)
+}
+
+// ReplaceConversationParticipantsContext honors cancellation during ReplaceConversationParticipants.
+func (s *Store) ReplaceConversationParticipantsContext(ctx context.Context, conversationID int64, participants []ConversationParticipantRef) error {
+	return s.withTxContext(ctx, func(tx *loggedTx) error {
+		if err := s.requireSyncConversationSourceTx(boundQuerier{ctx: ctx, q: tx}, conversationID); err != nil {
 			return err
 		}
 		return replaceConversationParticipantsTx(
-			context.Background(), tx, s.dialect, conversationID, participants,
+			ctx, tx, s.dialect, conversationID, participants,
 		)
 	})
 }
@@ -5547,7 +6083,7 @@ func consolidateConversationParticipantJournal(tx querier, dialect Dialect, conv
 }
 
 // UpsertReaction inserts or ignores a reaction.
-func (s *Store) UpsertReaction(messageID, participantID int64, reactionType, reactionValue string, createdAt time.Time) error {
+func (s *Store) UpsertReaction(ctx context.Context, messageID, participantID int64, reactionType, reactionValue string, createdAt time.Time) error {
 	write := func(q querier) error {
 		if err := s.requireSyncMessageSourceTx(q, messageID); err != nil {
 			return err
@@ -5557,9 +6093,105 @@ func (s *Store) UpsertReaction(messageID, participantID int64, reactionType, rea
 		return err
 	}
 	if s.syncGeneration != nil {
-		return s.withTx(func(tx *loggedTx) error { return write(tx) })
+		return s.withTxContext(ctx, func(tx *loggedTx) error { return write(boundQuerier{ctx: ctx, q: tx}) })
 	}
-	return write(s.db)
+	return write(boundQuerier{ctx: ctx, q: s.db})
+}
+
+// UpsertReactionWithSourceID inserts a reaction and records the provider event
+// that produced it, so a later provider redaction can remove it by event ID.
+func (s *Store) UpsertReactionWithSourceID(ctx context.Context, messageID, participantID int64, reactionType, reactionValue, sourceReactionID string, createdAt time.Time) error {
+	write := func(q querier) error {
+		if err := s.requireSyncMessageSourceTx(q, messageID); err != nil {
+			return err
+		}
+		if _, err := q.Exec(s.dialect.InsertOrIgnore(`INSERT OR IGNORE INTO reactions
+			(message_id, participant_id, reaction_type, reaction_value, created_at)
+			VALUES (?, ?, ?, ?, ?)`), messageID, participantID, reactionType, reactionValue, createdAt); err != nil {
+			return err
+		}
+		_, err := q.Exec(s.dialect.InsertOrIgnore(`INSERT OR IGNORE INTO reaction_source_events
+			(source_id, source_reaction_id, reaction_id)
+			SELECT m.source_id, ?, r.id
+			FROM reactions r
+			JOIN messages m ON m.id = r.message_id
+			WHERE r.message_id = ? AND r.participant_id = ?
+			  AND r.reaction_type = ? AND r.reaction_value = ?`),
+			sourceReactionID, messageID, participantID, reactionType, reactionValue)
+		return err
+	}
+	return s.withTxContext(ctx, func(tx *loggedTx) error { return write(boundQuerier{ctx: ctx, q: tx}) })
+}
+
+// DeleteReactionBySourceID forgets one provider reaction event in a
+// conversation and removes the visible reaction once no event backs it.
+func (s *Store) DeleteReactionBySourceID(ctx context.Context, sourceID, conversationID int64, sourceReactionID string) (bool, error) {
+	deleted := false
+	err := s.withSyncSourceWriteContext(ctx, sourceID, func(q querier) error {
+		var reactionID int64
+		err := q.QueryRow(`SELECT rse.reaction_id FROM reaction_source_events rse
+			JOIN reactions r ON r.id = rse.reaction_id
+			JOIN messages m ON m.id = r.message_id
+			WHERE rse.source_id = ? AND rse.source_reaction_id = ? AND m.conversation_id = ?`,
+			sourceID, sourceReactionID, conversationID).Scan(&reactionID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if _, err := q.Exec(`DELETE FROM reaction_source_events
+			WHERE source_id = ? AND source_reaction_id = ?`, sourceID, sourceReactionID); err != nil {
+			return err
+		}
+		deleted = true
+		_, err = q.Exec(`DELETE FROM reactions
+			WHERE id = ? AND NOT EXISTS (
+				SELECT 1 FROM reaction_source_events WHERE reaction_id = ?
+			)`, reactionID, reactionID)
+		return err
+	})
+	return deleted, err
+}
+
+// repointReactionSourceEvents moves provider reaction event IDs from the
+// absorbed participant's duplicate reactions to the surviving ones, before a
+// participant merge deletes the duplicates.
+func repointReactionSourceEvents(ctx context.Context, tx *loggedTx, loser, winner int64) error {
+	_, err := tx.ExecContext(ctx, `UPDATE reaction_source_events SET reaction_id = (
+			SELECT r2.id FROM reactions r1 JOIN reactions r2
+			  ON r2.message_id = r1.message_id AND r2.participant_id = ?
+			 AND r2.reaction_type = r1.reaction_type AND r2.reaction_value = r1.reaction_value
+			WHERE r1.id = reaction_source_events.reaction_id)
+		WHERE reaction_id IN (
+			SELECT r1.id FROM reactions r1 JOIN reactions r2
+			  ON r2.message_id = r1.message_id AND r2.participant_id = ?
+			 AND r2.reaction_type = r1.reaction_type AND r2.reaction_value = r1.reaction_value
+			WHERE r1.participant_id = ?)`, winner, winner, loser)
+	if err != nil {
+		return fmt.Errorf("repoint reaction source events (loser=%d, winner=%d): %w", loser, winner, err)
+	}
+	return nil
+}
+
+// MessageIDByMetadataValue finds a message in a conversation whose top-level
+// metadata key holds value, or returns 0.
+func (s *Store) MessageIDByMetadataValue(ctx context.Context, conversationID int64, key, value string) (int64, error) {
+	field := "json_extract(metadata, '$.' || ?)"
+	if s.IsPostgreSQL() {
+		field = "metadata ->> CAST(? AS TEXT)"
+	}
+	var messageID int64
+	err := s.db.QueryRowContext(ctx, `SELECT id FROM messages
+		WHERE conversation_id = ? AND `+field+` = ?
+		ORDER BY id LIMIT 1`, conversationID, key, value).Scan(&messageID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("find message by metadata %s: %w", key, err)
+	}
+	return messageID, nil
 }
 
 type ReactionRef struct {
@@ -5571,16 +6203,21 @@ type ReactionRef struct {
 
 // ReplaceReactions replaces all reactions for a message atomically.
 func (s *Store) ReplaceReactions(messageID int64, reactions []ReactionRef) error {
-	return s.withTx(func(tx *loggedTx) error {
-		if _, err := tx.Exec(`DELETE FROM reactions WHERE message_id = ?`, messageID); err != nil {
+	return s.ReplaceReactionsContext(context.Background(), messageID, reactions)
+}
+
+// ReplaceReactionsContext honors cancellation during ReplaceReactions.
+func (s *Store) ReplaceReactionsContext(ctx context.Context, messageID int64, reactions []ReactionRef) error {
+	return s.withTxContext(ctx, func(tx *loggedTx) error {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM reactions WHERE message_id = ?`, messageID); err != nil {
 			return err
 		}
 		for _, r := range reactions {
 			if r.ParticipantID == 0 {
 				continue
 			}
-			if _, err := tx.Exec(s.dialect.InsertOrIgnore(`INSERT OR IGNORE INTO reactions (message_id, participant_id, reaction_type, reaction_value, created_at)
-				VALUES (?, ?, ?, ?, ?)`), messageID, r.ParticipantID, r.Type, r.Value, r.CreatedAt); err != nil {
+			if _, err := tx.ExecContext(ctx, s.dialect.InsertOrIgnore(`INSERT OR IGNORE INTO reactions (message_id, participant_id, reaction_type, reaction_value, created_at)
+				VALUES (?, ?, ?, ?, ?)`), messageID, r.ParticipantID, r.Type, r.Value, sql.NullTime{Time: r.CreatedAt, Valid: !r.CreatedAt.IsZero()}); err != nil {
 				return err
 			}
 		}
@@ -5591,20 +6228,73 @@ func (s *Store) ReplaceReactions(messageID int64, reactions []ReactionRef) error
 // UpsertMessageRawWithFormat stores compressed raw data with an explicit format.
 // Unlike UpsertMessageRaw (which hardcodes 'mime'), this accepts the format as a parameter.
 func (s *Store) UpsertMessageRawWithFormat(messageID int64, rawData []byte, format string) error {
-	ctx := context.Background()
-	return s.withTxContext(ctx, func(tx *loggedTx) error {
+	return s.UpsertMessageRawWithFormatContext(context.Background(), messageID, rawData, format)
+}
+
+// UpsertMessageRawWithFormatContext honors cancellation during UpsertMessageRawWithFormat.
+func (s *Store) UpsertMessageRawWithFormatContext(ctx context.Context, messageID int64, rawData []byte, format string) error {
+	write := func(tx *loggedTx) error {
 		if err := s.lockMeetingEvidenceWith(ctx, tx, messageID); err != nil {
 			return err
 		}
 		if err := s.requireSyncMessageSourceTx(boundQuerier{ctx: ctx, q: tx}, messageID); err != nil {
 			return err
 		}
+		replacesMIME := false
+		if format != "mime" {
+			var stored int
+			err := tx.QueryRowContext(ctx,
+				`SELECT 1 FROM message_raw WHERE message_id = ? AND raw_format = 'mime'`, messageID).Scan(&stored)
+			switch {
+			case err == nil:
+				replacesMIME = true
+			case !errors.Is(err, sql.ErrNoRows):
+				return fmt.Errorf("read raw format of message %d: %w", messageID, err)
+			}
+			if replacesMIME && tx.attribution == nil {
+				return errRawNeedsAttributionLock
+			}
+		}
 		if err := upsertMessageRawWithFormat(boundQuerier{ctx: ctx, q: tx}, messageID, rawData, format); err != nil {
 			return err
 		}
-		return s.refreshMeetingProjectionWith(ctx, tx, messageID)
-	})
+		// Non-MIME raw has no linkage to derive, and only a replaced MIME payload
+		// leaves keys to clear. Anything else would look the message type up for nothing.
+		if format == "mime" || replacesMIME {
+			if _, err := s.refreshEmailLinkageTx(ctx, tx, messageID, emailLinkageForRaw(format, rawData)); err != nil {
+				return err
+			}
+		}
+		if err := s.refreshMeetingProjectionWith(ctx, tx, messageID); err != nil {
+			return err
+		}
+		if err := s.refreshCalendarEventProjectionWith(ctx, tx, messageID); err != nil {
+			return err
+		}
+		switch {
+		case format == "mime":
+			return s.refreshAccountAttributionAfterWriteTx(ctx, tx, messageID, deliveryFromMIME(rawData))
+		case replacesMIME:
+			return s.refreshAccountAttributionAfterWriteTx(ctx, tx, messageID,
+				deliveryInput{parsed: &emailattribution.Headers{}})
+		}
+		return nil
+	}
+	if format != "mime" {
+		// Delivery evidence comes only from MIME, so a write that neither
+		// stores MIME nor replaces it takes no attribution lock. One that
+		// finds MIME to replace rolls back and retries holding the lock.
+		err := s.withTxContext(ctx, write)
+		if !errors.Is(err, errRawNeedsAttributionLock) {
+			return err
+		}
+	}
+	return s.withMessageAttributionTxContext(ctx, messageID, write)
 }
+
+// errRawNeedsAttributionLock rolls back a non-MIME raw write that found MIME
+// to replace, so it can retry holding the message's source lock.
+var errRawNeedsAttributionLock = errors.New("raw write replaces MIME and needs the attribution lock")
 
 // AttachmentPathsUniqueToSource returns local content and thumbnail paths for
 // blobs referenced by sourceID and by no other source. Sharing is checked
@@ -5659,9 +6349,9 @@ func (s *Store) AttachmentPathsUniqueToSource(sourceID int64) ([]string, error) 
 // points to the given content or thumbnail path. Use this immediately before
 // deleting a file to guard against a concurrent sync that added a new
 // reference after the candidate list was collected.
-func (s *Store) IsAttachmentPathReferenced(storagePath string) (bool, error) {
+func (s *Store) IsAttachmentPathReferenced(ctx context.Context, storagePath string) (bool, error) {
 	var count int
-	err := s.db.QueryRow(
+	err := s.db.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM attachments WHERE storage_path = ? OR thumbnail_path = ?`,
 		storagePath, storagePath,
 	).Scan(&count)
@@ -5683,8 +6373,8 @@ func (s *Store) IsAttachmentPathReferenced(storagePath string) (bool, error) {
 // (message_id, empty-hash) match is used to avoid trivial duplicates,
 // but two concurrent empty-hash inserts on the same message may both
 // succeed.
-func (s *Store) UpsertAttachment(messageID int64, filename, mimeType, storagePath, contentHash string, size int) error {
-	return s.UpsertAttachmentRecord(context.Background(), messageID, AttachmentWrite{
+func (s *Store) UpsertAttachment(ctx context.Context, messageID int64, filename, mimeType, storagePath, contentHash string, size int) error {
+	return s.UpsertAttachmentRecord(ctx, messageID, AttachmentWrite{
 		Filename:    filename,
 		MIMEType:    mimeType,
 		StoragePath: storagePath,
@@ -5698,6 +6388,11 @@ func (s *Store) UpsertAttachment(messageID int64, filename, mimeType, storagePat
 // RecomputeMessageAttachmentStats refreshes the denormalized attachment flags
 // on one message from its current attachment rows.
 func (s *Store) RecomputeMessageAttachmentStats(messageID int64) error {
+	return s.RecomputeMessageAttachmentStatsContext(context.Background(), messageID)
+}
+
+// RecomputeMessageAttachmentStatsContext honors cancellation during RecomputeMessageAttachmentStats.
+func (s *Store) RecomputeMessageAttachmentStatsContext(ctx context.Context, messageID int64) error {
 	write := func(q querier) error {
 		if err := s.requireSyncMessageSourceTx(q, messageID); err != nil {
 			return err
@@ -5705,9 +6400,9 @@ func (s *Store) RecomputeMessageAttachmentStats(messageID int64) error {
 		return recomputeMessageAttachmentStatsWith(q, messageID)
 	}
 	if s.syncGeneration == nil {
-		return write(s.db)
+		return write(boundQuerier{ctx: ctx, q: s.db})
 	}
-	return s.withTx(func(tx *loggedTx) error { return write(tx) })
+	return s.withTxContext(ctx, func(tx *loggedTx) error { return write(boundQuerier{ctx: ctx, q: tx}) })
 }
 
 func recomputeMessageAttachmentStatsWith(q querier, messageID int64) error {
@@ -5745,26 +6440,34 @@ type AttachmentRef struct {
 	SkipReason attachmentpolicy.SkipReason
 }
 
-// replaceMessageAttachmentsWhere atomically reconciles a message's attachment
+// replaceMessageAttachmentsWhereContext atomically reconciles a message's attachment
 // rows matching deleteWhere with refs. Retained source-part keys keep their row
 // IDs so resync does not invalidate cached file listings. Refs with an empty
-// StoragePath (and, when requireHash is set, an empty ContentHash) are skipped.
-func (s *Store) replaceMessageAttachmentsWhere(
-	messageID int64, deleteWhere string, requireHash bool, refs []AttachmentRef, deleteArgs ...any,
+// StoragePath are skipped.
+func (s *Store) replaceMessageAttachmentsWhereContext(ctx context.Context,
+	messageID int64, deleteWhere string, refs []AttachmentRef, deleteArgs ...any,
 ) error {
-	return s.withTx(func(tx *loggedTx) error {
-		return s.replaceMessageAttachmentsWhereTx(tx, messageID, deleteWhere, requireHash, refs, deleteArgs...)
+	return s.withTxContext(ctx, func(tx *loggedTx) error {
+		return s.replaceMessageAttachmentsWhereTxContext(ctx, tx, messageID, deleteWhere, refs, deleteArgs...)
 	})
 }
 
 func (s *Store) replaceMessageAttachmentsWhereTx(
-	tx *loggedTx, messageID int64, deleteWhere string, requireHash bool,
+	tx *loggedTx, messageID int64, deleteWhere string,
+	refs []AttachmentRef, deleteArgs ...any,
+) error {
+	return s.replaceMessageAttachmentsWhereTxContext(context.Background(), tx, messageID, deleteWhere, refs, deleteArgs...)
+}
+
+// replaceMessageAttachmentsWhereTxContext honors cancellation during replaceMessageAttachmentsWhereTx.
+func (s *Store) replaceMessageAttachmentsWhereTxContext(ctx context.Context,
+	tx *loggedTx, messageID int64, deleteWhere string,
 	refs []AttachmentRef, deleteArgs ...any,
 ) error {
 	writes := make([]AttachmentWrite, 0, len(refs))
 	keys := make([]any, 0, len(refs))
 	for _, ref := range refs {
-		if ref.StoragePath == "" || (requireHash && ref.ContentHash == "") {
+		if ref.StoragePath == "" {
 			continue
 		}
 		write := AttachmentWrite{
@@ -5800,9 +6503,10 @@ func (s *Store) replaceMessageAttachmentsWhereTx(
 			// A provider ID already identifies the occurrence even if its row
 			// predates source-part keys. Assign the key before removing stale
 			// rows so the upsert can retain the existing file ID.
-			if _, err := tx.Exec(`
+			if _, err := tx.ExecContext(ctx, `
 				UPDATE attachments SET source_part_key = ?
 				WHERE message_id = ? AND source_attachment_id = ? AND source_part_key IS NULL
+				  AND NOT EXISTS (SELECT 1 FROM source_merge_preserved_attachments spa WHERE spa.attachment_id = attachments.id)
 			`, write.SourcePartKey, messageID, write.SourceAttachmentID); err != nil {
 				return fmt.Errorf("assign provider attachment source-part key: %w", err)
 			}
@@ -5812,18 +6516,19 @@ func (s *Store) replaceMessageAttachmentsWhereTx(
 			keys = append(keys, write.SourcePartKey)
 		}
 	}
-	deleteQuery := `DELETE FROM attachments WHERE message_id = ? AND (` + deleteWhere + `)`
+	deleteQuery := `DELETE FROM attachments WHERE message_id = ? AND (` + deleteWhere + `)
+		AND NOT EXISTS (SELECT 1 FROM source_merge_preserved_attachments spa WHERE spa.attachment_id = attachments.id)`
 	args := append([]any{messageID}, deleteArgs...)
 	if len(keys) > 0 {
 		deleteQuery += ` AND (source_part_key IS NULL OR source_part_key NOT IN (?` +
 			strings.Repeat(`, ?`, len(keys)-1) + `))`
 		args = append(args, keys...)
 	}
-	if _, err := tx.Exec(deleteQuery, args...); err != nil {
+	if _, err := tx.ExecContext(ctx, deleteQuery, args...); err != nil {
 		return err
 	}
 	for _, write := range writes {
-		if err := s.upsertAttachmentRecord(tx, messageID, write); err != nil {
+		if err := s.upsertAttachmentRecord(boundQuerier{ctx: ctx, q: tx}, messageID, write); err != nil {
 			return err
 		}
 	}
@@ -5845,7 +6550,7 @@ func nullIfZero(n int64) sql.NullInt64 {
 // excluded or unfinished, so an ordinary resync cannot detach archived media.
 // URL-backed reference/recording attachments are always left untouched.
 // The size estimate includes the stored body and downloaded attachment bytes.
-func (s *Store) ReplaceMessageInlineAttachments(messageID int64, refs []AttachmentRef, preserveLegacy bool) error {
+func (s *Store) ReplaceMessageInlineAttachments(ctx context.Context, messageID int64, refs []AttachmentRef, preserveLegacy bool) error {
 	deleteWhere := `source_attachment_id LIKE 'teams:inline:%'`
 	if !preserveLegacy {
 		deleteWhere += ` OR (
@@ -5859,16 +6564,16 @@ func (s *Store) ReplaceMessageInlineAttachments(messageID int64, refs []Attachme
 		  AND COALESCE(mime_type, '') = ''
 		)`
 	}
-	return s.withTx(func(tx *loggedTx) error {
-		if err := s.replaceMessageAttachmentsWhereTx(tx, messageID, deleteWhere, false, refs); err != nil {
+	return s.withTxContext(ctx, func(tx *loggedTx) error {
+		if err := s.replaceMessageAttachmentsWhereTxContext(ctx, tx, messageID, deleteWhere, refs); err != nil {
 			return err
 		}
 		var body sql.NullString
-		err := tx.QueryRow(`SELECT body_text FROM message_bodies WHERE message_id = ?`, messageID).Scan(&body)
+		err := tx.QueryRowContext(ctx, `SELECT body_text FROM message_bodies WHERE message_id = ?`, messageID).Scan(&body)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("read Teams message body for size estimate: %w", err)
 		}
-		_, err = tx.Exec(`
+		_, err = tx.ExecContext(ctx, `
 			UPDATE messages SET size_estimate = ? + (
 				SELECT COALESCE(SUM(size), 0) FROM attachments
 				WHERE message_id = ? AND content_hash != ''
@@ -5883,8 +6588,8 @@ func (s *Store) ReplaceMessageInlineAttachments(messageID int64, refs []Attachme
 
 // MessageTeamsInlineAttachments returns Teams-managed inline media rows keyed
 // by their stable hosted-content source identifier.
-func (s *Store) MessageTeamsInlineAttachments(messageID int64) (map[string]AttachmentRef, error) {
-	return s.messageProviderAttachments(messageID, "teams:inline:")
+func (s *Store) MessageTeamsInlineAttachments(ctx context.Context, messageID int64) (map[string]AttachmentRef, error) {
+	return s.messageProviderAttachmentsContext(ctx, messageID, "teams:inline:")
 }
 
 // ReplaceMessageBeeperAttachments replaces Beeper-managed attachment rows for
@@ -5898,7 +6603,7 @@ func (s *Store) ReplaceMessageBeeperAttachments(messageID int64, refs []Attachme
 		if err != nil {
 			return err
 		}
-		if err := s.replaceMessageAttachmentsWhereTx(tx, messageID, `source_attachment_id LIKE ?`, false, refs, "beeper:%"); err != nil {
+		if err := s.replaceMessageAttachmentsWhereTx(tx, messageID, `source_attachment_id LIKE ?`, refs, "beeper:%"); err != nil {
 			return err
 		}
 		if metadataChanged {
@@ -5969,8 +6674,75 @@ func (s *Store) beeperAttachmentMetadataChangedTx(
 // MessageBeeperAttachments returns the message's existing Beeper-managed
 // attachment rows keyed by source_attachment_id, so re-persisting a message
 // can keep already-downloaded media without re-fetching it.
-func (s *Store) MessageBeeperAttachments(messageID int64) (map[string]AttachmentRef, error) {
-	return s.messageProviderAttachments(messageID, "beeper:")
+func (s *Store) MessageBeeperAttachments(ctx context.Context, messageID int64) (map[string]AttachmentRef, error) {
+	return s.messageProviderAttachmentsContext(ctx, messageID, "beeper:")
+}
+
+// MessageProviderAttachments returns the message's rows whose
+// source_attachment_id starts with prefix, keyed by that ID.
+func (s *Store) MessageProviderAttachments(ctx context.Context, messageID int64, prefix string) (map[string]AttachmentRef, error) {
+	return s.messageProviderAttachmentsContext(ctx, messageID, prefix)
+}
+
+// EndWaitingProviderAttachments ends a source's provider rows, keyed with
+// prefix, still waiting for bytes on messages dated before before: unavailable
+// when the provider never produced the recording, failed otherwise. It
+// returns how many rows it ended. Calls queued for retry are excluded.
+func (s *Store) EndWaitingProviderAttachments(ctx context.Context, sourceID int64, prefix string, before time.Time, retryIDs []string) (int64, error) {
+	retries, err := json.Marshal(retryIDs)
+	if err != nil {
+		return 0, err
+	}
+	// A single JSON parameter also handles large first-sync retry queues.
+	retryQuery := `SELECT value FROM json_each(?)`
+	if s.IsPostgreSQL() {
+		retryQuery = `SELECT value FROM jsonb_array_elements_text(CAST(? AS jsonb)) AS retry_id(value)`
+	}
+	var ended int64
+	err = s.withSyncSourceWriteContext(ctx, sourceID, func(q querier) error {
+		result, err := q.Exec(s.Rebind(`
+		UPDATE attachments
+		SET attachment_state = CASE WHEN attachment_skip_reason = ? THEN ? ELSE ? END,
+		    attachment_skip_reason = CASE WHEN attachment_skip_reason = ? THEN ? ELSE ? END
+		WHERE source_attachment_id LIKE ?
+		  AND COALESCE(content_hash, '') = ''
+		  AND (COALESCE(attachment_state, '') IN ('', ?) OR attachment_state = ? AND COALESCE(attachment_skip_reason, '') <> ?)
+		  AND message_id IN (
+		    SELECT id FROM messages
+		    WHERE source_id = ? AND COALESCE(sent_at, received_at, internal_date) < ?
+		      AND source_message_id NOT IN (`+retryQuery+`)
+		  )
+	`),
+			attachmentpolicy.SkipSourceUnavailable, attachmentpolicy.StateUnavailable, attachmentpolicy.StateFailed,
+			attachmentpolicy.SkipSourceUnavailable, attachmentpolicy.SkipSourceUnavailable, attachmentpolicy.SkipFetchFailure,
+			prefix+"%",
+			attachmentpolicy.StatePending, attachmentpolicy.StateFailed, attachmentpolicy.SkipFetchFailure,
+			sourceID, before, string(retries),
+		)
+		if err != nil {
+			return err
+		}
+		ended, err = result.RowsAffected()
+		return err
+	})
+	if err != nil {
+		return 0, fmt.Errorf("end waiting provider attachments: %w", err)
+	}
+	return ended, nil
+}
+
+// markFTSMessageUnsearchable shares the terminal PostgreSQL overflow policy.
+func markFTSMessageUnsearchable(q querier, messageID int64) error {
+	_, err := q.Exec(`UPDATE messages SET search_fts = ''::tsvector, indexing_version = ? WHERE id = ?`, CurrentFTSIndexingVersion, messageID)
+	return err
+}
+
+// ftsMessageUnsearchable reports whether the PostgreSQL overflow policy
+// already marked messageID.
+func ftsMessageUnsearchable(q querier, messageID int64) (bool, error) {
+	var terminal bool
+	err := q.QueryRow(`SELECT COALESCE(search_fts = ''::tsvector AND indexing_version = ?, FALSE) FROM messages WHERE id = ?`, CurrentFTSIndexingVersion, messageID).Scan(&terminal)
+	return terminal, err
 }
 
 // ArchivedRawMessage is one archived message paired with the verbatim provider
@@ -5979,9 +6751,67 @@ type ArchivedRawMessage struct {
 	MessageID      int64
 	ConversationID int64
 	RawData        []byte
+	// RawDecodeError reports a corrupt compressed payload separately from SQL errors.
+	RawDecodeError error
 	// BodyText is the currently stored plain-text body, so a caller
 	// re-deriving it can skip rows that would not change.
 	BodyText string
+	Snippet  string
+	// stored is the stored text and search envelope read with the payload.
+	stored derivedEmailText
+	// rawFingerprint binds a scanned repair to its retained encoded MIME.
+	rawFingerprint *[sha256.Size]byte
+}
+
+// decompressArchivedRaw inflates a zlib-compressed archived payload.
+func decompressArchivedRaw(messageID int64, raw []byte, compression sql.NullString) ([]byte, error) {
+	if !compression.Valid || compression.String != "zlib" {
+		return raw, nil
+	}
+	r, err := zlib.NewReader(bytes.NewReader(raw))
+	if err != nil {
+		return nil, fmt.Errorf("zlib reader for message %d: %w", messageID, err)
+	}
+	defer func() { _ = r.Close() }()
+	raw, err = io.ReadAll(r)
+	if err != nil {
+		return nil, fmt.Errorf("decompress message %d: %w", messageID, err)
+	}
+	return raw, nil
+}
+
+// ScanArchivedEmailContext returns a source's first retained MIME message with
+// afterID < id <= throughID, read with its stored text and search envelope, or
+// nil when none remains. Reading one row bounds memory for very large messages.
+// An undecodable payload sets RawDecodeError; query failures return an error.
+func (s *Store) ScanArchivedEmailContext(ctx context.Context, sourceID, afterID, throughID int64) (*ArchivedRawMessage, error) {
+	item := &ArchivedRawMessage{}
+	var raw []byte
+	var compression sql.NullString
+	dest := append([]any{&item.MessageID, &item.ConversationID, &raw, &compression}, item.stored.scanDest()...)
+	err := s.db.QueryRowContext(ctx, `SELECT m.id, m.conversation_id, r.raw_data, r.compression, `+s.derivedEmailTextColumns()+`
+		FROM messages m
+		JOIN message_raw r ON r.message_id = m.id
+		LEFT JOIN message_bodies b ON b.message_id = m.id
+		WHERE m.source_id = ? AND r.raw_format = 'mime' AND m.id > ? AND m.id <= ?
+		ORDER BY m.id
+		LIMIT 1`, sourceID, afterID, throughID).Scan(dest...)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil //nolint:nilnil // An exhausted archive scan has no row and no error.
+	}
+	if err != nil {
+		return nil, fmt.Errorf("scan archived email: %w", err)
+	}
+	item.stored.fts.MessageID = item.MessageID
+	item.BodyText, item.Snippet = item.stored.body, item.stored.snippet
+	item.decodeArchivedEmail(raw, compression)
+	return item, nil
+}
+
+func (item *ArchivedRawMessage) decodeArchivedEmail(raw []byte, compression sql.NullString) {
+	fingerprint := rawMIMEFingerprint(raw, compression)
+	item.rawFingerprint = &fingerprint
+	item.RawData, item.RawDecodeError = decodeMessageRaw(raw, compression)
 }
 
 // ScanArchivedRawMessages returns up to limit archived messages for a source
@@ -5989,8 +6819,13 @@ type ArchivedRawMessage struct {
 // after afterID. Paging by ID keeps a full-archive walk bounded in memory;
 // callers loop until an empty batch comes back.
 func (s *Store) ScanArchivedRawMessages(sourceID int64, format string, afterID int64, limit int) ([]ArchivedRawMessage, error) {
-	rows, err := s.db.Query(s.Rebind(`
-		SELECT m.id, m.conversation_id, r.raw_data, r.compression, COALESCE(b.body_text, '')
+	return s.ScanArchivedRawMessagesContext(context.Background(), sourceID, format, afterID, limit)
+}
+
+// ScanArchivedRawMessagesContext honors cancellation during ScanArchivedRawMessages.
+func (s *Store) ScanArchivedRawMessagesContext(ctx context.Context, sourceID int64, format string, afterID int64, limit int) ([]ArchivedRawMessage, error) {
+	rows, err := s.db.QueryContext(ctx, s.Rebind(`
+		SELECT m.id, m.conversation_id, r.raw_data, r.compression, COALESCE(b.body_text, ''), COALESCE(m.snippet, '')
 		FROM messages m
 		JOIN message_raw r ON r.message_id = m.id
 		LEFT JOIN message_bodies b ON b.message_id = m.id
@@ -6007,21 +6842,12 @@ func (s *Store) ScanArchivedRawMessages(sourceID int64, format string, afterID i
 		var item ArchivedRawMessage
 		var raw []byte
 		var compression sql.NullString
-		if err := rows.Scan(&item.MessageID, &item.ConversationID, &raw, &compression, &item.BodyText); err != nil {
+		if err := rows.Scan(&item.MessageID, &item.ConversationID, &raw, &compression, &item.BodyText, &item.Snippet); err != nil {
 			return nil, err
 		}
-		if compression.Valid && compression.String == "zlib" {
-			r, zerr := zlib.NewReader(bytes.NewReader(raw))
-			if zerr != nil {
-				return nil, fmt.Errorf("zlib reader for message %d: %w", item.MessageID, zerr)
-			}
-			raw, err = io.ReadAll(r)
-			_ = r.Close()
-			if err != nil {
-				return nil, fmt.Errorf("decompress message %d: %w", item.MessageID, err)
-			}
+		if item.RawData, err = decompressArchivedRaw(item.MessageID, raw, compression); err != nil {
+			return nil, err
 		}
-		item.RawData = raw
 		out = append(out, item)
 	}
 	return out, rows.Err()
@@ -6032,9 +6858,10 @@ func (s *Store) ScanArchivedRawMessages(sourceID int64, format string, afterID i
 // joining message_bodies, so resolving a small slice of archive history does
 // not read every stored body for the source.
 func (s *Store) ScanArchivedRawMessagesForConversation(
+	ctx context.Context,
 	sourceID int64, sourceConversationID, format string, afterID int64, limit int,
 ) ([]ArchivedRawMessage, error) {
-	rows, err := s.db.Query(s.Rebind(`
+	rows, err := s.db.QueryContext(ctx, s.Rebind(`
 		SELECT m.id, m.conversation_id, r.raw_data, r.compression
 		FROM messages m
 		JOIN conversations c ON c.id = m.conversation_id
@@ -6056,18 +6883,9 @@ func (s *Store) ScanArchivedRawMessagesForConversation(
 		if err := rows.Scan(&item.MessageID, &item.ConversationID, &raw, &compression); err != nil {
 			return nil, err
 		}
-		if compression.Valid && compression.String == "zlib" {
-			r, zerr := zlib.NewReader(bytes.NewReader(raw))
-			if zerr != nil {
-				return nil, fmt.Errorf("zlib reader for message %d: %w", item.MessageID, zerr)
-			}
-			raw, err = io.ReadAll(r)
-			_ = r.Close()
-			if err != nil {
-				return nil, fmt.Errorf("decompress message %d: %w", item.MessageID, err)
-			}
+		if item.RawData, err = decompressArchivedRaw(item.MessageID, raw, compression); err != nil {
+			return nil, err
 		}
-		item.RawData = raw
 		out = append(out, item)
 	}
 	return out, rows.Err()
@@ -6077,29 +6895,200 @@ func (s *Store) ScanArchivedRawMessagesForConversation(
 // provider payload. A body, snippet, or FTS failure rolls the whole update
 // back, so callers can safely retry every derived field together.
 func (s *Store) UpdateMessageDerivedText(
+	ctx context.Context,
 	messageID int64, bodyText, bodyHTML, snippet sql.NullString, fts FTSDoc,
 ) error {
 	fts.MessageID = messageID
-	return s.withTx(func(tx *loggedTx) error {
-		if err := upsertMessageBody(tx, s.dialect, s.fts5Available, messageID, bodyText, bodyHTML); err != nil {
-			return fmt.Errorf("update derived message body: %w", err)
-		}
-		if _, err := tx.Exec(`UPDATE messages SET snippet = ? WHERE id = ?`, snippet, messageID); err != nil {
-			return fmt.Errorf("update derived message snippet: %w", err)
-		}
-		if s.fts5Available {
-			if err := s.dialect.FTSUpsert(tx, fts); err != nil {
-				return fmt.Errorf("update derived message FTS: %w", err)
-			}
-		}
-		return nil
+	return s.withTxContext(ctx, func(tx *loggedTx) error {
+		return s.updateMessageDerivedText(boundQuerier{ctx: ctx, q: tx}, messageID, bodyText, bodyHTML, snippet, fts, s.dialect.FTSUpsert)
 	})
+}
+
+// UpdateArchivedEmailTextContext atomically repairs body, snippet, and search
+// for a row from ScanArchivedEmailContext while preserving its current envelope.
+func (s *Store) UpdateArchivedEmailTextContext(ctx context.Context, item *ArchivedRawMessage, bodyText, bodyHTML, snippet sql.NullString) (bool, error) {
+	matches, err := s.archivedEmailTextMatchesContext(ctx, item, bodyText, bodyHTML, snippet)
+	if err != nil || matches {
+		return false, err
+	}
+	var changed bool
+	err = s.withTxContext(ctx, func(tx *loggedTx) (err error) {
+		changed, err = s.writeDerivedEmailTextPendingRevision(ctx, tx, item, bodyText, bodyHTML, snippet)
+		return err
+	})
+	return changed, err
+}
+
+func (s *Store) writeDerivedEmailTextPendingRevision(ctx context.Context, tx *loggedTx, item *ArchivedRawMessage, bodyText, bodyHTML, snippet sql.NullString) (bool, error) {
+	changed, err := s.writeDerivedEmailText(ctx, tx, item, bodyText, bodyHTML, snippet)
+	if err != nil || !changed {
+		return changed, err
+	}
+	return changed, setArchiveMetadataValueTx(ctx, tx, pendingDerivedEmailRevisionKey, "1")
+}
+
+// derivedEmailText is a retained email's stored text and the search document
+// FTSUpsert would write for its stored envelope.
+type derivedEmailText struct {
+	body, html, snippet string
+	fts                 FTSDoc
+}
+
+func (row *derivedEmailText) matches(bodyText, bodyHTML, snippet sql.NullString) bool {
+	return row.body == bodyText.String && row.html == bodyHTML.String && row.snippet == snippet.String
+}
+
+// derivedEmailTextColumns selects the columns scanned by derivedEmailText.scanDest
+// from messages m joined to message_bodies b.
+func (s *Store) derivedEmailTextColumns() string {
+	aggregate := "GROUP_CONCAT"
+	if s.IsPostgreSQL() {
+		aggregate = "STRING_AGG"
+	}
+	envelope := storedFTSEnvelopeSQL(aggregate)
+	return `COALESCE(b.body_text, ''), COALESCE(b.body_html, ''), COALESCE(m.snippet, ''), ` +
+		envelope.subject + `, ` + envelope.fromAddr + `, ` + envelope.toAddrs + `, ` + envelope.ccAddrs
+}
+
+func (row *derivedEmailText) scanDest() []any {
+	return []any{&row.body, &row.html, &row.snippet, &row.fts.Subject, &row.fts.FromAddr, &row.fts.ToAddrs, &row.fts.CcAddrs}
+}
+
+func (s *Store) loadDerivedEmailText(q querier, messageID int64) (derivedEmailText, error) {
+	row := derivedEmailText{fts: FTSDoc{MessageID: messageID}}
+	err := q.QueryRow(`SELECT `+s.derivedEmailTextColumns()+`
+		FROM messages m LEFT JOIN message_bodies b ON b.message_id = m.id WHERE m.id = ?`, messageID).
+		Scan(row.scanDest()...)
+	return row, err
+}
+
+func (s *Store) archivedEmailTextMatchesContext(ctx context.Context, item *ArchivedRawMessage, bodyText, bodyHTML, snippet sql.NullString) (bool, error) {
+	if item.rawFingerprint == nil {
+		return false, errors.New("email repair requires a scanned MIME fingerprint")
+	}
+	return s.derivedEmailTextMatchesContext(ctx, item.stored, bodyText, bodyHTML, snippet)
+}
+
+func (s *Store) derivedEmailTextMatchesContext(ctx context.Context, row derivedEmailText, bodyText, bodyHTML, snippet sql.NullString) (bool, error) {
+	if !row.matches(bodyText, bodyHTML, snippet) {
+		return false, nil
+	}
+	if !s.fts5Available {
+		return true, nil
+	}
+	q := boundQuerier{ctx: ctx, q: s.db}
+	row.fts.Body = bodyText.String
+	matches, err := s.dialect.FTSMatches(q, row.fts)
+	if s.dialect.IsFTSValueTooLargeError(err) {
+		return ftsMessageUnsearchable(q, row.fts.MessageID)
+	}
+	return matches, err
+}
+
+// writeDerivedEmailText indexes the new body with the envelope read under the
+// message lock. Current text is not rewritten, and an overflow that is already
+// terminal reports no change.
+func (s *Store) writeDerivedEmailText(ctx context.Context, tx *loggedTx, item *ArchivedRawMessage, bodyText, bodyHTML, snippet sql.NullString) (bool, error) {
+	if err := s.lockArchivedEmailTextContext(ctx, tx, item); err != nil {
+		return false, fmt.Errorf("lock derived email write: %w", err)
+	}
+	q := boundQuerier{ctx: ctx, q: tx}
+	row, err := s.loadArchivedEmailTextForWrite(q, item)
+	if err != nil {
+		return false, fmt.Errorf("load derived email envelope: %w", err)
+	}
+	row.fts.Body = bodyText.String
+	if row.matches(bodyText, bodyHTML, snippet) {
+		return s.upsertFTSOrUnsearchable(q, row.fts)
+	}
+	upsert := func(q querier, doc FTSDoc) error { _, err := s.upsertFTSOrUnsearchable(q, doc); return err }
+	return true, s.updateMessageDerivedText(q, item.MessageID, bodyText, bodyHTML, snippet, row.fts, upsert)
+}
+
+// ErrArchivedEmailSnippetChanged requires a fresh scan before retrying a repair.
+var ErrArchivedEmailSnippetChanged = errors.New("archived email snippet changed")
+
+// loadArchivedEmailTextForWrite preserves provider snippets changed since the
+// scan. The caller holds the message lock through this check and the writes.
+func (s *Store) loadArchivedEmailTextForWrite(q querier, item *ArchivedRawMessage) (derivedEmailText, error) {
+	row, err := s.loadDerivedEmailText(q, item.MessageID)
+	if err != nil {
+		return row, err
+	}
+	if row.snippet != item.stored.snippet {
+		return row, fmt.Errorf("%w after repair scan: message %d", ErrArchivedEmailSnippetChanged, item.MessageID)
+	}
+	return row, nil
+}
+
+// lockArchivedEmailTextContext orders writes with sync and rejects stale MIME
+// before any body, snippet, or search correction can replace the sync snapshot.
+func (s *Store) lockArchivedEmailTextContext(ctx context.Context, tx *loggedTx, item *ArchivedRawMessage) error {
+	if err := s.lockMeetingEvidenceWith(ctx, tx, item.MessageID); err != nil {
+		return err
+	}
+	var raw []byte
+	var compression sql.NullString
+	err := tx.QueryRowContext(ctx, `SELECT raw_data, compression FROM message_raw
+		WHERE message_id = ? AND raw_format = 'mime'`+s.dialect.SelectForUpdate(), item.MessageID).Scan(&raw, &compression)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if errors.Is(err, sql.ErrNoRows) || rawMIMEFingerprint(raw, compression) != *item.rawFingerprint {
+		return fmt.Errorf("message %d MIME changed after email repair scan", item.MessageID)
+	}
+	return nil
+}
+
+func (s *Store) updateMessageDerivedText(q querier, messageID int64, bodyText, bodyHTML, snippet sql.NullString, fts FTSDoc, upsertFTS func(querier, FTSDoc) error) error {
+	if err := upsertMessageBody(q, s.dialect, s.fts5Available, messageID, bodyText, bodyHTML); err != nil {
+		return fmt.Errorf("update derived message body: %w", err)
+	}
+	if _, err := q.Exec(`UPDATE messages SET snippet = ? WHERE id = ?`, snippet, messageID); err != nil {
+		return fmt.Errorf("update derived message snippet: %w", err)
+	}
+	if s.fts5Available {
+		if err := upsertFTS(q, fts); err != nil {
+			return fmt.Errorf("update derived message FTS: %w", err)
+		}
+	}
+	return nil
+}
+
+// upsertFTSOrUnsearchable applies the backfill's terminal policy when
+// PostgreSQL rejects the bounded search vector, keeping the caller's other
+// writes. It reports false when the row was already terminal.
+func (s *Store) upsertFTSOrUnsearchable(q querier, doc FTSDoc) (bool, error) {
+	if _, err := q.Exec("SAVEPOINT derived_fts"); err != nil {
+		return false, err
+	}
+	changed, err := true, s.dialect.FTSUpsert(q, doc)
+	if s.dialect.IsFTSValueTooLargeError(err) {
+		slog.Warn("marking message unsearchable after FTS overflow", "message_id", doc.MessageID, "error", err)
+		changed, err = markFTSOverflowUnsearchable(q, doc.MessageID)
+	}
+	if err != nil {
+		return false, err
+	}
+	_, err = q.Exec("RELEASE SAVEPOINT derived_fts")
+	return changed, err
+}
+
+func markFTSOverflowUnsearchable(q querier, messageID int64) (bool, error) {
+	if _, err := q.Exec("ROLLBACK TO SAVEPOINT derived_fts"); err != nil {
+		return false, err
+	}
+	terminal, err := ftsMessageUnsearchable(q, messageID)
+	if err != nil || terminal {
+		return false, err
+	}
+	return true, markFTSMessageUnsearchable(q, messageID)
 }
 
 // ArchivedSourceMessageIDs returns the subset of sourceMessageIDs already
 // archived for a source. Used to decide whether a page fetched from the
 // provider contains anything new without re-persisting it first.
-func (s *Store) ArchivedSourceMessageIDs(sourceID int64, sourceMessageIDs []string) (map[string]struct{}, error) {
+func (s *Store) ArchivedSourceMessageIDs(ctx context.Context, sourceID int64, sourceMessageIDs []string) (map[string]struct{}, error) {
 	out := make(map[string]struct{})
 	if len(sourceMessageIDs) == 0 {
 		return out, nil
@@ -6113,7 +7102,7 @@ func (s *Store) ArchivedSourceMessageIDs(sourceID int64, sourceMessageIDs []stri
 	}
 	query := s.Rebind(`SELECT source_message_id FROM messages WHERE source_id = ? AND source_message_id IN (` +
 		strings.Join(placeholders, ",") + `)`)
-	rows, err := s.db.Query(query, args...)
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("look up archived source message IDs: %w", err)
 	}
@@ -6139,12 +7128,14 @@ type SourceMessageRef struct {
 // ListRecentMessagesForSource returns refs of the source's most recently
 // archived, non-tombstoned messages, for verifying that stored IDs still
 // resolve to the same content at the source.
-func (s *Store) ListRecentMessagesForSource(sourceID int64, limit int) ([]SourceMessageRef, error) {
-	rows, err := s.db.Query(`
+func (s *Store) ListRecentMessagesForSource(ctx context.Context, sourceID int64, limit int) ([]SourceMessageRef, error) {
+	rows, err := s.db.QueryContext(ctx, `
 		SELECT m.source_message_id, c.source_conversation_id, m.sent_at
 		FROM messages m
 		JOIN conversations c ON c.id = m.conversation_id
 		WHERE m.source_id = ? AND m.sent_at IS NOT NULL AND m.deleted_from_source_at IS NULL
+ AND m.deleted_at IS NULL
+ AND NOT EXISTS (SELECT 1 FROM source_merge_archive_only_messages am WHERE am.message_id = m.id)
 		ORDER BY m.sent_at DESC, m.id DESC
 		LIMIT ?
 	`, sourceID, limit)
@@ -6178,7 +7169,12 @@ func (s *Store) ListBeeperPendingAttachmentMessages(sourceID int64) ([]BeeperPen
 // hang under a root far older than any history window — selecting threads
 // through the root's age alone leaves such replies unrepairable.
 func (s *Store) ListSlackRecentReplyThreadRoots(sourceID, conversationID int64, since time.Time) ([]string, error) {
-	rows, err := s.db.Query(`
+	return s.ListSlackRecentReplyThreadRootsContext(context.Background(), sourceID, conversationID, since)
+}
+
+// ListSlackRecentReplyThreadRootsContext honors cancellation during ListSlackRecentReplyThreadRoots.
+func (s *Store) ListSlackRecentReplyThreadRootsContext(ctx context.Context, sourceID, conversationID int64, since time.Time) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `
 		SELECT p.source_message_id
 		FROM messages p
 		WHERE p.source_id = ?
@@ -6211,7 +7207,7 @@ func (s *Store) ListSlackRecentReplyThreadRoots(sourceID, conversationID int64, 
 // downloaded (see normalizeSlackAttachmentRefs) — neither is pending work.
 func (s *Store) ListSlackPendingAttachmentMessages(sourceID int64) ([]PendingAttachmentMessage, error) {
 	rows, err := s.db.Query(`
-		SELECT m.id, m.source_message_id, c.source_conversation_id,
+		SELECT m.id, c.id, m.source_message_id, c.source_conversation_id,
 		       a.storage_path, COALESCE(a.content_hash, ''), COALESCE(a.media_type, ''),
 		       COALESCE(a.attachment_state, '')
 		FROM messages m
@@ -6219,6 +7215,8 @@ func (s *Store) ListSlackPendingAttachmentMessages(sourceID int64) ([]PendingAtt
 		JOIN attachments a ON a.message_id = m.id
 		WHERE m.source_id = ?
 		  AND a.source_attachment_id LIKE ?
+		  AND NOT EXISTS (SELECT 1 FROM source_merge_archive_only_messages am WHERE am.message_id = m.id)
+		  AND NOT EXISTS (SELECT 1 FROM source_merge_preserved_attachments spa WHERE spa.attachment_id = a.id)
 		ORDER BY m.id, a.id
 	`, sourceID, "slack:%")
 	if err != nil {
@@ -6238,7 +7236,7 @@ func (s *Store) ListSlackPendingAttachmentMessages(sourceID int64) ([]PendingAtt
 		var item PendingAttachmentMessage
 		var ref AttachmentRef
 		if err := rows.Scan(
-			&item.MessageID, &item.SourceMessageID, &item.ChatID,
+			&item.MessageID, &item.ConversationID, &item.SourceMessageID, &item.ChatID,
 			&ref.StoragePath, &ref.ContentHash, &ref.MediaType, &ref.State,
 		); err != nil {
 			return nil, err
@@ -6266,14 +7264,24 @@ func (s *Store) ListSlackPendingAttachmentMessages(sourceID int64) ([]PendingAtt
 // Stable Slack file IDs are persisted as source-part keys so every file keeps
 // one row even when several files on a message have identical bytes.
 func (s *Store) ReplaceMessageSlackAttachments(messageID int64, refs []AttachmentRef) error {
-	return s.replaceMessageProviderAttachments(messageID, "slack:", refs)
+	return s.ReplaceMessageSlackAttachmentsContext(context.Background(), messageID, refs)
+}
+
+// ReplaceMessageSlackAttachmentsContext honors cancellation during ReplaceMessageSlackAttachments.
+func (s *Store) ReplaceMessageSlackAttachmentsContext(ctx context.Context, messageID int64, refs []AttachmentRef) error {
+	return s.replaceMessageProviderAttachmentsContext(ctx, messageID, "slack:", refs)
 }
 
 // MessageSlackAttachments returns the message's existing Slack-managed
 // attachment rows keyed by source_attachment_id, so re-persisting a message
 // can keep already-downloaded media without re-fetching it.
 func (s *Store) MessageSlackAttachments(messageID int64) (map[string]AttachmentRef, error) {
-	refs, err := s.messageProviderAttachments(messageID, "slack:")
+	return s.MessageSlackAttachmentsContext(context.Background(), messageID)
+}
+
+// MessageSlackAttachmentsContext honors cancellation during MessageSlackAttachments.
+func (s *Store) MessageSlackAttachmentsContext(ctx context.Context, messageID int64) (map[string]AttachmentRef, error) {
+	refs, err := s.messageProviderAttachmentsContext(ctx, messageID, "slack:")
 	if err != nil {
 		return nil, err
 	}
@@ -6294,9 +7302,25 @@ func (s *Store) MessageSlackAttachments(messageID int64) (map[string]AttachmentR
 // rows (source_attachment_id 'teams:inline:%'), whose URL-backed storage_path
 // records a durable pending/skipped/failed outcome, not a link attachment.
 func (s *Store) ReplaceMessageLinkAttachments(messageID int64, refs []AttachmentRef) error {
-	return s.replaceMessageAttachmentsWhere(messageID,
-		`(storage_path LIKE 'http://%' OR storage_path LIKE 'https://%')
-		 AND COALESCE(source_attachment_id, '') NOT LIKE 'teams:inline:%'`, false, refs)
+	return s.withTx(func(tx *loggedTx) error {
+		before, err := readRecordingPointers(context.Background(), tx, messageID, "source_attachment_id, storage_path")
+		if err != nil {
+			return err
+		}
+		if err := s.replaceMessageAttachmentsWhereTx(tx, messageID,
+			`(storage_path LIKE 'http://%' OR storage_path LIKE 'https://%')
+			 AND COALESCE(source_attachment_id, '') NOT LIKE 'teams:inline:%'`, refs); err != nil {
+			return err
+		}
+		after, err := readRecordingPointers(context.Background(), tx, messageID, "source_attachment_id, storage_path")
+		if err != nil {
+			return err
+		}
+		if !slices.Equal(before, after) {
+			_, err = tx.Exec(`UPDATE messages SET content_changed_at = `+s.dialect.ContentChangedNow()+` WHERE id = ?`, messageID)
+		}
+		return err
+	})
 }
 
 // LabelIDContext finds a label by its provider ID within a source.
@@ -6314,7 +7338,11 @@ func (s *Store) MessageIDsWithLabelContext(ctx context.Context, sourceID, labelI
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT m.source_message_id, m.id FROM messages m
 		JOIN message_labels ml ON ml.message_id = m.id
-		WHERE m.source_id = ? AND ml.label_id = ? AND m.deleted_from_source_at IS NULL`, sourceID, labelID)
+		WHERE m.source_id = ? AND ml.label_id = ? AND m.deleted_from_source_at IS NULL
+		AND NOT EXISTS (
+			SELECT 1 FROM source_merge_archive_only_messages marker
+			WHERE marker.message_id = m.id
+		)`, sourceID, labelID)
 	if err != nil {
 		return nil, fmt.Errorf("list messages in label: %w", err)
 	}
@@ -6329,4 +7357,87 @@ func (s *Store) MessageIDsWithLabelContext(ctx context.Context, sourceID, labelI
 		ids[sourceMsgID] = id
 	}
 	return ids, rows.Err()
+}
+
+// PhoneParticipantContext finds the one participant holding an E.164 phone,
+// as its primary number or as an alias kept by a merge or service identifier.
+// It never creates an identity from unconfirmed evidence. A missing phone, or
+// one held by more than one participant, returns zero.
+func (s *Store) PhoneParticipantContext(ctx context.Context, phone string) (int64, error) {
+	id, err := s.soleAddressParticipantContext(ctx, `
+		SELECT id FROM participants WHERE phone_number = ?
+		UNION
+		SELECT participant_id FROM participant_identifiers WHERE identifier_value = ?`, phone)
+	if err != nil {
+		return 0, fmt.Errorf("look up phone participant: %w", err)
+	}
+	return id, nil
+}
+
+// EmailParticipantContext finds the one participant holding an email address,
+// as its primary address or as an alias, without creating identities from
+// review-only evidence. A missing or ambiguous email returns zero.
+func (s *Store) EmailParticipantContext(ctx context.Context, email string) (int64, error) {
+	id, err := s.soleAddressParticipantContext(ctx, `
+		SELECT id FROM participants WHERE LOWER(email_address) = LOWER(?)
+		UNION
+		SELECT participant_id FROM participant_identifiers WHERE LOWER(identifier_value) = LOWER(?)`, email)
+	if err != nil {
+		return 0, fmt.Errorf("look up email participant: %w", err)
+	}
+	return id, nil
+}
+
+func (s *Store) soleAddressParticipantContext(ctx context.Context, query, address string) (int64, error) {
+	rows, err := s.db.QueryContext(ctx, query+` LIMIT 2`, address, address)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = rows.Close() }()
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return 0, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	if len(ids) != 1 {
+		return 0, nil
+	}
+	return ids[0], nil
+}
+
+// ResolveDeferredMessageRepliesContext links archived replies whose metadata
+// contains referenced_message_id once their parent is available.
+func (s *Store) ResolveDeferredMessageRepliesContext(ctx context.Context, sourceID int64, messageType string, pageSize int) error {
+	afterID := int64(0)
+	for {
+		unresolved, err := s.ListUnresolvedMessageRepliesAfterContext(ctx,
+			sourceID, messageType, afterID, pageSize, 0,
+		)
+		if err != nil {
+			return err
+		}
+		for _, reply := range unresolved {
+			var metadata struct {
+				ReferencedMessageID string `json:"referenced_message_id"`
+			}
+			if err := json.Unmarshal([]byte(reply.Metadata), &metadata); err != nil {
+				return fmt.Errorf("decode reply metadata for %s: %w", reply.SourceMessageID, err)
+			}
+			if metadata.ReferencedMessageID != "" {
+				if err := s.SetReplyToContext(ctx, sourceID, reply.SourceMessageID, metadata.ReferencedMessageID); err != nil {
+					return fmt.Errorf("resolve deferred reply %s: %w", reply.SourceMessageID, err)
+				}
+			}
+			afterID = reply.MessageID
+		}
+		if len(unresolved) < pageSize {
+			return nil
+		}
+	}
 }

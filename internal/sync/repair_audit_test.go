@@ -2,6 +2,7 @@ package sync
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"fmt"
 	"os"
@@ -18,6 +19,99 @@ import (
 	testemail "go.kenn.io/msgvault/internal/testutil/email"
 )
 
+func TestAuditGmailMessagesOmitsCoherentInlineBinarySnapshot(t *testing.T) {
+	t.Parallel()
+	assert := assert.New(t)
+	require := require.New(t)
+	env := newTestEnv(t)
+	source := env.CreateSource(t)
+	id := seedRepairRow(t, env.Store, source.ID, "gmail-a", "thread-a", "coherent inline")
+	payload := []byte("inline bytes")
+	hash := fmt.Sprintf("%x", sha256.Sum256(payload))
+	raw := testemail.NewMessage().Subject("coherent inline").
+		Header("Message-ID", "<gmail-a@example.com>").Body("coherent inline body").
+		WithAttachment("inline.bin", "application/octet-stream", payload).Bytes()
+	raw = []byte(strings.ReplaceAll(string(raw), "Content-Disposition: attachment", "Content-Disposition: inline"))
+	require.NoError(env.Store.UpsertMessageRaw(id, raw))
+	require.NoError(env.Store.UpsertMessageBody(id, sql.NullString{String: "coherent inline body", Valid: true}, sql.NullString{}))
+	// Seed the physical keyed row independently of Parse, as an older ingest
+	// would after upserting the overlapping listings of this one MIME part.
+	require.NoError(env.Store.UpsertAttachmentRecord(t.Context(), id, store.AttachmentWrite{
+		Filename: "inline.bin", MIMEType: "application/octet-stream", Size: int64(len(payload)),
+		ContentHash: hash, StoragePath: hash[:2] + "/" + hash, SourcePartKey: "mime:2",
+		Role: store.AttachmentRoleInline, RoleSource: store.AttachmentRoleSourceMIMEDisposition,
+	}))
+	require.NoError(env.Store.RecomputeMessageAttachmentStats(id))
+	before := readRepairSnapshot(t, env.Store, id)
+	assert.Empty(collectAudit(t, env.Syncer, source.ID))
+	assert.Equal(before, readRepairSnapshot(t, env.Store, id), "audit must not modify coherent legacy rows")
+}
+
+func TestRepairMessageInlineBinaryAttachmentsConverge(t *testing.T) {
+	t.Parallel()
+	assert := assert.New(t)
+	require := require.New(t)
+	env := newTestEnv(t)
+	source := env.CreateSource(t)
+	payload := []byte{0, 1, 254, 255}
+	raw := testemail.NewMessage().Subject("inline duplicates").Body("body").
+		Header("Message-ID", "<gmail-a@example.com>").
+		WithAttachment("first.bin", "application/octet-stream", payload).
+		WithAttachment("second.bin", "application/octet-stream", payload).Bytes()
+	raw = []byte(strings.ReplaceAll(string(raw), "Content-Disposition: attachment", "Content-Disposition: inline"))
+	env.Mock.AddMessage("gmail-a", raw, []string{"INBOX"})
+	env.Mock.Profile.MessagesTotal = 1
+	env.Mock.Profile.HistoryID = 10
+	attachmentsDir := filepath.Join(env.TmpDir, "attachments")
+	env.SetOptions(t, func(options *Options) { options.AttachmentsDir = attachmentsDir })
+	runFullSync(t, env)
+	var id int64
+	require.NoError(env.Store.DB().QueryRowContext(t.Context(), `SELECT id FROM messages WHERE source_id = ? AND source_message_id = 'gmail-a'`, source.ID).Scan(&id))
+	assertInlineBinaryOccurrences(t, env.Store, id, attachmentsDir, payload)
+	assert.Empty(collectAudit(t, env.Syncer, source.ID), "fresh ingest is coherent")
+
+	_, err := env.Store.DB().ExecContext(t.Context(), `DELETE FROM attachments WHERE message_id = ? AND source_part_key = 'mime:3'`, id)
+	require.NoError(err)
+	results := collectAudit(t, env.Syncer, source.ID)
+	require.Len(results, 1)
+	assert.Equal(AuditMismatch, results[0].Fields[AuditFieldAttachmentHashes])
+	assert.Equal(AuditMismatch, results[0].Fields[AuditFieldAttachmentPartKeys])
+	for range 2 {
+		result, err := env.Syncer.RepairMessage(t.Context(), RepairRequest{Reference: "gmail-a", SourceID: source.ID})
+		require.NoError(err)
+		assert.Equal(id, result.InternalID)
+		assertInlineBinaryOccurrences(t, env.Store, id, attachmentsDir, payload)
+		assert.Empty(collectAudit(t, env.Syncer, source.ID), "repair and repeated repair must converge")
+	}
+}
+
+func assertInlineBinaryOccurrences(t *testing.T, st *store.Store, id int64, dir string, payload []byte) {
+	t.Helper()
+	assert := assert.New(t)
+	require := require.New(t)
+	var count int
+	require.NoError(st.DB().QueryRowContext(t.Context(), `SELECT attachment_count FROM messages WHERE id = ?`, id).Scan(&count))
+	assert.Equal(2, count)
+	rows, err := st.DB().QueryContext(t.Context(), `SELECT source_part_key, content_hash, attachment_role, storage_path, size FROM attachments WHERE message_id = ? ORDER BY source_part_key`, id)
+	require.NoError(err)
+	defer func() { _ = rows.Close() }()
+	var keys []string
+	for rows.Next() {
+		var key, hash, role, path string
+		var size int64
+		require.NoError(rows.Scan(&key, &hash, &role, &path, &size))
+		keys = append(keys, key)
+		assert.Equal(fmt.Sprintf("%x", sha256.Sum256(payload)), hash)
+		assert.Equal("inline", role)
+		assert.Equal(int64(len(payload)), size)
+		stored, err := os.ReadFile(filepath.Join(dir, path))
+		require.NoError(err)
+		assert.Equal(payload, stored)
+	}
+	require.NoError(rows.Err())
+	assert.Equal([]string{"mime:2", "mime:3"}, keys)
+}
+
 func TestAuditGmailMessagesReportsCrossedFieldsAndInconclusiveRaw(t *testing.T) {
 	t.Parallel()
 	assert := assert.New(t)
@@ -32,7 +126,7 @@ func TestAuditGmailMessagesReportsCrossedFieldsAndInconclusiveRaw(t *testing.T) 
 		From("other@example.com").To("different@example.com").
 		Subject("other").Header("Message-ID", "<other@example.com>").Body("other body").Bytes()
 	require.NoError(env.Store.UpsertMessageRaw(crossedID, crossedRaw))
-	_, err := env.Store.DB().Exec(`DELETE FROM message_raw WHERE message_id = ?`, missingID)
+	_, err := env.Store.DB().ExecContext(t.Context(), `DELETE FROM message_raw WHERE message_id = ?`, missingID)
 	require.NoError(err)
 	require.NoError(env.Store.UpsertMessageRaw(badID, []byte("not MIME\x00")))
 
@@ -47,6 +141,33 @@ func TestAuditGmailMessagesReportsCrossedFieldsAndInconclusiveRaw(t *testing.T) 
 	assert.Equal(AuditInconclusive, byID[missingID].Fields[AuditFieldRawMIME])
 	assert.Equal(AuditInconclusive, byID[badID].Status)
 	assert.Equal(AuditInconclusive, byID[badID].Fields[AuditFieldRawMIME])
+}
+
+func TestAuditGmailMessagesMarksEmptyRawInconclusive(t *testing.T) {
+	for _, compression := range []string{"zlib", "uncompressed"} {
+		t.Run(compression, func(t *testing.T) {
+			t.Parallel()
+			assert := assert.New(t)
+			require := require.New(t)
+			st := testutil.NewTestStore(t)
+			source, err := st.GetOrCreateSource("gmail", "audit@example.com")
+			require.NoError(err)
+			id := seedRepairRow(t, st, source.ID, "empty-raw", "thread-empty", "original")
+			require.NoError(st.UpsertMessageRaw(id, []byte{}))
+			if compression == "uncompressed" {
+				_, err = st.DB().ExecContext(t.Context(), st.Rebind(`
+					UPDATE message_raw SET raw_data = ?, compression = NULL WHERE message_id = ?
+				`), []byte{}, id)
+				require.NoError(err)
+			}
+
+			results := collectAudit(t, New(nil, st, nil), source.ID)
+			require.Len(results, 1)
+			assert.Equal(AuditInconclusive, results[0].Status)
+			assert.Equal(AuditInconclusive, results[0].Fields[AuditFieldRawMIME])
+			assert.Equal("stored raw MIME is empty", results[0].Error)
+		})
+	}
 }
 
 func TestAuditGmailMessagesTreatsParsedEmptyFieldsAsAuthoritative(t *testing.T) {
@@ -74,7 +195,8 @@ func TestAuditGmailMessagesMarksNonMIMEStoredRawInconclusive(t *testing.T) {
 	source := env.CreateSource(t)
 	id := seedRepairRow(t, env.Store, source.ID, "gmail-a", "thread-a", "stored")
 
-	_, err := env.Store.DB().Exec(
+	_, err := env.Store.DB().ExecContext(
+		t.Context(),
 		`UPDATE message_raw SET raw_format = 'gcal_json' WHERE message_id = ?`, id)
 	require.NoError(err)
 
@@ -95,14 +217,14 @@ func TestAuditGmailMessagesOmitsCoherentLegacyEvidence(t *testing.T) {
 	env.SetOptions(t, func(options *Options) { options.AttachmentsDir = filepath.Join(env.TmpDir, "attachments") })
 	runFullSync(t, env)
 	var id int64
-	require.NoError(env.Store.DB().QueryRow(`SELECT id FROM messages WHERE source_id = ? AND source_message_id = 'gmail-a'`, source.ID).Scan(&id))
+	require.NoError(env.Store.DB().QueryRowContext(t.Context(), `SELECT id FROM messages WHERE source_id = ? AND source_message_id = 'gmail-a'`, source.ID).Scan(&id))
 	participantID, err := env.Store.EnsureParticipant("merged@example.com", "Merged", "example.com")
 	require.NoError(err)
-	_, err = env.Store.DB().Exec(`UPDATE messages SET sender_id = ? WHERE id = ?`, participantID, id)
+	_, err = env.Store.DB().ExecContext(t.Context(), `UPDATE messages SET sender_id = ? WHERE id = ?`, participantID, id)
 	require.NoError(err)
-	_, err = env.Store.DB().Exec(`UPDATE message_recipients SET email_address = NULL WHERE message_id = ?`, id)
+	_, err = env.Store.DB().ExecContext(t.Context(), `UPDATE message_recipients SET email_address = NULL WHERE message_id = ?`, id)
 	require.NoError(err)
-	_, err = env.Store.DB().Exec(`UPDATE attachments SET source_part_key = NULL WHERE message_id = ?`, id)
+	_, err = env.Store.DB().ExecContext(t.Context(), `UPDATE attachments SET source_part_key = NULL WHERE message_id = ?`, id)
 	require.NoError(err)
 
 	assert.Empty(t, collectAudit(t, env.Syncer, source.ID))
@@ -121,8 +243,8 @@ func TestAuditGmailMessagesComparesAttachmentHashesWithoutOccurrenceKeys(t *test
 	env.SetOptions(t, func(options *Options) { options.AttachmentsDir = filepath.Join(env.TmpDir, "attachments") })
 	runFullSync(t, env)
 	var id int64
-	require.NoError(env.Store.DB().QueryRow(`SELECT id FROM messages WHERE source_id = ? AND source_message_id = 'gmail-a'`, source.ID).Scan(&id))
-	_, err := env.Store.DB().Exec(`UPDATE attachments SET content_hash = 'wrong', source_part_key = NULL WHERE message_id = ?`, id)
+	require.NoError(env.Store.DB().QueryRowContext(t.Context(), `SELECT id FROM messages WHERE source_id = ? AND source_message_id = 'gmail-a'`, source.ID).Scan(&id))
+	_, err := env.Store.DB().ExecContext(t.Context(), `UPDATE attachments SET content_hash = 'wrong', source_part_key = NULL WHERE message_id = ?`, id)
 	require.NoError(err)
 
 	results := collectAudit(t, env.Syncer, source.ID)
@@ -146,10 +268,10 @@ func TestAuditGmailMessagesAttachmentHashMultisetPreservesDuplicateCounts(t *tes
 	env.SetOptions(t, func(options *Options) { options.AttachmentsDir = filepath.Join(env.TmpDir, "attachments") })
 	runFullSync(t, env)
 	var id int64
-	require.NoError(env.Store.DB().QueryRow(`SELECT id FROM messages WHERE source_id = ? AND source_message_id = 'gmail-a'`, source.ID).Scan(&id))
+	require.NoError(env.Store.DB().QueryRowContext(t.Context(), `SELECT id FROM messages WHERE source_id = ? AND source_message_id = 'gmail-a'`, source.ID).Scan(&id))
 	var attachmentID int64
-	require.NoError(env.Store.DB().QueryRow(`SELECT id FROM attachments WHERE message_id = ? ORDER BY id LIMIT 1`, id).Scan(&attachmentID))
-	_, err := env.Store.DB().Exec(`DELETE FROM attachments WHERE id = ?`, attachmentID)
+	require.NoError(env.Store.DB().QueryRowContext(t.Context(), `SELECT id FROM attachments WHERE message_id = ? ORDER BY id LIMIT 1`, id).Scan(&attachmentID))
+	_, err := env.Store.DB().ExecContext(t.Context(), `DELETE FROM attachments WHERE id = ?`, attachmentID)
 	require.NoError(err)
 
 	results := collectAudit(t, env.Syncer, source.ID)
@@ -172,14 +294,14 @@ func TestAuditGmailMessagesAcceptsRepeatedPartStoredOnceWithoutOccurrenceKeys(t 
 	env.SetOptions(t, func(options *Options) { options.AttachmentsDir = filepath.Join(env.TmpDir, "attachments") })
 	runFullSync(t, env)
 	var id int64
-	require.NoError(env.Store.DB().QueryRow(`SELECT id FROM messages WHERE source_id = ? AND source_message_id = 'gmail-a'`, source.ID).Scan(&id))
+	require.NoError(env.Store.DB().QueryRowContext(t.Context(), `SELECT id FROM messages WHERE source_id = ? AND source_message_id = 'gmail-a'`, source.ID).Scan(&id))
 	// Archives written before occurrence keys existed hold one unkeyed row per
 	// (message, content hash), so the repeated part was stored exactly once.
 	var keep int64
-	require.NoError(env.Store.DB().QueryRow(`SELECT id FROM attachments WHERE message_id = ? ORDER BY id LIMIT 1`, id).Scan(&keep))
-	_, err := env.Store.DB().Exec(`DELETE FROM attachments WHERE message_id = ? AND id <> ?`, id, keep)
+	require.NoError(env.Store.DB().QueryRowContext(t.Context(), `SELECT id FROM attachments WHERE message_id = ? ORDER BY id LIMIT 1`, id).Scan(&keep))
+	_, err := env.Store.DB().ExecContext(t.Context(), `DELETE FROM attachments WHERE message_id = ? AND id <> ?`, id, keep)
 	require.NoError(err)
-	_, err = env.Store.DB().Exec(`UPDATE attachments SET source_part_key = NULL WHERE id = ?`, keep)
+	_, err = env.Store.DB().ExecContext(t.Context(), `UPDATE attachments SET source_part_key = NULL WHERE id = ?`, keep)
 	require.NoError(err)
 
 	assert.Empty(t, collectAudit(t, env.Syncer, source.ID))
@@ -197,10 +319,10 @@ func TestAuditGmailMessagesTreatsLegacyOnlyAttachmentAsInconclusive(t *testing.T
 	env.SetOptions(t, func(options *Options) { options.AttachmentsDir = filepath.Join(env.TmpDir, "attachments") })
 	runFullSync(t, env)
 	var id int64
-	require.NoError(env.Store.DB().QueryRow(`SELECT id FROM messages WHERE source_id = ? AND source_message_id = 'gmail-a'`, source.ID).Scan(&id))
+	require.NoError(env.Store.DB().QueryRowContext(t.Context(), `SELECT id FROM messages WHERE source_id = ? AND source_message_id = 'gmail-a'`, source.ID).Scan(&id))
 	// Older ingests recorded small nameless text parts as attachments. Such a
 	// row has no counterpart in the current parse but is not corruption.
-	_, err := env.Store.DB().Exec(`UPDATE attachments SET source_part_key = NULL WHERE message_id = ?`, id)
+	_, err := env.Store.DB().ExecContext(t.Context(), `UPDATE attachments SET source_part_key = NULL WHERE message_id = ?`, id)
 	require.NoError(err)
 	require.NoError(env.Store.UpsertAttachmentRecord(t.Context(), id, store.AttachmentWrite{
 		Filename: "", MIMEType: "text/plain", StoragePath: "ab/abcd", ContentHash: "abcd", Size: 150,
@@ -227,9 +349,11 @@ func TestAuditGmailMessagesFlagsSwappedAttachmentHashes(t *testing.T) {
 	env.SetOptions(t, func(options *Options) { options.AttachmentsDir = filepath.Join(env.TmpDir, "attachments") })
 	runFullSync(t, env)
 	var id int64
-	require.NoError(env.Store.DB().QueryRow(
+	require.NoError(env.Store.DB().QueryRowContext(
+		t.Context(),
 		`SELECT id FROM messages WHERE source_id = ? AND source_message_id = 'gmail-a'`, source.ID).Scan(&id))
-	rows, err := env.Store.DB().Query(
+	rows, err := env.Store.DB().QueryContext(
+		t.Context(),
 		`SELECT id, content_hash FROM attachments WHERE message_id = ? ORDER BY id`, id)
 	require.NoError(err)
 	defer func() { require.NoError(rows.Close()) }()
@@ -246,9 +370,9 @@ func TestAuditGmailMessagesFlagsSwappedAttachmentHashes(t *testing.T) {
 	require.NoError(rows.Err())
 	require.Len(stored, 2)
 	require.NotEqual(stored[0].hash, stored[1].hash)
-	_, err = env.Store.DB().Exec(`UPDATE attachments SET content_hash = ? WHERE id = ?`, stored[1].hash, stored[0].id)
+	_, err = env.Store.DB().ExecContext(t.Context(), `UPDATE attachments SET content_hash = ? WHERE id = ?`, stored[1].hash, stored[0].id)
 	require.NoError(err)
-	_, err = env.Store.DB().Exec(`UPDATE attachments SET content_hash = ? WHERE id = ?`, stored[0].hash, stored[1].id)
+	_, err = env.Store.DB().ExecContext(t.Context(), `UPDATE attachments SET content_hash = ? WHERE id = ?`, stored[0].hash, stored[1].id)
 	require.NoError(err)
 
 	results := collectAudit(t, env.Syncer, source.ID)
@@ -263,7 +387,6 @@ func TestAuditGmailMessagesIsReadOnlyAndKeysetPaged(t *testing.T) {
 	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
-	testutil.SkipIfPostgres(t, "filesystem and SQLite query-only proof")
 	env := newTestEnv(t)
 	source := env.CreateSource(t)
 	var firstID, secondPageID int64
@@ -276,7 +399,7 @@ func TestAuditGmailMessagesIsReadOnlyAndKeysetPaged(t *testing.T) {
 			secondPageID = id
 		}
 	}
-	_, err := env.Store.DB().Exec(`UPDATE message_raw SET raw_data = ?, compression = 'zlib' WHERE message_id = ?`, []byte("not-zlib"), firstID)
+	_, err := env.Store.DB().ExecContext(t.Context(), `UPDATE message_raw SET raw_data = ?, compression = 'zlib' WHERE message_id = ?`, []byte("not-zlib"), firstID)
 	require.NoError(err)
 	require.NoError(env.Store.UpsertMessageRaw(secondPageID,
 		testemail.NewMessage().Subject("second-page-mismatch").Body("different").Bytes()))
@@ -373,7 +496,7 @@ func TestRepairedMessageWithProviderAttachmentIsNotAuditedAgain(t *testing.T) {
 	env := newTestEnv(t)
 	source := env.CreateSource(t)
 	id := seedRepairRow(t, env.Store, source.ID, "gmail-a", "thread-a", "old")
-	_, err := env.Store.DB().Exec(`INSERT INTO attachments (
+	_, err := env.Store.DB().ExecContext(t.Context(), `INSERT INTO attachments (
 		message_id, filename, mime_type, size, content_hash, storage_path,
 		source_attachment_id, attachment_role, role_source
 	) VALUES (?, 'provider.bin', 'application/octet-stream', 8, 'providerhash', 'pr/provider',
@@ -385,7 +508,7 @@ func TestRepairedMessageWithProviderAttachmentIsNotAuditedAgain(t *testing.T) {
 	require.NoError(err)
 	assert.Empty(collectAudit(t, env.Syncer, source.ID))
 	var providerRows int
-	require.NoError(env.Store.DB().QueryRow(`SELECT COUNT(*) FROM attachments WHERE message_id = ? AND source_attachment_id IS NOT NULL`, id).Scan(&providerRows))
+	require.NoError(env.Store.DB().QueryRowContext(t.Context(), `SELECT COUNT(*) FROM attachments WHERE message_id = ? AND source_attachment_id IS NOT NULL`, id).Scan(&providerRows))
 	assert.Equal(1, providerRows)
 }
 
@@ -449,9 +572,9 @@ func seedGmailAuditRow(
 ) int64 {
 	t.Helper()
 	require := require.New(t)
-	convID, err := st.EnsureConversation(sourceID, "thread-"+sourceMessageID, subject)
+	convID, err := st.EnsureConversation(t.Context(), sourceID, "thread-"+sourceMessageID, subject)
 	require.NoError(err)
-	participants, err := st.EnsureParticipantsBatch([]mime.Address{
+	participants, err := st.EnsureParticipantsBatch(t.Context(), []mime.Address{
 		{Email: "sender@example.com", Domain: "example.com"},
 		{Email: "recipient@example.com", Domain: "example.com"},
 	})

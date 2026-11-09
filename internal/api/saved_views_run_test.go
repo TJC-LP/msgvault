@@ -35,13 +35,14 @@ func newSavedViewRunTestServer(t *testing.T) (*Server, *store.Store) {
 		Engine:         newExploreDuckDBFixture(t),
 		Logger:         testLogger(),
 	})
-	t.Cleanup(func() { require.NoError(t, srv.Shutdown(context.Background())) })
+	// Cleanup runs after t.Context() is canceled.
+	t.Cleanup(func() { require.NoError(t, srv.Shutdown(context.WithoutCancel(t.Context()))) })
 	return srv, st
 }
 
 func createRunTestView(t *testing.T, st *store.Store, name, state string) *store.SavedView {
 	t.Helper()
-	view, err := st.CreateSavedView(context.Background(), store.SavedViewInput{
+	view, err := st.CreateSavedView(t.Context(), store.SavedViewInput{
 		Name: name, CanonicalState: json.RawMessage(state), SchemaVersion: store.CurrentSavedViewSchemaVersion,
 	})
 	require.NoError(t, err)
@@ -89,6 +90,31 @@ func TestRunSavedViewExecutesEntriesWithTheExploreContract(t *testing.T) {
 	requirements.Len(next.Rows, 1)
 	assertions.Equal("Older", next.Rows[0].Title)
 	assertions.Empty(next.NextCursor)
+}
+
+func TestRunSavedViewPreservesVersionedPipeMeaning(t *testing.T) {
+	t.Parallel()
+	requirements := require.New(t)
+	assertions := assert.New(t)
+	st, engine := newExploreSearchFixture(t, []string{"alpha | gamma", "alpha", "gamma"})
+	srv := NewServerWithOptions(ServerOptions{
+		Config: &config.Config{Server: config.ServerConfig{APIPort: 8080}}, Store: st, SavedViewStore: st,
+		Engine: engine, Logger: testLogger(),
+	})
+	// Cleanup runs after t.Context() is canceled.
+	t.Cleanup(func() { require.NoError(t, srv.Shutdown(context.WithoutCancel(t.Context()))) })
+	view, err := st.CreateSavedView(t.Context(), store.SavedViewInput{
+		Name: "v1 literal AND", SchemaVersion: 1,
+		CanonicalState: json.RawMessage(`{"query":"alpha | gamma","search_mode":"full_text"}`),
+	})
+	requirements.NoError(err)
+	response, page := runSavedView(t, srv, view.ID, `{"limit":1}`)
+	requirements.Equal(http.StatusOK, response.Code, response.Body.String())
+	requirements.NotNil(page.TotalCount)
+	assertions.Equal(int64(1), *page.TotalCount)
+	requirements.Len(page.Rows, 1)
+	requirements.NotNil(page.Rows[0].AnchorMessageID)
+	assertions.Equal(int64(1), *page.Rows[0].AnchorMessageID)
 }
 
 func TestRunSavedViewExecutesGroupsAtTheFirstChainLevel(t *testing.T) {
@@ -158,7 +184,7 @@ func TestRunSavedViewRelaysSavedViewAndExploreErrors(t *testing.T) {
 	assertions.Contains(badCursor.Body.String(), "invalid_cursor", "Explore errors pass through unchanged")
 
 	srv.savedViewStore = &staleSavedViewStore{view: store.SavedView{
-		ID: 1, Name: "Stale", SchemaVersion: 2, CanonicalState: json.RawMessage(`{}`), Revision: 1,
+		ID: 1, Name: "Stale", SchemaVersion: 3, CanonicalState: json.RawMessage(`{}`), Revision: 1,
 	}}
 	stale, _ := runSavedView(t, srv, 1, `{}`)
 	assertions.Equal(http.StatusBadRequest, stale.Code, stale.Body.String())
@@ -297,7 +323,8 @@ func TestRunSavedViewFilesDeclaresSemanticDeletionScope(t *testing.T) {
 		Store:          &mockStore{messages: []APIMessage{{ID: 1}}, total: 1, stats: &StoreStats{}},
 		SavedViewStore: st, Engine: engine, HybridEngine: hybridEngine, Backend: backend, Logger: testLogger(),
 	})
-	t.Cleanup(func() { require.NoError(t, srv.Shutdown(context.Background())) })
+	// Cleanup runs after t.Context() is canceled.
+	t.Cleanup(func() { require.NoError(t, srv.Shutdown(context.WithoutCancel(t.Context()))) })
 	view := createRunTestView(t, st, "Semantic files", `{"query":"alpha","search_mode":"semantic","presentation":"files"}`)
 
 	response, page := runSavedView(t, srv, view.ID, `{}`)

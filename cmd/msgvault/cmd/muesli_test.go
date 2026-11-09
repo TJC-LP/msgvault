@@ -5,7 +5,6 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json/v2"
-	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -20,41 +19,14 @@ import (
 	"go.kenn.io/msgvault/internal/api"
 	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/muesli"
-	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/testutil"
 )
-
-func TestResolveMuesliSources(t *testing.T) {
-	assert := assert.New(t)
-	require := require.New(t)
-	cfg := &config.Config{}
-	_, err := resolveMuesliSources(nil, cfg)
-	require.Error(err)
-	assert.Contains(err.Error(), "[[muesli]]")
-
-	cfg = &config.Config{Muesli: []config.MuesliSource{
-		{Identifier: "mac", AccountEmail: "you@example.com"},
-		{Identifier: "studio", AccountEmail: "you@example.com"},
-	}}
-	all, err := resolveMuesliSources(nil, cfg)
-	require.NoError(err)
-	assert.Len(all, 2)
-
-	one, err := resolveMuesliSources([]string{"STUDIO"}, cfg)
-	require.NoError(err)
-	require.Len(one, 1)
-	assert.Equal("studio", one[0].Identifier)
-
-	_, err = resolveMuesliSources([]string{"laptop"}, cfg)
-	require.Error(err)
-	assert.Contains(err.Error(), "configured: mac, studio")
-}
 
 func TestProbeMuesliDatabaseRejectsForeignFiles(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "notes.txt")
 	require.NoError(t, os.WriteFile(path, []byte("not sqlite"), 0o600))
 
-	err := probeMuesliDatabase(context.Background(), path)
+	err := probeMuesliDatabase(t.Context(), path)
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "db_path")
@@ -63,9 +35,9 @@ func TestProbeMuesliDatabaseRejectsForeignFiles(t *testing.T) {
 func TestRunConfiguredMuesliSyncRefusesUnregisteredSource(t *testing.T) {
 	st := testutil.NewTestStore(t)
 
-	err := runConfiguredMuesliSync(context.Background(), st, config.MuesliSource{
+	err := runConfiguredMuesliSync(t.Context(), st, config.MuesliSource{
 		Identifier: "removed", AccountEmail: "you@example.com",
-	})
+	}, t.TempDir())
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "add-muesli removed")
@@ -83,7 +55,7 @@ func TestServeScheduledMuesliSyncCompletes(t *testing.T) {
 	db, err := sql.Open("sqlite3", path)
 	require.NoError(err)
 	t.Cleanup(func() { _ = db.Close() })
-	_, err = db.Exec(`CREATE TABLE meetings (id INTEGER PRIMARY KEY, title TEXT, start_time TEXT, created_at TEXT, raw_transcript TEXT);
+	_, err = db.ExecContext(t.Context(), `CREATE TABLE meetings (id INTEGER PRIMARY KEY, title TEXT, start_time TEXT, created_at TEXT, raw_transcript TEXT);
 		INSERT INTO meetings VALUES (1, 'Planning', '2026-09-01T14:00:00Z', '2026-09-01 14:00:03', 'Synthetic meeting notes')`)
 	require.NoError(err)
 	require.NoError(db.Close())
@@ -92,10 +64,7 @@ func TestServeScheduledMuesliSyncCompletes(t *testing.T) {
 		Identifier: "mac", AccountEmail: "you@example.com", DBPath: path,
 		Contacts: &contacts, Enabled: true, Schedule: "0 0 1 1 *",
 	}}
-	st, err := store.Open(cfg.DatabaseDSN())
-	require.NoError(err)
-	t.Cleanup(func() { _ = st.Close() })
-	require.NoError(st.InitSchema())
+	st := testutil.NewSQLiteTestStoreAt(t, cfg.DatabaseDSN())
 	_, err = st.GetOrCreateSource(muesli.SourceType, "mac")
 	require.NoError(err)
 
@@ -115,14 +84,21 @@ func TestServeScheduledMuesliSyncCompletes(t *testing.T) {
 	})
 	waitForServeHealth(t, cfg.Server.APIPort, errCh)
 	baseURL := fmt.Sprintf("http://127.0.0.1:%d", cfg.Server.APIPort)
-	client := &http.Client{Timeout: time.Second}
-	response, err := client.Post(baseURL+"/api/v1/sync/mac?source_type=muesli", "application/json", nil)
+	client := &http.Client{Timeout: serveLifecycleTestTimeout}
+	syncRequest, err := http.NewRequestWithContext(t.Context(), http.MethodPost, baseURL+"/api/v1/sync/mac?source_type=muesli", nil)
+	require.NoError(err)
+	syncRequest.Header.Set("Content-Type", "application/json")
+	response, err := client.Do(syncRequest)
 	require.NoError(err)
 	require.NoError(response.Body.Close())
 	require.Equal(http.StatusAccepted, response.StatusCode)
 	var status api.SourceStatusResponse
 	require.Eventually(func() bool {
-		response, err := client.Get(baseURL + "/api/v1/sources/status?source_type=muesli")
+		statusRequest, err := http.NewRequestWithContext(t.Context(), http.MethodGet, baseURL+"/api/v1/sources/status?source_type=muesli", nil)
+		if err != nil {
+			return false
+		}
+		response, err := client.Do(statusRequest)
 		if err != nil {
 			return false
 		}
@@ -132,16 +108,6 @@ func TestServeScheduledMuesliSyncCompletes(t *testing.T) {
 	}, serveLifecycleTestTimeout, 20*time.Millisecond, "scheduled import did not finish")
 	assert.Equal(int64(1), status.Sources[0].LastSuccessfulSync.MessagesAdded)
 	assert.Empty(status.Sources[0].SchedulerLastError, "post-import cache refresh must receive the daemon configuration")
-}
-
-func TestFinishMuesliImportRefreshesCacheAfterPartialWrites(t *testing.T) {
-	refreshed := 0
-	err := finishMuesliImport("mac", &muesli.ImportSummary{MeetingsAdded: 1},
-		errors.New("meeting 3 failed"), func() error { refreshed++; return nil })
-
-	require.Error(t, err)
-	assert.Equal(t, 1, refreshed)
-	assert.Contains(t, err.Error(), "muesli sync mac failed")
 }
 
 func TestWriteMuesliSummaryReportsSkippedMeetings(t *testing.T) {
@@ -172,19 +138,6 @@ func TestWriteMuesliSummaryReportsContactsState(t *testing.T) {
 
 	assert.Contains(t, out.String(), "Contacts:           unavailable")
 	assert.Contains(t, out.String(), "Full Disk Access")
-}
-
-func TestMuesliImportOptionsCarryContactsSettings(t *testing.T) {
-	enabled := false
-	opts := muesliImportOptions(config.MuesliSource{
-		Identifier: "mac", AccountEmail: "you@example.com", DBPath: "/tmp/muesli.db",
-		Contacts: &enabled, ContactsPath: "/tmp/AddressBook", PhoneCountryCode: "44",
-	})
-
-	assert.Equal(t, muesli.ImportOptions{
-		Identifier: "mac", AccountEmail: "you@example.com", DBPath: "/tmp/muesli.db",
-		ContactsEnabled: false, ContactsPath: "/tmp/AddressBook", PhoneCountryCode: "44",
-	}, opts)
 }
 
 func TestMuesliCommandsUseInvocationConfiguration(t *testing.T) {

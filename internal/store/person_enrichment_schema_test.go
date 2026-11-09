@@ -152,44 +152,7 @@ func TestPersonEnrichmentBackendParityMatrix(t *testing.T) {
 	})
 }
 
-func TestPersonEnrichmentSchemaEnforcesConsentAuditState(t *testing.T) {
-	require := require.New(t)
-	st := testutil.NewTestStore(t)
-	profile := enrichmentTestProfile(t)
-	_, err := st.EnsurePersonEnrichmentProfile(t.Context(), profile)
-	require.NoError(err)
-
-	_, err = st.DB().ExecContext(t.Context(), st.Rebind(`
-		INSERT INTO person_enrichment_consents
-			(profile_fingerprint, granted_by, revoked_by)
-		VALUES (?, 'cli', 'cli')`), profile.Fingerprint)
-	require.Error(err, "revocation actor without timestamp must fail")
-
-	_, err = st.DB().ExecContext(t.Context(), st.Rebind(`
-		INSERT INTO person_enrichment_consents
-			(profile_fingerprint, granted_by)
-		VALUES (?, 'cli')`), profile.Fingerprint)
-	require.NoError(err)
-	_, err = st.DB().ExecContext(t.Context(), st.Rebind(`
-		INSERT INTO person_enrichment_consents
-			(profile_fingerprint, granted_by)
-		VALUES (?, 'second')`), profile.Fingerprint)
-	require.Error(err, "only one active consent is allowed")
-
-	_, err = st.DB().ExecContext(t.Context(), st.Rebind(`
-		UPDATE person_enrichment_consents
-		SET revoked_by = 'cli', revoked_at = CURRENT_TIMESTAMP
-		WHERE profile_fingerprint = ? AND revoked_at IS NULL`), profile.Fingerprint)
-	require.NoError(err)
-	_, err = st.DB().ExecContext(t.Context(), st.Rebind(`
-		INSERT INTO person_enrichment_consents
-			(profile_fingerprint, granted_by)
-		VALUES (?, 'second')`), profile.Fingerprint)
-	require.NoError(err, "a revoked consent must not block regrant")
-}
-
 func TestPersonEnrichmentSchemaSQLiteForeignKeysAndIndexes(t *testing.T) {
-	require := require.New(t)
 	assert := assert.New(t)
 	st := testutil.NewSQLiteTestStore(t)
 
@@ -206,19 +169,8 @@ func TestPersonEnrichmentSchemaSQLiteForeignKeysAndIndexes(t *testing.T) {
 	suppressionFKs := pragmaTextColumn(
 		t, st.DB(), `PRAGMA foreign_key_list(person_enrichment_suppressions)`, 2)
 	assert.Empty(suppressionFKs, "suppressions must survive person deletion")
-	consentFKs := pragmaTextColumn(
-		t, st.DB(), `PRAGMA foreign_key_list(person_enrichment_consents)`, 2)
-	assert.Equal([]string{"person_enrichment_profiles"}, consentFKs)
 
-	indexes := pragmaIndexes(t, st.DB(), "person_enrichment_consents")
-	active, ok := indexes["person_enrichment_consents_active"]
-	require.True(ok)
-	assert.True(active.unique)
-	assert.True(active.partial)
-	assert.Equal([]string{"profile_fingerprint"}, pragmaIndexColumns(
-		t, st.DB(), "person_enrichment_consents_active"))
-
-	indexes = pragmaIndexes(t, st.DB(), "person_enrichment_suppressions")
+	indexes := pragmaIndexes(t, st.DB(), "person_enrichment_suppressions")
 	wantUniqueColumns := []string{
 		"provider_namespace", "identifier_class", "normalization_version", "key_id", "digest",
 	}
@@ -280,25 +232,6 @@ func TestPersonEnrichmentSchemaManualRunTargetBinding(t *testing.T) {
 		`PRAGMA foreign_key_list(person_enrichment_manual_run_targets)`, 2))
 }
 
-func TestPersonEnrichmentAttemptProviderStartedAtLegacyMigrationParity(t *testing.T) {
-	for name, migrations := range map[string][]store.ColumnMigration{
-		"sqlite":   (&store.SQLiteDialect{}).LegacyColumnMigrations(),
-		"postgres": (&store.PostgreSQLDialect{}).LegacyColumnMigrations(),
-	} {
-		t.Run(name, func(t *testing.T) {
-			matches := 0
-			for _, migration := range migrations {
-				if migration.Desc == "person_enrichment_attempts.provider_started_at" {
-					matches++
-					assert.Contains(t, migration.SQL, "ADD COLUMN")
-					assert.Contains(t, migration.SQL, "provider_started_at")
-				}
-			}
-			assert.Equal(t, 1, matches)
-		})
-	}
-}
-
 func TestPersonEnrichmentAttemptDispatchAuthorizationLegacyMigrationParity(t *testing.T) {
 	for name, migrations := range map[string][]store.ColumnMigration{
 		"sqlite":   (&store.SQLiteDialect{}).LegacyColumnMigrations(),
@@ -318,45 +251,6 @@ func TestPersonEnrichmentAttemptDispatchAuthorizationLegacyMigrationParity(t *te
 	}
 }
 
-func TestPersonEnrichmentAttemptTargetsLegacyMigrationParity(t *testing.T) {
-	for name, migrations := range map[string][]store.ColumnMigration{
-		"sqlite":   (&store.SQLiteDialect{}).LegacyColumnMigrations(),
-		"postgres": (&store.PostgreSQLDialect{}).LegacyColumnMigrations(),
-	} {
-		t.Run(name, func(t *testing.T) {
-			matches := 0
-			for _, migration := range migrations {
-				if migration.Desc == "person_enrichment_attempts.targets_json" {
-					matches++
-					assert.Contains(t, migration.SQL, "ADD COLUMN")
-					assert.Contains(t, migration.SQL, "targets_json TEXT")
-				}
-			}
-			assert.Equal(t, 1, matches)
-		})
-	}
-}
-
-func TestPersonEnrichmentFreshTriggerLegacyMigrationParity(t *testing.T) {
-	for name, migrations := range map[string][]store.ColumnMigration{
-		"sqlite":   (&store.SQLiteDialect{}).LegacyColumnMigrations(),
-		"postgres": (&store.PostgreSQLDialect{}).LegacyColumnMigrations(),
-	} {
-		t.Run(name, func(t *testing.T) {
-			assert := assert.New(t)
-			matches := 0
-			for _, migration := range migrations {
-				if migration.Desc == "person_enrichment_work.has_fresh_trigger" {
-					matches++
-					assert.Contains(migration.SQL, "ADD COLUMN")
-					assert.Contains(migration.SQL, "has_fresh_trigger")
-				}
-			}
-			assert.Equal(1, matches)
-		})
-	}
-}
-
 func TestInitSchemaAddsDurableAttemptTargetsToLegacySchema(t *testing.T) {
 	requirements := require.New(t)
 	st := testutil.NewTestStore(t)
@@ -364,7 +258,7 @@ func TestInitSchemaAddsDurableAttemptTargetsToLegacySchema(t *testing.T) {
 	if st.IsPostgreSQL() {
 		drop += ` CASCADE`
 	}
-	_, err := st.DB().Exec(drop)
+	_, err := st.DB().ExecContext(t.Context(), drop)
 	requirements.NoError(err)
 
 	requirements.NoError(st.InitSchema())
@@ -375,7 +269,7 @@ func TestInitSchemaAddsDurableAttemptTargetsToLegacySchema(t *testing.T) {
 		         WHERE table_schema = current_schema()
 		           AND table_name = 'person_enrichment_attempts' AND column_name = 'targets_json'`
 	}
-	requirements.NoError(st.DB().QueryRow(query).Scan(&columnCount))
+	requirements.NoError(st.DB().QueryRowContext(t.Context(), query).Scan(&columnCount))
 	assert.Equal(t, 1, columnCount)
 }
 
@@ -386,7 +280,7 @@ func TestInitSchemaAddsProviderStartedAtToLegacySchema(t *testing.T) {
 	if st.IsPostgreSQL() {
 		drop += ` CASCADE`
 	}
-	_, err := st.DB().Exec(drop)
+	_, err := st.DB().ExecContext(t.Context(), drop)
 	requirements.NoError(err)
 
 	requirements.NoError(st.InitSchema())
@@ -397,7 +291,7 @@ func TestInitSchemaAddsProviderStartedAtToLegacySchema(t *testing.T) {
 		         WHERE table_schema = current_schema()
 		           AND table_name = 'person_enrichment_attempts' AND column_name = 'provider_started_at'`
 	}
-	requirements.NoError(st.DB().QueryRow(query).Scan(&columnCount))
+	requirements.NoError(st.DB().QueryRowContext(t.Context(), query).Scan(&columnCount))
 	assert.Equal(t, 1, columnCount)
 }
 
@@ -409,7 +303,7 @@ func TestInitSchemaAddsFreshTriggerMarkerToLegacySchema(t *testing.T) {
 	if st.IsPostgreSQL() {
 		drop += ` CASCADE`
 	}
-	_, err := st.DB().Exec(drop)
+	_, err := st.DB().ExecContext(t.Context(), drop)
 	require.NoError(err)
 
 	require.NoError(st.InitSchema())
@@ -420,7 +314,7 @@ func TestInitSchemaAddsFreshTriggerMarkerToLegacySchema(t *testing.T) {
 		         WHERE table_schema = current_schema()
 		           AND table_name = 'person_enrichment_work' AND column_name = 'has_fresh_trigger'`
 	}
-	require.NoError(st.DB().QueryRow(query).Scan(&columnCount))
+	require.NoError(st.DB().QueryRowContext(t.Context(), query).Scan(&columnCount))
 	assert.Equal(1, columnCount)
 }
 

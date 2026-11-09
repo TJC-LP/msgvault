@@ -7,6 +7,7 @@ import type {
   AgentTokenIssueRequest,
   AgentTokenIssueResponse,
   AgentTokenListResponse,
+  AgentTokenView,
   AggregateResponse,
   AppendPersonNoteParams,
   AppendPersonNotePathParameters,
@@ -61,6 +62,7 @@ import type {
   CardDAVSyncRequest,
   Catalog,
   ChangesResponse,
+  ChatDiscoveryPage,
   CheckSettingsPeopleInferenceProviderPathParameters,
   ClearOrganizationAttributeParams,
   ClearOrganizationAttributePathParameters,
@@ -78,6 +80,7 @@ import type {
   CommunicationService,
   CommunicationServicesResponse,
   ConsentSettingsPeopleInferenceProviderPathParameters,
+  ContactCandidatePage,
   ContactState,
   ConversationResponse,
   CreateAttributeDefinitionRequest,
@@ -113,19 +116,25 @@ import type {
   DirectoryPeopleResponse,
   DiscoverEvent,
   DiscoverRequest,
+  DocbankAttachmentBackfillResponse,
+  DocbankAttachmentStatus,
   DocumentIndexStatusResponse,
   DocumentSearchResponse,
   DocumentVectorOperationsResponse,
   DomainSummary,
+  EmbeddingStatus,
   Employment,
   EmploymentBody,
   EmploymentsResponse,
   EndEmploymentBody,
   EndEmploymentPathParameters,
+  ExplainPersonTierPathParameters,
   FastSearchParams,
   FileMetadataResponse,
   FilterMessagesParams,
   FilteredMessagesResponse,
+  FindContactCandidatesParams,
+  FindKataIssuesParams,
   FindSimilarMessagesParams,
   GeneratePersonBriefPathParameters,
   GetActivityDayParams,
@@ -151,15 +160,20 @@ import type {
   GetDocumentIndexStatusParams,
   GetDocumentVectorStatusParams,
   GetDomainPathParameters,
+  GetEmbeddingStatusParams,
   GetEmploymentPathParameters,
   GetFileContentPathParameters,
   GetFilePathParameters,
   GetGmailIDsByFilterParams,
   GetIdentityMatchCandidatePathParameters,
   GetImportJobPathParameters,
+  GetKataIssueContextParams,
+  GetKataIssueContextPathParameters,
   GetMessageInlinePartParams,
   GetMessageInlinePartPathParameters,
   GetMessagePathParameters,
+  GetMessageTagsParams,
+  GetMessageTagsPathParameters,
   GetOperationRunPathParameters,
   GetOrganizationHistoryPathParameters,
   GetOrganizationPathParameters,
@@ -169,9 +183,11 @@ import type {
   GetPersonActivityDayPathParameters,
   GetPersonBriefEnrollmentPathParameters,
   GetPersonBriefPathParameters,
+  GetPersonByUIDParams,
   GetPersonContactStatePathParameters,
   GetPersonMergePathParameters,
   GetPersonMergeSnapshotPathParameters,
+  GetPersonMessagingRoutesParams,
   GetPersonNetworkParams,
   GetPersonNetworkPathParameters,
   GetPersonProfileHistoryPathParameters,
@@ -199,6 +215,15 @@ import type {
   IdentityMatchRejectResponse,
   ImportJobRequest,
   ImportJobResponse,
+  ImportMuesliRecordingParams,
+  KataEvidenceLinkRequest,
+  KataEvidencePrepareRequest,
+  KataEvidencePrepareResponse,
+  KataIssueContextResponse,
+  KataIssueCreateRequest,
+  KataIssueListResponse,
+  KataIssueResponse,
+  LinkKataEvidencePathParameters,
   LinkPersonAgendaItemPathParameters,
   ListAttributeDefinitionsParams,
   ListCardDAVBooksParams,
@@ -211,6 +236,8 @@ import type {
   ListDeletionsResponse,
   ListDirectoryPeopleParams,
   ListIdentityMatchCandidatesParams,
+  ListLoopsParams,
+  ListMessageRecordingsPathParameters,
   ListMessageTasksPathParameters,
   ListMessagesParams,
   ListOperationRunsParams,
@@ -239,6 +266,7 @@ import type {
   ListPersonFactEvidenceStatusEventsPathParameters,
   ListPersonFactPinsPathParameters,
   ListPersonFactTargetsParams,
+  ListPersonIdentitiesPathParameters,
   ListPersonMatchJudgmentsParams,
   ListPersonMergesParams,
   ListPersonMergesPathParameters,
@@ -250,7 +278,15 @@ import type {
   ListTextConversationMessagesParams,
   ListTextConversationMessagesPathParameters,
   ListTextConversationsParams,
+  LocalEmbeddingsStatus,
+  LoopDecisionResponse,
+  LoopListResponse,
+  MCPCapabilities,
   Manifest,
+  MarkLoopDoneParams,
+  MarkLoopDonePathParameters,
+  MediaSearchResponse,
+  MediaSearchStatusResponse,
   MeetingImportRequest,
   MeetingImportResponse,
   MergeOrganizationBody,
@@ -259,6 +295,11 @@ import type {
   MergePersonsPathParameters,
   MessageDetail,
   MessageListResponse,
+  MessageRecordingsResponse,
+  MessageTagChange,
+  MessageTagResult,
+  MuesliRemoteRequest,
+  MuesliRemoteResult,
   OperationRunDetail,
   OperationRunsResponse,
   OperationStatusResponse,
@@ -318,6 +359,7 @@ import type {
   PersonFactEvidenceStatusEventsResponse,
   PersonFactPinWrite,
   PersonFactPinsResponse,
+  PersonIdentitiesResponse,
   PersonInboxResponse,
   PersonMatchConsentDecisionRequest,
   PersonMatchConsentDecisionResponse,
@@ -330,6 +372,7 @@ import type {
   PersonMergeReviewCandidate,
   PersonMergeSnapshotResponse,
   PersonMergesResponse,
+  PersonMessagingRoutesPage,
   PersonNetwork,
   PersonProfileHistory,
   PersonProfilePatchRequest,
@@ -339,6 +382,8 @@ import type {
   PersonSearchResponse,
   PersonSplitResult,
   PersonSummary,
+  PersonTierExplanation,
+  PersonTierPreview,
   PersonTracking,
   PreviewCardDAVPublicationPathParameters,
   ProviderCredentialResponse,
@@ -360,6 +405,7 @@ import type {
   RelationshipType,
   RelationshipTypesResponse,
   RemoteImageRequest,
+  ReopenLoopPathParameters,
   ResolveCardDAVConflictPathParameters,
   ReviewAcceptIdentityMatchCandidatePathParameters,
   ReviewRejectIdentityMatchCandidatePathParameters,
@@ -374,9 +420,11 @@ import type {
   SavedViewsResponse,
   SchedulerStatusResponse,
   SearchCLIParams,
+  SearchChatsParams,
   SearchDocumentsParams,
   SearchFastResponse,
   SearchIntegrationTasksParams,
+  SearchMediaParams,
   SearchMessagesByDomainsParams,
   SearchMessagesParams,
   SearchResult,
@@ -394,6 +442,9 @@ import type {
   SettingsPatchRequest,
   SettingsResponse,
   SimilarSearchResponse,
+  SnoozeLoopParams,
+  SnoozeLoopPathParameters,
+  SnoozeLoopRequest,
   SourceIdentitiesResponse,
   SourceStatusResponse,
   SplitPersonMergePathParameters,
@@ -412,6 +463,8 @@ import type {
   TaskLinkMutationRequest,
   TaskLinkMutationResponse,
   TaskSearchResponse,
+  TelemetryEventRequest,
+  TelemetryEventResponse,
   TextConversationsResponse,
   TextMessagesResponse,
   TextSearchResponse,
@@ -420,10 +473,12 @@ import type {
   TotalStatsResponse,
   TriggerSyncParams,
   TriggerSyncPathParameters,
+  TriggerSyncResponse,
   UnlinkMessageTaskPathParameters,
   UnlinkPersonAgendaItemPathParameters,
   UnpublishCardDAVPersonPathParameters,
   UpdateCardDAVBookRolesPathParameters,
+  UpdateMessageTagsPathParameters,
   UpdatePersonAgendaItemPathParameters,
   UploadTokenPathParameters,
   VerifyCLIParams,
@@ -466,7 +521,7 @@ export const addAccount = (
   );
 };
 /**
- * @summary List active agent grants
+ * @summary List agent grants
  */
 export const listAgentTokens = (
   options?: SecondParameter<typeof orvalFetch<AgentTokenListResponse>>,
@@ -490,6 +545,17 @@ export const issueAgentToken = (
       headers: { "Content-Type": "application/json" },
       data: agentTokenIssueRequest,
     },
+    options,
+  );
+};
+/**
+ * @summary Get the calling agent's grant
+ */
+export const getAgentTokenSelf = (
+  options?: SecondParameter<typeof orvalFetch<AgentTokenView>>,
+) => {
+  return orvalFetch<AgentTokenView>(
+    { url: `/api/v1/agent-tokens/self`, method: "GET" },
     options,
   );
 };
@@ -1190,7 +1256,7 @@ export const getCLIMessageRaw = (
   );
 };
 /**
- * @summary List one conversation in chronological order for export
+ * @summary List one conversation in chronological order for export. SQLite compares instants to the millisecond, with ties in message-ID order.
  */
 export const getCLIMessageThread = (
   params?: GetCLIMessageThreadParams,
@@ -1363,6 +1429,18 @@ export const getRemoteImage = (
       data: remoteImageRequest,
       responseType: "blob",
     },
+    options,
+  );
+};
+/**
+ * @summary Find archived chats by ranked name tokens
+ */
+export const searchChats = (
+  params: SearchChatsParams,
+  options?: SecondParameter<typeof orvalFetch<ChatDiscoveryPage>>,
+) => {
+  return orvalFetch<ChatDiscoveryPage>(
+    { url: `/api/v1/conversations/search`, method: "GET", params },
     options,
   );
 };
@@ -1570,6 +1648,40 @@ export const getDomain = (
       url: `/api/v1/domains/${encodeURIComponent(String(domain))}`,
       method: "GET",
     },
+    options,
+  );
+};
+/**
+ * @summary Get local search setup
+ */
+export const getLocalEmbeddings = (
+  options?: SecondParameter<typeof orvalFetch<LocalEmbeddingsStatus>>,
+) => {
+  return orvalFetch<LocalEmbeddingsStatus>(
+    { url: `/api/v1/embeddings/local`, method: "GET" },
+    options,
+  );
+};
+/**
+ * @summary Turn on local search
+ */
+export const enableLocalEmbeddings = (
+  options?: SecondParameter<typeof orvalFetch<LocalEmbeddingsStatus>>,
+) => {
+  return orvalFetch<LocalEmbeddingsStatus>(
+    { url: `/api/v1/embeddings/local`, method: "POST" },
+    options,
+  );
+};
+/**
+ * @summary Get message embedding coverage and live batch diagnostics
+ */
+export const getEmbeddingStatus = (
+  params?: GetEmbeddingStatusParams,
+  options?: SecondParameter<typeof orvalFetch<EmbeddingStatus>>,
+) => {
+  return orvalFetch<EmbeddingStatus>(
+    { url: `/api/v1/embeddings/status`, method: "GET", params },
     options,
   );
 };
@@ -1908,6 +2020,42 @@ export const importMeeting = (
   );
 };
 /**
+ * @summary Import one recorder-local Muesli meeting
+ */
+export const importMuesli = (
+  muesliRemoteRequest: MuesliRemoteRequest,
+  options?: SecondParameter<typeof orvalFetch<MuesliRemoteResult>>,
+) => {
+  return orvalFetch<MuesliRemoteResult>(
+    {
+      url: `/api/v1/import/muesli`,
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      data: muesliRemoteRequest,
+    },
+    options,
+  );
+};
+/**
+ * @summary Stream retained audio for an archived Muesli meeting
+ */
+export const importMuesliRecording = (
+  importMuesliRecordingBody: Blob,
+  params: ImportMuesliRecordingParams,
+  options?: SecondParameter<typeof orvalFetch<MuesliRemoteResult>>,
+) => {
+  return orvalFetch<MuesliRemoteResult>(
+    {
+      url: `/api/v1/import/muesli/recording`,
+      method: "POST",
+      headers: { "Content-Type": "audio/mp4" },
+      data: importMuesliRecordingBody,
+      params,
+    },
+    options,
+  );
+};
+/**
  * @summary Start a bounded historical import
  */
 export const createImportJob = (
@@ -1935,6 +2083,115 @@ export const getImportJob = (
     {
       url: `/api/v1/imports/${encodeURIComponent(String(jobId))}`,
       method: "GET",
+    },
+    options,
+  );
+};
+/**
+ * @summary Read attachment mirror status
+ */
+export const getDocbankAttachmentStatus = (
+  options?: SecondParameter<typeof orvalFetch<DocbankAttachmentStatus>>,
+) => {
+  return orvalFetch<DocbankAttachmentStatus>(
+    { url: `/api/v1/integrations/docbank/attachments`, method: "GET" },
+    options,
+  );
+};
+/**
+ * @summary Retry failures and restart attachment mirror discovery
+ */
+export const backfillDocbankAttachments = (
+  options?: SecondParameter<
+    typeof orvalFetch<DocbankAttachmentBackfillResponse>
+  >,
+) => {
+  return orvalFetch<DocbankAttachmentBackfillResponse>(
+    {
+      url: `/api/v1/integrations/docbank/attachments/backfill`,
+      method: "POST",
+    },
+    options,
+  );
+};
+/**
+ * @summary Prepare exact message and file evidence for a Kata issue
+ */
+export const prepareKataEvidence = (
+  kataEvidencePrepareRequest: KataEvidencePrepareRequest,
+  options?: SecondParameter<typeof orvalFetch<KataEvidencePrepareResponse>>,
+) => {
+  return orvalFetch<KataEvidencePrepareResponse>(
+    {
+      url: `/api/v1/integrations/kata/evidence/prepare`,
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      data: kataEvidencePrepareRequest,
+    },
+    options,
+  );
+};
+/**
+ * @summary Find Kata issues, open or closed, that cite a message or one of its files
+ */
+export const findKataIssues = (
+  params: FindKataIssuesParams,
+  options?: SecondParameter<typeof orvalFetch<KataIssueListResponse>>,
+) => {
+  return orvalFetch<KataIssueListResponse>(
+    { url: `/api/v1/integrations/kata/issues`, method: "GET", params },
+    options,
+  );
+};
+/**
+ * Returns 201 both when it files the issue and when an earlier request under the same Idempotency-Key already did; `replayed` tells them apart.
+ * @summary Create a Kata issue that quotes exact archive evidence
+ */
+export const createKataIssue = (
+  kataIssueCreateRequest: KataIssueCreateRequest,
+  options?: SecondParameter<typeof orvalFetch<KataIssueResponse>>,
+) => {
+  return orvalFetch<KataIssueResponse>(
+    {
+      url: `/api/v1/integrations/kata/issues`,
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      data: kataIssueCreateRequest,
+    },
+    options,
+  );
+};
+/**
+ * @summary Read each passage a Kata issue cites with its state in the archive today
+ */
+export const getKataIssueContext = (
+  { ref }: GetKataIssueContextPathParameters,
+  params?: GetKataIssueContextParams,
+  options?: SecondParameter<typeof orvalFetch<KataIssueContextResponse>>,
+) => {
+  return orvalFetch<KataIssueContextResponse>(
+    {
+      url: `/api/v1/integrations/kata/issues/${encodeURIComponent(String(ref))}/context`,
+      method: "GET",
+      params,
+    },
+    options,
+  );
+};
+/**
+ * @summary Add exact archive evidence to an existing Kata issue
+ */
+export const linkKataEvidence = (
+  { ref }: LinkKataEvidencePathParameters,
+  kataEvidenceLinkRequest: KataEvidenceLinkRequest,
+  options?: SecondParameter<typeof orvalFetch<KataIssueResponse>>,
+) => {
+  return orvalFetch<KataIssueResponse>(
+    {
+      url: `/api/v1/integrations/kata/issues/${encodeURIComponent(String(ref))}/evidence`,
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      data: kataEvidenceLinkRequest,
     },
     options,
   );
@@ -1981,6 +2238,104 @@ export const testTaskIntegration = (
 ) => {
   return orvalFetch<TaskIntegrationStatusResponse>(
     { url: `/api/v1/integrations/tasks/test`, method: "POST" },
+    options,
+  );
+};
+/**
+ * @summary List conversations waiting on a reply
+ */
+export const listLoops = (
+  params?: ListLoopsParams,
+  options?: SecondParameter<typeof orvalFetch<LoopListResponse>>,
+) => {
+  return orvalFetch<LoopListResponse>(
+    { url: `/api/v1/loops`, method: "GET", params },
+    options,
+  );
+};
+/**
+ * @summary Mark a loop done
+ */
+export const markLoopDone = (
+  { messageId }: MarkLoopDonePathParameters,
+  params?: MarkLoopDoneParams,
+  options?: SecondParameter<typeof orvalFetch<LoopDecisionResponse>>,
+) => {
+  return orvalFetch<LoopDecisionResponse>(
+    {
+      url: `/api/v1/loops/${encodeURIComponent(String(messageId))}/done`,
+      method: "POST",
+      params,
+    },
+    options,
+  );
+};
+/**
+ * @summary Clear a loop decision
+ */
+export const reopenLoop = (
+  { messageId }: ReopenLoopPathParameters,
+  options?: SecondParameter<typeof orvalFetch<LoopDecisionResponse>>,
+) => {
+  return orvalFetch<LoopDecisionResponse>(
+    {
+      url: `/api/v1/loops/${encodeURIComponent(String(messageId))}/reopen`,
+      method: "POST",
+    },
+    options,
+  );
+};
+/**
+ * @summary Hide a loop until a later time
+ */
+export const snoozeLoop = (
+  { messageId }: SnoozeLoopPathParameters,
+  snoozeLoopRequest: SnoozeLoopRequest,
+  params?: SnoozeLoopParams,
+  options?: SecondParameter<typeof orvalFetch<LoopDecisionResponse>>,
+) => {
+  return orvalFetch<LoopDecisionResponse>(
+    {
+      url: `/api/v1/loops/${encodeURIComponent(String(messageId))}/snooze`,
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      data: snoozeLoopRequest,
+      params,
+    },
+    options,
+  );
+};
+/**
+ * @summary Describe supported MCP daemon operations
+ */
+export const getMCPCapabilities = (
+  options?: SecondParameter<typeof orvalFetch<MCPCapabilities>>,
+) => {
+  return orvalFetch<MCPCapabilities>(
+    { url: `/api/v1/mcp/capabilities`, method: "GET" },
+    options,
+  );
+};
+/**
+ * @summary Search recordings and attachments as visible messages
+ */
+export const searchMedia = (
+  params: SearchMediaParams,
+  options?: SecondParameter<typeof orvalFetch<MediaSearchResponse>>,
+) => {
+  return orvalFetch<MediaSearchResponse>(
+    { url: `/api/v1/media/search`, method: "GET", params },
+    options,
+  );
+};
+/**
+ * @summary Get recording transcript search configuration status
+ */
+export const getMediaSearchStatus = (
+  options?: SecondParameter<typeof orvalFetch<MediaSearchStatusResponse>>,
+) => {
+  return orvalFetch<MediaSearchStatusResponse>(
+    { url: `/api/v1/media/search/status`, method: "GET" },
     options,
   );
 };
@@ -2061,6 +2416,56 @@ export const getMessageInlinePart = (
       method: "GET",
       params,
       responseType: "blob",
+    },
+    options,
+  );
+};
+/**
+ * @summary List a message's recordings with transcript state
+ */
+export const listMessageRecordings = (
+  { id }: ListMessageRecordingsPathParameters,
+  options?: SecondParameter<typeof orvalFetch<MessageRecordingsResponse>>,
+) => {
+  return orvalFetch<MessageRecordingsResponse>(
+    {
+      url: `/api/v1/messages/${encodeURIComponent(String(id))}/recordings`,
+      method: "GET",
+    },
+    options,
+  );
+};
+/**
+ * @summary Read native email tags
+ */
+export const getMessageTags = (
+  { id }: GetMessageTagsPathParameters,
+  params?: GetMessageTagsParams,
+  options?: SecondParameter<typeof orvalFetch<MessageTagResult>>,
+) => {
+  return orvalFetch<MessageTagResult>(
+    {
+      url: `/api/v1/messages/${encodeURIComponent(String(id))}/tags`,
+      method: "GET",
+      params,
+    },
+    options,
+  );
+};
+/**
+ * @summary Add or remove native email tags
+ */
+export const updateMessageTags = (
+  { id }: UpdateMessageTagsPathParameters,
+  messageTagChange: MessageTagChange,
+  options?: SecondParameter<typeof orvalFetch<MessageTagResult>>,
+) => {
+  return orvalFetch<MessageTagResult>(
+    {
+      url: `/api/v1/messages/${encodeURIComponent(String(id))}/tags`,
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      data: messageTagChange,
     },
     options,
   );
@@ -2503,6 +2908,31 @@ export const createPerson = (
   );
 };
 /**
+ * Resolves the person's current vCard UID, a retired UID that still aliases the person, or the UID of a CardDAV resource mapped to the person. Returns a conflict when one remote UID maps to different people.
+ * @summary Look up a durable person by vCard or CardDAV UID
+ */
+export const getPersonByUID = (
+  params: GetPersonByUIDParams,
+  options?: SecondParameter<typeof orvalFetch<Person>>,
+) => {
+  return orvalFetch<Person>(
+    { url: `/api/v1/people/by-uid`, method: "GET", params },
+    options,
+  );
+};
+/**
+ * @summary Find durable people by saved or observed names without selecting a duplicate
+ */
+export const findContactCandidates = (
+  params: FindContactCandidatesParams,
+  options?: SecondParameter<typeof orvalFetch<ContactCandidatePage>>,
+) => {
+  return orvalFetch<ContactCandidatePage>(
+    { url: `/api/v1/people/contact-candidates`, method: "GET", params },
+    options,
+  );
+};
+/**
  * Returns one stable, non-sensitive page of promoted durable people.
  * @summary Query durable people for the Directory
  */
@@ -2512,6 +2942,18 @@ export const listDirectoryPeople = (
 ) => {
   return orvalFetch<DirectoryPeopleResponse>(
     { url: `/api/v1/people/directory`, method: "GET", params },
+    options,
+  );
+};
+/**
+ * @summary Read one person's archived messaging routes and contact evidence by stable UID
+ */
+export const getPersonMessagingRoutes = (
+  params: GetPersonMessagingRoutesParams,
+  options?: SecondParameter<typeof orvalFetch<PersonMessagingRoutesPage>>,
+) => {
+  return orvalFetch<PersonMessagingRoutesPage>(
+    { url: `/api/v1/people/messaging-routes`, method: "GET", params },
     options,
   );
 };
@@ -2530,6 +2972,17 @@ export const searchPeople = (
       headers: { "Content-Type": "application/json" },
       data: personSearchRequest,
     },
+    options,
+  );
+};
+/**
+ * @summary List saved people in tier 1 or 2
+ */
+export const previewPersonTiers = (
+  options?: SecondParameter<typeof orvalFetch<PersonTierPreview>>,
+) => {
+  return orvalFetch<PersonTierPreview>(
+    { url: `/api/v1/people/tiers`, method: "GET" },
     options,
   );
 };
@@ -2985,6 +3438,22 @@ export const setPersonFactPin = (
   );
 };
 /**
+ * Lists the identities of the person's current participants. Email addresses are supported draft recipients; phone numbers and chat identifiers are not. Curated contact points and postal addresses are not listed.
+ * @summary List a durable person's archived identities
+ */
+export const listPersonIdentities = (
+  { id }: ListPersonIdentitiesPathParameters,
+  options?: SecondParameter<typeof orvalFetch<PersonIdentitiesResponse>>,
+) => {
+  return orvalFetch<PersonIdentitiesResponse>(
+    {
+      url: `/api/v1/people/${encodeURIComponent(String(id))}/identities`,
+      method: "GET",
+    },
+    options,
+  );
+};
+/**
  * @summary Merge one durable person profile into another
  */
 export const mergePersons = (
@@ -3156,6 +3625,21 @@ export const splitPersonMerge = (
       method: "POST",
       headers: { "Content-Type": "application/json" },
       data: splitPersonRequest,
+    },
+    options,
+  );
+};
+/**
+ * @summary Show every count behind one person's tier
+ */
+export const explainPersonTier = (
+  { id }: ExplainPersonTierPathParameters,
+  options?: SecondParameter<typeof orvalFetch<PersonTierExplanation>>,
+) => {
+  return orvalFetch<PersonTierExplanation>(
+    {
+      url: `/api/v1/people/${encodeURIComponent(String(id))}/tier`,
+      method: "GET",
     },
     options,
   );
@@ -3507,6 +3991,7 @@ export const getSavedView = (
   );
 };
 /**
+ * Sending canonical_state without schema_version keeps the stored schema version, so schema 1 keeps pipes as literal text. Send schema_version 2 to adopt pipe OR.
  * @summary Update a shared analytical Saved View
  */
 export const patchSavedView = (
@@ -3983,13 +4468,30 @@ export const getTotalStats = (
 export const triggerSync = (
   { account }: TriggerSyncPathParameters,
   params?: TriggerSyncParams,
-  options?: SecondParameter<typeof orvalFetch<StatusMessageResponse>>,
+  options?: SecondParameter<typeof orvalFetch<TriggerSyncResponse>>,
 ) => {
-  return orvalFetch<StatusMessageResponse>(
+  return orvalFetch<TriggerSyncResponse>(
     {
       url: `/api/v1/sync/${encodeURIComponent(String(account))}`,
       method: "POST",
       params,
+    },
+    options,
+  );
+};
+/**
+ * @summary Report a web, terminal UI, or interactive CLI usage event
+ */
+export const captureTelemetryEvent = (
+  telemetryEventRequest: TelemetryEventRequest,
+  options?: SecondParameter<typeof orvalFetch<TelemetryEventResponse>>,
+) => {
+  return orvalFetch<TelemetryEventResponse>(
+    {
+      url: `/api/v1/telemetry/events`,
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      data: telemetryEventRequest,
     },
     options,
   );

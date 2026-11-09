@@ -19,6 +19,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/msgvault/internal/carddav"
 	"go.kenn.io/msgvault/internal/config"
+	"go.kenn.io/msgvault/internal/mscontacts"
 	"go.kenn.io/msgvault/internal/oauth"
 	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/testutil"
@@ -78,7 +79,7 @@ func TestGoogleCardDAVRuntimeRecoversAfterCLIAuthorization(t *testing.T) {
 	status, err = controller.Status(t.Context(), "")
 	required.NoError(err)
 	assertions.Equal("google_authorization_required", status.RepairReason)
-	mgr, err := carddav.NewGoogleOAuthManager(cfg.OAuth.ClientSecrets, cfg.TokensDir(), "", cfg.CardDAV.Username, testLogger())
+	mgr, err := carddav.NewGoogleOAuthManagerWithCredentials(t.Context(), config.OAuthApp{ClientSecrets: cfg.OAuth.ClientSecrets}, cfg.TokensDir(), config.OAuthTokenCommands{}, "", cfg.CardDAV.Username, testLogger())
 	required.NoError(err)
 	required.NoError(os.MkdirAll(filepath.Dir(mgr.TokenPath(cfg.CardDAV.Username)), 0700))
 	required.NoError(os.WriteFile(mgr.TokenPath(cfg.CardDAV.Username), []byte(token), 0600))
@@ -88,6 +89,198 @@ func TestGoogleCardDAVRuntimeRecoversAfterCLIAuthorization(t *testing.T) {
 	assertions.True(status.Available)
 	assertions.True(status.CredentialConfigured)
 	assertions.Same(service, controller.Current())
+}
+
+func TestGoogleOAuthManagerClassifiesTokenInspectionFailure(t *testing.T) {
+	assertions := assert.New(t)
+	required := require.New(t)
+	cfg, _ := savedGoogleCardDAVFixture(t)
+	commands := config.OAuthTokenCommands(testutil.SecretStoreFixture(t))
+	commands.ReadCommand = testutil.SecretCommand(t, "fail")
+	cfg.OAuth.Tokens = commands
+	controller := &CardDAVController{cfg: cfg}
+
+	_, err := controller.googleOAuthManager(t.Context(), carddav.Credential{Username: cfg.CardDAV.Username})
+	required.Error(err)
+	required.ErrorIs(err, carddav.ErrGoogleTokenUnavailable)
+	required.NotErrorIs(err, carddav.ErrGoogleAuthorizationRequired)
+	var statusErr *carddav.StatusError
+	required.ErrorAs(err, &statusErr)
+	assertions.Equal(http.StatusBadGateway, statusErr.StatusCode)
+}
+
+func TestGoogleOAuthManagerRequiresAuthorizationForMalformedFileToken(t *testing.T) {
+	assertions := assert.New(t)
+	required := require.New(t)
+	cfg, _ := savedGoogleCardDAVFixture(t)
+	mgr, err := carddav.NewGoogleOAuthManagerWithCredentials(
+		t.Context(), config.OAuthApp{ClientSecrets: cfg.OAuth.ClientSecrets}, cfg.TokensDir(),
+		config.OAuthTokenCommands{}, "", cfg.CardDAV.Username, nil,
+	)
+	required.NoError(err)
+	required.NoError(os.MkdirAll(filepath.Dir(mgr.TokenPath(cfg.CardDAV.Username)), 0700))
+	required.NoError(os.WriteFile(mgr.TokenPath(cfg.CardDAV.Username), []byte("{"), 0600))
+	controller := &CardDAVController{cfg: cfg}
+
+	_, err = controller.googleOAuthManager(t.Context(), carddav.Credential{Username: cfg.CardDAV.Username})
+	required.ErrorIs(err, carddav.ErrGoogleAuthorizationRequired)
+	assertions.NotErrorIs(err, carddav.ErrGoogleTokenUnavailable)
+}
+
+func TestGoogleOAuthManagerUsesSelectedTokenSnapshot(t *testing.T) {
+	required := require.New(t)
+	cfg, _ := savedGoogleCardDAVFixture(t)
+	commands := config.OAuthTokenCommands(testutil.SecretStoreFixture(t))
+	commands.ReadCommand = testutil.SecretCommand(t, "read-once")
+	cfg.OAuth.Tokens = commands
+	token := fmt.Sprintf(`{"access_token":"synthetic-access","refresh_token":"synthetic-refresh","client_id":"synthetic-client","scopes":[%q]}`, oauth.ScopeCardDAV)
+	required.NoError(oauth.NewTokenStore(cfg.TokensDir(), commands).Write(t.Context(), cfg.CardDAV.Username, []byte(token)))
+	controller := &CardDAVController{cfg: cfg}
+
+	mgr, err := controller.googleOAuthManager(t.Context(), carddav.Credential{Username: cfg.CardDAV.Username})
+	required.NoError(err)
+	required.NotNil(mgr)
+}
+
+// A refresh that Google accepts but the secret store cannot save is a storage
+// failure; asking the user to sign in again would not fix it.
+func TestGoogleCardDAVRefreshSaveFailureIsUnavailable(t *testing.T) {
+	required := require.New(t)
+	endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"access_token":"fresh-access","token_type":"Bearer","expires_in":3600}`)
+	}))
+	t.Cleanup(endpoint.Close)
+	cfg, _ := savedGoogleCardDAVFixture(t)
+	secrets := fmt.Sprintf(`{"web":{"client_id":"synthetic-client","client_secret":"synthetic-secret","token_uri":%q,"redirect_uris":["https://archive.example/"]}}`, endpoint.URL)
+	required.NoError(os.WriteFile(cfg.OAuth.ClientSecrets, []byte(secrets), 0600))
+	commands := config.OAuthTokenCommands(testutil.SecretStoreFixture(t))
+	token := fmt.Sprintf(`{"access_token":"expired-access","refresh_token":"synthetic-refresh","expiry":"2000-01-01T00:00:00Z","client_id":"synthetic-client","scopes":[%q]}`, oauth.ScopeCardDAV)
+	required.NoError(oauth.NewTokenStore(cfg.TokensDir(), commands).Write(t.Context(), cfg.CardDAV.Username, []byte(token)))
+	commands.WriteCommand = testutil.SecretCommand(t, "fail")
+	cfg.OAuth.Tokens = commands
+	controller := &CardDAVController{cfg: cfg}
+
+	_, err := controller.googleBearerToken(t.Context(), carddav.Credential{Username: cfg.CardDAV.Username})
+	required.ErrorIs(err, carddav.ErrGoogleTokenUnavailable)
+	required.NotErrorIs(err, carddav.ErrGoogleAuthorizationRequired)
+	var statusErr *carddav.StatusError
+	required.ErrorAs(err, &statusErr)
+	required.Equal(http.StatusBadGateway, statusErr.StatusCode)
+}
+
+// A locked secret store is not a missing authorization: status says the
+// credential is unavailable and the schedule stays so a later run can retry.
+func TestGoogleCardDAVTokenStoreFailureKeepsScheduleAndStatus(t *testing.T) {
+	assertions := assert.New(t)
+	required := require.New(t)
+	cfg, st := savedGoogleCardDAVFixture(t)
+	commands := config.OAuthTokenCommands(testutil.SecretStoreFixture(t))
+	commands.ReadCommand = testutil.SecretCommand(t, "fail")
+	cfg.OAuth.Tokens = commands
+	controller, err := NewCardDAVController(cfg, st, testLogger())
+	required.NoError(err)
+	status, err := controller.Status(t.Context(), "")
+	required.NoError(err)
+	assertions.Equal("credential_unavailable", status.RepairReason)
+	var scheduled CardDAVOperations
+	controller.SetScheduleReconciler(func(_ config.CardDAVConfig, service CardDAVOperations) error {
+		scheduled = service
+		return nil
+	})
+	required.NoError(controller.ReconcileSchedule(t.Context()))
+	assertions.NotNil(scheduled)
+
+	// The same holds when the client secrets command is the part that fails.
+	cfg.OAuth.Tokens = config.OAuthTokenCommands{}
+	cfg.OAuth.ClientSecrets, cfg.OAuth.ClientSecretsCommand = "", testutil.SecretCommand(t, "fail")
+	status, err = controller.Status(t.Context(), "")
+	required.NoError(err)
+	assertions.Equal("credential_unavailable", status.RepairReason)
+	scheduled = nil
+	required.NoError(controller.ReconcileSchedule(t.Context()))
+	assertions.NotNil(scheduled)
+}
+
+// Sign-in stays the answer when a new grant or a settings fix is what helps.
+func TestGoogleCardDAVKnownFailuresStillNeedAPerson(t *testing.T) {
+	t.Run("expired token without refresh token", func(t *testing.T) {
+		required := require.New(t)
+		cfg, _ := savedGoogleCardDAVFixture(t)
+		token := fmt.Sprintf(`{"access_token":"expired-access","expiry":"2000-01-01T00:00:00Z","client_id":"synthetic-client","scopes":[%q]}`, oauth.ScopeCardDAV)
+		required.NoError(os.WriteFile(filepath.Join(cfg.TokensDir(), cfg.CardDAV.Username+".json"), []byte(token), 0600))
+		controller := &CardDAVController{cfg: cfg}
+		_, err := controller.googleBearerToken(t.Context(), carddav.Credential{Username: cfg.CardDAV.Username})
+		required.ErrorIs(err, carddav.ErrGoogleAuthorizationRequired)
+		required.NotErrorIs(err, carddav.ErrGoogleTokenUnavailable)
+	})
+	t.Run("missing client secrets file", func(t *testing.T) {
+		assertions := assert.New(t)
+		required := require.New(t)
+		cfg, st := savedGoogleCardDAVFixture(t)
+		required.NoError(os.Remove(cfg.OAuth.ClientSecrets))
+		controller, err := NewCardDAVController(cfg, st, testLogger())
+		required.NoError(err)
+		status, err := controller.Status(t.Context(), "")
+		required.NoError(err)
+		assertions.Equal("google_authorization_required", status.RepairReason)
+		srv := NewServerWithOptions(ServerOptions{Config: cfg, Store: &mockStore{}, Logger: testLogger(), CardDAV: controller})
+		request := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "https://archive.example/api/v1/carddav/google/authorize", strings.NewReader(`{"email":"person@example.com","redirect_uri":"https://archive.example/"}`))
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Origin", "https://archive.example")
+		response := httptest.NewRecorder()
+		srv.Router().ServeHTTP(response, request)
+		assertions.Equal(http.StatusBadRequest, response.Code, response.Body.String())
+		assertions.Contains(response.Body.String(), `"error":"oauth_not_configured"`)
+	})
+}
+
+func TestGoogleCardDAVAuthorizeClassifiesTokenInspectionFailure(t *testing.T) {
+	assertions := assert.New(t)
+	required := require.New(t)
+	cfg, st := savedGoogleCardDAVFixture(t)
+	required.NoError(os.WriteFile(cfg.OAuth.ClientSecrets, []byte(`{"web":{"client_id":"synthetic-client","client_secret":"synthetic-secret","auth_uri":"https://accounts.example/authorize","token_uri":"https://accounts.example/token","redirect_uris":["https://archive.example/"]}}`), 0600))
+	clientSecrets := cfg.OAuth.ClientSecrets
+	commands := config.OAuthTokenCommands(testutil.SecretStoreFixture(t))
+	commands.ReadCommand = testutil.SecretCommand(t, "fail")
+	cfg.OAuth.Tokens = commands
+	controller, err := NewCardDAVController(cfg, st, testLogger())
+	required.NoError(err)
+	srv := NewServerWithOptions(ServerOptions{Config: cfg, Store: &mockStore{}, Logger: testLogger(), CardDAV: controller})
+	request := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "https://archive.example/api/v1/carddav/google/authorize", strings.NewReader(`{"email":"person@example.com","redirect_uri":"https://archive.example/"}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Origin", "https://archive.example")
+	response := httptest.NewRecorder()
+	srv.Router().ServeHTTP(response, request)
+
+	assertions.Equal(http.StatusServiceUnavailable, response.Code, response.Body.String())
+	assertions.Contains(response.Body.String(), `"error":"oauth_unavailable"`)
+	assertions.NotContains(response.Body.String(), "example-private")
+
+	// A failing client secrets command is the same storage outage.
+	cfg.OAuth.Tokens = config.OAuthTokenCommands{}
+	cfg.OAuth.ClientSecrets, cfg.OAuth.ClientSecretsCommand = "", testutil.SecretCommand(t, "fail")
+	request = httptest.NewRequestWithContext(t.Context(), http.MethodPost, "https://archive.example/api/v1/carddav/google/authorize", strings.NewReader(`{"email":"person@example.com","redirect_uri":"https://archive.example/"}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Origin", "https://archive.example")
+	response = httptest.NewRecorder()
+	srv.Router().ServeHTTP(response, request)
+	assertions.Equal(http.StatusServiceUnavailable, response.Code, response.Body.String())
+	assertions.Contains(response.Body.String(), `"error":"oauth_unavailable"`)
+
+	// A store that answers the first read but fails when sign-in rereads it is the same outage.
+	commands.ReadCommand = testutil.SecretCommand(t, "read-once")
+	cfg.OAuth.Tokens = commands
+	cfg.OAuth.ClientSecrets, cfg.OAuth.ClientSecretsCommand = clientSecrets, nil
+	token := fmt.Sprintf(`{"access_token":"synthetic-access","refresh_token":"synthetic-refresh","client_id":"synthetic-client","scopes":[%q]}`, oauth.ScopeCardDAV)
+	required.NoError(oauth.NewTokenStore(cfg.TokensDir(), commands).Write(t.Context(), "person@example.com", []byte(token)))
+	request = httptest.NewRequestWithContext(t.Context(), http.MethodPost, "https://archive.example/api/v1/carddav/google/authorize", strings.NewReader(`{"email":"person@example.com","redirect_uri":"https://archive.example/"}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Origin", "https://archive.example")
+	response = httptest.NewRecorder()
+	srv.Router().ServeHTTP(response, request)
+	assertions.Equal(http.StatusServiceUnavailable, response.Code, response.Body.String())
+	assertions.Contains(response.Body.String(), `"error":"oauth_unavailable"`)
 }
 
 func TestGoogleCardDAVScheduleSaveDoesNotRequireAuthorization(t *testing.T) {
@@ -114,6 +307,7 @@ func TestGoogleCardDAVRefreshFailuresReachAPIAndSyncHistory(t *testing.T) {
 		truncatedBody                                            bool
 		closeEndpoint                                            bool
 	}{
+		{name: "invalid client", status: 401, body: `{"error":"invalid_client"}`, apiStatus: 502, apiCode: "google_authorization_required", runCode: "google_authorization_required"},
 		{name: "revoked", status: 400, body: `{"error":"invalid_grant"}`, apiStatus: 502, apiCode: "google_authorization_required", runCode: "google_authorization_required"},
 		{name: "unavailable", status: 503, body: `{"error":"server_error"}`, apiStatus: 502, apiCode: "carddav_upstream_failed", runCode: "upstream_failed"},
 		{name: "rate limited", status: 429, body: `{}`, wantRetryAfter: "1", apiStatus: 503, apiCode: "carddav_retry_after", runCode: "retry_after"},
@@ -193,8 +387,8 @@ func TestGoogleCardDAVRefreshFailuresReachAPIAndSyncHistory(t *testing.T) {
 			publicRun := cardDAVRunResponse(&runs[0])
 			assertions.Equal(tc.runCode, publicRun.ErrorCode)
 			if tc.runCode == "google_authorization_required" {
-				assertions.Contains(syncErr.Error(), "Connect Google")
-				assertions.Contains(publicRun.ErrorMessage, "Connect Google")
+				assertions.Contains(syncErr.Error(), "client settings")
+				assertions.Contains(publicRun.ErrorMessage, "client settings")
 			}
 			srv := &Server{cardDAV: controller}
 			response := httptest.NewRecorder()
@@ -206,28 +400,69 @@ func TestGoogleCardDAVRefreshFailuresReachAPIAndSyncHistory(t *testing.T) {
 	}
 }
 
-func TestCardDAVGoogleAccountSelection(t *testing.T) {
+func TestCardDAVAccountSelection(t *testing.T) {
 	t.Parallel()
-	assertions := assert.New(t)
-	required := require.New(t)
-	req := normalizeCardDAVAccountRequest(CardDAVAccountRequest{Provider: "google", Username: "person@example.com", OAuthApp: "contacts", Enabled: new(true)})
-	required.NoError(validateCardDAVAccountRequest(req))
-	assertions.Equal(carddav.GoogleDiscoveryURL, req.BaseURL)
-	controller := &CardDAVController{}
-	credential, err := controller.credentialForRequest(t.Context(), req)
-	required.NoError(err)
-	assertions.True(credential.Google)
-	assertions.Empty(credential.Password)
-	assertions.Equal("contacts", credential.OAuthApp)
-	credential.ConnectionGeneration = 1
-	dir := t.TempDir()
-	required.NoError(carddav.SaveCredential(dir, credential))
-	saved, err := carddav.LoadCredential(dir)
-	required.NoError(err)
-	assertions.True(cardDAVCredentialMatchesConfig(saved, config.CardDAVConfig{Provider: "google", OAuthApp: "contacts"}))
-	assertions.False(cardDAVCredentialMatchesConfig(saved, config.CardDAVConfig{}))
-	req.Password = "synthetic-password"
-	required.Error(validateCardDAVAccountRequest(req))
+	for _, tc := range []struct {
+		request      CardDAVAccountRequest
+		baseURL      string
+		wantUsername string
+		matches      config.CardDAVConfig
+		// otherProvider is a config of another provider, which the credential
+		// must not match.
+		otherProvider *config.CardDAVConfig
+		// refusesOAuthApp: an OAuth app is a Google setting.
+		refusesOAuthApp bool
+	}{
+		{
+			request: CardDAVAccountRequest{Provider: "google", Username: "person@example.com", OAuthApp: "contacts", Enabled: new(true)},
+			baseURL: carddav.GoogleDiscoveryURL,
+			matches: config.CardDAVConfig{Provider: "google", OAuthApp: "contacts"},
+		},
+		{
+			request:         CardDAVAccountRequest{Provider: "microsoft", Username: "Person@Example.com", Enabled: new(true)},
+			baseURL:         mscontacts.GraphBaseURL,
+			wantUsername:    "person@example.com",
+			matches:         config.CardDAVConfig{Provider: "microsoft"},
+			otherProvider:   &config.CardDAVConfig{Provider: "google"},
+			refusesOAuthApp: true,
+		},
+	} {
+		t.Run(tc.request.Provider, func(t *testing.T) {
+			t.Parallel()
+			assertions := assert.New(t)
+			required := require.New(t)
+			req := normalizeCardDAVAccountRequest(tc.request)
+			required.NoError(validateCardDAVAccountRequest(req))
+			assertions.Equal(tc.baseURL, req.BaseURL)
+			if tc.wantUsername != "" {
+				assertions.Equal(tc.wantUsername, req.Username)
+			}
+			controller := &CardDAVController{}
+			credential, err := controller.credentialForRequest(t.Context(), req)
+			required.NoError(err)
+			assertions.Equal(tc.request.Provider == "google", credential.Google)
+			assertions.Equal(tc.request.Provider == "microsoft", credential.Microsoft)
+			assertions.Empty(credential.Password)
+			assertions.Equal(tc.request.OAuthApp, credential.OAuthApp)
+			credential.ConnectionGeneration = 1
+			dir := t.TempDir()
+			required.NoError(carddav.SaveCredential(dir, credential))
+			saved, err := carddav.LoadCredential(dir)
+			required.NoError(err)
+			assertions.True(cardDAVCredentialMatchesConfig(saved, tc.matches))
+			if tc.otherProvider != nil {
+				assertions.False(cardDAVCredentialMatchesConfig(saved, *tc.otherProvider))
+			}
+			assertions.False(cardDAVCredentialMatchesConfig(saved, config.CardDAVConfig{}))
+
+			req.Password = "synthetic-password"
+			required.Error(validateCardDAVAccountRequest(req))
+			if tc.refusesOAuthApp {
+				req.Password, req.OAuthApp = "", "contacts"
+				required.Error(validateCardDAVAccountRequest(req), "an OAuth app is a Google setting")
+			}
+		})
+	}
 }
 
 func TestCardDAVGoogleAuthorizationConsumedOnceAndExpires(t *testing.T) {
@@ -297,7 +532,7 @@ func TestGoogleAuthorizationCompletesWhileArchiveGateHeld(t *testing.T) { //noli
 		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(strings.NewReader(body)), Request: r}, nil
 	})}
 	begin := func() CardDAVGoogleAuthorizeResponse {
-		start := httptest.NewRequest(http.MethodPost, "https://archive.example/api/v1/carddav/google/authorize", strings.NewReader(`{"email":"person@example.com","redirect_uri":"https://archive.example/"}`))
+		start := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "https://archive.example/api/v1/carddav/google/authorize", strings.NewReader(`{"email":"person@example.com","redirect_uri":"https://archive.example/"}`))
 		start.Header.Set("Content-Type", "application/json")
 		start.Header.Set("Origin", "https://archive.example")
 		started := httptest.NewRecorder()
@@ -309,20 +544,20 @@ func TestGoogleAuthorizationCompletesWhileArchiveGateHeld(t *testing.T) { //noli
 	}
 	older := begin()
 	flow := begin()
-	callback := httptest.NewRequest(http.MethodPost, "https://archive.example/api/v1/carddav/google/callback", strings.NewReader(fmt.Sprintf(`{"state":%q,"code":"synthetic-code"}`, flow.State)))
+	callback := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "https://archive.example/api/v1/carddav/google/callback", strings.NewReader(fmt.Sprintf(`{"state":%q,"code":"synthetic-code"}`, flow.State)))
 	callback.Header.Set("Content-Type", "application/json")
 	callback = callback.WithContext(context.WithValue(callback.Context(), oauth2.HTTPClient, provider))
 	completed := httptest.NewRecorder()
 	srv.Router().ServeHTTP(completed, callback)
 	required.Equal(http.StatusOK, completed.Code, completed.Body.String())
 	assertions.Equal(1, reconciled, "successful authorization must reconcile the schedule without an account save")
-	mgr, err := carddav.NewGoogleOAuthManager(secrets, cfg.TokensDir(), "", "person@example.com", testLogger())
+	mgr, err := carddav.NewGoogleOAuthManagerWithCredentials(t.Context(), config.OAuthApp{ClientSecrets: secrets}, cfg.TokensDir(), config.OAuthTokenCommands{}, "", "person@example.com", testLogger())
 	required.NoError(err)
-	assertions.True(mgr.TokenMatchesClient("person@example.com"))
-	assertions.True(mgr.HasScope("person@example.com", oauth.ScopeCardDAV))
+	assertions.True(mgr.TokenMatchesClient(t.Context(), "person@example.com"))
+	assertions.True(mgr.HasScope(t.Context(), "person@example.com", oauth.ScopeCardDAV))
 	saved, err := os.ReadFile(mgr.TokenPath("person@example.com"))
 	required.NoError(err)
-	callback = httptest.NewRequest(http.MethodPost, "https://archive.example/api/v1/carddav/google/callback", strings.NewReader(fmt.Sprintf(`{"state":%q,"code":"synthetic-code"}`, older.State)))
+	callback = httptest.NewRequestWithContext(t.Context(), http.MethodPost, "https://archive.example/api/v1/carddav/google/callback", strings.NewReader(fmt.Sprintf(`{"state":%q,"code":"synthetic-code"}`, older.State)))
 	callback.Header.Set("Content-Type", "application/json")
 	callback = callback.WithContext(context.WithValue(callback.Context(), oauth2.HTTPClient, provider))
 	stale := httptest.NewRecorder()
@@ -384,7 +619,7 @@ func TestGoogleAuthorizationCallbackReportsTransientProviderFailures(t *testing.
 				return &http.Response{StatusCode: status, Header: header, Body: io.NopCloser(strings.NewReader(body)), Request: r}, nil
 			})}
 
-			start := httptest.NewRequest(http.MethodPost, "https://archive.example/api/v1/carddav/google/authorize", strings.NewReader(`{"email":"person@example.com","redirect_uri":"https://archive.example/"}`))
+			start := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "https://archive.example/api/v1/carddav/google/authorize", strings.NewReader(`{"email":"person@example.com","redirect_uri":"https://archive.example/"}`))
 			start.Header.Set("Content-Type", "application/json")
 			start.Header.Set("Origin", "https://archive.example")
 			started := httptest.NewRecorder()
@@ -393,7 +628,7 @@ func TestGoogleAuthorizationCallbackReportsTransientProviderFailures(t *testing.
 			var flow CardDAVGoogleAuthorizeResponse
 			required.NoError(json.Unmarshal(started.Body.Bytes(), &flow))
 
-			callback := httptest.NewRequest(http.MethodPost, "https://archive.example/api/v1/carddav/google/callback", strings.NewReader(fmt.Sprintf(`{"state":%q,"code":"synthetic-code"}`, flow.State)))
+			callback := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "https://archive.example/api/v1/carddav/google/callback", strings.NewReader(fmt.Sprintf(`{"state":%q,"code":"synthetic-code"}`, flow.State)))
 			callback.Header.Set("Content-Type", "application/json")
 			callback = callback.WithContext(context.WithValue(callback.Context(), oauth2.HTTPClient, provider))
 			response := httptest.NewRecorder()
@@ -404,4 +639,19 @@ func TestGoogleAuthorizationCallbackReportsTransientProviderFailures(t *testing.
 			assertions.Contains(response.Body.String(), `"error":"oauth_unavailable"`)
 		})
 	}
+}
+
+func TestGoogleTokenFailureKeepsPendingWrite(t *testing.T) {
+	t.Parallel()
+	err := googleCardDAVTokenError(&net.OpError{Op: "dial", Err: errors.New("connection refused")})
+	require.ErrorIs(t, err, carddav.ErrWriteNotSent)
+	require.ErrorIs(t, err, carddav.ErrGoogleTokenUnavailable)
+	err = googleCardDAVTokenError(&oauth2.RetrieveError{Response: &http.Response{StatusCode: http.StatusServiceUnavailable, Header: http.Header{}}})
+	require.ErrorIs(t, err, carddav.ErrWriteNotSent, "a token endpoint failure sends no contacts write")
+}
+
+func TestGoogleCardDAVInvalidClientWithoutResponseRequiresRepair(t *testing.T) {
+	err := googleCardDAVTokenError(&oauth2.RetrieveError{ErrorCode: "invalid_client"})
+	require.ErrorIs(t, err, carddav.ErrGoogleAuthorizationRequired)
+	assert.NotErrorIs(t, err, carddav.ErrGoogleTokenUnavailable)
 }

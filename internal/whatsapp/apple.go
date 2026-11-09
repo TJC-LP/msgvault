@@ -1,7 +1,6 @@
 package whatsapp
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json/v2"
@@ -114,7 +113,7 @@ func (imp *Importer) importApple(
 		return nil, fmt.Errorf("get or create source: %w", err)
 	}
 	if opts.DisplayName != "" {
-		_ = imp.store.UpdateSourceDisplayName(source.ID, opts.DisplayName)
+		_ = imp.store.UpdateSourceDisplayNameContext(ctx, source.ID, opts.DisplayName)
 	}
 	summary.SourceID = source.ID
 
@@ -126,11 +125,24 @@ func (imp *Importer) importApple(
 	scoped.store = imp.store.ScopedToSync(source.ID, syncID)
 	imp = &scoped
 	defer func() {
+		if summary != nil {
+			retErr = errors.Join(retErr, imp.store.UpdateSyncCheckpoint(syncID, &store.Checkpoint{
+				MessagesProcessed: summary.MessagesProcessed, MessagesAdded: summary.MessagesAdded,
+				MessagesUpdated: summary.MessagesUpdated, ErrorsCount: summary.Errors,
+			}))
+		}
 		if retErr != nil {
-			_ = imp.store.FailSync(syncID, retErr.Error())
+			if summary != nil {
+				_ = imp.store.FailSyncWithCheckpoint(syncID, retErr.Error(), &store.Checkpoint{
+					MessagesProcessed: summary.MessagesProcessed, MessagesAdded: summary.MessagesAdded,
+					MessagesUpdated: summary.MessagesUpdated, ErrorsCount: summary.Errors,
+				})
+			} else {
+				_ = imp.store.FailSync(syncID, retErr.Error())
+			}
 			return
 		}
-		if err := imp.store.CompleteSync(syncID, ""); err != nil {
+		if err := imp.store.CompleteSyncAndPreserveSourceCursorContext(context.WithoutCancel(ctx), syncID, source.ID, ""); err != nil {
 			retErr = fmt.Errorf("complete sync: %w", err)
 		}
 	}()
@@ -158,6 +170,7 @@ func (imp *Importer) importApple(
 	}
 
 	selfParticipantID, err := imp.store.EnsureParticipantByPhone(
+		ctx,
 		opts.Phone, opts.DisplayName, "whatsapp",
 	)
 	if err != nil {
@@ -169,6 +182,39 @@ func (imp *Importer) importApple(
 	chats, err := fetchAppleChats(ctx, db)
 	if err != nil {
 		return nil, fmt.Errorf("fetch Apple chats: %w", err)
+	}
+
+	aggregates, markersAvailable, err := fetchAppleChatAggregates(ctx, db)
+	if err != nil {
+		return nil, fmt.Errorf("read Apple chat change markers: %w", err)
+	}
+	// Without a store identity, markers cannot tell one database from another,
+	// so every chat is read.
+	storeIdentity, err := fetchAppleStoreIdentity(ctx, db)
+	if err != nil {
+		return nil, fmt.Errorf("read Apple chat change markers: %w", err)
+	}
+	if storeIdentity == "" {
+		markersAvailable, aggregates = false, nil
+	}
+	importContext, err := appleImportContext(
+		storeIdentity, selfParticipantID, lidMap, pushNames, duplicateStanzas,
+	)
+	if err != nil {
+		return nil, err
+	}
+	var previousMarkers map[int64]string
+	if !opts.Full && markersAvailable {
+		previousMarkers, err = imp.previousAppleChatMarkers(ctx, source, syncID, importContext)
+		if err != nil {
+			return nil, err
+		}
+	}
+	nextMarkers := make(map[int64]string, len(chats))
+	for _, chat := range chats {
+		if marker, ok := previousMarkers[chat.RowID]; ok {
+			nextMarkers[chat.RowID] = marker
+		}
 	}
 
 	batchSize := opts.BatchSize
@@ -197,7 +243,8 @@ func (imp *Importer) importApple(
 			conversationType = "group_chat"
 			conversationTitle = chat.Name
 		}
-		conversationID, err := imp.store.EnsureConversationWithType(
+		conversationID, err := imp.store.EnsureConversationWithTypeContext(
+			ctx,
 			source.ID, canonicalChatJID, conversationType, conversationTitle,
 		)
 		if err != nil {
@@ -206,7 +253,8 @@ func (imp *Importer) importApple(
 		summary.ChatsProcessed++
 		imp.progress.OnChatStart(canonicalChatJID, appleChatTitle(chat, lidMap), 0)
 
-		if err := imp.store.EnsureConversationParticipant(
+		if err := imp.store.EnsureConversationParticipantContext(
+			ctx,
 			conversationID, selfParticipantID, "member",
 		); err != nil {
 			return summary, fmt.Errorf("add self to Apple conversation: %w", err)
@@ -224,6 +272,7 @@ func (imp *Importer) importApple(
 				}
 				legacyName := firstNonEmptyApple(member.ContactName, member.FirstName)
 				participantID, err := ensureAppleParticipant(
+					ctx,
 					imp.store, phone, legacyName,
 					participantIDs, summary,
 				)
@@ -239,7 +288,8 @@ func (imp *Importer) importApple(
 				if member.IsAdmin {
 					role = "admin"
 				}
-				if err := imp.store.EnsureConversationParticipant(
+				if err := imp.store.EnsureConversationParticipantContext(
+					ctx,
 					conversationID, participantID, role,
 				); err != nil {
 					return summary, fmt.Errorf("add Apple group participant: %w", err)
@@ -247,6 +297,7 @@ func (imp *Importer) importApple(
 			}
 		} else if phone := applePhoneForJID(chat.RawJID, lidMap); phone != "" {
 			participantID, err := ensureAppleParticipant(
+				ctx,
 				imp.store, phone, chat.Name, participantIDs, summary,
 			)
 			if err != nil {
@@ -257,12 +308,20 @@ func (imp *Importer) importApple(
 					pendingPushNames[phone] = pushName
 				}
 			}
-			if err := imp.store.EnsureConversationParticipant(
+			if err := imp.store.EnsureConversationParticipantContext(
+				ctx,
 				conversationID, participantID, "member",
 			); err != nil {
 				return summary, fmt.Errorf("add Apple direct participant: %w", err)
 			}
 		}
+
+		marker := appleChatMarker(aggregates, chat, conversationID)
+		if marker != "" && previousMarkers[chat.RowID] == marker {
+			imp.progress.OnChatComplete(canonicalChatJID, 0)
+			continue
+		}
+		delete(nextMarkers, chat.RowID)
 
 		var afterRowID int64
 		var chatAdded int64
@@ -286,7 +345,8 @@ func (imp *Importer) importApple(
 
 			var stanzaIDs []string
 			for _, sourceMessage := range messages {
-				if isImportableAppleMessage(sourceMessage, duplicateStanzas) {
+				if appleMessageInWindow(sourceMessage, opts) &&
+					isImportableAppleMessage(sourceMessage, duplicateStanzas) {
 					stanzaIDs = append(stanzaIDs, sourceMessage.StanzaID)
 				}
 			}
@@ -302,6 +362,9 @@ func (imp *Importer) importApple(
 					break
 				}
 				afterRowID = sourceMessage.RowID
+				if !appleMessageInWindow(sourceMessage, opts) {
+					continue
+				}
 				summary.MessagesProcessed++
 				if !isImportableAppleMessage(sourceMessage, duplicateStanzas) {
 					summary.MessagesSkipped++
@@ -309,6 +372,7 @@ func (imp *Importer) importApple(
 				}
 
 				senderID, senderPhone, err := resolveAppleMessageSender(
+					ctx,
 					imp.store, sourceMessage, chat, lidMap,
 					selfParticipantID, participantIDs, summary,
 				)
@@ -325,7 +389,8 @@ func (imp *Importer) importApple(
 					senderPhone = opts.Phone
 				}
 				if senderID.Valid {
-					if err := imp.store.EnsureConversationParticipant(
+					if err := imp.store.EnsureConversationParticipantContext(
+						ctx,
 						conversationID, senderID.Int64, "member",
 					); err != nil {
 						return summary, fmt.Errorf("add Apple message sender: %w", err)
@@ -350,7 +415,7 @@ func (imp *Importer) importApple(
 						FromAddr: senderPhone,
 					},
 				}
-				if existing, ok := stored[sourceMessage.StanzaID]; ok && appleMessageStored(existing, data) {
+				if existing, ok := stored[sourceMessage.StanzaID]; ok && existing.Matches(data.Message, data.RawMIME) {
 					unchanged, err := imp.store.MessageContentMatchesContext(
 						ctx, existing.ID, data.BodyText, *data.FTS,
 					)
@@ -365,7 +430,11 @@ func (imp *Importer) importApple(
 				if _, err := imp.store.PersistMessageContext(ctx, data); err != nil {
 					return summary, fmt.Errorf("persist Apple message: %w", err)
 				}
-				summary.MessagesAdded++
+				if _, exists := stored[sourceMessage.StanzaID]; exists {
+					summary.MessagesUpdated++
+				} else {
+					summary.MessagesAdded++
+				}
 				chatAdded++
 				totalAdded++
 			}
@@ -373,6 +442,8 @@ func (imp *Importer) importApple(
 			if err := imp.store.UpdateSyncCheckpoint(syncID, &store.Checkpoint{
 				MessagesProcessed: summary.MessagesProcessed,
 				MessagesAdded:     summary.MessagesAdded,
+				MessagesUpdated:   summary.MessagesUpdated,
+				ErrorsCount:       summary.Errors,
 			}); err != nil {
 				return summary, fmt.Errorf("checkpoint Apple import: %w", err)
 			}
@@ -386,18 +457,33 @@ func (imp *Importer) importApple(
 				break
 			}
 		}
+		// A chat cut short by --limit may still hold unread changes. A date
+		// window leaves older messages unwritten on purpose, so those chats
+		// stay unmarked and a later unfiltered run still imports them.
+		windowed := !opts.After.IsZero() || !opts.Before.IsZero()
+		if marker != "" && !windowed && (totalLimit == 0 || totalAdded < totalLimit) {
+			nextMarkers[chat.RowID] = marker
+		}
 		imp.progress.OnChatComplete(canonicalChatJID, chatAdded)
 	}
 	for phone, pushName := range pendingPushNames {
 		if _, err := ensureAppleParticipant(
+			ctx,
 			imp.store, phone, pushName, participantIDs, summary,
 		); err != nil {
 			return summary, err
 		}
 	}
 
-	if err := imp.store.RecomputeConversationStats(source.ID); err != nil {
+	if err := imp.store.RecomputeConversationStatsContext(ctx, source.ID); err != nil {
 		return summary, fmt.Errorf("recompute Apple conversation stats: %w", err)
+	}
+	if markersAvailable {
+		if err := imp.saveAppleChatMarkers(
+			ctx, source.ID, syncID, importContext, nextMarkers,
+		); err != nil {
+			return summary, err
+		}
 	}
 	summary.Duration = time.Since(startedAt)
 	imp.progress.OnComplete(summary)
@@ -646,6 +732,7 @@ func loadApplePushNames(
 }
 
 func resolveAppleMessageSender(
+	ctx context.Context,
 	s *store.Store,
 	message appleMessage,
 	chat appleChat,
@@ -669,6 +756,7 @@ func resolveAppleMessageSender(
 		return sql.NullInt64{}, "", nil
 	}
 	participantID, err := ensureAppleParticipant(
+		ctx,
 		s, phone, name, participantIDs, summary,
 	)
 	if err != nil {
@@ -678,6 +766,7 @@ func resolveAppleMessageSender(
 }
 
 func ensureAppleParticipant(
+	ctx context.Context,
 	s *store.Store,
 	phone, displayName string,
 	participantIDs map[string]int64,
@@ -685,13 +774,13 @@ func ensureAppleParticipant(
 ) (int64, error) {
 	if participantID, ok := participantIDs[phone]; ok {
 		if displayName != "" {
-			if _, err := s.EnsureParticipantByPhone(phone, displayName, "whatsapp"); err != nil {
+			if _, err := s.EnsureParticipantByPhone(ctx, phone, displayName, "whatsapp"); err != nil {
 				return 0, fmt.Errorf("update Apple participant: %w", err)
 			}
 		}
 		return participantID, nil
 	}
-	participantID, err := s.EnsureParticipantByPhone(phone, displayName, "whatsapp")
+	participantID, err := s.EnsureParticipantByPhone(ctx, phone, displayName, "whatsapp")
 	if err != nil {
 		return 0, fmt.Errorf("ensure Apple participant: %w", err)
 	}
@@ -700,6 +789,9 @@ func ensureAppleParticipant(
 	return participantID, nil
 }
 
+// mapAppleMessage derives a stored message from an Apple row. Bump
+// appleChatMarkerVersion when it or isImportableAppleMessage changes, or
+// unchanged chats keep the old derivation.
 func mapAppleMessage(
 	message appleMessage,
 	conversationID, sourceID int64,
@@ -734,30 +826,6 @@ func isImportableAppleMessage(message appleMessage, duplicateStanzas map[string]
 	return !duplicate
 }
 
-// appleMessageStored reports whether the stored message columns and raw
-// payload already equal the derived message. Body and search document are
-// checked separately because they need a per-message read.
-func appleMessageStored(stored store.StoredMessage, data *store.MessagePersistData) bool {
-	message := data.Message
-	return stored.ConversationID == message.ConversationID &&
-		stored.SenderID == message.SenderID &&
-		stored.SourceIsFromMe.Valid && stored.SourceIsFromMe.Bool == message.IsFromMe &&
-		stored.MessageType == message.MessageType &&
-		sameAppleInstant(stored.SentAt, message.SentAt) &&
-		sameAppleInstant(stored.InternalDate, message.InternalDate) &&
-		stored.Snippet == message.Snippet &&
-		stored.SizeEstimate == message.SizeEstimate &&
-		bytes.Equal(stored.Raw, data.RawMIME)
-}
-
-// sameAppleInstant ignores differences below the microsecond PostgreSQL keeps.
-func sameAppleInstant(stored, derived sql.NullTime) bool {
-	if stored.Valid != derived.Valid {
-		return false
-	}
-	return !stored.Valid || stored.Time.Sub(derived.Time).Abs() < time.Microsecond
-}
-
 func appleMessageTimestamp(value appleTimestampValue) sql.NullTime {
 	if !value.Valid || value.Seconds <= 0 ||
 		math.IsNaN(value.Seconds) || math.IsInf(value.Seconds, 0) {
@@ -769,6 +837,26 @@ func appleMessageTimestamp(value appleTimestampValue) sql.NullTime {
 		Time:  time.Unix(int64(seconds)+appleEpochOffset, nanoseconds).UTC(),
 		Valid: true,
 	}
+}
+
+// appleMessageInWindow reports whether the message falls within the optional
+// [After, Before) window. A message without a valid timestamp is outside any
+// bounded window.
+func appleMessageInWindow(message appleMessage, opts ImportOptions) bool {
+	if opts.After.IsZero() && opts.Before.IsZero() {
+		return true
+	}
+	sent := appleMessageTimestamp(message.MessageDate)
+	if !sent.Valid {
+		return false
+	}
+	if !opts.After.IsZero() && sent.Time.Before(opts.After) {
+		return false
+	}
+	if !opts.Before.IsZero() && !sent.Time.Before(opts.Before) {
+		return false
+	}
+	return true
 }
 
 func appleMessageSnippet(text sql.NullString) sql.NullString {

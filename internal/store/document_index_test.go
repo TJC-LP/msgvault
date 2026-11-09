@@ -44,7 +44,7 @@ func TestDocumentExtractionProfileRequiresExactConsent(t *testing.T) {
 	})
 	require.NoError(err)
 	var enabled bool
-	require.NoError(f.Store.DB().QueryRow(f.Store.Rebind(
+	require.NoError(f.Store.DB().QueryRowContext(t.Context(), f.Store.Rebind(
 		`SELECT enabled FROM document_extraction_profiles WHERE id = ?`), profile.ID).Scan(&enabled))
 	assert.True(enabled)
 	revision, err := f.Store.GetDocumentIndexRevision(t.Context())
@@ -126,13 +126,13 @@ func TestReconcileDocumentOccurrenceUsesTrustedCASAndLiveRole(t *testing.T) {
 	require.NoError(err)
 	assert.Equal(int64(1), revision, "sequence-only reconciliation must not invalidate search cursors")
 	var sourceSequence int64
-	require.NoError(f.Store.DB().QueryRow(f.Store.Rebind(`
+	require.NoError(f.Store.DB().QueryRowContext(t.Context(), f.Store.Rebind(`
 		SELECT source_sequence FROM document_occurrences WHERE attachment_id = ?`),
 		attachmentID,
 	).Scan(&sourceSequence))
 	assert.Equal(int64(11), sourceSequence)
 
-	_, err = f.Store.DB().Exec(f.Store.Rebind(
+	_, err = f.Store.DB().ExecContext(t.Context(), f.Store.Rebind(
 		`UPDATE messages SET deleted_from_source_at = CURRENT_TIMESTAMP WHERE id = ?`), messageID)
 	require.NoError(err)
 	_, eligible, err = f.Store.ReconcileDocumentOccurrence(t.Context(), attachmentID, 12)
@@ -142,7 +142,8 @@ func TestReconcileDocumentOccurrenceUsesTrustedCASAndLiveRole(t *testing.T) {
 	require.NoError(err)
 	assert.Equal(int64(2), revision)
 	var occurrences int
-	require.NoError(f.Store.DB().QueryRow(
+	require.NoError(f.Store.DB().QueryRowContext(
+		t.Context(),
 		`SELECT COUNT(*) FROM document_occurrences`).Scan(&occurrences))
 	assert.Zero(occurrences)
 }
@@ -154,6 +155,7 @@ func TestReconcileDocumentOccurrenceFailsClosedForUnknownRole(t *testing.T) {
 	messageID := f.CreateMessage("document-unknown-role")
 	hash := strings.Repeat("c", 64)
 	require.NoError(f.Store.UpsertAttachment(
+		t.Context(),
 		messageID, "synthetic.pdf", "application/pdf", hash[:2]+"/"+hash, hash, 64,
 	))
 	attachmentID := singleAttachmentID(t, f, messageID)
@@ -176,7 +178,7 @@ func TestDocumentCandidatesReprocessOwnerWhenRepresentativeRouteChanges(t *testi
 	require.NoError(err)
 	require.Equal(int64(1), status.ReadyOwners)
 
-	_, err = f.Store.DB().Exec(f.Store.Rebind(
+	_, err = f.Store.DB().ExecContext(t.Context(), f.Store.Rebind(
 		`UPDATE attachments SET mime_type = ? WHERE id = ?`), "text/csv", attachmentID)
 	require.NoError(err)
 	occurrence, eligible, err := f.Store.ReconcileDocumentOccurrence(t.Context(), attachmentID, 2)
@@ -210,10 +212,128 @@ func TestDocumentCandidatesReprocessOwnerWhenRepresentativeRouteChanges(t *testi
 	}
 	require.NoError(f.Store.PublishDocumentExtraction(t.Context(), publication))
 	var servedExtraction string
-	require.NoError(f.Store.DB().QueryRow(f.Store.Rebind(
+	require.NoError(f.Store.DB().QueryRowContext(t.Context(), f.Store.Rebind(
 		`SELECT extraction_id FROM document_extraction_heads WHERE canonical_blob_hash = ?`), hash).Scan(&servedExtraction))
 	assert.Equal("mime-route-csv", servedExtraction)
 	assert.Empty(documentCandidates(t, f, profile, nil))
+}
+
+func TestRetryDocumentExtractionAllowsFailedReplacementRoute(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	f := storetest.New(t)
+	profile, hash := seedDocumentPublicationAuthorityForMediaTypes(t, f, []string{"application/pdf", "text/csv"})
+	publishSearchDocument(t, f, profile, hash, "PDF route evidence", "failed-route-pdf-head")
+	attachmentID := seededDocumentAttachmentID(t, f, hash)
+
+	_, err := f.Store.DB().ExecContext(t.Context(), f.Store.Rebind(
+		`UPDATE attachments SET mime_type = ? WHERE id = ?`), "text/csv", attachmentID)
+	require.NoError(err)
+	_, eligible, err := f.Store.ReconcileDocumentOccurrence(t.Context(), attachmentID, 2)
+	require.NoError(err)
+	require.True(eligible)
+
+	claim, err := f.Store.ClaimDocumentExtraction(t.Context(), documentClaimInputForHash(t, f, store.DocumentExtractionClaimInput{
+		ExtractionID: "failed-route-csv", ProfileID: profile.ID,
+		CanonicalBlobHash: hash, ExtractionInputKey: "original",
+		LeaseOwner: "worker-csv", LeaseUntil: time.Now().UTC().Add(10 * time.Minute),
+		LocalBytes: 128, SourceSequence: 2, RequireNoHead: true,
+	}))
+	require.NoError(err)
+	require.Equal("text/csv", claim.OccurrenceMIMEType)
+	require.NoError(f.Store.FailDocumentExtraction(t.Context(), store.DocumentExtractionFailure{
+		Claim: claim, ReasonCode: "provider_rejected", Terminal: true,
+	}))
+
+	changed, err := f.Store.RetryDocumentExtraction(t.Context(), profile.ID, hash)
+	require.NoError(err)
+	require.True(changed)
+	var headID string
+	require.NoError(f.Store.DB().QueryRowContext(t.Context(), f.Store.Rebind(
+		`SELECT extraction_id FROM document_extraction_heads WHERE profile_id = ? AND canonical_blob_hash = ?`),
+		profile.ID, hash).Scan(&headID))
+	assert.Equal("failed-route-pdf-head", headID, "retrying the failed CSV replacement must preserve the old PDF head")
+	candidates := documentCandidates(t, f, profile, nil)
+	require.Len(candidates, 1)
+	assert.Equal("text/csv", candidates[0].MIMEType)
+}
+
+func TestRetryDocumentExtractionClearsFailedRouteAfterAnotherRouteChange(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	f := storetest.New(t)
+	profile, hash := seedDocumentPublicationAuthorityForMediaTypes(t, f, []string{"application/pdf", "text/csv", "text/plain"})
+	publishSearchDocument(t, f, profile, hash, "PDF route evidence", "three-route-pdf-head")
+	attachmentID := seededDocumentAttachmentID(t, f, hash)
+	reconcileAs := func(mimeType string, sequence int64) {
+		_, err := f.Store.DB().ExecContext(t.Context(), f.Store.Rebind(
+			`UPDATE attachments SET mime_type = ? WHERE id = ?`), mimeType, attachmentID)
+		require.NoError(err)
+		_, eligible, err := f.Store.ReconcileDocumentOccurrence(t.Context(), attachmentID, sequence)
+		require.NoError(err)
+		require.True(eligible)
+	}
+
+	reconcileAs("text/csv", 2)
+	claim, err := f.Store.ClaimDocumentExtraction(t.Context(), documentClaimInputForHash(t, f, store.DocumentExtractionClaimInput{
+		ExtractionID: "three-route-csv", ProfileID: profile.ID,
+		CanonicalBlobHash: hash, ExtractionInputKey: "original",
+		LeaseOwner: "worker-csv", LeaseUntil: time.Now().UTC().Add(10 * time.Minute),
+		LocalBytes: 128, SourceSequence: 2, RequireNoHead: true,
+	}))
+	require.NoError(err)
+	require.NoError(f.Store.FailDocumentExtraction(t.Context(), store.DocumentExtractionFailure{
+		Claim: claim, ReasonCode: "provider_rejected", Terminal: true,
+	}))
+	// The attachment moves to a third route that neither the head nor the
+	// failed CSV attempt covers. The CSV failure still suppresses the owner.
+	reconcileAs("text/plain", 3)
+	require.Empty(documentCandidates(t, f, profile, nil))
+
+	changed, err := f.Store.RetryDocumentExtraction(t.Context(), profile.ID, hash)
+	require.NoError(err)
+	require.True(changed)
+	var headID string
+	require.NoError(f.Store.DB().QueryRowContext(t.Context(), f.Store.Rebind(
+		`SELECT extraction_id FROM document_extraction_heads WHERE profile_id = ? AND canonical_blob_hash = ?`),
+		profile.ID, hash).Scan(&headID))
+	assert.Equal("three-route-pdf-head", headID)
+	candidates := documentCandidates(t, f, profile, nil)
+	require.Len(candidates, 1)
+	assert.Equal("text/plain", candidates[0].MIMEType)
+}
+
+func TestRetryDocumentExtractionRejectsStaleFailedRoute(t *testing.T) {
+	require := require.New(t)
+	f := storetest.New(t)
+	profile, hash := seedDocumentPublicationAuthorityForMediaTypes(t, f, []string{"application/pdf", "text/csv"})
+	publishSearchDocument(t, f, profile, hash, "PDF route evidence", "stale-route-pdf-head")
+	attachmentID := seededDocumentAttachmentID(t, f, hash)
+	reconcileAs := func(mimeType string, sequence int64) {
+		_, err := f.Store.DB().ExecContext(t.Context(), f.Store.Rebind(
+			`UPDATE attachments SET mime_type = ? WHERE id = ?`), mimeType, attachmentID)
+		require.NoError(err)
+		_, eligible, err := f.Store.ReconcileDocumentOccurrence(t.Context(), attachmentID, sequence)
+		require.NoError(err)
+		require.True(eligible)
+	}
+
+	reconcileAs("text/csv", 2)
+	claim, err := f.Store.ClaimDocumentExtraction(t.Context(), documentClaimInputForHash(t, f, store.DocumentExtractionClaimInput{
+		ExtractionID: "stale-route-csv", ProfileID: profile.ID,
+		CanonicalBlobHash: hash, ExtractionInputKey: "original",
+		LeaseOwner: "worker-csv", LeaseUntil: time.Now().UTC().Add(10 * time.Minute),
+		LocalBytes: 128, SourceSequence: 2, RequireNoHead: true,
+	}))
+	require.NoError(err)
+	require.NoError(f.Store.FailDocumentExtraction(t.Context(), store.DocumentExtractionFailure{
+		Claim: claim, ReasonCode: "provider_rejected", Terminal: true,
+	}))
+	// The attachment returns to the PDF route the current head already covers.
+	reconcileAs("application/pdf", 3)
+
+	_, err = f.Store.RetryDocumentExtraction(t.Context(), profile.ID, hash)
+	require.ErrorContains(err, "already current")
 }
 
 func TestDocumentCandidatesReprocessOwnerWhenReplacedStableKeyChangesRoute(t *testing.T) {
@@ -223,7 +343,7 @@ func TestDocumentCandidatesReprocessOwnerWhenReplacedStableKeyChangesRoute(t *te
 	profile, hash := seedDocumentPublicationAuthorityForMediaTypes(t, f, []string{"application/pdf", "text/csv"})
 	publishSearchDocument(t, f, profile, hash, "PDF route evidence", "mime-route-replaced-head")
 	attachmentID := seededDocumentAttachmentID(t, f, hash)
-	_, err := f.Store.DB().Exec(f.Store.Rebind(
+	_, err := f.Store.DB().ExecContext(t.Context(), f.Store.Rebind(
 		`UPDATE attachments SET mime_type = ?, source_part_key = ? WHERE id = ?`),
 		"text/csv", "mime:1.3", attachmentID)
 	require.NoError(err)
@@ -262,10 +382,10 @@ func TestDocumentCandidatesTreatUntrackedRouteAsCurrent(t *testing.T) {
 	f := storetest.New(t)
 	profile, hash := seedDocumentPublicationAuthorityForMediaTypes(t, f, []string{"application/pdf", "text/csv"})
 	publishSearchDocument(t, f, profile, hash, "PDF route evidence", "mime-route-legacy-head")
-	_, err := f.Store.DB().Exec(`UPDATE document_extractions SET source_media_type = NULL`)
+	_, err := f.Store.DB().ExecContext(t.Context(), `UPDATE document_extractions SET source_media_type = NULL`)
 	require.NoError(err)
 	attachmentID := seededDocumentAttachmentID(t, f, hash)
-	_, err = f.Store.DB().Exec(f.Store.Rebind(
+	_, err = f.Store.DB().ExecContext(t.Context(), f.Store.Rebind(
 		`UPDATE attachments SET mime_type = ? WHERE id = ?`), "text/csv", attachmentID)
 	require.NoError(err)
 	_, eligible, err := f.Store.ReconcileDocumentOccurrence(t.Context(), attachmentID, 2)
@@ -304,7 +424,7 @@ func TestDocumentCandidatesIgnoreOutOfScopeOccurrenceWhenRouteChanges(t *testing
 	reconcileDocumentAttachmentUntilOrdered(t, f, imageAttachmentID, hash, "route-mask", true)
 	require.Empty(documentCandidates(t, f, profile, nil))
 
-	_, err := f.Store.DB().Exec(f.Store.Rebind(
+	_, err := f.Store.DB().ExecContext(t.Context(), f.Store.Rebind(
 		`UPDATE attachments SET mime_type = ? WHERE id = ?`), "text/csv", pdfAttachmentID)
 	require.NoError(err)
 	_, eligible, err := f.Store.ReconcileDocumentOccurrence(t.Context(), pdfAttachmentID, 100)
@@ -334,9 +454,9 @@ func TestDocumentCandidatesFollowMessageTypeScopeChanges(t *testing.T) {
 	require.Empty(documentCandidates(t, f, profile, messageTypes))
 
 	var pdfMessageID int64
-	require.NoError(f.Store.DB().QueryRow(f.Store.Rebind(
+	require.NoError(f.Store.DB().QueryRowContext(t.Context(), f.Store.Rebind(
 		`SELECT message_id FROM attachments WHERE id = ?`), pdfAttachmentID).Scan(&pdfMessageID))
-	_, err = f.Store.DB().Exec(f.Store.Rebind(
+	_, err = f.Store.DB().ExecContext(t.Context(), f.Store.Rebind(
 		`UPDATE messages SET message_type = ? WHERE id = ?`), "chat", pdfMessageID)
 	require.NoError(err)
 
@@ -361,7 +481,7 @@ func TestDocumentCandidatesReprocessOwnerWhenRemovedOccurrenceChangesRepresentat
 	publishSearchDocument(t, f, profile, hash, "PDF route evidence", "mime-route-removed-head")
 	require.Empty(documentCandidates(t, f, profile, nil))
 
-	_, err := f.Store.DB().Exec(f.Store.Rebind(
+	_, err := f.Store.DB().ExecContext(t.Context(), f.Store.Rebind(
 		`UPDATE attachments SET attachment_role = ? WHERE id = ?`), store.AttachmentRolePreview, pdfAttachmentID)
 	require.NoError(err)
 	_, eligible, err := f.Store.ReconcileDocumentOccurrence(t.Context(), pdfAttachmentID, 100)
@@ -380,7 +500,7 @@ func TestDocumentCandidatesReprocessReturningOwnerOnlyThroughAnotherRoute(t *tes
 	profile, hash := seedDocumentPublicationAuthorityForMediaTypes(t, f, []string{"application/pdf", "text/csv"})
 	publishSearchDocument(t, f, profile, hash, "PDF route evidence", "mime-route-vanished-head")
 	pdfAttachmentID := seededDocumentAttachmentID(t, f, hash)
-	_, err := f.Store.DB().Exec(f.Store.Rebind(
+	_, err := f.Store.DB().ExecContext(t.Context(), f.Store.Rebind(
 		`UPDATE attachments SET attachment_role = ? WHERE id = ?`), store.AttachmentRolePreview, pdfAttachmentID)
 	require.NoError(err)
 	_, eligible, err := f.Store.ReconcileDocumentOccurrence(t.Context(), pdfAttachmentID, 2)
@@ -417,7 +537,7 @@ func documentCandidates(
 func seededDocumentAttachmentID(t *testing.T, f *storetest.Fixture, hash string) int64 {
 	t.Helper()
 	var attachmentID int64
-	require.NoError(t, f.Store.DB().QueryRow(f.Store.Rebind(
+	require.NoError(t, f.Store.DB().QueryRowContext(t.Context(), f.Store.Rebind(
 		`SELECT id FROM attachments WHERE content_hash = ? AND mime_type = ?`), hash, "application/pdf").Scan(&attachmentID))
 	return attachmentID
 }
@@ -425,7 +545,7 @@ func seededDocumentAttachmentID(t *testing.T, f *storetest.Fixture, hash string)
 func documentHeadCount(t *testing.T, f *storetest.Fixture, hash string) int {
 	t.Helper()
 	var heads int
-	require.NoError(t, f.Store.DB().QueryRow(f.Store.Rebind(
+	require.NoError(t, f.Store.DB().QueryRowContext(t.Context(), f.Store.Rebind(
 		`SELECT COUNT(*) FROM document_extraction_heads WHERE canonical_blob_hash = ?`), hash).Scan(&heads))
 	return heads
 }
@@ -454,14 +574,14 @@ func reconcileDocumentAttachmentUntilOrdered(
 	t.Helper()
 	for index := range 64 {
 		sourcePartKey := keyPrefix + ":" + strconv.Itoa(index)
-		_, err := f.Store.DB().Exec(f.Store.Rebind(
+		_, err := f.Store.DB().ExecContext(t.Context(), f.Store.Rebind(
 			`UPDATE attachments SET source_part_key = ? WHERE id = ?`), sourcePartKey, attachmentID)
 		require.NoError(t, err)
 		_, eligible, err := f.Store.ReconcileDocumentOccurrence(t.Context(), attachmentID, int64(index+2))
 		require.NoError(t, err)
 		require.True(t, eligible)
 		var firstAttachmentID int64
-		require.NoError(t, f.Store.DB().QueryRow(f.Store.Rebind(`
+		require.NoError(t, f.Store.DB().QueryRowContext(t.Context(), f.Store.Rebind(`
 			SELECT attachment_id FROM document_occurrences
 			WHERE canonical_blob_hash = ? ORDER BY occurrence_key LIMIT 1`), hash).Scan(&firstAttachmentID))
 		if (firstAttachmentID == attachmentID) == wantFirst {
@@ -501,7 +621,7 @@ func TestListPendingDocumentExtractionsRespectsAuthorityAndRetryState(t *testing
 	require.NoError(err)
 	assert.Empty(candidates)
 
-	_, err = f.Store.DB().Exec(f.Store.Rebind(
+	_, err = f.Store.DB().ExecContext(t.Context(), f.Store.Rebind(
 		`UPDATE document_extractions SET next_retry_at = ? WHERE id = ?`),
 		time.Now().UTC().Add(-time.Minute), claim.ExtractionID)
 	require.NoError(err)
@@ -594,6 +714,7 @@ func TestDocumentIndexScopedStatusClassifiesOwnersAndRoleExclusions(t *testing.T
 	messageID := f.CreateMessage("document-status-exclusions")
 	unknownHash := strings.Repeat("c", 64)
 	require.NoError(t, f.Store.UpsertAttachment(
+		t.Context(),
 		messageID, "unknown.pdf", "application/pdf", unknownHash[:2]+"/"+unknownHash,
 		unknownHash, 64,
 	))
@@ -664,7 +785,7 @@ func TestDocumentIndexScopedStatusUsesCurrentTerminalAttempt(t *testing.T) {
 	assert.Zero(status.RetryOwners)
 	assert.Equal(int64(1), status.TerminalOwners)
 	var retryConsumed bool
-	require.NoError(f.Store.DB().QueryRow(f.Store.Rebind(`
+	require.NoError(f.Store.DB().QueryRowContext(t.Context(), f.Store.Rebind(`
 		SELECT next_retry_at IS NULL FROM document_extractions WHERE id = ?`),
 		transientClaim.ExtractionID,
 	).Scan(&retryConsumed))
@@ -685,8 +806,8 @@ func TestDocumentIndexStatusCountsCompletedAttemptOutcomes(t *testing.T) {
 	require.NoError(err)
 	require.NoError(f.Store.FailDocumentExtraction(t.Context(), store.DocumentExtractionFailure{
 		Claim: failedClaim, ReasonCode: "provider_transient",
-		RetryAt:      time.Now().UTC().Add(time.Minute),
-		RequestCount: 2, RetryCount: 1, ProviderLatencyMS: 50,
+		RetryAt:     time.Now().UTC().Add(time.Minute),
+		UploadCount: 1, RequestCount: 2, RetryCount: 1, ProviderLatencyMS: 50,
 	}))
 	publishSearchDocument(t, f, profile, hash, "successful retry", "status-successful-retry")
 
@@ -699,7 +820,7 @@ func TestDocumentIndexStatusCountsCompletedAttemptOutcomes(t *testing.T) {
 	assert.Equal(int64(1), status.ProviderRetries)
 	assert.Equal(int64(75), status.ProviderLatencyMillis)
 	assert.InDelta(25, status.AverageProviderLatencyMS, 0.001)
-	_, err = f.Store.DB().Exec(f.Store.Rebind(`
+	_, err = f.Store.DB().ExecContext(t.Context(), f.Store.Rebind(`
 		UPDATE document_extractions SET attempt_count = 1 WHERE id = ?`),
 		"status-successful-retry")
 	require.NoError(err)
@@ -751,7 +872,7 @@ func TestDocumentIndexStatusCountsBytesOnlyAfterProviderRequest(t *testing.T) {
 	require.NoError(err)
 	require.NoError(f.Store.FailDocumentExtraction(t.Context(), store.DocumentExtractionFailure{
 		Claim: providerClaim, ReasonCode: "provider_rejected", Terminal: true,
-		RequestCount: 1,
+		UploadCount: 1, RequestCount: 1,
 	}))
 
 	status, err := f.Store.GetDocumentIndexStatus(t.Context(), profile.ID)

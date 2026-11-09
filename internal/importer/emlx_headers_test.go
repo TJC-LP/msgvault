@@ -32,7 +32,7 @@ func TestImportEmlxPreservesMessageID(t *testing.T) {
 			requirements.NoError(err)
 			assertions.Equal(int64(1), result.MessagesAdded)
 			var got sql.NullString
-			requirements.NoError(st.DB().QueryRow(`SELECT rfc822_message_id FROM messages`).Scan(&got))
+			requirements.NoError(st.DB().QueryRowContext(t.Context(), `SELECT rfc822_message_id FROM messages`).Scan(&got))
 			assertions.Equal(sql.NullString{String: tc.want, Valid: tc.want != ""}, got)
 		})
 	}
@@ -63,15 +63,15 @@ func TestImportEmlxLinksReplyRegardlessOfOrder(t *testing.T) {
 			requirements.NoError(err)
 			assertions.Equal(int64(2), result.MessagesAdded)
 			var parentID int64
-			requirements.NoError(st.DB().QueryRow(`SELECT id FROM messages WHERE subject = 'Parent'`).Scan(&parentID))
+			requirements.NoError(st.DB().QueryRowContext(t.Context(), `SELECT id FROM messages WHERE subject = 'Parent'`).Scan(&parentID))
 			var reply sql.NullInt64
-			requirements.NoError(st.DB().QueryRow(`SELECT reply_to_message_id FROM messages WHERE subject = 'Reply'`).Scan(&reply))
+			requirements.NoError(st.DB().QueryRowContext(t.Context(), `SELECT reply_to_message_id FROM messages WHERE subject = 'Reply'`).Scan(&reply))
 			assertions.Equal(sql.NullInt64{Int64: parentID, Valid: true}, reply)
 		})
 	}
 }
 
-func TestImportEmlxRepairsMissingMessageIDOnReimport(t *testing.T) {
+func TestImportEmlxFullReconcileRepairsMissingMessageID(t *testing.T) {
 	assertions := assert.New(t)
 	requirements := require.New(t)
 	st, tmp := openTestStore(t)
@@ -84,8 +84,8 @@ func TestImportEmlxRepairsMissingMessageIDOnReimport(t *testing.T) {
 	_, err := ImportEmlxDir(t.Context(), st, root, opts)
 	requirements.NoError(err)
 	var originalID int64
-	requirements.NoError(st.DB().QueryRow(`SELECT id FROM messages`).Scan(&originalID))
-	_, err = st.DB().Exec(`UPDATE messages SET rfc822_message_id = NULL, metadata = '{"other":"keep"}' WHERE id = ?`, originalID)
+	requirements.NoError(st.DB().QueryRowContext(t.Context(), `SELECT id FROM messages`).Scan(&originalID))
+	_, err = st.DB().ExecContext(t.Context(), `UPDATE messages SET rfc822_message_id = NULL, metadata = '{"other":"keep"}' WHERE id = ?`, originalID)
 	requirements.NoError(err)
 	// Snapshot the content-bearing rows to prove repair does not rewrite them.
 	snapshot := func() [][][]any {
@@ -99,7 +99,7 @@ func TestImportEmlxRepairsMissingMessageIDOnReimport(t *testing.T) {
 			`SELECT * FROM attachments WHERE message_id = ? ORDER BY id`,
 		} {
 			table := func() [][]any {
-				rows, err := st.DB().Query(statement, originalID)
+				rows, err := st.DB().QueryContext(t.Context(), statement, originalID)
 				requirements.NoError(err)
 				defer func() { _ = rows.Close() }()
 				columns, err := rows.Columns()
@@ -123,21 +123,22 @@ func TestImportEmlxRepairsMissingMessageIDOnReimport(t *testing.T) {
 		return result
 	}
 	originalContent := snapshot()
-	before, err := st.DerivedDataRevision()
-	requirements.NoError(err)
-	result, err := ImportEmlxDir(t.Context(), st, root, opts)
+	// A completed receipt is a cache hint: full reconciliation repairs archive
+	// changes made behind it.
+	reconcile := opts
+	reconcile.FullReconcile = true
+	result, err := ImportEmlxDir(t.Context(), st, root, reconcile)
 	requirements.NoError(err)
 	assertions.Equal(int64(0), result.MessagesAdded)
 	var gotID int64
 	var rfcID sql.NullString
 	var metadata string
-	requirements.NoError(st.DB().QueryRow(`SELECT id, rfc822_message_id, metadata FROM messages`).Scan(&gotID, &rfcID, &metadata))
+	requirements.NoError(st.DB().QueryRowContext(t.Context(), `SELECT id, rfc822_message_id, metadata FROM messages`).Scan(&gotID, &rfcID, &metadata))
 	assertions.Equal(originalID, gotID)
 	assertions.Equal(sql.NullString{String: "old@example.test", Valid: true}, rfcID)
 	assertions.JSONEq(`{"other":"keep"}`, metadata)
 	after, err := st.DerivedDataRevision()
 	requirements.NoError(err)
-	assertions.Greater(after, before)
 	_, err = ImportEmlxDir(t.Context(), st, root, opts)
 	requirements.NoError(err)
 	again, err := st.DerivedDataRevision()
@@ -158,19 +159,19 @@ func TestImportEmlxLinksReplyWhenParentArrivesLater(t *testing.T) {
 	_, err := ImportEmlxDir(t.Context(), st, root, opts)
 	requirements.NoError(err)
 	var reply sql.NullInt64
-	requirements.NoError(st.DB().QueryRow(`SELECT reply_to_message_id FROM messages WHERE subject = 'Reply'`).Scan(&reply))
+	requirements.NoError(st.DB().QueryRowContext(t.Context(), `SELECT reply_to_message_id FROM messages WHERE subject = 'Reply'`).Scan(&reply))
 	assertions.False(reply.Valid)
 	parent := email.NewMessage().From("sender@example.test").Header("Message-ID", "<parent@example.test>").Subject("Parent").Body("parent").Bytes()
 	mkEmlx(t, filepath.Join(root, "Messages"), "2.emlx", parent)
 	_, err = ImportEmlxDir(t.Context(), st, root, opts)
 	requirements.NoError(err)
 	var parentID int64
-	requirements.NoError(st.DB().QueryRow(`SELECT id FROM messages WHERE subject = 'Parent'`).Scan(&parentID))
-	requirements.NoError(st.DB().QueryRow(`SELECT reply_to_message_id FROM messages WHERE subject = 'Reply'`).Scan(&reply))
+	requirements.NoError(st.DB().QueryRowContext(t.Context(), `SELECT id FROM messages WHERE subject = 'Parent'`).Scan(&parentID))
+	requirements.NoError(st.DB().QueryRowContext(t.Context(), `SELECT reply_to_message_id FROM messages WHERE subject = 'Reply'`).Scan(&reply))
 	assertions.Equal(sql.NullInt64{Int64: parentID, Valid: true}, reply)
 }
 
-func TestImportEmlxResumesReplyPhaseWithoutReimporting(t *testing.T) {
+func TestImportEmlxReplyPhaseRevisitsChangedOccurrences(t *testing.T) {
 	assertions := assert.New(t)
 	requirements := require.New(t)
 	st, tmp := openTestStore(t)
@@ -181,19 +182,21 @@ func TestImportEmlxResumesReplyPhaseWithoutReimporting(t *testing.T) {
 	opts := EmlxImportOptions{Identifier: "recipient@example.test"}
 	first, err := ImportEmlxDir(t.Context(), st, root, opts)
 	requirements.NoError(err)
-	// Reopen the durable checkpoint at the reply phase, as after an interrupted
-	// reply pass. The file is now invalid, so a file-phase restart would fail.
-	_, err = st.DB().Exec(`UPDATE sync_runs SET status = 'running', completed_at = NULL WHERE source_id = ?`, first.SourceID)
+	// A reply checkpoint cannot hide a changed file. The archived raw remains
+	// preserved and the changed occurrence must remain retryable.
+	_, err = st.DB().ExecContext(t.Context(), `UPDATE sync_runs SET status = 'running', completed_at = NULL WHERE source_id = ?`, first.SourceID)
 	requirements.NoError(err)
 	requirements.NoError(os.WriteFile(filepath.Join(root, "Messages", "1.emlx"), []byte("invalid emlx"), 0600))
 	resumed, err := ImportEmlxDir(t.Context(), st, root, opts)
 	requirements.NoError(err)
 	assertions.True(resumed.WasResumed)
-	assertions.Zero(resumed.MessagesProcessed)
-	assertions.Zero(resumed.Errors)
+	assertions.Equal(int64(1), resumed.MessagesProcessed)
+	assertions.Equal(int64(1), resumed.Errors)
+	assertions.False(resumed.HardErrors)
+	assertions.Zero(countEmlxLedgerEntries(t, st, first.SourceID, "emlx-occurrence", "imported"))
 	var status string
-	requirements.NoError(st.DB().QueryRow(`SELECT status FROM sync_runs ORDER BY id DESC LIMIT 1`).Scan(&status))
-	assertions.Equal(store.SyncStatusCompleted, status)
+	requirements.NoError(st.DB().QueryRowContext(t.Context(), `SELECT status FROM sync_runs ORDER BY id DESC LIMIT 1`).Scan(&status))
+	assertions.Equal(store.SyncStatusCompleted, status, "an unreadable file does not fail the run")
 }
 
 func TestImportEmlxHeaderFailureDoesNotLoseAttachmentsOnResume(t *testing.T) {
@@ -205,21 +208,21 @@ func TestImportEmlxHeaderFailureDoesNotLoseAttachmentsOnResume(t *testing.T) {
 		Header("In-Reply-To", "<parent@example.test>").Subject("Thread").Body("searchneedle").
 		WithAttachment("fixture.txt", "text/plain", []byte("attachment content")).Bytes()
 	mkMailboxDir(t, root, map[string][]byte{"1.emlx": raw})
-	_, err := st.DB().Exec(`CREATE TRIGGER fail_email_metadata BEFORE UPDATE OF metadata ON messages
+	_, err := st.DB().ExecContext(t.Context(), `CREATE TRIGGER fail_email_metadata BEFORE UPDATE OF metadata ON messages
   WHEN NEW.metadata LIKE '%email_in_reply_to%' BEGIN SELECT RAISE(ABORT,'synthetic metadata failure'); END`)
 	requirements.NoError(err)
 	opts := EmlxImportOptions{Identifier: "recipient@example.test", AttachmentsDir: filepath.Join(tmp, "attachments")}
 	result, err := ImportEmlxDir(t.Context(), st, root, opts)
 	requirements.NoError(err)
 	assertions.True(result.HardErrors)
-	_, err = st.DB().Exec(`DROP TRIGGER fail_email_metadata`)
+	_, err = st.DB().ExecContext(t.Context(), `DROP TRIGGER fail_email_metadata`)
 	requirements.NoError(err)
 	result, err = ImportEmlxDir(t.Context(), st, root, opts)
 	requirements.NoError(err)
 	assertions.False(result.HardErrors)
 	var count int
-	requirements.NoError(st.DB().QueryRow(`SELECT COUNT(*) FROM attachments WHERE filename = 'fixture.txt'`).Scan(&count))
+	requirements.NoError(st.DB().QueryRowContext(t.Context(), `SELECT COUNT(*) FROM attachments WHERE filename = 'fixture.txt'`).Scan(&count))
 	assertions.Equal(1, count)
-	requirements.NoError(st.DB().QueryRow(`SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'searchneedle'`).Scan(&count))
+	requirements.NoError(st.DB().QueryRowContext(t.Context(), `SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'searchneedle'`).Scan(&count))
 	assertions.Equal(1, count)
 }

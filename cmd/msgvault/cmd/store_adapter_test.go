@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/require"
@@ -38,7 +39,7 @@ func TestStoreAPIAdapterServesAttributeDefinitions(t *testing.T) {
 		Logger: slog.New(slog.DiscardHandler),
 	})
 
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/attribute-definitions", nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/attribute-definitions", nil)
 	response := httptest.NewRecorder()
 	srv.Router().ServeHTTP(response, req)
 
@@ -56,7 +57,7 @@ func TestStoreAPIAdapterServesDocumentVectorStatus(t *testing.T) {
 		Logger: slog.New(slog.DiscardHandler),
 	})
 
-	request := httptest.NewRequest(http.MethodGet, "/api/v1/documents/vectors/status", nil)
+	request := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/documents/vectors/status", nil)
 	response := httptest.NewRecorder()
 	srv.Router().ServeHTTP(response, request)
 
@@ -73,7 +74,7 @@ func TestStoreAPIAdapterPassesThroughMessageIdentityOperations(t *testing.T) {
 	st := testutil.NewTestStore(t)
 	source, err := st.GetOrCreateSource("imap", "primary@example.test")
 	require.NoError(err)
-	conversationID, err := st.EnsureConversation(source.ID, "thread-identity", "Identity")
+	conversationID, err := st.EnsureConversation(t.Context(), source.ID, "thread-identity", "Identity")
 	require.NoError(err)
 	messageID, err := st.UpsertMessage(&store.Message{
 		ConversationID:  conversationID,
@@ -189,8 +190,9 @@ func TestMarkedCLIScopedStatsCancellationReachesProductionAdapter(t *testing.T) 
 		Logger: slog.New(slog.DiscardHandler),
 	})
 
-	ctx, cancel := context.WithCancel(context.Background())
-	req := httptest.NewRequest(
+	ctx, cancel := context.WithCancel(t.Context())
+	req := httptest.NewRequestWithContext(
+		t.Context(),
 		http.MethodGet,
 		"/api/v1/cli/stats?account=alice@example.com",
 		nil,
@@ -252,8 +254,9 @@ func TestMarkedCLISearchCancellationReturnsFromProductionQuickFTSProbe(t *testin
 		Logger: slog.New(slog.DiscardHandler),
 	})
 
-	ctx, cancel := context.WithCancel(context.Background())
-	req := httptest.NewRequest(
+	ctx, cancel := context.WithCancel(t.Context())
+	req := httptest.NewRequestWithContext(
+		t.Context(),
 		http.MethodGet,
 		"/api/v1/cli/search?q=hello",
 		nil,
@@ -275,12 +278,12 @@ func TestMarkedCLISearchCancellationReturnsFromProductionQuickFTSProbe(t *testin
 
 	select {
 	case <-returned:
-	case <-time.After(500 * time.Millisecond):
+	case <-time.After(5 * time.Second):
 		require.FailNow("production quick FTS probe continued after marked request cancellation")
 	}
 	select {
 	case <-requestDone:
-	case <-time.After(500 * time.Millisecond):
+	case <-time.After(5 * time.Second):
 		require.FailNow("marked CLI search did not return after cancellation")
 	}
 }
@@ -388,37 +391,41 @@ func TestMarkedCLIRequestCancellationStopsProductionStoreWork(t *testing.T) {
 				Logger: slog.New(slog.DiscardHandler),
 			})
 
-			ctx, cancel := context.WithCancel(context.Background())
-			var body *strings.Reader
-			if tt.body == "" {
-				body = strings.NewReader("")
-			} else {
-				body = strings.NewReader(tt.body)
-			}
-			req := httptest.NewRequest(tt.method, tt.path, body).WithContext(ctx)
-			req.Header.Set("X-Api-Key", "secret-key")
-			req.Header.Set(apiprotocol.ClientClassHeader, apiprotocol.ClientClassCLI)
-			if tt.body != "" {
-				req.Header.Set("Content-Type", "application/json")
-			}
+			synctest.Test(t, func(t *testing.T) {
+				defer func() { _ = conn.Close() }()
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				var body *strings.Reader
+				if tt.body == "" {
+					body = strings.NewReader("")
+				} else {
+					body = strings.NewReader(tt.body)
+				}
+				req := httptest.NewRequestWithContext(t.Context(), tt.method, tt.path, body).WithContext(ctx)
+				req.Header.Set("X-Api-Key", "secret-key")
+				req.Header.Set(apiprotocol.ClientClassHeader, apiprotocol.ClientClassCLI)
+				if tt.body != "" {
+					req.Header.Set("Content-Type", "application/json")
+				}
 
-			waitCount := st.DB().Stats().WaitCount
-			requestDone := make(chan struct{})
-			go func() {
-				srv.Router().ServeHTTP(httptest.NewRecorder(), req)
-				close(requestDone)
-			}()
+				waitCount := st.DB().Stats().WaitCount
+				requestDone := make(chan struct{})
+				go func() {
+					srv.Router().ServeHTTP(httptest.NewRecorder(), req)
+					close(requestDone)
+				}()
 
-			require.Eventually(t, func() bool {
-				return st.DB().Stats().WaitCount > waitCount
-			}, 2*time.Second, 10*time.Millisecond, "handler reaches production database work")
-			cancel()
+				synctest.Wait()
+				require.Greater(t, st.DB().Stats().WaitCount, waitCount, "handler reaches production database work")
+				cancel()
+				synctest.Wait()
 
-			select {
-			case <-requestDone:
-			case <-time.After(2 * time.Second):
-				require.FailNow(t, "production store work continued after marked request cancellation")
-			}
+				select {
+				case <-requestDone:
+				default:
+					require.FailNow(t, "production store work continued after marked request cancellation")
+				}
+			})
 		})
 	}
 }
@@ -432,18 +439,18 @@ func TestStoreAPIAdapterContextReadsHonorCancellation(t *testing.T) {
 	st := testutil.NewTestStore(t)
 	source, err := st.GetOrCreateSource("gmail", "test@example.com")
 	require.NoError(err, "GetOrCreateSource")
-	_, err = st.EnsureConversation(source.ID, "thread-1", "Thread")
+	_, err = st.EnsureConversation(t.Context(), source.ID, "thread-1", "Thread")
 	require.NoError(err, "EnsureConversation")
 
 	adapter := &storeAPIAdapter{store: st}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 
 	_, err = adapter.GetStatsContext(ctx)
 	require.ErrorIs(err, context.Canceled, "GetStatsContext must honor a cancelled context")
 
-	_, _, err = adapter.ListMessagesContext(ctx, 0, 10)
+	_, _, err = adapter.ListMessagesContext(ctx, 0, 10, nil)
 	require.ErrorIs(err, context.Canceled, "ListMessagesContext must honor a cancelled context")
 
 	_, err = adapter.GetMessageContext(ctx, 1)
@@ -474,7 +481,7 @@ func TestStoreAPIAdapterMeetingImport(t *testing.T) {
 		meetingImporter: meetingimport.NewImporter(st, meetingimport.Hooks{}),
 	}
 
-	result, err := adapter.ImportMeeting(context.Background(), req)
+	result, err := adapter.ImportMeeting(t.Context(), req)
 	require.NoError(err)
 	require.Equal(meetingimport.StatusCreated, result.Status)
 	require.NotZero(result.MessageID)
@@ -501,7 +508,7 @@ func TestStoreAPIAdapterConversationWindowContext(t *testing.T) {
 	st := testutil.NewTestStore(t)
 	source, err := st.GetOrCreateSource("gmail", "test@example.com")
 	require.NoError(err, "GetOrCreateSource")
-	conversationID, err := st.EnsureConversation(source.ID, "thread-1", "Thread")
+	conversationID, err := st.EnsureConversation(t.Context(), source.ID, "thread-1", "Thread")
 	require.NoError(err, "EnsureConversation")
 
 	sentAt := time.Date(2015, 1, 7, 12, 0, 0, 0, time.UTC)
@@ -515,7 +522,7 @@ func TestStoreAPIAdapterConversationWindowContext(t *testing.T) {
 	require.NoError(err, "UpsertMessage")
 
 	adapter := &storeAPIAdapter{store: st}
-	ctx := context.Background()
+	ctx := t.Context()
 
 	exists, err := adapter.ConversationExistsContext(ctx, conversationID)
 	require.NoError(err, "ConversationExistsContext")

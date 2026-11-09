@@ -1,7 +1,6 @@
 package daemonclient
 
 import (
-	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -72,7 +71,7 @@ func TestIssueAgentTokenRoundTripReadsIDForRevoke(t *testing.T) {
 	c, err := New(Config{URL: srv.URL, APIKey: "owner-key", AllowInsecure: true})
 	require.NoError(err)
 
-	result, err := c.IssueAgentToken(context.Background(), "round-trip-test", []string{"draft.create"}, []int64{1}, map[int64][]string{1: {"alice@example.com"}})
+	result, err := c.IssueAgentToken(t.Context(), "round-trip-test", []string{"draft.create"}, []int64{1}, map[int64][]string{1: {"alice@example.com"}}, time.Time{})
 	require.NoError(err)
 	require.NotNil(result)
 	assert.Equal("application/json", issueContentType, "issue requests must identify their JSON body")
@@ -81,7 +80,7 @@ func TestIssueAgentTokenRoundTripReadsIDForRevoke(t *testing.T) {
 	assert.Equal(wantID, result.ID, "id must be decoded from the 201 body")
 	assert.Equal(wantSecret, result.Secret)
 
-	err = c.RevokeAgentToken(context.Background(), result.ID)
+	err = c.RevokeAgentToken(t.Context(), result.ID)
 	require.NoError(err)
 	assert.Equal(wantID, revokedID, "revoke must use the id from the issue response")
 }
@@ -127,7 +126,7 @@ func TestAgentTokenBusyResponseRetriesAndNotifies(t *testing.T) {
 		notifyMsg = msg
 	})
 
-	err = c.RevokeAgentToken(context.Background(), "tok_abc")
+	err = c.RevokeAgentToken(t.Context(), "tok_abc")
 	require.New(t).NoError(err, "must succeed after retries")
 	assert.Equal(t, 3, callCount, "must have retried twice before succeeding")
 	assert.GreaterOrEqual(t, notifyCount, 1, "busy notifier must have fired at least once")
@@ -152,8 +151,32 @@ func TestIssueAgentTokenSenderSelectionRefusesOldDaemon(t *testing.T) {
 
 	client, err := New(Config{URL: srv.URL, APIKey: "owner-key", AllowInsecure: true})
 	requirements.NoError(err)
-	_, err = client.IssueAgentToken(t.Context(), "old-daemon", []string{"draft.create"}, []int64{1}, map[int64][]string{1: {"alice@example.com"}})
+	_, err = client.IssueAgentToken(t.Context(), "old-daemon", []string{"draft.create"}, []int64{1}, map[int64][]string{1: {"alice@example.com"}}, time.Time{})
 	requirements.Error(err)
 	assertions.Contains(err.Error(), "requires daemon API schema 2.32.0")
 	assertions.Zero(postCount)
+}
+
+func TestIssueAgentTokenExpiryRefusesOldDaemon(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	posts := 0
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/health", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok","api_schema_version":"3.8.0"}`))
+	})
+	mux.HandleFunc("/api/v1/agent-tokens", func(w http.ResponseWriter, _ *http.Request) {
+		posts++
+		w.WriteHeader(http.StatusCreated)
+	})
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+	client, err := New(Config{URL: server.URL, APIKey: "owner", AllowInsecure: true})
+	require.NoError(err)
+	t.Cleanup(func() { _ = client.Close() })
+	_, err = client.IssueAgentToken(t.Context(), "reader", []string{"stats.read"}, []int64{1}, nil, time.Now().Add(time.Hour))
+	require.Error(err)
+	assert.Contains(err.Error(), "requires daemon API schema 3.9.0")
+	assert.Zero(posts)
 }

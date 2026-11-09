@@ -15,7 +15,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/scheduler"
-	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/testutil"
 	"go.kenn.io/msgvault/internal/vector"
 	"go.kenn.io/msgvault/internal/vector/sqlitevec"
 )
@@ -34,9 +34,7 @@ func TestRunEmbeddingsPruneRemovesOrphansWithoutEmbeddingCalls(t *testing.T) {
 	testCtx := withTestConfig(t, c)
 	_ = testCtx
 
-	mainStore, err := store.Open(mainPath)
-	require.NoError(t, err)
-	require.NoError(t, mainStore.InitSchema())
+	mainStore := testutil.NewSQLiteTestStoreAt(t, mainPath)
 	backend, err := sqlitevec.Open(testCtx, sqlitevec.Options{
 		Path: vectorPath, MainPath: mainPath, Dimension: 4, MainDB: mainStore.DB(),
 	})
@@ -82,9 +80,7 @@ func TestRunEmbeddingsOptimizeBuildsFromStoredVectorsWithoutProvider(t *testing.
 	testCtx := withTestConfig(t, c)
 	_ = testCtx
 
-	mainStore, err := store.Open(mainPath)
-	require.NoError(t, err)
-	require.NoError(t, mainStore.InitSchema())
+	mainStore := testutil.NewSQLiteTestStoreAt(t, mainPath)
 	backend, err := sqlitevec.Open(testCtx, sqlitevec.Options{
 		Path: vectorPath, MainPath: mainPath, Dimension: 4, MainDB: mainStore.DB(),
 	})
@@ -154,11 +150,8 @@ func (p *convergenceProgressPublisher) GetDocumentProgress(context.Context, vect
 func TestContextualConvergenceCheckerRequiresExactJournalAndCompletedReconciliation(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
-	mainStore, err := store.Open(filepath.Join(t.TempDir(), "msgvault.db"))
-	require.NoError(err)
-	t.Cleanup(func() { _ = mainStore.Close() })
-	require.NoError(mainStore.InitSchema())
-	_, err = mainStore.DB().Exec(`UPDATE embedding_change_clock SET sequence = 12 WHERE singleton = 1`)
+	mainStore := testutil.NewSQLiteTestStoreAt(t, filepath.Join(t.TempDir(), "msgvault.db"))
+	_, err := mainStore.DB().ExecContext(t.Context(), `UPDATE embedding_change_clock SET sequence = 12 WHERE singleton = 1`)
 	require.NoError(err)
 
 	publisher := &convergenceProgressPublisher{progress: vector.DocumentProgress{
@@ -238,10 +231,8 @@ func TestRunEmbeddingsActivate_ContextualRequiresConvergenceUnlessForced(t *test
 	testCtx := withTestConfig(t, c)
 	_ = testCtx
 
-	mainStore, err := store.Open(mainPath)
-	require.NoError(err)
-	require.NoError(mainStore.InitSchema())
-	_, err = mainStore.DB().Exec(`UPDATE embedding_change_clock SET sequence = 2 WHERE singleton = 1`)
+	mainStore := testutil.NewSQLiteTestStoreAt(t, mainPath)
+	_, err := mainStore.DB().ExecContext(t.Context(), `UPDATE embedding_change_clock SET sequence = 2 WHERE singleton = 1`)
 	require.NoError(err)
 	require.NoError(sqlitevec.RegisterExtension())
 	backend, err := sqlitevec.Open(testCtx, sqlitevec.Options{
@@ -301,9 +292,7 @@ func TestRunEmbeddingsActivateOpenAIBlocksMissingPersonCoverage(t *testing.T) {
 	_ = testCtx
 	require.NoError(c.Save())
 
-	mainStore, err := store.Open(mainPath)
-	require.NoError(err)
-	require.NoError(mainStore.InitSchema())
+	mainStore := testutil.NewSQLiteTestStoreAt(t, mainPath)
 	semanticProfile, err := c.Vector.SemanticPersonEmbeddingProfile()
 	require.NoError(err)
 	_, err = mainStore.EnsurePersonSemanticEmbeddingProfile(testCtx, semanticProfile)
@@ -312,7 +301,7 @@ func TestRunEmbeddingsActivateOpenAIBlocksMissingPersonCoverage(t *testing.T) {
 		testCtx, semanticProfile.Fingerprint, "test",
 	)
 	require.NoError(err)
-	_, err = mainStore.DB().Exec(`INSERT INTO persons (vcard_uid, display_name) VALUES (?, ?)`,
+	_, err = mainStore.DB().ExecContext(t.Context(), `INSERT INTO persons (vcard_uid, display_name) VALUES (?, ?)`,
 		"urn:uuid:00000000-0000-0000-0000-000000000002", "Synthetic Missing Person")
 	require.NoError(err)
 	require.NoError(sqlitevec.RegisterExtension())
@@ -364,9 +353,7 @@ func setupManualContextualGeneration(t *testing.T, fingerprint string, retire bo
 		fingerprint = c.Vector.GenerationFingerprint()
 	}
 
-	mainStore, err := store.Open(mainPath)
-	require.NoError(t, err)
-	require.NoError(t, mainStore.InitSchema())
+	mainStore := testutil.NewSQLiteTestStoreAt(t, mainPath)
 	require.NoError(t, sqlitevec.RegisterExtension())
 	backend, err := sqlitevec.Open(testCtx, sqlitevec.Options{
 		Path: vectorPath, MainPath: mainPath, Dimension: 4, MainDB: mainStore.DB(),
@@ -419,4 +406,104 @@ func TestRunEmbeddingsActivate_ContextualLifecycleRefusalsStayNonActivating(t *t
 		assert.Contains(t, err.Error(), `is "retired", not "building"`)
 		assertManualGenerationState(t, gen, vector.GenerationRetired)
 	})
+}
+
+func TestRunEmbeddingsListDoesNotWriteDuringEmbeddingJob(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	dir := t.TempDir()
+	cfg := config.NewDefaultConfig()
+	cfg.HomeDir = dir
+	cfg.Data.DataDir = dir
+	cfg.Vector.DBPath = filepath.Join(dir, "vectors.db")
+	cfg.Vector.Embeddings.Dimension = 4
+	cfg.Vector.Embed.Scope.Accounts = []string{"catalogue@example.test"}
+	ctx := withTestConfig(t, cfg)
+	main := testutil.NewSQLiteTestStoreAt(t, cfg.DatabaseDSN())
+	_, err := main.GetOrCreateSource("gmail", "catalogue@example.test")
+	require.NoError(err)
+	backend, err := sqlitevec.Open(ctx, sqlitevec.Options{Path: cfg.Vector.DBPath, MainDB: main.DB(), Dimension: 4})
+	require.NoError(err)
+	defer func() { require.NoError(backend.Close()) }()
+	_, err = backend.CreateGeneration(ctx, "example-model", 4, "example-fingerprint")
+	require.NoError(err)
+	writer, err := backend.DB().Conn(ctx)
+	require.NoError(err)
+	defer func() { require.NoError(writer.Close()) }()
+	_, err = writer.ExecContext(ctx, "BEGIN IMMEDIATE")
+	require.NoError(err)
+	defer func() {
+		_, err := writer.ExecContext(ctx, "ROLLBACK")
+		require.NoError(err)
+	}()
+	mainWriter, err := main.DB().Conn(ctx)
+	require.NoError(err)
+	defer func() { require.NoError(mainWriter.Close()) }()
+	_, err = mainWriter.ExecContext(ctx, "BEGIN IMMEDIATE")
+	require.NoError(err)
+	defer func() {
+		_, err := mainWriter.ExecContext(ctx, "ROLLBACK")
+		require.NoError(err)
+	}()
+	var output bytes.Buffer
+	cmd := &cobra.Command{Use: "list"}
+	cmd.SetContext(ctx)
+	cmd.SetOut(&output)
+	require.NoError(runEmbeddingsList(cmd, nil))
+	assert.Contains(output.String(), "example-model")
+}
+
+func TestEmbeddingsListRequiresUpgradeWithoutWritingOldMetadata(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	dir := t.TempDir()
+	cfg := config.NewDefaultConfig()
+	cfg.HomeDir = dir
+	cfg.Data.DataDir = dir
+	cfg.Vector.DBPath = filepath.Join(dir, "vectors.db")
+	cfg.Vector.Embeddings.Dimension = 4
+	ctx := withTestConfig(t, cfg)
+	main := testutil.NewSQLiteTestStoreAt(t, cfg.DatabaseDSN())
+	backend, err := sqlitevec.Open(ctx, sqlitevec.Options{Path: cfg.Vector.DBPath, MainDB: main.DB(), Dimension: 4})
+	require.NoError(err)
+	defer func() { require.NoError(backend.Close()) }()
+	_, err = backend.CreateGeneration(ctx, "example-model", 4, "example")
+	require.NoError(err)
+	_, err = main.DB().ExecContext(t.Context(), "DELETE FROM applied_migrations WHERE name='embed_gen_backfill_active_v1'")
+	require.NoError(err)
+	cmd := &cobra.Command{Use: "list"}
+	cmd.SetContext(ctx)
+	err = runEmbeddingsList(cmd, nil)
+	require.ErrorContains(err, "requires an upgrade")
+	require.ErrorContains(err, "enable [vector]", "a restart alone skips vector upgrades while vector search is off")
+	var marked bool
+	require.NoError(main.DB().QueryRowContext(t.Context(), "SELECT EXISTS (SELECT 1 FROM applied_migrations WHERE name='embed_gen_backfill_active_v1')").Scan(&marked))
+	assert.False(marked)
+}
+
+func TestEmbeddingsListReportsOldSchemaWithoutMigrating(t *testing.T) {
+	require := require.New(t)
+	dir := t.TempDir()
+	cfg := config.NewDefaultConfig()
+	cfg.HomeDir = dir
+	cfg.Data.DataDir = dir
+	cfg.Vector.DBPath = filepath.Join(dir, "vectors.db")
+	cfg.Vector.Embeddings.Dimension = 4
+	cfg.Vector.Enabled = true
+	ctx := withTestConfig(t, cfg)
+	backend, err := sqlitevec.Open(ctx, sqlitevec.Options{Path: cfg.Vector.DBPath, Dimension: 4})
+	require.NoError(err)
+	defer func() { require.NoError(backend.Close()) }()
+	_, err = backend.CreateGeneration(ctx, "example-model", 4, "example")
+	require.NoError(err)
+	_, err = backend.DB().ExecContext(t.Context(), "ALTER TABLE index_generations DROP COLUMN seeded_at")
+	require.NoError(err)
+	cmd := &cobra.Command{Use: "list"}
+	cmd.SetContext(ctx)
+	err = runEmbeddingsList(cmd, nil)
+	require.ErrorContains(err, "requires an upgrade")
+	require.NotContains(err.Error(), "enable [vector]")
+	require.ErrorContains(err, "msgvault daemon restart")
+	_, err = backend.DB().ExecContext(t.Context(), "SELECT seeded_at FROM index_generations")
+	require.ErrorContains(err, "no such column", "listing must leave the old schema unchanged")
 }

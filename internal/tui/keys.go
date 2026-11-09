@@ -3,6 +3,7 @@ package tui
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"charm.land/bubbles/v2/textinput"
@@ -248,7 +249,7 @@ func (m Model) handleGlobalKeys(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 		m.mode = next
 		// A frozen view and the email search loading flags describe the mode
 		// being left. Do not let them obscure or animate the destination mode.
-		m.transitionBuffer = ""
+		m.transitionBuffer, m.submittedQuery = "", ""
 		m.inlineSearchLoading = false
 		m.searchLoadingMore = false
 		switch m.mode {
@@ -1285,6 +1286,8 @@ func (m Model) handleAccountSelectorKeys(msg tea.KeyPressMsg) (tea.Model, tea.Cm
 			switch selected.kind {
 			case scopeOptionAll:
 				m.sourceScope = allSourceScope()
+			case scopeOptionVirtual:
+				m.sourceScope = virtualSourceScope(*selected.virtualAccount)
 			case scopeOptionAccount:
 				m.sourceScope = accountSourceScope(selected.accountID)
 			case scopeOptionCollection:
@@ -1524,6 +1527,8 @@ func (m *Model) resetViewState() {
 // setDrillFilterForView sets the appropriate filter field on drillFilter based on the current viewType.
 func (m *Model) setDrillFilterForView(key string) {
 	switch m.viewType {
+	case query.ViewNoStats:
+		return // This sentinel is not an aggregate view to drill into.
 	case query.ViewSenders:
 		m.drillFilter.Sender = key
 		if key == "" {
@@ -1754,7 +1759,7 @@ func (m Model) commitInlineSearch() (tea.Model, tea.Cmd) {
 	if err := m.searchInputValidationError(queryStr); err != nil {
 		m.inlineSearchLoading = false
 		m.inlineSearchError = err.Error()
-		return m, nil
+		return m, m.reportActionCmd("error_shown", "kind", "search")
 	}
 	aggregateReloadNeeded := (m.level == levelAggregates || m.level == levelDrillDown) &&
 		(queryStr != m.searchQuery || m.inlineSearchLoading)
@@ -1772,6 +1777,7 @@ func (m Model) commitInlineSearch() (tea.Model, tea.Cmd) {
 		return m.reloadCurrentView()
 	}
 
+	m.submittedQuery = queryStr
 	m.searchQuery = queryStr
 	// In message list view, execute search to show results
 	if m.level == levelMessageList {
@@ -1789,6 +1795,10 @@ func (m Model) commitInlineSearch() (tea.Model, tea.Cmd) {
 		return m, tea.Batch(spinCmd, m.loadData())
 	}
 	// Aggregate rows already match the committed debounced search.
+	m.submittedQuery = ""
+	if !m.aggregateLoadFailed && len(m.rows) == 0 && strings.TrimSpace(queryStr) != "" {
+		return m, m.reportActionCmd("search_empty", "search_type", "text")
+	}
 	return m, nil
 }
 
@@ -1796,7 +1806,7 @@ func (m Model) searchInputValidationError(queryStr string) error {
 	if queryStr == "" {
 		return nil
 	}
-	parsed := search.Parse(queryStr)
+	parsed := search.ParseWithOR(queryStr, m.searchMode != searchModeSemantic)
 	if m.searchMode == searchModeSemantic {
 		if parsed.Err() == nil && len(parsed.TextTerms) == 0 {
 			return errors.New("semantic search requires free text")
@@ -1869,6 +1879,7 @@ func (m *Model) clearPreSearchSnapshot() {
 }
 
 func (m *Model) activateInlineSearch(placeholder string) tea.Cmd {
+	m.submittedQuery = ""
 	// Snapshot current message list so Esc can restore instantly.
 	// Only take a snapshot if we don't already have one (re-searches
 	// keep the original snapshot). This also handles inherited search

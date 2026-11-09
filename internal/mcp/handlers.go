@@ -16,12 +16,14 @@ import (
 	"go.kenn.io/msgvault/internal/daemonclient"
 	"go.kenn.io/msgvault/internal/deletion"
 	"go.kenn.io/msgvault/internal/export"
+	"go.kenn.io/msgvault/internal/msgsegment"
 	"go.kenn.io/msgvault/internal/peoplebrowser"
 	"go.kenn.io/msgvault/internal/personscope"
 	personresolver "go.kenn.io/msgvault/internal/personscope/resolver"
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/savedview"
 	"go.kenn.io/msgvault/internal/search"
+	"go.kenn.io/msgvault/internal/senderauth"
 	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/vector"
 	"go.kenn.io/msgvault/internal/vector/chunkmatch"
@@ -56,6 +58,7 @@ const (
 	toolArgOffset        = "offset"
 	toolArgLength        = "length"
 	toolArgSourceMsgID   = "source_message_id"
+	toolArgSourceID      = "source_id"
 	toolArgThreadID      = "thread_id"
 	toolArgMinScore      = "min_score"
 	toolArgMaxChars      = "max_chars"
@@ -131,26 +134,36 @@ func listLimitArg(args map[string]any) int {
 }
 
 type handlers struct {
-	downloads           *downloadCache
-	engine              query.Engine
-	archiveSQLQuerier   ArchiveSQLQuerier
-	attachmentsDir      string
-	attachmentReader    AttachmentReader
-	manifestSaver       DeletionManifestSaver
-	hybridSearcher      HybridSearcher
-	similarSearcher     SimilarSearcher
-	dataDir             string
-	documentSearcher    DocumentSearcher
-	personFileSearcher  PersonFileSearcher
-	peopleBackend       peoplebrowser.Backend
-	directoryBackend    peoplebrowser.DirectoryLister
-	savedViews          savedview.Service
-	meetings            MeetingBackend
-	calendar            CalendarBackend
-	personAgendaBackend PersonAgendaBackend
-	identityReview      IdentityReviewBackend
-	personCardDAV       PersonCardDAVBackend
-	identityScoring     IdentityScoringBackend
+	embeddingStatus      EmbeddingStatusReader
+	delegatedOnly        bool
+	sensitiveConfirm     bool
+	downloads            *downloadCache
+	engine               query.Engine
+	archiveSQLQuerier    ArchiveSQLQuerier
+	attachmentsDir       string
+	attachmentReader     AttachmentReader
+	manifestSaver        DeletionManifestSaver
+	hybridSearcher       HybridSearcher
+	similarSearcher      SimilarSearcher
+	dataDir              string
+	documentSearcher     DocumentSearcher
+	mediaSearcher        MediaSearcher
+	personFileSearcher   PersonFileSearcher
+	peopleBackend        peoplebrowser.Backend
+	directoryBackend     peoplebrowser.DirectoryLister
+	savedViews           savedview.Service
+	meetings             MeetingBackend
+	calendar             CalendarBackend
+	personAgendaBackend  PersonAgendaBackend
+	personTierBackend    PersonTierBackend
+	kata                 KataBackend
+	identityReview       IdentityReviewBackend
+	personCardDAV        PersonCardDAVBackend
+	messageTags          MessageTagBackend
+	identityScoring      IdentityScoringBackend
+	drafts               DraftRunner
+	contactRoutesBackend ContactRoutesBackend
+	chatDiscoveryBackend ChatDiscoveryBackend
 
 	// Optional vector-search wiring. When hybridEngine is nil, the
 	// search_message_bodies handler rejects mode=vector and mode=hybrid with
@@ -440,6 +453,7 @@ type HybridSearchRequest struct {
 	Query          string
 	Mode           string
 	Account        string
+	AccountScopes  []search.AccountScope
 	Limit          int
 	Offset         int
 	IncludeMatches bool
@@ -484,6 +498,7 @@ type SimilarSearcher interface {
 }
 
 type SimilarSearchRequest struct {
+	AccountScopes []search.AccountScope
 	MessageID     int64
 	Limit         int
 	Account       string
@@ -510,6 +525,9 @@ type daemonAPIErrorCoder interface {
 }
 
 func translateDaemonRequestError(err error) *toolResult {
+	if local, ok := errors.AsType[*daemonclient.LocalDaemonUnavailableError](err); ok {
+		return toolErrorResult(local.Error())
+	}
 	var coded daemonAPIErrorCoder
 	if !errors.As(err, &coded) {
 		return nil
@@ -517,6 +535,11 @@ func translateDaemonRequestError(err error) *toolResult {
 
 	var message string
 	switch coded.APIErrorCode() {
+	case "permission_denied", "unsupported_agent_scope":
+		// The daemon's message names the missing permission or the supported scope.
+		message = coded.APIErrorCode() + ": " + daemonErrorMessage(err)
+	case "unauthorized":
+		message = "unauthorized: Archive authentication failed"
 	case "visual_search_not_ready":
 		message = "visual_search_not_ready: visual attachment search is unavailable"
 	case "vector_initializing":
@@ -525,6 +548,8 @@ func translateDaemonRequestError(err error) *toolResult {
 		message = "vector_init_failed: vector search failed to initialize"
 	case "invalid_query":
 		message = "invalid_query: search query is invalid"
+	case "unsupported_filter_mode":
+		message = "unsupported_filter_mode: a filter is not supported in this search mode"
 	case "invalid_account":
 		message = "invalid_account: account filter is invalid"
 	case "account_not_found":
@@ -538,13 +563,20 @@ func translateDaemonRequestError(err error) *toolResult {
 	case "body_search_unavailable":
 		message = "body_search_unavailable: exact message body search is unavailable"
 	case "body_search_index_unavailable":
-		message = "body_search_index_unavailable: message body search index is unavailable"
+		message = "body_search_index_unavailable: message body search index is unavailable; ask the archive owner to search or run rebuild-fts, then retry"
 	case "invalid_message_id":
 		message = "invalid_message_id: seed message ID is invalid"
 	default:
 		return nil
 	}
 	return toolErrorResult(message)
+}
+
+func daemonErrorMessage(err error) string {
+	if apiErr, ok := errors.AsType[*daemonclient.APIError](err); ok && apiErr.Message != "" {
+		return apiErr.Message
+	}
+	return "grant does not authorize this operation or account scope"
 }
 
 func dependencyError(operation string, err error) (*toolResult, error) {
@@ -593,9 +625,12 @@ func translateVectorErr(err error) *toolResult {
 			"vector_not_enabled: vector search is not configured",
 		)
 	case errors.Is(err, vector.ErrIndexStale):
+		if apiErr, ok := errors.AsType[*daemonclient.APIError](err); ok && apiErr.Message != "" {
+			return toolErrorResult("index_stale: " + apiErr.Message)
+		}
 		return toolErrorResult(
 			"index_stale: the vector index does not match configured embedding settings; " +
-				"align [vector.embed.scope] accounts for an existing account-scoped index, or run `msgvault embeddings build --full-rebuild`",
+				"if the embedding settings on the archive host changed since its daemon started, restart that daemon; otherwise align [vector.embed.scope] accounts for an existing account-scoped index, or run `msgvault embeddings build --full-rebuild`",
 		)
 	case errors.Is(err, vector.ErrIndexBuilding):
 		return toolErrorResult(
@@ -620,8 +655,11 @@ func translateVectorErr(err error) *toolResult {
 	return nil
 }
 
-// getAccountID looks up a source ID by email address.
-// Returns nil if account is empty (no filter), or an error if not found.
+// getAccountID looks up a source ID by its identifier, preferring an exact
+// match and otherwise ignoring letter case, so "Me@gmail.com" names the same
+// source as "me@gmail.com"; failing that, by its display name, which for an
+// IMAP source is often its mailbox address. Returns nil if account is empty
+// (no filter), or an error if not found.
 func (h *handlers) getAccountID(ctx context.Context, account string) (*int64, error) {
 	if account == "" {
 		return nil, nil //nolint:nilnil // empty input -> no filter, not an error
@@ -630,18 +668,27 @@ func (h *handlers) getAccountID(ctx context.Context, account string) (*int64, er
 	if err != nil {
 		return nil, newInternalError("list accounts", err)
 	}
-	var matched *int64
-	for _, acc := range accounts {
-		if acc.Identifier == account {
+	for _, same := range []func(query.AccountInfo) bool{
+		func(acc query.AccountInfo) bool { return acc.Identifier == account },
+		func(acc query.AccountInfo) bool { return strings.EqualFold(acc.Identifier, account) },
+		func(acc query.AccountInfo) bool {
+			return acc.DisplayName != "" && strings.EqualFold(acc.DisplayName, account)
+		},
+	} {
+		var matched *int64
+		for _, acc := range accounts {
+			if !same(acc) {
+				continue
+			}
 			if matched != nil {
 				return nil, &expectedHandlerError{message: "account matches multiple sources: " + account}
 			}
 			id := acc.ID
 			matched = &id
 		}
-	}
-	if matched != nil {
-		return matched, nil
+		if matched != nil {
+			return matched, nil
+		}
 	}
 	return nil, &expectedHandlerError{message: "account not found: " + account}
 }
@@ -712,36 +759,45 @@ func (h *handlers) searchMetadata(ctx context.Context, req toolRequest) (*toolRe
 		return toolErrorResult("query parameter is required"), nil
 	}
 
-	q := search.Parse(queryStr)
+	q := search.ParseOR(queryStr)
 	if err := q.Err(); err != nil {
 		return toolErrorResult(err.Error()), nil
 	}
 	limit := searchLimitArg(args)
-	offset := limitArg(args, toolArgOffset, 0)
+	offset := intArg(args, toolArgOffset, 0)
 
 	account, _ := args[toolArgAccount].(string)
-	sourceID, err := h.getAccountID(ctx, account)
+	selection, err := h.resolveAccount(ctx, account)
 	if err != nil {
 		return dependencyError("resolve metadata-search account", err)
 	}
 
-	if sourceID != nil {
-		q.AccountIDs = []int64{*sourceID}
+	if selection.sourceID != nil {
+		q.AccountIDs = []int64{*selection.sourceID}
 	}
 
-	filter := query.MessageFilter{SourceID: sourceID}
+	var filter query.MessageFilter
+	selection.applyToFilter(&filter)
 
-	results, err := h.engine.SearchFast(ctx, q, filter, limit, offset)
+	// Fetch one extra row so unknown totals still support reliable pagination.
+	result, err := h.engine.SearchFastWithStats(ctx, q, queryStr, filter, query.ViewNoStats, limit+1, offset)
 	if err != nil {
 		return nil, newInternalError("search metadata", err)
 	}
-
-	totalMatched, err := h.engine.SearchFastCount(ctx, q, filter)
-	if err != nil {
-		return nil, newInternalError("count metadata search", err)
+	hasMore := len(result.Messages) > limit
+	if hasMore {
+		result.Messages = result.Messages[:limit]
 	}
+	if result.TotalCount < 0 {
+		return jsonResult(searchMetadataResponse{
+			paginatedResponse: newPaginatedResponseNoTotal(result.Messages, offset, hasMore), Hints: result.Hints, IndexState: result.IndexState, Warnings: search.LiteralORWarnings(queryStr),
+		})
+	}
+	return metadataSearchResult(result.Messages, result.TotalCount, offset, result.IndexState, search.LiteralORWarnings(queryStr), result.Hints)
+}
 
-	return jsonResult(searchMetadataResponse(newPaginatedResponse(results, totalMatched, offset)))
+func metadataSearchResult(messages []query.MessageSummary, total int64, offset int, state string, warnings []string, hints []query.SearchHint) (*toolResult, error) {
+	return jsonResult(searchMetadataResponse{paginatedResponse: newPaginatedResponse(messages, total, offset), IndexState: state, Warnings: warnings, Hints: hints})
 }
 
 func (h *handlers) searchDocuments(ctx context.Context, req toolRequest) (*toolResult, error) {
@@ -894,16 +950,15 @@ func (h *handlers) searchMessageBodies(ctx context.Context, req toolRequest) (*t
 		return toolErrorResult(err.Error()), nil
 	}
 	limit := searchLimitArg(args)
-	offset := limitArg(args, toolArgOffset, 0)
+	offset := intArg(args, toolArgOffset, 0)
 
 	account, _ := args[toolArgAccount].(string)
-	sourceID, err := h.getAccountID(ctx, account)
+	selection, err := h.resolveAccount(ctx, account)
 	if err != nil {
 		return dependencyError("resolve body-search account", err)
 	}
-
-	if sourceID != nil {
-		q.AccountIDs = []int64{*sourceID}
+	if err := selection.applyToQuery(q); err != nil {
+		return toolErrorResult(err.Error()), nil
 	}
 
 	if len(q.TextTerms) == 0 {
@@ -918,10 +973,11 @@ func (h *handlers) searchMessageBodies(ctx context.Context, req toolRequest) (*t
 	if !ok {
 		return toolErrorResult("search_message_bodies is unavailable: the query engine does not support exact body-only search"), nil
 	}
-	results, err := bodySearcher.SearchMessageBodies(ctx, q, limit+1, offset)
+	result, err := bodySearcher.SearchMessageBodies(ctx, q, limit+1, offset)
 	if err != nil {
 		return bodySearchError(err)
 	}
+	results := result.Messages
 
 	hasMore := len(results) > limit
 	if hasMore {
@@ -948,6 +1004,7 @@ func (h *handlers) searchMessageBodies(ctx context.Context, req toolRequest) (*t
 	return jsonResult(searchMessageBodiesResponse{
 		paginatedResponse: newPaginatedResponseNoTotal(data, offset, hasMore),
 		Mode:              searchModeKeyword,
+		IndexState:        result.IndexState,
 	})
 }
 
@@ -1014,6 +1071,7 @@ type hybridGenerationSummary = HybridGeneration
 type searchMessageBodiesResponse struct {
 	paginatedResponse[searchMessageItem]
 
+	IndexState    string                  `json:"index_state,omitempty"`
 	Mode          string                  `json:"mode"`
 	PoolSaturated bool                    `json:"pool_saturated"`
 	Accelerator   string                  `json:"accelerator,omitempty"`
@@ -1044,13 +1102,14 @@ func (h *handlers) searchMessageBodiesHybrid(
 
 	// Resolve account filter to a source ID for the structured Filter.
 	account, _ := args[toolArgAccount].(string)
-	sourceID, err := h.getAccountID(ctx, account)
+	selection, err := h.resolveAccount(ctx, account)
 	if err != nil {
 		return dependencyError("resolve semantic-search account", err)
 	}
+	sourceID := selection.sourceID
 
 	limit := searchLimitArg(args)
-	offset := limitArg(args, toolArgOffset, 0)
+	offset := intArg(args, toolArgOffset, 0)
 
 	freeText := strings.Join(parsed.TextTerms, " ")
 
@@ -1076,6 +1135,7 @@ func (h *handlers) searchMessageBodiesHybrid(
 	if sourceID != nil {
 		filter.SourceIDs = []int64{*sourceID}
 	}
+	filter.AccountScopes = append(filter.AccountScopes, selection.scopes()...)
 
 	maxPage := h.vectorCfg.Search.MaxPageSizeHybridClamp()
 	requestedEnd := offset + limit
@@ -1201,7 +1261,7 @@ func (h *handlers) searchMessageBodiesHybridViaSearcher(
 	queryStr string, parsed *search.Query, mode string, explain bool,
 ) (*toolResult, error) {
 	limit := searchLimitArg(args)
-	offset := limitArg(args, toolArgOffset, 0)
+	offset := intArg(args, toolArgOffset, 0)
 
 	freeText := strings.Join(parsed.TextTerms, " ")
 	if freeText == "" {
@@ -1211,11 +1271,15 @@ func (h *handlers) searchMessageBodiesHybridViaSearcher(
 		), nil
 	}
 
-	account, _ := args[toolArgAccount].(string)
+	account, accountScopes, err := h.resolveForwardedAccount(ctx, stringArgument(args, toolArgAccount))
+	if err != nil {
+		return dependencyError("resolve semantic-search account", err)
+	}
 	result, err := h.hybridSearcher.SearchHybrid(ctx, HybridSearchRequest{
 		Query:          queryStr,
 		Mode:           mode,
 		Account:        account,
+		AccountScopes:  accountScopes,
 		Limit:          limit,
 		Offset:         offset,
 		IncludeMatches: true,
@@ -1399,7 +1463,10 @@ func (h *handlers) findSimilarMessagesViaSearcher(ctx context.Context, req toolR
 	if maxPage := h.vectorCfg.Search.MaxPageSizeHybridClamp(); maxPage > 0 && limit > maxPage {
 		limit = maxPage
 	}
-	account, _ := args[toolArgAccount].(string)
+	account, accountScopes, err := h.resolveForwardedAccount(ctx, stringArgument(args, toolArgAccount))
+	if err != nil {
+		return dependencyError("resolve similar-search account", err)
+	}
 	messageType, _ := args["message_type"].(string)
 	after, err := getDateArg(args, toolArgAfter)
 	if err != nil {
@@ -1415,6 +1482,7 @@ func (h *handlers) findSimilarMessagesViaSearcher(ctx context.Context, req toolR
 	}
 
 	result, err := h.similarSearcher.FindSimilar(ctx, SimilarSearchRequest{
+		AccountScopes: accountScopes,
 		MessageID:     seedID,
 		Limit:         limit,
 		Account:       account,
@@ -1451,13 +1519,14 @@ func (h *handlers) filterFromFindSimilarArgs(ctx context.Context, args map[strin
 	var f vector.Filter
 
 	account, _ := args[toolArgAccount].(string)
-	srcID, err := h.getAccountID(ctx, account)
+	selection, err := h.resolveAccount(ctx, account)
 	if err != nil {
 		return f, err
 	}
-	if srcID != nil {
-		f.SourceIDs = []int64{*srcID}
+	if selection.sourceID != nil {
+		f.SourceIDs = []int64{*selection.sourceID}
 	}
+	f.AccountScopes = selection.scopes()
 	if messageType, _ := args["message_type"].(string); messageType != "" {
 		f.MessageTypes = vector.NewBuildScope([]string{messageType}, nil).MessageTypes
 	}
@@ -1569,32 +1638,40 @@ func lineNumberAt(body string, byteOffset int) int {
 }
 
 type getMessageResponse struct {
-	WebURL               string                 `json:"web_url,omitempty"`
-	ID                   int64                  `json:"id"`
-	SourceMessageID      string                 `json:"source_message_id"`
-	ConversationID       int64                  `json:"conversation_id"`
-	SourceConversationID string                 `json:"source_conversation_id"`
-	Subject              string                 `json:"subject"`
-	MessageType          string                 `json:"message_type,omitempty"`
-	Snippet              string                 `json:"snippet"`
-	SentAt               time.Time              `json:"sent_at"`
-	ReceivedAt           *time.Time             `json:"received_at,omitempty"`
-	DeletedAt            *time.Time             `json:"deleted_at,omitempty"`
-	SizeEstimate         int64                  `json:"size_estimate"`
-	HasAttachments       bool                   `json:"has_attachments"`
-	From                 []query.Address        `json:"from"`
-	To                   []query.Address        `json:"to"`
-	Cc                   []query.Address        `json:"cc"`
-	Bcc                  []query.Address        `json:"bcc"`
-	BodyText             string                 `json:"body_text"`
-	BodyHTML             string                 `json:"body_html"`
-	BodyFormat           string                 `json:"body_format,omitempty"`
-	BodyLength           int                    `json:"body_length"`
-	BodyReturned         int                    `json:"body_returned"`
-	Offset               int                    `json:"offset"`
-	HasMore              bool                   `json:"has_more"`
-	Labels               []string               `json:"labels"`
-	Attachments          []query.AttachmentInfo `json:"attachments"`
+	SenderAuth           *senderauth.Verdict       `json:"sender_auth,omitempty"`
+	SegmentsVersion      string                    `json:"segments_version,omitempty" jsonschema:"Segment classification version, present when plain-text ranges were requested."`
+	Segments             []msgsegment.Segment      `json:"segments,omitempty" jsonschema:"Ranges overlapping this body window, with absolute, unclipped byte offsets."`
+	SegmentsTruncated    bool                      `json:"segments_truncated,omitzero" jsonschema:"The 1 MiB scan limit was reached; unexamined bytes keep the last label."`
+	SegmentsUnavailable  string                    `json:"segments_unavailable,omitempty" jsonschema:"unsupported_format when ranges were requested for HTML."`
+	WebURL               string                    `json:"web_url,omitempty"`
+	ID                   int64                     `json:"id"`
+	SourceMessageID      string                    `json:"source_message_id"`
+	ConversationID       int64                     `json:"conversation_id"`
+	SourceConversationID string                    `json:"source_conversation_id"`
+	Subject              string                    `json:"subject"`
+	MessageType          string                    `json:"message_type,omitempty"`
+	RelatedMessageID     *int64                    `json:"related_message_id,omitempty"`
+	Calendar             *store.CalendarProjection `json:"calendar,omitempty"`
+	Snippet              string                    `json:"snippet"`
+	SentAt               time.Time                 `json:"sent_at"`
+	ReceivedAt           *time.Time                `json:"received_at,omitempty"`
+	DeletedAt            *time.Time                `json:"deleted_at,omitempty"`
+	SizeEstimate         int64                     `json:"size_estimate"`
+	HasAttachments       bool                      `json:"has_attachments"`
+	From                 []query.Address           `json:"from"`
+	To                   []query.Address           `json:"to"`
+	Cc                   []query.Address           `json:"cc"`
+	Bcc                  []query.Address           `json:"bcc"`
+	BodyText             string                    `json:"body_text"`
+	BodyHTML             string                    `json:"body_html"`
+	HiddenTextPresent    bool                      `json:"hidden_text_present"`
+	BodyFormat           string                    `json:"body_format,omitempty"`
+	BodyLength           int                       `json:"body_length"`
+	BodyReturned         int                       `json:"body_returned"`
+	Offset               int                       `json:"offset"`
+	HasMore              bool                      `json:"has_more"`
+	Labels               []string                  `json:"labels"`
+	Attachments          []query.AttachmentInfo    `json:"attachments"`
 }
 
 func (h *handlers) getMessage(ctx context.Context, req toolRequest) (*toolResult, error) {
@@ -1629,10 +1706,7 @@ func (h *handlers) getMessage(ctx context.Context, req toolRequest) (*toolResult
 	bodyFormat := bodyFormatText
 	switch requestedBodyFormat {
 	case bodyFormatAuto:
-		if fullBody == "" && msg.BodyHTML != "" {
-			fullBody = msg.BodyHTML
-			bodyFormat = bodyFormatHTML
-		}
+		fullBody, bodyFormat = automaticMessageBody(msg)
 	case bodyFormatText:
 	case bodyFormatHTML:
 		fullBody = msg.BodyHTML
@@ -1663,7 +1737,9 @@ func (h *handlers) getMessage(ctx context.Context, req toolRequest) (*toolResult
 		bodyHTML = bodySlice
 	}
 
-	return jsonResult(getMessageResponse{
+	response := getMessageResponse{
+		SenderAuth:           msg.SenderAuth,
+		Calendar:             msg.Calendar,
 		WebURL:               msg.WebURL,
 		ID:                   msg.ID,
 		SourceMessageID:      msg.SourceMessageID,
@@ -1671,6 +1747,7 @@ func (h *handlers) getMessage(ctx context.Context, req toolRequest) (*toolResult
 		SourceConversationID: msg.SourceConversationID,
 		Subject:              msg.Subject,
 		MessageType:          msg.MessageType,
+		RelatedMessageID:     msg.RelatedMessageID,
 		Snippet:              msg.Snippet,
 		SentAt:               msg.SentAt,
 		ReceivedAt:           msg.ReceivedAt,
@@ -1683,6 +1760,7 @@ func (h *handlers) getMessage(ctx context.Context, req toolRequest) (*toolResult
 		Bcc:                  msg.Bcc,
 		BodyText:             bodyText,
 		BodyHTML:             bodyHTML,
+		HiddenTextPresent:    msg.HiddenTextPresent,
 		BodyFormat:           bodyFormat,
 		BodyLength:           bodyLen,
 		BodyReturned:         len(bodySlice),
@@ -1690,7 +1768,31 @@ func (h *handlers) getMessage(ctx context.Context, req toolRequest) (*toolResult
 		HasMore:              sliceEnd < bodyLen,
 		Labels:               msg.Labels,
 		Attachments:          msg.Attachments,
-	})
+	}
+	if includeSegments, _ := args["include_segments"].(bool); includeSegments {
+		if bodyFormat == bodyFormatHTML {
+			response.SegmentsUnavailable = "unsupported_format"
+		} else {
+			response.SegmentsVersion = msgsegment.Version
+			var split msgsegment.Result
+			if store.IsEmailMessageType(msg.MessageType) {
+				split = msgsegment.Split(fullBody)
+			} else if bodyLen > 0 {
+				split.Segments = []msgsegment.Segment{{Kind: msgsegment.Authored, Start: 0, End: bodyLen}}
+			}
+			response.SegmentsTruncated = split.Truncated
+			for _, segment := range split.Segments {
+				if segment.Start >= sliceEnd {
+					break
+				}
+				if segment.End <= sliceStart {
+					continue
+				}
+				response.Segments = append(response.Segments, segment)
+			}
+		}
+	}
+	return jsonResult(response)
 }
 
 func (h *handlers) attachVectorChunkMatches(
@@ -1776,7 +1878,10 @@ func (h *handlers) vectorMatchesInMessage(
 
 	total := int64(len(allMatches))
 	if offset >= len(allMatches) {
-		return jsonResult(searchInMessageResponse(newPaginatedResponse([]messageMatch{}, total, offset)))
+		return jsonResult(searchInMessageResponse{
+			paginatedResponse: newPaginatedResponse([]messageMatch{}, total, offset),
+			HiddenTextPresent: msg.HiddenTextPresent,
+		})
 	}
 	end := min(offset+limit, len(allMatches))
 	page := allMatches[offset:end]
@@ -1784,7 +1889,10 @@ func (h *handlers) vectorMatchesInMessage(
 	if len(page) > limit {
 		page = page[:limit]
 	}
-	return jsonResult(searchInMessageResponse(newPaginatedResponse(page, total, offset)))
+	return jsonResult(searchInMessageResponse{
+		paginatedResponse: newPaginatedResponse(page, total, offset),
+		HiddenTextPresent: msg.HiddenTextPresent,
+	})
 }
 
 func (h *handlers) searchInMessage(ctx context.Context, req toolRequest) (*toolResult, error) {
@@ -1803,7 +1911,7 @@ func (h *handlers) searchInMessage(ctx context.Context, req toolRequest) (*toolR
 
 	mode, _ := args[toolArgMode].(string)
 	limit := limitArg(args, toolArgLimit, 10)
-	offset := limitArg(args, toolArgOffset, 0)
+	offset := intArg(args, toolArgOffset, 0)
 
 	switch mode {
 	case "", "keyword":
@@ -1824,13 +1932,28 @@ func (h *handlers) searchInMessage(ctx context.Context, req toolRequest) (*toolR
 		return toolErrorResult("message not found"), nil
 	}
 
-	allMatches := findTermMatches(msg.BodyText, queryStr)
+	body, _ := automaticMessageBody(msg)
+	allMatches := findTermMatches(body, queryStr)
 	total := int64(len(allMatches))
 	if offset >= len(allMatches) {
-		return jsonResult(searchInMessageResponse(newPaginatedResponse([]messageMatch{}, total, offset)))
+		return jsonResult(searchInMessageResponse{
+			paginatedResponse: newPaginatedResponse([]messageMatch{}, total, offset),
+			HiddenTextPresent: msg.HiddenTextPresent,
+		})
 	}
 	end := min(offset+limit, len(allMatches))
-	return jsonResult(searchInMessageResponse(newPaginatedResponse(allMatches[offset:end], total, offset)))
+	return jsonResult(searchInMessageResponse{
+		paginatedResponse: newPaginatedResponse(allMatches[offset:end], total, offset),
+		HiddenTextPresent: msg.HiddenTextPresent,
+	})
+}
+
+// automaticMessageBody keeps HTML raw so search offsets match get_message windows.
+func automaticMessageBody(msg *query.MessageDetail) (string, string) {
+	if msg.BodyText == "" && msg.BodyHTML != "" {
+		return msg.BodyHTML, bodyFormatHTML
+	}
+	return msg.BodyText, bodyFormatText
 }
 
 func findTermMatches(body, term string) []messageMatch {
@@ -1892,7 +2015,20 @@ func (h *handlers) getAttachment(ctx context.Context, req toolRequest) (*toolRes
 			if err != nil {
 				return nil, err
 			}
-			return &downloadSnapshot{data: payload.data, attachment: payload}, nil
+			snapshot := &downloadSnapshot{data: payload.data, attachment: payload}
+			if h.delegatedOnly {
+				snapshot.validate = func(ctx context.Context) error {
+					current, err := h.engine.GetAttachment(ctx, id)
+					if err != nil {
+						return newInternalError("authorize attachment chunk", err)
+					}
+					if current == nil || current.ContentHash != payload.metadata.ContentHash {
+						return errDownloadExpired
+					}
+					return nil
+				}
+			}
+			return snapshot, nil
 		})
 		if err == nil {
 			payload = snapshot.attachment
@@ -1911,6 +2047,7 @@ func (h *handlers) getAttachment(ctx context.Context, req toolRequest) (*toolRes
 	}
 	att := payload.metadata
 	metaObj := getAttachmentResponse{
+		Docbank:  att.Docbank,
 		Filename: att.Filename,
 		MIMEType: payload.mimeType,
 		Size:     att.Size,
@@ -2009,18 +2146,18 @@ func (h *handlers) listMessages(ctx context.Context, req toolRequest) (*toolResu
 
 	// Look up account filter
 	account, _ := args[toolArgAccount].(string)
-	sourceID, err := h.getAccountID(ctx, account)
+	selection, err := h.resolveAccount(ctx, account)
 	if err != nil {
 		return dependencyError("resolve message-list account", err)
 	}
 
 	filter := query.MessageFilter{
-		SourceID: sourceID,
 		Pagination: query.Pagination{
 			Limit:  listLimitArg(args) + 1,
-			Offset: limitArg(args, toolArgOffset, 0),
+			Offset: intArg(args, toolArgOffset, 0),
 		},
 	}
+	selection.applyToFilter(&filter)
 
 	if v, ok := args[toolArgFrom].(string); ok && v != "" {
 		// If it looks like an email address, filter by email; otherwise by display name.
@@ -2084,6 +2221,18 @@ func (h *handlers) getStats(ctx context.Context, _ toolRequest) (*toolResult, er
 	if err != nil {
 		return nil, newInternalError("list archive accounts", err)
 	}
+	if lister, ok := h.engine.(query.VirtualAccountLister); ok {
+		// The catalog is extra detail; get_stats answers without it, keeping
+		// the last known children the account list already carries.
+		virtual, err := lister.ListVirtualAccounts(ctx)
+		if err != nil {
+			slog.Warn("MCP statistics use the last known virtual accounts", "error", err)
+		} else {
+			for i := range accounts {
+				accounts[i].VirtualAccounts = virtual[accounts[i].ID]
+			}
+		}
+	}
 
 	vs, vsErr := vector.CollectStats(ctx, h.backend)
 	if vsErr != nil {
@@ -2107,14 +2256,15 @@ func (h *handlers) aggregate(ctx context.Context, req toolRequest) (*toolResult,
 
 	// Look up account filter
 	account, _ := args[toolArgAccount].(string)
-	sourceID, err := h.getAccountID(ctx, account)
+	selection, err := h.resolveAccount(ctx, account)
 	if err != nil {
 		return dependencyError("resolve aggregate account", err)
 	}
 
 	opts := query.AggregateOptions{
-		SourceID: sourceID,
-		Limit:    limitArg(args, toolArgLimit, 50),
+		SourceID:      selection.sourceID,
+		AccountScopes: selection.scopes(),
+		Limit:         limitArg(args, toolArgLimit, 50),
 	}
 
 	if opts.After, err = getDateArg(args, toolArgAfter); err != nil {
@@ -2146,11 +2296,9 @@ func (h *handlers) aggregate(ctx context.Context, req toolRequest) (*toolResult,
 	return jsonResult(aggregateResponse{Data: nonNilSlice(rows)})
 }
 
-// limitArg extracts a non-negative integer limit from a map, with a default.
-// JSON numbers arrive as float64. Clamps to maxLimit to prevent excessive
-// result sets.
 // intArg extracts a non-negative integer from args without the maxLimit clamp
-// used by limitArg. Suitable for body-text offsets and similar unbounded values.
+// used by limitArg. It reads unbounded non-negative integers such as
+// pagination and body offsets.
 func intArg(args map[string]any, key string, def int) int {
 	v, ok := args[key].(float64)
 	if !ok {
@@ -2162,6 +2310,9 @@ func intArg(args map[string]any, key string, def int) int {
 	return int(v)
 }
 
+// limitArg extracts a non-negative integer limit from a map, with a default.
+// JSON numbers arrive as float64. Clamps to maxLimit to prevent excessive
+// result sets.
 func limitArg(args map[string]any, key string, def int) int {
 	v, ok := args[key].(float64)
 	if !ok {
@@ -2251,17 +2402,18 @@ func stringArrayArg(args map[string]any, key string) ([]string, error) {
 }
 
 // maxStageDeletionResults limits how many messages can be staged in one call.
-const maxStageDeletionResults = 100000
+const maxStageDeletionResults = query.MaxDeletionTargetSearchResults - 1
 
 func (h *handlers) stageDeletion(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 
 	// Look up account filter
 	account, _ := args[toolArgAccount].(string)
-	sourceID, err := h.getAccountID(ctx, account)
+	selection, err := h.resolveAccount(ctx, account)
 	if err != nil {
 		return dependencyError("resolve deletion account", err)
 	}
+	sourceID := selection.sourceID
 
 	// Check for query vs structured filters
 	queryStr, _ := args[toolArgQuery].(string)
@@ -2293,62 +2445,52 @@ func (h *handlers) stageDeletion(ctx context.Context, req toolRequest) (*toolRes
 		return toolErrorResult("must provide either 'query' or at least one filter (from, domain, label, after, before, has_attachment)"), nil
 	}
 
-	accounts, err := h.engine.ListAccounts(ctx)
-	if err != nil {
-		return dependencyError("list deletion sources", err)
-	}
-	accountsByID := make(map[int64]query.AccountInfo, len(accounts))
-	for _, info := range accounts {
-		accountsByID[info.ID] = info
-	}
-
 	var targets []query.DeletionTarget
 	var description string
+	var searchNote string
+	var skipped int
 
 	if hasQuery {
 		// Query-based search
-		q := search.Parse(queryStr)
+		q := search.ParseOR(queryStr)
 		if err := q.Err(); err != nil {
 			return toolErrorResult(err.Error()), nil
 		}
 		if q.IsEmpty() {
 			return toolErrorResult("query must contain at least one search term or filter"), nil
 		}
-		if sourceID != nil {
-			q.AccountIDs = []int64{*sourceID}
+		// Query scopes survive FTS fallback; SourceID also crosses the daemon boundary.
+		if err := selection.applyToQuery(q); err != nil {
+			return toolErrorResult(err.Error()), nil
 		}
-
-		// Try fast search first
+		mode := query.DeletionSearchFast
+		if q.HasOR() && q.HasTextTerms() {
+			mode = query.DeletionSearchDeep
+			searchNote = "Full-text OR search includes body matches. "
+		}
+		resolver, ok := h.engine.(query.BoundedDeletionTargetSearchResolver)
+		if !ok {
+			return dependencyError("search messages for deletion", errors.New("query engine requires bounded deletion search support"))
+		}
 		filter := query.MessageFilter{SourceID: sourceID}
-		results, err := h.engine.SearchFast(ctx, q, filter, maxStageDeletionResults, 0)
+		var matched int
+		targets, matched, err = resolver.GetDeletionTargetsBySearchBounded(ctx, q, filter, mode, maxStageDeletionResults+1)
+		if err == nil && mode == query.DeletionSearchFast && matched == 0 && q.HasTextTerms() {
+			targets, matched, err = resolver.GetDeletionTargetsBySearchBounded(ctx, q, filter, query.DeletionSearchDeep, maxStageDeletionResults+1)
+		}
+		if errors.Is(err, daemonclient.ErrBoundedDeletionSearchUnsupported) {
+			return toolErrorResult(err.Error()), nil
+		}
 		if err != nil {
-			return nil, newInternalError("search messages for deletion", err)
+			return dependencyError("search messages for deletion", err)
 		}
-
-		// Fall back to FTS if no results and query has text terms
-		if len(results) == 0 && len(q.TextTerms) > 0 {
-			results, err = h.engine.Search(ctx, q, maxStageDeletionResults, 0)
-			if err != nil {
-				return nil, newInternalError("fallback search messages for deletion", err)
-			}
+		if matched > maxStageDeletionResults {
+			return toolErrorResult(fmt.Sprintf("more than %d Gmail, Microsoft Graph, or IMAP messages match; stage_deletion stages at most %d per call. Narrow the selection with before:/after: or account and stage each part", maxStageDeletionResults, maxStageDeletionResults)), nil
 		}
-
-		for _, msg := range results {
-			if msg.SourceID <= 0 {
-				return toolErrorResult(fmt.Sprintf("selected message %d has no source metadata", msg.ID)), nil
-			}
-			info, ok := accountsByID[msg.SourceID]
-			if !ok {
-				return toolErrorResult(fmt.Sprintf("selected message %d has no source metadata", msg.ID)), nil
-			}
-			if strings.TrimSpace(info.SourceType) == "" || strings.TrimSpace(info.Identifier) == "" {
-				return toolErrorResult(fmt.Sprintf("selected message %d has incomplete source metadata", msg.ID)), nil
-			}
-			targets = append(targets, query.DeletionTarget{
-				MessageID: msg.ID, SourceID: msg.SourceID, SourceType: info.SourceType,
-				SourceIdentifier: info.Identifier, SourceMessageID: msg.SourceMessageID,
-			})
+		if matched > 0 && len(targets) == 0 {
+			return toolErrorResult(fmt.Sprintf("%d messages match, but none can be deleted from their source", matched)), nil
 		}
+		skipped = matched - len(targets)
 		description = "query: " + queryStr
 		if len(description) > 50 {
 			description = description[:50]
@@ -2364,14 +2506,19 @@ func (h *handlers) stageDeletion(ctx context.Context, req toolRequest) (*toolRes
 			After:               afterDate,
 			Before:              beforeDate,
 			Pagination: query.Pagination{
-				Limit: maxStageDeletionResults,
+				Limit: maxStageDeletionResults + 1,
 			},
 		}
+		selection.applyToFilter(&filter)
 
 		var err error
 		targets, err = h.engine.GetDeletionTargetsByFilter(ctx, filter)
 		if err != nil {
 			return nil, newInternalError("filter messages for deletion", err)
+		}
+
+		if len(targets) > maxStageDeletionResults {
+			return toolErrorResult(fmt.Sprintf("more than %d messages match; stage_deletion stages at most %d per call. Narrow the selection with before:/after: or account and stage each part", maxStageDeletionResults, maxStageDeletionResults)), nil
 		}
 
 		// Build description from filters
@@ -2442,11 +2589,15 @@ func (h *handlers) stageDeletion(ctx context.Context, req toolRequest) (*toolRes
 
 	resp := stageDeletionResponse{
 		BatchID:      manifest.ID,
+		SkippedCount: skipped,
 		MessageCount: len(gmailIDs),
 		Status:       string(manifest.Status),
-		NextStep:     "In the invoking CLI's config.toml, set '[deletion] remote_enabled = true' for durable consent and run 'msgvault delete-staged'; for one command instead, run 'MSGVAULT_ENABLE_REMOTE_DELETE=1 msgvault delete-staged'. Run 'msgvault cancel-deletion " + manifest.ID + "' to cancel",
+		NextStep:     searchNote + "In the invoking CLI's config.toml, set '[deletion] remote_enabled = true' for durable consent and run 'msgvault delete-staged'; for one command instead, run 'MSGVAULT_ENABLE_REMOTE_DELETE=1 msgvault delete-staged'. Run 'msgvault cancel-deletion " + manifest.ID + "' to cancel",
 	}
 
+	if skipped > 0 {
+		resp.NextStep = fmt.Sprintf("%d of %d matching item(s) were skipped because they are no longer in the archive or cannot be deleted from their source. ", skipped, skipped+len(targets)) + resp.NextStep
+	}
 	return jsonResult(resp)
 }
 
@@ -2484,7 +2635,10 @@ func (h *handlers) searchByDomains(ctx context.Context, req toolRequest) (*toolR
 	}
 
 	limit := limitArg(args, toolArgLimit, 100)
-	offset := limitArg(args, toolArgOffset, 0)
+	if limit == 0 {
+		limit = 100
+	}
+	offset := intArg(args, toolArgOffset, 0)
 
 	afterDate, err := getDateArg(args, toolArgAfter)
 	if err != nil {
@@ -2495,12 +2649,13 @@ func (h *handlers) searchByDomains(ctx context.Context, req toolRequest) (*toolR
 		return toolErrorResult(err.Error()), nil
 	}
 
-	results, err := h.engine.SearchByDomains(ctx, domains, afterDate, beforeDate, limit, offset)
+	result, err := h.engine.SearchByDomains(ctx, domains, afterDate, beforeDate, limit, offset, nil)
 	if err != nil {
 		return nil, newInternalError("search messages by domain", err)
 	}
 
-	return jsonResult(searchByDomainsResponse{Data: nonNilSlice(results)})
+	return jsonResult(searchByDomainsResponse(newPaginatedResponseNoTotal(
+		result.Messages, offset, result.HasMore)))
 }
 
 func nonNilSlice[T any](values []T) []T {

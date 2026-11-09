@@ -4,13 +4,17 @@
 
 export type DeepSearchParams = {
   /**
-   * Search query
+   * Search query; full text accepts standalone pipe-separated OR alternatives
    */
   q: string;
   /**
    * Exact search scope: body; omit for composite full-text search
    */
   scope?: string;
+  /**
+   * JSON list of account scopes that intersect, for structured clients
+   */
+  account_scopes?: string;
   /**
    * Sender email/address filter; not supported when scope=body
    */

@@ -27,6 +27,8 @@ inference without making a model provider the system of record.
 - SQLite archives have Parquet analytics, packed attachment storage, and
   verifiable backup repositories.
 
+The daemon also serves [native MCP endpoints](../usage/chat.md#native-daemon-endpoints).
+
 ## Current boundaries
 
 - Source APIs and export formats determine which history and media can be
@@ -62,13 +64,20 @@ records. Attachments are addressed by their SHA-256 content hash so occurrences
 can share the same stored bytes. Repeated imports and syncs use source identity
 to update or skip records according to that provider's rules.
 
+Meeting providers use the shared meeting archiver to write messages, raw
+evidence, search text, and meeting projections. Pocket discovers and reconciles
+recordings through REST, verifies the personal account through MCP, and binds
+each source to the authenticated email and stable user ID. Its recoverable
+attempt state rotates detail fetches across limited and failed runs. See the
+[meeting workflow](../usage/meetings.md#pocket) for the content contract and limits.
+
 On SQLite, analytics exports message metadata to Parquet. DuckDB queries those
 files for grouping and drill-down without scanning message bodies. FTS5 indexes
 message text for keyword search. Semantic search stores vectors in a separate
 SQLite index; PostgreSQL uses its own full-text search and optional pgvector.
 See [storage](storage.md) and [search ranking](search-ranking.md).
 
-Opt-in [calendar control](../usage/calendar.md#control-events-unreleased) runs
+Opt-in [calendar control](../usage/calendar.md#control-events) runs
 through the daemon's serialized mutation gate. The daemon verifies source policy,
 delegated grants, OAuth scope, and live calendar access before sending a provider
 write. Successful changes use calendar sync's Store persistence path immediately,
@@ -93,10 +102,13 @@ reported separately so clients can reconcile a partial failure.
 ### The daemon coordinates archive mutations
 
 Archive-access CLI commands discover or start the local daemon unless a remote
-is configured. `--local` selects the local daemon; it does not make the CLI open
-SQLite directly. Mutating jobs wait for the daemon's writer coordination instead
-of competing through independent foreground database connections. Some offline
-recovery commands require the daemon to be stopped. The
+is configured. For ordinary archive commands, `--local` selects the local daemon;
+it does not make the CLI open SQLite directly. Mutating jobs wait for the daemon's
+writer coordination instead of competing through independent foreground database
+connections. Some offline recovery commands require the daemon to be stopped. The
+offline `migrate` command applies the candidate binary's main archive schema
+migrations directly; `schema-version --database` reads its completion marker
+without migrations or daemon startup. See the [CLI contracts](../cli-reference.md#schema-version). The
 [daemon guide](../guides/daemon-migration.md) owns those lifecycle rules.
 
 ### Archive records and derived indexes have different lifetimes

@@ -21,6 +21,10 @@ import (
 
 var attachmentLooseStores sync.Map
 
+// ErrAttachmentSourceChanged reports that a source no longer matches the
+// identity observed before it was staged.
+var ErrAttachmentSourceChanged = errors.New("attachment source changed")
+
 type attachmentLooseStoreKey struct {
 	baseDir string
 	staging packstore.StagingMode
@@ -157,7 +161,7 @@ type DurableAttachmentReceipt struct {
 // existing authoritative copy after the loose file is durable. Its receipt is
 // populated even when publication succeeded but a later durability step
 // failed, so callers can roll back a newly created blob.
-func StoreAttachmentFileDurable(attachmentsDir string, att *mime.Attachment) (DurableAttachmentReceipt, error) {
+func StoreAttachmentFileDurable(ctx context.Context, attachmentsDir string, att *mime.Attachment) (DurableAttachmentReceipt, error) {
 	if attachmentsDir == "" {
 		return DurableAttachmentReceipt{}, nil
 	}
@@ -181,7 +185,7 @@ func StoreAttachmentFileDurable(attachmentsDir string, att *mime.Attachment) (Du
 	if err != nil {
 		return DurableAttachmentReceipt{}, err
 	}
-	result, writeErr := loose.WriteBytes(context.Background(), att.Content, packstore.WriteOptions{
+	result, writeErr := loose.WriteBytes(ctx, att.Content, packstore.WriteOptions{
 		Durability:   packstore.DurablePublication,
 		Dedup:        packstore.VerifyFullHash,
 		ExpectedHash: expectedHash,
@@ -256,6 +260,119 @@ func hashSourceFile(f *os.File, srcPath string, maxSize int64) (string, int64, e
 	return hex.EncodeToString(h.Sum(nil)), size, nil
 }
 
+// StoreAttachmentFromPathVerified stores a regular source file under its
+// verified content hash. It hashes the source before staging, verifies an
+// existing blob before returning it, and checks the same identity again while
+// staging a new blob. expectedHash and expectedSize must come from a prior
+// trusted snapshot; maxSize bounds both reads when positive.
+func StoreAttachmentFromPathVerified(ctx context.Context, attachmentsDir, srcPath, expectedHash string, expectedSize, maxSize int64) (string, string, int64, error) {
+	if attachmentsDir == "" || srcPath == "" || expectedHash == "" || expectedSize < 0 {
+		return "", "", 0, errors.New("attachments dir, source path, and expected identity are required")
+	}
+	expectedHash = strings.ToLower(expectedHash)
+	hash, err := packstore.ParseHash(expectedHash)
+	if err != nil {
+		return "", "", 0, fmt.Errorf("parse attachment content hash: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return "", "", 0, err
+	}
+	linfo, err := os.Lstat(srcPath)
+	if err != nil {
+		return "", "", 0, fmt.Errorf("lstat attachment source: %w", err)
+	}
+	if !linfo.Mode().IsRegular() {
+		return "", "", 0, fmt.Errorf("attachment source %q is not a regular file", srcPath)
+	}
+	if linfo.Size() != expectedSize {
+		return "", "", linfo.Size(), ErrAttachmentSourceChanged
+	}
+	if maxSize > 0 && linfo.Size() > maxSize {
+		return "", "", 0, fmt.Errorf("attachment source %q is %d bytes (max %d)", srcPath, linfo.Size(), maxSize)
+	}
+	f, err := os.Open(srcPath)
+	if err != nil {
+		return "", "", 0, fmt.Errorf("open attachment source: %w", err)
+	}
+	defer func() { _ = f.Close() }()
+	baseDir, err := prepareStorageDir(attachmentsDir)
+	if err != nil {
+		return "", "", 0, err
+	}
+	contentHash, size, err := hashSourceFileContext(ctx, f, srcPath, maxSize)
+	if err != nil {
+		return "", "", 0, err
+	}
+	if contentHash != expectedHash || size != expectedSize {
+		return "", contentHash, size, ErrAttachmentSourceChanged
+	}
+	loose, err := attachmentLooseStore(baseDir, packstore.StagingStoreDirectory)
+	if err != nil {
+		return "", contentHash, size, err
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return "", contentHash, size, fmt.Errorf("rewind attachment source: %w", err)
+	}
+	result, writeErr := loose.Write(ctx, &ContextReader{Context: ctx, Reader: f}, packstore.WriteOptions{
+		Durability:   packstore.AtomicPublication,
+		Dedup:        packstore.VerifyFullHash,
+		ExpectedHash: hash,
+		ExpectedSize: size,
+		SizeKnown:    true,
+		MaxBytes:     maxSize,
+	})
+	if writeErr != nil {
+		return "", contentHash, size, fmt.Errorf("store attachment source %q: %w", srcPath, writeErr)
+	}
+	recordLooseBlobCreated(baseDir, result.Created)
+	return path.Join(expectedHash[:2], expectedHash), expectedHash, size, nil
+}
+
+func hashSourceFileContext(ctx context.Context, f *os.File, srcPath string, maxSize int64) (string, int64, error) {
+	src := io.Reader(&ContextReader{Context: ctx, Reader: f})
+	if maxSize > 0 {
+		src = io.LimitReader(src, maxSize+1)
+	}
+	h := sha256.New()
+	size, err := io.Copy(h, src)
+	if err != nil {
+		return "", 0, fmt.Errorf("hash attachment source %q: %w", srcPath, err)
+	}
+	if maxSize > 0 && size > maxSize {
+		return "", 0, ErrAttachmentSourceChanged
+	}
+	return hex.EncodeToString(h.Sum(nil)), size, nil
+}
+
+// ContextReader stops reading when its context is canceled.
+type ContextReader struct {
+	Context context.Context
+	Reader  io.Reader
+}
+
+func (r *ContextReader) Read(p []byte) (int, error) {
+	if err := r.Context.Err(); err != nil {
+		return 0, err
+	}
+	return r.Reader.Read(p)
+}
+
+// OpenAttachmentSource opens a regular file and checks its size when maxSize > 0.
+func OpenAttachmentSource(srcPath string, maxSize int64) (*os.File, error) {
+	linfo, err := os.Lstat(srcPath)
+	if err != nil {
+		return nil, fmt.Errorf("lstat attachment source: %w", err)
+	}
+	if !linfo.Mode().IsRegular() {
+		return nil, &os.PathError{Op: "open attachment source", Path: srcPath, Err: errors.New("not a regular file")}
+	}
+	if maxSize > 0 && linfo.Size() > maxSize {
+		return nil, fmt.Errorf("attachment source %q is %d bytes (max %d)", srcPath, linfo.Size(), maxSize)
+	}
+
+	return os.Open(srcPath)
+}
+
 // StoreAttachmentFromPath streams the regular file at srcPath into
 // content-addressed storage under attachmentsDir (hash[:2]/hash), hashing
 // without loading the file into memory. maxSize > 0 rejects larger sources.
@@ -271,24 +388,13 @@ func hashSourceFile(f *os.File, srcPath string, maxSize int64) (string, int64, e
 // the stored size. On failures after the source was hashed, contentHash and
 // size are still returned (with an empty storage path) so callers can record
 // metadata for content they could not store.
-func StoreAttachmentFromPath(attachmentsDir, srcPath string, maxSize int64) (string, string, int64, error) {
+func StoreAttachmentFromPath(ctx context.Context, attachmentsDir, srcPath string, maxSize int64) (string, string, int64, error) {
 	if attachmentsDir == "" || srcPath == "" {
 		return "", "", 0, errors.New("attachments dir and source path are required")
 	}
-	linfo, err := os.Lstat(srcPath)
+	f, err := OpenAttachmentSource(srcPath, maxSize)
 	if err != nil {
-		return "", "", 0, fmt.Errorf("lstat attachment source: %w", err)
-	}
-	if !linfo.Mode().IsRegular() {
-		return "", "", 0, fmt.Errorf("attachment source %q is not a regular file", srcPath)
-	}
-	if maxSize > 0 && linfo.Size() > maxSize {
-		return "", "", 0, fmt.Errorf("attachment source %q is %d bytes (max %d)", srcPath, linfo.Size(), maxSize)
-	}
-
-	f, err := os.Open(srcPath)
-	if err != nil {
-		return "", "", 0, fmt.Errorf("open attachment source: %w", err)
+		return "", "", 0, err
 	}
 	defer func() { _ = f.Close() }()
 
@@ -318,7 +424,7 @@ func StoreAttachmentFromPath(attachmentsDir, srcPath string, maxSize int64) (str
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		return "", contentHash, size, fmt.Errorf("rewind attachment source: %w", err)
 	}
-	result, writeErr := loose.Write(context.Background(), f, packstore.WriteOptions{
+	result, writeErr := loose.Write(ctx, f, packstore.WriteOptions{
 		Durability: packstore.AtomicPublication,
 		Dedup:      packstore.VerifyFullHash,
 		MaxBytes:   maxSize,
@@ -332,4 +438,67 @@ func StoreAttachmentFromPath(attachmentsDir, srcPath string, maxSize int64) (str
 	}
 	recordLooseBlobCreated(baseDir, result.Created)
 	return path.Join(contentHash[:2], contentHash), contentHash, size, nil
+}
+
+// SourceReader remembers a failed read from the source, so a caller of
+// StoreAttachmentStream can tell a dropped download from a local write failure.
+type SourceReader struct {
+	R   io.Reader
+	Err error
+}
+
+func (s *SourceReader) Read(p []byte) (int, error) {
+	n, err := s.R.Read(p)
+	if err != nil && !errors.Is(err, io.EOF) {
+		s.Err = err
+	}
+	return n, err
+}
+
+// ErrAttachmentTooLarge reports a stream that exceeded its size cap; nothing was published.
+var ErrAttachmentTooLarge = errors.New("attachment exceeds size limit")
+
+// StoreAttachmentStream streams r into content-addressed storage under
+// attachmentsDir without buffering it in memory. maxSize > 0 caps the stream.
+// Returns the storage path relative to attachmentsDir, the content hash, and the size.
+func StoreAttachmentStream(ctx context.Context, attachmentsDir string, r io.Reader, maxSize int64) (string, string, int64, error) {
+	if attachmentsDir == "" || r == nil {
+		return "", "", 0, errors.New("attachments dir and reader are required")
+	}
+	baseDir, err := prepareStorageDir(attachmentsDir)
+	if err != nil {
+		return "", "", 0, err
+	}
+	loose, err := attachmentLooseStore(baseDir, packstore.StagingStoreDirectory)
+	if err != nil {
+		return "", "", 0, err
+	}
+	counted := &countingReader{r: r}
+	result, err := loose.Write(ctx, counted, packstore.WriteOptions{
+		Durability: packstore.AtomicPublication,
+		Dedup:      packstore.VerifyFullHash,
+		MaxBytes:   maxSize,
+	})
+	if err != nil {
+		// packstore reports the cap and a corrupt existing blob alike, so the
+		// bytes read decide: only a stream past the cap is too large.
+		if maxSize > 0 && counted.n > maxSize && errors.Is(err, packstore.ErrContentMismatch) {
+			return "", "", 0, ErrAttachmentTooLarge
+		}
+		return "", "", 0, fmt.Errorf("store attachment stream: %w", err)
+	}
+	recordLooseBlobCreated(baseDir, result.Created)
+	contentHash := result.Hash.String()
+	return path.Join(contentHash[:2], contentHash), contentHash, result.Size, nil
+}
+
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
 }

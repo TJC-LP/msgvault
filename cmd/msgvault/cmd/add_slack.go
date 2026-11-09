@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -22,6 +23,12 @@ var (
 )
 
 func newAddSlackCmd() *cobra.Command {
+	return newAddSlackCmdWithClientFactory(func(token string) *slack.Client {
+		return slack.NewClient("", token)
+	})
+}
+
+func newAddSlackCmdWithClientFactory(clientFactory func(token string) *slack.Client) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "add-slack",
 		Short: "Add a Slack workspace as an archive source",
@@ -79,7 +86,7 @@ Examples:
 			if token == "" {
 				return errors.New("missing Slack token in daemon subprocess (set MSGVAULT_SLACK_TOKEN)")
 			}
-			client := slack.NewClient("", token)
+			client := clientFactory(token)
 			auth, err := client.AuthTest(cmd.Context())
 			if err != nil {
 				return err
@@ -89,7 +96,7 @@ Examples:
 				return fmt.Errorf("save slack token: %w", err)
 			}
 
-			s, cleanup, err := openWritableStoreAndInitForIngestInvocation(state)
+			s, cleanup, err := openWritableStoreAndInitForIngestInvocation(cmd.Context(), state)
 			if err != nil {
 				return err
 			}
@@ -101,13 +108,13 @@ Examples:
 				return fmt.Errorf("create source for %s: %w", identifier, err)
 			}
 			displayName := "Slack " + auth.Team
-			if err := s.UpdateSourceDisplayName(source.ID, displayName); err != nil {
+			if err := updateSourceDisplayNameForRegistration(s, source.ID, displayName, state.logger); err != nil {
 				return fmt.Errorf("set display name for %s: %w", identifier, err)
 			}
 			if !noDefaultIdentityAddSlack {
-				confirmDefaultSlackIdentity(cmd.OutOrStdout(), s, source.ID, auth.TeamID, auth.UserID, state.logger)
+				confirmDefaultSlackIdentity(cmd.Context(), cmd.OutOrStdout(), s, source.ID, auth.TeamID, auth.UserID, state.logger)
 			}
-			if err := runPostSourceCreateMigrationsForInvocation(s, state); err != nil {
+			if err := runPostSourceCreateMigrationsForInvocation(cmd.Context(), s, state); err != nil {
 				return fmt.Errorf("post-source-create migrations: %w", err)
 			}
 
@@ -127,9 +134,9 @@ func writeAddedSlackWorkspace(out io.Writer, team, teamID, identifier string) {
 		textutil.SanitizeTerminal(team), teamID, identifier)
 }
 
-func confirmDefaultSlackIdentity(out io.Writer, s *store.Store, sourceID int64, teamID, userID string, logger *slog.Logger) {
+func confirmDefaultSlackIdentity(ctx context.Context, out io.Writer, s *store.Store, sourceID int64, teamID, userID string, logger *slog.Logger) {
 	account := teamID + ":" + userID
-	confirmDefaultIdentity(out, s, sourceID, account, account, "account-identifier", logger)
+	confirmDefaultIdentity(ctx, out, s, sourceID, account, account, "account-identifier", logger)
 }
 
 // readAddSlackToken resolves the user token: env var, then --token-file,
@@ -162,7 +169,7 @@ func readAddSlackToken(cmd *cobra.Command) (string, error) {
 	)
 	switch method {
 	case passwordInteractive:
-		return readPasswordInteractive(prompt, promptOut)
+		return readPasswordInteractive(prompt, promptOut, false)
 	case passwordNoPrompt:
 		return "", errors.New("cannot read token: no terminal available for prompt (try --token-file, piping the token via stdin, or setting MSGVAULT_SLACK_TOKEN)")
 	case passwordPipe:

@@ -21,6 +21,7 @@ import (
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/kit/stacktest"
 	"go.kenn.io/msgvault/internal/deletion"
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/query/querytest"
@@ -28,8 +29,6 @@ import (
 )
 
 const task3ModernProtocolVersion = "2026-07-28"
-
-const task5ExpectedServerVersion = "1.0.0"
 
 type task3RPCError struct {
 	Code    int64  `json:"code"`
@@ -43,8 +42,8 @@ type task3RPCResponse struct {
 	Error   *task3RPCError `json:"error"`
 }
 
-func task3ModernRequest(method, name, body string) *http.Request {
-	req := httptest.NewRequest(http.MethodPost, "/mcp", bytes.NewBufferString(body))
+func task3ModernRequest(ctx context.Context, method, name, body string) *http.Request {
+	req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/mcp", bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
 	req.Header.Set("Mcp-Protocol-Version", task3ModernProtocolVersion)
@@ -142,6 +141,7 @@ func newTask5RawStdioPeerWithServer(t *testing.T, server *sdkmcp.Server) *task5R
 		select {
 		case <-done:
 		case <-time.After(5 * time.Second):
+			stacktest.Dump(t)
 			assert.Fail(t, "raw stdio server did not stop within timeout")
 		}
 	})
@@ -159,6 +159,7 @@ func (p *task5RawStdioPeer) writeLiteralLine(t *testing.T, line string) {
 	case err := <-done:
 		require.NoError(t, err)
 	case <-time.After(5 * time.Second):
+		stacktest.Dump(t)
 		require.FailNow(t, "raw stdio request write timed out")
 	}
 }
@@ -187,6 +188,7 @@ func (p *task5RawStdioPeer) callRaw(t *testing.T, line string) (task3RPCResponse
 		require.NoError(t, scanned.err, "raw stdio response")
 		raw = scanned.line
 	case <-time.After(5 * time.Second):
+		stacktest.Dump(t)
 		require.FailNow(t, "raw stdio response read timed out")
 	}
 	var response task3RPCResponse
@@ -256,7 +258,7 @@ func TestMCPPostHandlerErrorIsolationModernHTTP(t *testing.T) {
 	body := task3ToolCallBody(1, task6PostHandlerFailureTool, `{}`)
 	recorder, response := task3Serve(
 		handler,
-		task3ModernRequest("tools/call", task6PostHandlerFailureTool, body),
+		task3ModernRequest(t.Context(), "tools/call", task6PostHandlerFailureTool, body),
 	)
 
 	task6AssertPostHandlerFailureIsPrivate(t, response, recorder.Body.String(), logs.String(), sentinel)
@@ -307,7 +309,7 @@ func TestRawStdioModern(t *testing.T) {
 	checks.Contains(instructions, "Only Notes with user provenance are user-authored")
 	meta, ok := discover.Result["_meta"].(map[string]any)
 	must.True(ok, "discover result: %#v", discover.Result)
-	checks.Equal(map[string]any{"name": "msgvault", "version": task5ExpectedServerVersion}, meta["io.modelcontextprotocol/serverInfo"])
+	assertMCPServerInfo(t, meta["io.modelcontextprotocol/serverInfo"])
 
 	listed := peer.call(t, `{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}`)
 	must.Nil(listed.Error)
@@ -318,7 +320,7 @@ func TestRawStdioModern(t *testing.T) {
 	checks.Equal("complete", called.Result["resultType"])
 	callMeta, ok := called.Result["_meta"].(map[string]any)
 	must.True(ok, "tool result: %#v", called.Result)
-	checks.Equal(map[string]any{"name": "msgvault", "version": task5ExpectedServerVersion}, callMeta["io.modelcontextprotocol/serverInfo"])
+	assertMCPServerInfo(t, callMeta["io.modelcontextprotocol/serverInfo"])
 	task5AssertRawJSONParity(t, called.Result)
 
 	removed := peer.call(t, `{"jsonrpc":"2.0","id":4,"method":"ping","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}`)
@@ -335,7 +337,7 @@ func TestRawStdioLegacy(t *testing.T) {
 	initialized := peer.call(t, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"raw-legacy","version":"raw-legacy-version"}}}`)
 	must.Nil(initialized.Error)
 	checks.Equal("2025-11-25", initialized.Result["protocolVersion"])
-	checks.Equal(map[string]any{"name": "msgvault", "version": task5ExpectedServerVersion}, initialized.Result["serverInfo"])
+	assertMCPServerInfo(t, initialized.Result["serverInfo"])
 
 	peer.writeLiteralLine(t, `{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}`)
 	listed := peer.call(t, `{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}`)
@@ -354,7 +356,7 @@ func task5LegacyHTTPPost(
 	body string,
 ) (*httptest.ResponseRecorder, task3RPCResponse) {
 	t.Helper()
-	req := httptest.NewRequest(http.MethodPost, "/mcp", bytes.NewBufferString(body))
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/mcp", bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
 	if protocolVersion != "" {
@@ -364,25 +366,28 @@ func task5LegacyHTTPPost(
 	assert.Empty(t, req.Header.Get("Mcp-Session-Id"))
 	recorder, response := task3Serve(handler, req)
 	assert.Equal(t, "no-store", recorder.Header().Get("Cache-Control"))
-	assert.Empty(t, recorder.Header().Get("Mcp-Session-Id"))
 	return recorder, response
 }
 
 func TestRawHTTPLegacy(t *testing.T) {
+	assert := assert.New(t)
 	fixture := newTask5Fixture(t, "000")
 	handler := newMCPHTTPServer(fixture.opts, HTTPOptions{}).Handler
 
 	initializeRecorder, initialized := task5LegacyHTTPPost(t, handler, "", `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"raw-http-legacy","version":"raw-http-legacy-version"}}}`)
 	task3RequireSuccess(t, initializeRecorder, initialized)
-	assert.Equal(t, "2025-11-25", initialized.Result["protocolVersion"])
+	assert.Equal("2025-11-25", initialized.Result["protocolVersion"])
+	assert.Empty(initializeRecorder.Header().Get("Mcp-Session-Id"))
 
 	listRecorder, listed := task5LegacyHTTPPost(t, handler, "2025-11-25", `{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}`)
 	task3RequireSuccess(t, listRecorder, listed)
-	assert.Equal(t, task5ExpectedTools("000", false), task3ToolNames(t, listed))
+	assert.Equal(task5ExpectedTools("000", false), task3ToolNames(t, listed))
+	assert.Empty(listRecorder.Header().Get("Mcp-Session-Id"))
 
 	callRecorder, called := task5LegacyHTTPPost(t, handler, "2025-11-25", `{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_stats","arguments":{}}}`)
 	task3RequireSuccess(t, callRecorder, called)
 	task5AssertRawJSONParity(t, called.Result)
+	assert.Empty(callRecorder.Header().Get("Mcp-Session-Id"))
 }
 
 func TestMCPHTTPConfirmationWritesRequireModernProtocol(t *testing.T) {
@@ -393,6 +398,10 @@ func TestMCPHTTPConfirmationWritesRequireModernProtocol(t *testing.T) {
 		IdentityScoring: newIdentityScoringMCPBackend(t), AllowIdentityDecisions: true,
 		AllowPersonMerges: true, AllowCardDAVWrites: true, AllowIdentityScoring: true,
 		Calendar: calendar, AllowCalendarWrites: true,
+		Operations:             operationalTestBackend{},
+		OperationCapabilities:  []string{"get_source_scheduler_status", "sync_source", "update_slack_sync_policy", "set_person_display_name", "list_open_loops", "close_open_loop", "snooze_open_loop", "reopen_open_loop"},
+		OperationWriteFamilies: []OperationFamily{OperationFamilySources, OperationFamilyRecords, OperationFamilyLoops},
+		PeopleBackend:          &namedPromotionTestBackend{recordingPeopleBackend: &recordingPeopleBackend{}}, AllowProfileWrites: true,
 	}
 	handler := newMCPHTTPServer(opts, HTTPOptions{AllowWrites: true}).Handler
 	for _, version := range []string{"2025-03-26", "2025-06-18", "2025-11-25", task3ModernProtocolVersion} {
@@ -404,9 +413,9 @@ func TestMCPHTTPConfirmationWritesRequireModernProtocol(t *testing.T) {
 			var recorder *httptest.ResponseRecorder
 			if version == task3ModernProtocolVersion {
 				listBody = `{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}`
-				recorder, listed = task3Serve(handler, task3ModernRequest("tools/list", "", listBody))
+				recorder, listed = task3Serve(handler, task3ModernRequest(t.Context(), "tools/list", "", listBody))
 				task3RequireSuccess(t, recorder, listed)
-				recorder, called = task3Serve(handler, task3ModernRequest("tools/call", ToolGetIdentityMatch, task3ToolCallBody(2, ToolGetIdentityMatch, `{"candidate_id":1}`)))
+				recorder, called = task3Serve(handler, task3ModernRequest(t.Context(), "tools/call", ToolGetIdentityMatch, task3ToolCallBody(2, ToolGetIdentityMatch, `{"candidate_id":1}`)))
 			} else {
 				initialize := fmt.Sprintf(`{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":%q,"capabilities":{"elicitation":{"form":{}}},"clientInfo":{"name":"confirmation-test","version":"1"}}}`, version)
 				initializeRecorder, initialized := task5LegacyHTTPPost(t, handler, "", initialize)
@@ -416,12 +425,30 @@ func TestMCPHTTPConfirmationWritesRequireModernProtocol(t *testing.T) {
 				recorder, called = task5LegacyHTTPPost(t, handler, version, readBody)
 			}
 			task3RequireSuccess(t, recorder, called)
+			assert.Empty(recorder.Header().Get("Mcp-Session-Id"))
 			assert.NotEqual(true, called.Result["isError"])
 			assert.InDelta(1, toolStructuredContent(t, called.Result)["id"], 0)
 			names := task3ToolNames(t, listed)
 			assert.Contains(names, ToolGetIdentityMatch)
 			assert.Contains(names, "calendar_freebusy")
-			for _, name := range []string{ToolAcceptIdentityMatch, ToolRejectIdentityMatch, ToolScoreIdentityMatches, ToolMergePerson, ToolApproveCardDAVPublication, ToolSyncCardDAV, "calendar_create", "calendar_update", "calendar_delete", "calendar_move", "calendar_respond"} {
+			assert.Contains(names, "get_source_scheduler_status")
+			assert.Contains(names, "list_open_loops")
+			assert.Contains(names, ToolPromotePerson)
+			tools, ok := listed.Result["tools"].([]any)
+			require.True(t, ok)
+			for _, tool := range tools {
+				definition, ok := tool.(map[string]any)
+				require.True(t, ok)
+				if definition["name"] == ToolPromotePerson {
+					properties := toolPropertyNames(t, definition)
+					if version == task3ModernProtocolVersion {
+						assert.Contains(properties, "display_name")
+					} else {
+						assert.NotContains(properties, "display_name")
+					}
+				}
+			}
+			for _, name := range []string{ToolAcceptIdentityMatch, ToolRejectIdentityMatch, ToolScoreIdentityMatches, ToolMergePerson, ToolApproveCardDAVPublication, ToolSyncCardDAV, "calendar_create", "calendar_update", "calendar_delete", "calendar_move", "calendar_respond", "sync_source", "update_slack_sync_policy", "set_person_display_name", "close_open_loop", "snooze_open_loop", "reopen_open_loop"} {
 				if version == task3ModernProtocolVersion {
 					assert.Contains(names, name)
 				} else {
@@ -442,7 +469,7 @@ func TestMCPStdioLegacyCanConfirmCalendarMutation(t *testing.T) {
 	requirements := require.New(t)
 	assertions := assert.New(t)
 	backend := &calendarMCPFake{}
-	peer := newTask5RawStdioPeer(t, ServeOptions{Calendar: backend, CalendarOnly: true, AllowCalendarWrites: true})
+	peer := newTask5RawStdioPeer(t, ServeOptions{Calendar: backend, DelegatedOnly: true, AllowCalendarWrites: true})
 	initialized := peer.call(t, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{"elicitation":{"form":{}}},"clientInfo":{"name":"calendar-confirmation-test","version":"1"}}}`)
 	requirements.Nil(initialized.Error)
 	peer.writeLiteralLine(t, `{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}`)
@@ -520,7 +547,7 @@ func TestMCPModernHTTPDiscovery(t *testing.T) {
 	}, HTTPOptions{}).Handler
 	body := `{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}`
 
-	recorder, response := task3Serve(handler, task3ModernRequest("server/discover", "", body))
+	recorder, response := task3Serve(handler, task3ModernRequest(t.Context(), "server/discover", "", body))
 
 	task3RequireSuccess(t, recorder, response)
 	assert.Equal("2.0", response.JSONRPC)
@@ -535,10 +562,7 @@ func TestMCPModernHTTPDiscovery(t *testing.T) {
 	assert.Contains(response.Result["supportedVersions"], task3ModernProtocolVersion)
 	meta, ok := response.Result["_meta"].(map[string]any)
 	require.True(t, ok, "result: %#v", response.Result)
-	assert.Equal(map[string]any{
-		"name":    "msgvault",
-		"version": "1.0.0",
-	}, meta["io.modelcontextprotocol/serverInfo"])
+	assertMCPServerInfo(t, meta["io.modelcontextprotocol/serverInfo"])
 	assert.Empty(recorder.Header().Get("Mcp-Session-Id"))
 	assert.Equal("no-store", recorder.Header().Get("Cache-Control"))
 }
@@ -567,7 +591,7 @@ func TestMCPModernHTTPMetadataValidation(t *testing.T) {
 
 			recorder, response := task3Serve(
 				handler,
-				task3ModernRequest("server/discover", "", test.body),
+				task3ModernRequest(t.Context(), "server/discover", "", test.body),
 			)
 
 			assert.Equal(http.StatusBadRequest, recorder.Code, "response: %s", recorder.Body.String())
@@ -591,15 +615,15 @@ func TestMCPModernHTTPHeaderAgreement(t *testing.T) {
 	}{
 		{
 			name:    "method mismatch",
-			request: task3ModernRequest("tools/list", "", discoverBody),
+			request: task3ModernRequest(t.Context(), "tools/list", "", discoverBody),
 		},
 		{
 			name:    "name mismatch",
-			request: task3ModernRequest("tools/call", ToolStageDeletion, toolBody),
+			request: task3ModernRequest(t.Context(), "tools/call", ToolStageDeletion, toolBody),
 		},
 		{
 			name:    "version mismatch",
-			request: task3ModernRequest("server/discover", "", discoverBody),
+			request: task3ModernRequest(t.Context(), "server/discover", "", discoverBody),
 			changeHead: func(header http.Header) {
 				header.Set("Mcp-Protocol-Version", "2026-07-29")
 			},
@@ -631,7 +655,7 @@ func TestMCPModernHTTPMethods(t *testing.T) {
 	}, HTTPOptions{}).Handler
 	for _, method := range []string{http.MethodGet, http.MethodDelete} {
 		t.Run(method, func(t *testing.T) {
-			req := httptest.NewRequest(method, "/mcp", nil)
+			req := httptest.NewRequestWithContext(t.Context(), method, "/mcp", nil)
 			recorder, _ := task3Serve(handler, req)
 
 			assert.Equal(http.StatusMethodNotAllowed, recorder.Code)
@@ -641,7 +665,7 @@ func TestMCPModernHTTPMethods(t *testing.T) {
 	}
 
 	body := `{"jsonrpc":"2.0","id":1,"method":"ping","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}`
-	recorder, response := task3Serve(handler, task3ModernRequest("ping", "", body))
+	recorder, response := task3Serve(handler, task3ModernRequest(t.Context(), "ping", "", body))
 	assert.Equal(http.StatusNotFound, recorder.Code, "response: %s", recorder.Body.String())
 	require.NotNil(t, response.Error, "response: %s", recorder.Body.String())
 	assert.Equal(int64(-32601), response.Error.Code)
@@ -656,7 +680,7 @@ func TestMCPModernHTTPOriginAuthAndBodyLimit(t *testing.T) {
 	}, HTTPOptions{APIKey: "test-api-key"}).Handler
 	discoverBody := `{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}`
 
-	crossOrigin := task3ModernRequest("server/discover", "", discoverBody)
+	crossOrigin := task3ModernRequest(t.Context(), "server/discover", "", discoverBody)
 	crossOrigin.Header.Set("Authorization", "Bearer test-api-key")
 	crossOrigin.Header.Set("Origin", "https://attacker.example")
 	crossOrigin.Header.Set("Sec-Fetch-Site", "cross-site")
@@ -677,7 +701,7 @@ func TestMCPModernHTTPOriginAuthAndBodyLimit(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			assert := assert.New(t)
 
-			req := task3ModernRequest("server/discover", "", discoverBody)
+			req := task3ModernRequest(t.Context(), "server/discover", "", discoverBody)
 			if test.authorization != "" {
 				req.Header.Set("Authorization", test.authorization)
 			}
@@ -694,6 +718,7 @@ func TestMCPModernHTTPOriginAuthAndBodyLimit(t *testing.T) {
 	// documented maximum plus the JSON envelope; one byte past it must
 	// still be rejected at the transport.
 	oversized := task3ModernRequest(
+		t.Context(),
 		"server/discover",
 		"",
 		strings.Repeat("x", int((visual.MaxQueryImageBytes*4)/3+2<<20)+1),
@@ -721,8 +746,8 @@ func TestMCPModernHTTPCancellation(t *testing.T) {
 		},
 	}
 	handler := newMCPHTTPServer(ServeOptions{Engine: engine}, HTTPOptions{}).Handler
-	ctx, cancel := context.WithCancel(context.Background())
-	req := task3ModernRequest("tools/call", ToolGetStats, task3ToolCallBody(1, ToolGetStats, `{}`)).WithContext(ctx)
+	ctx, cancel := context.WithCancel(t.Context())
+	req := task3ModernRequest(t.Context(), "tools/call", ToolGetStats, task3ToolCallBody(1, ToolGetStats, `{}`)).WithContext(ctx)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -741,7 +766,7 @@ func TestMCPModernHTTPCancellation(t *testing.T) {
 	select {
 	case <-canceled:
 		wasCanceled = true
-	case <-time.After(500 * time.Millisecond):
+	case <-time.After(5 * time.Second):
 	}
 	close(release)
 	select {
@@ -791,7 +816,7 @@ func TestMCPHTTPPolicyWriteTools(t *testing.T) {
 
 	listBody := `{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}`
 	readOnlyHandler := newMCPHTTPServer(opts, HTTPOptions{}).Handler
-	recorder, response := task3Serve(readOnlyHandler, task3ModernRequest("tools/list", "", listBody))
+	recorder, response := task3Serve(readOnlyHandler, task3ModernRequest(t.Context(), "tools/list", "", listBody))
 	task3RequireSuccess(t, recorder, response)
 	names := task3ToolNames(t, response)
 	assert.NotContains(names, ToolExportAttachment)
@@ -801,7 +826,7 @@ func TestMCPHTTPPolicyWriteTools(t *testing.T) {
 	assert.NotContains(names, ToolDeleteSavedView)
 
 	writableHandler := newMCPHTTPServer(opts, HTTPOptions{AllowWrites: true}).Handler
-	recorder, response = task3Serve(writableHandler, task3ModernRequest("tools/list", "", listBody))
+	recorder, response = task3Serve(writableHandler, task3ModernRequest(t.Context(), "tools/list", "", listBody))
 	task3RequireSuccess(t, recorder, response)
 	names = task3ToolNames(t, response)
 	assert.Contains(names, ToolExportAttachment)
@@ -817,7 +842,7 @@ func TestMCPHTTPPolicyWriteTools(t *testing.T) {
 	)
 	recorder, response = task3Serve(
 		readOnlyHandler,
-		task3ModernRequest("tools/call", ToolExportAttachment, exportBody),
+		task3ModernRequest(t.Context(), "tools/call", ToolExportAttachment, exportBody),
 	)
 	assert.Equal(http.StatusBadRequest, recorder.Code, "response: %s", recorder.Body.String())
 	require.NotNil(response.Error, "response: %s", recorder.Body.String())
@@ -825,7 +850,7 @@ func TestMCPHTTPPolicyWriteTools(t *testing.T) {
 	stageBody := task3ToolCallBody(3, ToolStageDeletion, `{"query":"match"}`)
 	recorder, response = task3Serve(
 		readOnlyHandler,
-		task3ModernRequest("tools/call", ToolStageDeletion, stageBody),
+		task3ModernRequest(t.Context(), "tools/call", ToolStageDeletion, stageBody),
 	)
 	assert.Equal(http.StatusBadRequest, recorder.Code, "response: %s", recorder.Body.String())
 	require.NotNil(response.Error, "response: %s", recorder.Body.String())
@@ -834,7 +859,7 @@ func TestMCPHTTPPolicyWriteTools(t *testing.T) {
 		`{"name":"Hidden","canonical_state":{},"schema_version":1}`)
 	recorder, response = task3Serve(
 		readOnlyHandler,
-		task3ModernRequest("tools/call", ToolCreateSavedView, createBody),
+		task3ModernRequest(t.Context(), "tools/call", ToolCreateSavedView, createBody),
 	)
 	assert.Equal(http.StatusBadRequest, recorder.Code, "response: %s", recorder.Body.String())
 	require.NotNil(response.Error, "response: %s", recorder.Body.String())
@@ -864,7 +889,7 @@ func TestMCPInvocationLimitRateBurst(t *testing.T) {
 
 	for id := 1; id <= 2; id++ {
 		body := task3ToolCallBody(id, ToolGetStats, `{}`)
-		recorder, response := task3Serve(handler, task3ModernRequest("tools/call", ToolGetStats, body))
+		recorder, response := task3Serve(handler, task3ModernRequest(t.Context(), "tools/call", ToolGetStats, body))
 		task3RequireSuccess(t, recorder, response)
 		assert.Equal(true, response.Result["isError"], "result: %#v", response.Result)
 		assert.Equal("server is busy; retry this tool call later", task3ToolErrorText(t, response))
@@ -872,10 +897,10 @@ func TestMCPInvocationLimitRateBurst(t *testing.T) {
 	assert.Equal(int32(0), calls.Load(), "rejected calls from separate HTTP requests must not invoke their handlers")
 
 	discoverBody := `{"jsonrpc":"2.0","id":42,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}`
-	recorder, response := task3Serve(handler, task3ModernRequest("server/discover", "", discoverBody))
+	recorder, response := task3Serve(handler, task3ModernRequest(t.Context(), "server/discover", "", discoverBody))
 	task3RequireSuccess(t, recorder, response)
 	listBody := `{"jsonrpc":"2.0","id":43,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}`
-	recorder, response = task3Serve(handler, task3ModernRequest("tools/list", "", listBody))
+	recorder, response = task3Serve(handler, task3ModernRequest(t.Context(), "tools/list", "", listBody))
 	task3RequireSuccess(t, recorder, response)
 }
 
@@ -895,7 +920,7 @@ func TestMCPInvocationLimitRateBurstAppliesToResourceReads(t *testing.T) {
 	handler := newMCPHTTPServerWithPolicy(opts, HTTPOptions{}, policy).Handler
 	recorder, response := task3Serve(
 		handler,
-		task3ModernRequest("resources/read", uri, task3ResourceReadBody(1, uri)),
+		task3ModernRequest(t.Context(), "resources/read", uri, task3ResourceReadBody(1, uri)),
 	)
 
 	require.NotNil(t, response.Error, "response: %s", recorder.Body.String())
@@ -930,7 +955,7 @@ func TestMCPInvocationLimitConcurrentResourceReadsSharePolicy(t *testing.T) {
 	go func() {
 		_, response := task3Serve(
 			handler,
-			task3ModernRequest("resources/read", uri, task3ResourceReadBody(1, uri)),
+			task3ModernRequest(t.Context(), "resources/read", uri, task3ResourceReadBody(1, uri)),
 		)
 		firstDone <- response
 	}()
@@ -943,7 +968,7 @@ func TestMCPInvocationLimitConcurrentResourceReadsSharePolicy(t *testing.T) {
 
 	secondRecorder, secondResponse := task3Serve(
 		handler,
-		task3ModernRequest("resources/read", uri, task3ResourceReadBody(2, uri)),
+		task3ModernRequest(t.Context(), "resources/read", uri, task3ResourceReadBody(2, uri)),
 	)
 	must.NotNil(secondResponse.Error, "response: %s", secondRecorder.Body.String())
 	checks.Equal(int64(-32000), secondResponse.Error.Code)
@@ -1018,7 +1043,7 @@ func TestMCPInvocationLimitConcurrentCallsShareHTTPPolicy(t *testing.T) {
 		go func() {
 			defer wait.Done()
 			body := task3ToolCallBody(id, ToolGetStats, `{}`)
-			_, _ = task3Serve(handler, task3ModernRequest("tools/call", ToolGetStats, body))
+			_, _ = task3Serve(handler, task3ModernRequest(t.Context(), "tools/call", ToolGetStats, body))
 		}()
 	}
 	for range 8 {
@@ -1038,7 +1063,7 @@ func TestMCPInvocationLimitConcurrentCallsShareHTTPPolicy(t *testing.T) {
 		body := task3ToolCallBody(9, ToolGetStats, `{}`)
 		ninthRecorder, ninthResponse = task3Serve(
 			handler,
-			task3ModernRequest("tools/call", ToolGetStats, body),
+			task3ModernRequest(t.Context(), "tools/call", ToolGetStats, body),
 		)
 	}()
 

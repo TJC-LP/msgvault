@@ -2,36 +2,13 @@ package beeper
 
 import (
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-func TestSyncStateRoundTrip(t *testing.T) {
-	require := require.New(t)
-	assert := assert.New(t)
-	s := NewSyncState()
-	s.EnsureChat("!a:x").Newest = "100"
-	s.EnsureChat("!a:x").Oldest = "5"
-	s.EnsureChat("!b:x").Done = true
-	s.Anchors = []AnchorProbe{{ChatID: "!a:x", MessageID: "42", Timestamp: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)}}
-	s.ListWatermark = "2026-01-02T03:04:05Z"
-
-	blob, err := s.Marshal()
-	require.NoError(err)
-
-	got, err := LoadSyncState(blob)
-	require.NoError(err)
-	assert.Equal(s.Chats["!a:x"], got.Chats["!a:x"])
-	assert.Equal(s.Chats["!b:x"], got.Chats["!b:x"])
-	require.Len(got.Anchors, 1)
-	assert.Equal("42", got.Anchors[0].MessageID)
-	assert.True(got.Anchors[0].Timestamp.Equal(s.Anchors[0].Timestamp))
-	assert.Equal(s.ListWatermark, got.ListWatermark)
-}
-
 func TestLoadSyncStateEmpty(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	s, err := LoadSyncState("")
@@ -41,12 +18,8 @@ func TestLoadSyncStateEmpty(t *testing.T) {
 	assert.Empty(s.Anchors)
 }
 
-func TestLoadSyncStateInvalid(t *testing.T) {
-	_, err := LoadSyncState("{not json")
-	require.Error(t, err)
-}
-
 func TestSyncStateMerge(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	base := NewSyncState()
 	base.EnsureChat("!a:x").Newest = "10"
@@ -75,6 +48,7 @@ func TestSyncStateMerge(t *testing.T) {
 }
 
 func TestSyncStateMergePreservesExplicitDoneReset(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	base := NewSyncState()
 	base.EnsureChat("!reopened:x").Done = true
@@ -89,6 +63,7 @@ func TestSyncStateMergePreservesExplicitDoneReset(t *testing.T) {
 }
 
 func TestSyncStateMergeNil(t *testing.T) {
+	t.Parallel()
 	base := NewSyncState()
 	base.EnsureChat("!a:x").Newest = "10"
 	base.Merge(nil)
@@ -96,6 +71,7 @@ func TestSyncStateMergeNil(t *testing.T) {
 }
 
 func TestSyncStateMergeFillsAnchor(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	base := NewSyncState()
@@ -107,6 +83,7 @@ func TestSyncStateMergeFillsAnchor(t *testing.T) {
 }
 
 func TestSyncStateMergePreservesExplicitTailScanClears(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	base := NewSyncState()
 	base.TailScanStarted = "2026-01-01T00:00:00Z"

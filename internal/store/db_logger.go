@@ -139,7 +139,7 @@ func (d *loggedDB) QueryContext(
 	query = d.rebind(query)
 	reqID := RequestIDFromContext(ctx)
 	start := time.Now()
-	rows, err := d.DB.QueryContext(ctx, query, args...) //nolint:rowserrcheck // caller owns rows.Err
+	rows, err := ReadDBContext(ctx, d.DB).QueryContext(ctx, query, args...) //nolint:rowserrcheck // caller owns rows.Err
 	if err != nil {
 		logStmtWith("query", reqID, query, args, err, time.Since(start))
 		return nil, err
@@ -167,7 +167,7 @@ func (d *loggedDB) QueryRowContext(
 ) *sql.Row {
 	query = d.rebind(query)
 	start := time.Now()
-	row := d.DB.QueryRowContext(ctx, query, args...)
+	row := ReadDBContext(ctx, d.DB).QueryRowContext(ctx, query, args...)
 	logStmtWith("queryrow", RequestIDFromContext(ctx), query, args, nil, time.Since(start))
 	return row
 }
@@ -186,7 +186,11 @@ func (d *loggedDB) ExecContext(
 ) (sql.Result, error) {
 	query = d.rebind(query)
 	start := time.Now()
-	res, err := d.DB.ExecContext(ctx, query, args...)
+	var executor contextQuerier = d.DB
+	if tx := writableSnapshot(ctx, d.DB); tx != nil {
+		executor = tx.Tx
+	}
+	res, err := executor.ExecContext(ctx, query, args...)
 	elapsed := time.Since(start)
 	rowsAffected := int64(-1)
 	if err == nil && res != nil {
@@ -226,6 +230,12 @@ type loggedTx struct {
 	*sql.Tx
 
 	rebind func(string) string
+	// attribution records the locks withAttributionTxContext took before the
+	// sync fence; nil for every other transaction.
+	attribution *attributionLockState
+
+	// Set only after this transaction successfully fences a running sync run.
+	syncGenerationFenced bool
 }
 
 // Exec rebinds before delegating. Transaction-scoped queries are

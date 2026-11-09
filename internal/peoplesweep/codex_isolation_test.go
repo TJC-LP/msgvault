@@ -90,6 +90,9 @@ func buildCodexIsolationExecutableFixture(
 		"-X=main.markerBase64=" + base64.StdEncoding.EncodeToString([]byte(fixture.marker)),
 		"-X=main.secret=" + fixture.secret,
 	}
+	// This read makes Go's test cache rerun the test when the child's inputs change.
+	_, err := os.ReadDir(filepath.Join("testdata", "codexfixture"))
+	require.NoError(t, err)
 	command := exec.CommandContext(
 		t.Context(), "go", "build", "-trimpath", "-ldflags", strings.Join(linkerValues, " "), "-o", path, ".",
 	)
@@ -320,7 +323,7 @@ func TestCodexVersionTimeoutKillsHangingFixture(t *testing.T) {
 	checks.Less(time.Since(started), 900*time.Millisecond)
 	checks.NotContains(err.Error(), secret)
 	checks.NotContains(err.Error(), executable)
-	time.Sleep(700 * time.Millisecond) //nolint:kennlint // waits past the fixture process's late write
+	time.Sleep(700 * time.Millisecond) //nolint:kennlint // sleeptest: waits past the fixture process's late write
 	checks.NoFileExists(lateMarker, "timed-out version process group must be terminated")
 }
 
@@ -344,7 +347,7 @@ func TestCodexVersionTimeoutClosesDescendantStdout(t *testing.T) {
 	must.Error(err)
 	checks.Less(time.Since(started), 900*time.Millisecond)
 	checks.NotContains(err.Error(), lateMarker)
-	time.Sleep(time.Second) //nolint:kennlint // waits past the fixture process's late write
+	time.Sleep(time.Second) //nolint:kennlint // sleeptest: waits past the fixture process's late write
 	checks.NoFileExists(lateMarker, "stdout-holding descendant must be terminated")
 }
 
@@ -374,12 +377,12 @@ func TestCodexAppServerCleanupTerminatesDescendantProcess(t *testing.T) {
 		if time.Now().After(deadline) {
 			must.FailNow("app-server fixture did not start its descendant")
 		}
-		time.Sleep(10 * time.Millisecond) //nolint:kennlint // polls for the fixture process's ready file
+		time.Sleep(10 * time.Millisecond) //nolint:kennlint // sleeptest: polls for the fixture process's ready file
 	}
 	started := time.Now()
 	must.NoError(finishCodexProcess(t.Context(), process, client, true))
 	checks.Less(time.Since(started), 900*time.Millisecond)
-	time.Sleep(1500 * time.Millisecond) //nolint:kennlint // waits past the fixture process's late write
+	time.Sleep(1500 * time.Millisecond) //nolint:kennlint // sleeptest: waits past the fixture process's late write
 	checks.NoFileExists(lateMarker, "app-server cleanup must terminate stderr-holding descendants")
 }
 
@@ -457,6 +460,8 @@ func TestCodexLauncherRejectsUntrustedAuthHome(t *testing.T) {
 	privateHome := t.TempDir()
 	requireChecks.NoError(os.Chmod(privateHome, 0o700))
 	requireChecks.NoError(os.WriteFile(filepath.Join(privateHome, "auth.json"), []byte("SYNTHETIC"), 0o644))
+	// Keep this fixture non-private even when the caller uses umask 077.
+	requireChecks.NoError(os.Chmod(filepath.Join(privateHome, "auth.json"), 0o644))
 	_, err = launcher.Start(t.Context(), attestation, privateHome)
 	requireChecks.ErrorContains(err, "private regular file")
 	assertChecks.Zero(starter.starts.Load())

@@ -1,6 +1,6 @@
 # Frontend build stage. Bun is present only here; the release image contains
 # neither a JavaScript runtime nor a filesystem web distribution.
-FROM oven/bun:1.3.14@sha256:e10577f0db68676a7024391c6e5cb4b879ebd17188ab750cf10024a6d700e5c4 AS web-builder
+FROM oven/bun:1.4.4@sha256:1d22548f177f4ff38e0c15baa3c2c46c6c2060ba2d1bc573bb4720b407548f1d AS web-builder
 
 WORKDIR /src
 COPY web/package.json web/bun.lock ./web/
@@ -11,7 +11,7 @@ RUN cd web && bun run generate && bun run build
 
 # Go build stage.
 # Pin by digest for reproducibility; update periodically.
-FROM golang:1.27.2-bookworm@sha256:5cf287a799e6b94384bad13d16b14904c531f51ba65792237e122ce42b392f61 AS builder
+FROM golang:1.27.3-bookworm@sha256:05237276236793ebedaf0b87dab86add9ec9adc66ebef2dbc3107c18254cde1c AS builder
 
 # Install build dependencies for CGO (SQLite, DuckDB).
 # libsqlite3-dev provides sqlite3.h, required to compile the sqlite-vec
@@ -45,6 +45,8 @@ ARG COMMIT=unknown
 ARG BUILD_DATE=unknown
 
 # Note: Module path must match go.mod (go.kenn.io/msgvault)
+# posthog.projectKey is the public PostHog ingest key for anonymous telemetry;
+# builds without it send no telemetry.
 RUN CGO_ENABLED=0 go build -trimpath -buildvcs=false \
         -o /msgvault-codex-bridge ./cmd/msgvault-codex-bridge \
     && bridge_digest=$(sha256sum /msgvault-codex-bridge | cut -d' ' -f1) \
@@ -55,12 +57,13 @@ RUN CGO_ENABLED=0 go build -trimpath -buildvcs=false \
         -X go.kenn.io/msgvault/cmd/msgvault/cmd.Version=${VERSION} \
         -X go.kenn.io/msgvault/cmd/msgvault/cmd.Commit=${COMMIT} \
         -X go.kenn.io/msgvault/cmd/msgvault/cmd.BuildDate=${BUILD_DATE} \
+        -X go.kenn.io/kit/telemetry/posthog.projectKey=phc_AzHd9YvuHR7M5poKzC6eW654d3SgKyBdoQPuwkWhimUf \
         -X go.kenn.io/msgvault/internal/peoplesweep.codexBridgeSHA256=${bridge_digest}" \
     -o /msgvault \
     ./cmd/msgvault
 
 # Runtime stage - Debian provides current glibc for CGO/DuckDB bindings
-FROM debian:bookworm-slim@sha256:96e378d7e6531ac9a15ad505478fcc2e69f371b10f5cdf87857c4b8188404716
+FROM debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3
 
 # Install runtime dependencies (libstdc++ required for CGO/DuckDB)
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
@@ -68,6 +71,7 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
     tzdata \
     wget \
     libstdc++6 \
+    libpcre2-8-0 \
     bubblewrap \
     && rm -rf /var/lib/apt/lists/*
 

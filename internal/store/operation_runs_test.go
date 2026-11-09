@@ -76,6 +76,11 @@ func TestOperationRunsSourceProjectsStatesCountersAndFilters(t *testing.T) {
 			wantError: sourceOperationPublicError(),
 		},
 		{
+			name:      "paused after progress",
+			seed:      sourceOperationRunSeed{startedAt: base.Add(5*time.Minute + 30*time.Second), state: "paused", processed: 5, added: 2},
+			wantState: operations.StatePaused,
+		},
+		{
 			name: "exact legacy cancelled",
 			seed: sourceOperationRunSeed{
 				startedAt: base.Add(6 * time.Minute), state: "cancelled", processed: 1,
@@ -124,6 +129,7 @@ func TestOperationRunsSourceProjectsStatesCountersAndFilters(t *testing.T) {
 		operations.StatePartial,
 		operations.StateFailed,
 		operations.StateCancelled,
+		operations.StatePaused,
 	} {
 		filtered, filterErr := store.ListSourceOperationRunsForTest(st, t.Context(), operations.Query{
 			States: []operations.State{state}, Limit: 100,
@@ -869,6 +875,8 @@ func TestOperationRunsCardDAVProjectsOnlyFixedFailureMessages(t *testing.T) {
 		{"retry_after", store.CardDAVSyncRunFailed, operations.PublicErrorRetryAfter, "CardDAV sync is temporarily paused."},
 		{"authentication_failed", store.CardDAVSyncRunFailed, operations.PublicErrorAuthenticationFailed, "CardDAV authentication failed."},
 		{"google_authorization_required", store.CardDAVSyncRunFailed, operations.PublicErrorGoogleAuthorizationRequired, "Google Contacts authorization is required. Connect Google in CardDAV account settings."},
+		{"microsoft_authorization_required", store.CardDAVSyncRunFailed, operations.PublicErrorMicrosoftAuthorizationRequired, "Microsoft contacts authorization is required. Run msgvault carddav authorize-microsoft with your account email."},
+		{"microsoft_contact_too_large", store.CardDAVSyncRunFailed, operations.PublicErrorMicrosoftContactTooLarge, "A published contact is over Outlook's 4 MB limit, and each sync reports it until it fits. The daemon log names its person ID. Removing stored photos or other media currently needs the profile API; the CLI and Web UI have no control for it."},
 		{"upstream_failed", store.CardDAVSyncRunFailed, operations.PublicErrorUpstreamFailed, "CardDAV server request failed."},
 		{"safety_limit", store.CardDAVSyncRunFailed, operations.PublicErrorSafetyLimit, "CardDAV sync exceeded its safety limits."},
 		{"sync_failed", store.CardDAVSyncRunFailed, operations.PublicErrorSyncFailed, "CardDAV sync failed."},

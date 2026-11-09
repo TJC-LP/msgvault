@@ -13,6 +13,7 @@ import (
 
 	"go.kenn.io/kit/embedclient"
 	"go.kenn.io/kit/embedconfig"
+	"go.kenn.io/msgvault/internal/jobctx"
 	"go.kenn.io/msgvault/internal/vector"
 )
 
@@ -70,16 +71,20 @@ func NewClient(cfg Config) *Client {
 	return &Client{cfg: cfg, http: newHTTPClient(cfg.Timeout, nil, cfg.RejectRedirects || cfg.BeforeRequest != nil)}
 }
 
-// Embed embeds document chunks in input order. Kit owns transport validation
-// and retry policy; MaxRetries is the total attempt budget. Empty input is a no-op.
+// Embed embeds document chunks in input order. Kit owns transport
+// validation; MaxRetries is the total attempt budget. Empty input is a no-op.
 func (c *Client) Embed(ctx context.Context, inputs []string) ([][]float32, error) {
 	return c.embed(ctx, embedconfig.RoleDocument, inputs)
 }
 
 func (c *Client) embed(ctx context.Context, role embedconfig.Role, inputs []string) ([][]float32, error) {
+	if jobctx.PreemptionRequested(ctx) {
+		return nil, jobctx.ErrYieldedToWaiter
+	}
 	if len(inputs) == 0 {
 		return nil, nil
 	}
+	ctx = withEmbeddingAttemptGroup(ctx)
 	httpClient := *c.http
 	if c.cfg.BeforeRequest != nil {
 		// Consent failure ends this call, including Kit retries. Each concrete
@@ -99,6 +104,10 @@ func (c *Client) embed(ctx context.Context, role embedconfig.Role, inputs []stri
 			return err
 		}}
 	}
+	retryCtx, retryTransport, cleanupRetry := cooperativeRetryContext(ctx, httpClient.Transport)
+	defer cleanupRetry()
+	ctx = retryCtx
+	httpClient.Transport = retryTransport
 	client, err := embedclient.New(embedclient.Options{
 		Model: embedconfig.Model{Name: c.cfg.Model, Dimensions: c.cfg.Dimension,
 			Metric: embedconfig.MetricCosine, Normalization: embedconfig.NormalizationNone},
@@ -120,10 +129,19 @@ func (c *Client) embed(ctx context.Context, role embedconfig.Role, inputs []stri
 	}
 	vectors, err := client.EmbedTexts(ctx, role, inputs)
 	if err == nil {
+		if role == embedconfig.RoleDocument {
+			addEmbeddingPrefix(ctx, c.cfg.DocumentPrefix, len(inputs))
+		}
 		return vectors, nil
 	}
 	if cause := beforeRequestCause(err); cause != nil {
 		return nil, cause
+	}
+	if jobctx.YieldedToWaiter(ctx) {
+		if isRetryableEmbedClientError(err) {
+			return nil, jobctx.ErrYieldedToWaiter
+		}
+		return nil, errors.Join(jobctx.ErrYieldedToWaiter, fmt.Errorf("embed: %w", err))
 	}
 	if apiErr, ok := errors.AsType[*embedclient.APIError](err); ok {
 		if apiErr.StatusCode >= 300 && apiErr.StatusCode < 400 {
@@ -144,6 +162,14 @@ func (c *Client) embed(ctx context.Context, role embedconfig.Role, inputs []stri
 		return nil, fmt.Errorf("embed: %w", err)
 	}
 	return nil, fmt.Errorf("%w: %w", vector.ErrInvalidProviderShape, err)
+}
+
+func isRetryableEmbedClientError(err error) bool {
+	if apiErr, ok := errors.AsType[*embedclient.APIError](err); ok {
+		return apiErr.Retryable()
+	}
+	_, ok := errors.AsType[*embedclient.TransportError](err)
+	return ok
 }
 
 // EmbedQuery embeds one query and returns its single vector.

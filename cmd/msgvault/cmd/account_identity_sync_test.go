@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
@@ -114,6 +115,71 @@ func TestAddServiceAccountDefaultIdentityScheduledSync(t *testing.T) {
 	}
 }
 
+func TestScheduledSyncResolvesGmailAliasToCanonicalIdentifier(t *testing.T) {
+	require, assert := require.New(t), assert.New(t)
+	savedTransport := http.DefaultTransport
+	t.Cleanup(func() { http.DefaultTransport = savedTransport })
+	profileEmail := "reader@example.test"
+	http.DefaultTransport = testTransport(func(req *http.Request) (*http.Response, error) {
+		var body string
+		switch req.Method + " " + req.URL.String() {
+		case "POST https://token.example.com/oauth2":
+			body = `{"access_token":"synthetic-token","token_type":"Bearer","expires_in":3600}`
+		case "GET https://gmail.googleapis.com/gmail/v1/users/me/profile":
+			body = fmt.Sprintf(`{"emailAddress":%q,"historyId":"100"}`, profileEmail)
+		default:
+			return nil, fmt.Errorf("unexpected request: %s %s", req.Method, req.URL)
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header),
+			Body: io.NopCloser(strings.NewReader(body)), Request: req}, nil
+	})
+
+	home := t.TempDir()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(err)
+	keyDER, err := x509.MarshalPKCS8PrivateKey(key)
+	require.NoError(err)
+	keyJSON, err := json.Marshal(map[string]string{
+		"type": "service_account", "client_email": "service@example.test",
+		"private_key": string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})),
+		"token_uri":   "https://token.example.com/oauth2",
+	})
+	require.NoError(err)
+	keyPath := filepath.Join(home, "service-account.json")
+	require.NoError(os.WriteFile(keyPath, keyJSON, 0600))
+	cfg := &config.Config{HomeDir: home, Data: config.DataConfig{DataDir: home},
+		OAuth: config.OAuthConfig{ServiceAccountKey: keyPath}}
+	ctx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	st := testutil.NewSQLiteTestStoreAt(t, cfg.DatabaseDSN())
+
+	canonicalEmail := "reader@example.test"
+	source, err := st.GetOrCreateSource(sourceTypeGmail, canonicalEmail)
+	require.NoError(err)
+	selector := "primary-mailbox"
+	_, err = st.UpdateSourceSettingsContext(ctx, source.ID, store.SourceSettingsUpdate{Alias: &selector})
+	require.NoError(err)
+	require.NoError(st.UpdateSourceSyncCursor(source.ID, "100"))
+
+	originalRebuild := rebuildCacheAfterScheduledSourceRun
+	var rebuiltSelectors []string
+	rebuildCacheAfterScheduledSourceRun = func(_ context.Context, identifier string) error {
+		rebuiltSelectors = append(rebuiltSelectors, identifier)
+		return nil
+	}
+	t.Cleanup(func() { rebuildCacheAfterScheduledSourceRun = originalRebuild })
+
+	assert.Equal(canonicalEmail, scheduledGmailAccountIdentifier(selector, source))
+	assert.Equal(selector, scheduledGmailAccountIdentifier(selector, nil),
+		"missing sources retain the token-first selector")
+	require.NoError(runScheduledSync(ctx, selector, st, nil, invocationFromContext(ctx)))
+	assert.Equal([]string{selector}, rebuiltSelectors, "cache rebuild logging keeps the supplied selector")
+	resolved, err := st.GetSourceByTypeAndIdentifier(t.Context(), sourceTypeGmail, canonicalEmail)
+	require.NoError(err)
+	assert.Equal(source.ID, resolved.ID)
+	_, err = st.GetSourceByTypeAndIdentifier(t.Context(), sourceTypeGmail, selector)
+	assert.ErrorIs(err, store.ErrSourceNotFound, "scheduled sync must not create a source under the alias")
+}
+
 func TestAddIMAPDefaultIdentityScheduledSync(t *testing.T) {
 	assert, require := assert.New(t), require.New(t)
 	savedHost, savedPort, savedUsername := imapHost, imapPort, imapUsername
@@ -214,7 +280,7 @@ func TestAddMicrosoftDefaultIdentityOptOut(t *testing.T) {
 					err := runScheduledMSMailSync(ctx, sources[0], st, invocationFromContext(ctx))
 					require.ErrorContains(err, "no valid token")
 				} else {
-					confirmDefaultIdentity(io.Discard, st, sources[0].ID, email, email, "account-identifier", testDiscardLogger())
+					confirmDefaultIdentity(t.Context(), io.Discard, st, sources[0].ID, email, email, "account-identifier", testDiscardLogger())
 				}
 				ids, err := st.ListAccountIdentities(sources[0].ID)
 				require.NoError(err)

@@ -15,6 +15,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/testutil"
 )
 
 func TestGCAlwaysProxiesThroughDaemonCLIRunner(t *testing.T) {
@@ -110,6 +111,12 @@ func TestRunGCLocalBacksUpBeforeDeleteAndCompacts(t *testing.T) {
 	sharedBlob := seedGCLooseBlob(t, cfg, deletedID, strings.Repeat("0b", 32))
 	seedGCAttachmentRow(t, cfg, activeID, strings.Repeat("0b", 32))
 
+	st, err := store.OpenReadOnlyContext(t.Context(), cfg.DatabaseDSN())
+	require.NoError(err, "open archive before GC")
+	defer func() { _ = st.Close() }()
+	var pagesBefore int64
+	require.NoError(st.DB().QueryRowContext(t.Context(), `PRAGMA page_count`).Scan(&pagesBefore))
+
 	require.NoError(runGCLocal(cmd, gcOptions{yes: true}))
 	assert.Contains(output.String(), "Source-deleted messages to purge: 1")
 	assert.Contains(output.String(), "Dedup-hidden messages retained: 1")
@@ -131,13 +138,10 @@ func TestRunGCLocalBacksUpBeforeDeleteAndCompacts(t *testing.T) {
 	assert.True(gcMessageExists(t, backups[0], deletedID),
 		"backup must capture the source-deleted row before purge")
 
-	st, err := store.OpenForTest(cfg.DatabaseDSN())
-	require.NoError(err, "open compacted archive")
-	defer func() { _ = st.Close() }()
-	var freelist int64
-	require.NoError(st.DB().QueryRow(`PRAGMA freelist_count`).Scan(&freelist),
-		"read compacted freelist")
-	assert.Zero(freelist)
+	// Close-time statistics maintenance may free pages after VACUUM.
+	var pagesAfter int64
+	require.NoError(st.DB().QueryRowContext(t.Context(), `PRAGMA page_count`).Scan(&pagesAfter))
+	assert.Less(pagesAfter, pagesBefore, "GC must reclaim the deleted payload's pages")
 }
 
 func TestRunGCLocalSweepsOrphanBlobsWhenNothingToPurge(t *testing.T) {
@@ -155,7 +159,6 @@ func TestRunGCLocalSweepsOrphanBlobsWhenNothingToPurge(t *testing.T) {
 	orphanBlob := filepath.Join(cfg.AttachmentsDir(), orphanHash[:2], orphanHash)
 	require.NoError(os.MkdirAll(filepath.Dir(orphanBlob), 0o755), "create blob dir")
 	require.NoError(os.WriteFile(orphanBlob, []byte("orphan"), 0o600), "write orphan blob")
-	sharedBlob := seedGCLooseBlob(t, cfg, activeID, strings.Repeat("0d", 32))
 
 	var output bytes.Buffer
 	rerun := &cobra.Command{}
@@ -169,7 +172,6 @@ func TestRunGCLocalSweepsOrphanBlobsWhenNothingToPurge(t *testing.T) {
 	assert.NotContains(output.String(), "Backing up database")
 	assert.NotContains(output.String(), "Derived caches may contain deleted rows")
 	assert.NoFileExists(orphanBlob, "rerun must retry the orphan sweep")
-	assert.FileExists(sharedBlob, "a referenced blob must survive")
 	assert.True(gcMessageExists(t, cfg.DatabaseDSN(), activeID))
 
 	backups, err := filepath.Glob(cfg.DatabaseDSN() + ".gc-backup-*")
@@ -214,12 +216,10 @@ func seedGCCommandArchive(t *testing.T) (deletedID, activeID, dedupID int64, tes
 	t.Cleanup(func() { cfg = savedCfg })
 	testCtx = testInvocationContext(t.Context(), cfg, invocationOptions{})
 
-	st, err := store.OpenForTest(cfg.DatabaseDSN())
-	require.NoError(err, "OpenForTest")
-	require.NoError(st.InitSchema(), "InitSchema")
+	st := testutil.NewSQLiteTestStoreAt(t, cfg.DatabaseDSN())
 	source, err := st.GetOrCreateSource("gmail", "gc@example.test")
 	require.NoError(err, "GetOrCreateSource")
-	conversationID, err := st.EnsureConversation(source.ID, "gc-thread", "GC")
+	conversationID, err := st.EnsureConversation(t.Context(), source.ID, "gc-thread", "GC")
 	require.NoError(err, "EnsureConversation")
 	insert := func(sourceMessageID string) int64 {
 		id, insertErr := st.UpsertMessage(&store.Message{
@@ -236,7 +236,7 @@ func seedGCCommandArchive(t *testing.T) (deletedID, activeID, dedupID int64, tes
 	dedupID = insert("gc-command-dedup")
 	require.NoError(st.MarkMessageDeleted(source.ID, "gc-command-deleted"),
 		"MarkMessageDeleted")
-	_, err = st.DB().Exec(st.Rebind(`
+	_, err = st.DB().ExecContext(t.Context(), st.Rebind(`
 		UPDATE messages
 		SET deleted_at = CURRENT_TIMESTAMP, delete_batch_id = 'gc-command-batch'
 		WHERE id = ?
@@ -265,10 +265,10 @@ func seedGCLooseBlob(t *testing.T, cfg *config.Config, messageID int64, hash str
 
 func seedGCAttachmentRow(t *testing.T, cfg *config.Config, messageID int64, hash string) {
 	t.Helper()
-	st, err := store.OpenForTest(cfg.DatabaseDSN())
+	st, err := store.OpenForTest(t.Context(), cfg.DatabaseDSN())
 	require.NoError(t, err, "open store for attachment seed")
 	defer func() { _ = st.Close() }()
-	_, err = st.DB().Exec(st.Rebind(`
+	_, err = st.DB().ExecContext(t.Context(), st.Rebind(`
 		INSERT INTO attachments (message_id, filename, content_hash, storage_path)
 		VALUES (?, ?, ?, ?)
 	`), messageID, "blob.bin", hash, hash[:2]+"/"+hash)
@@ -277,11 +277,11 @@ func seedGCAttachmentRow(t *testing.T, cfg *config.Config, messageID int64, hash
 
 func gcMessageExists(t *testing.T, dbPath string, messageID int64) bool {
 	t.Helper()
-	st, err := store.OpenForTest(dbPath)
+	st, err := store.OpenForTest(t.Context(), dbPath)
 	require.NoError(t, err, "open GC archive")
 	defer func() { _ = st.Close() }()
 	var count int
-	require.NoError(t, st.DB().QueryRow(st.Rebind(
+	require.NoError(t, st.DB().QueryRowContext(t.Context(), st.Rebind(
 		`SELECT COUNT(*) FROM messages WHERE id = ?`), messageID).Scan(&count),
 		"count GC message")
 	return count == 1

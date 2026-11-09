@@ -13,7 +13,7 @@ import (
 	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/daemonclient"
 	"go.kenn.io/msgvault/internal/oauth"
-	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/testutil"
 	"google.golang.org/api/drive/v3"
 )
 
@@ -133,8 +133,6 @@ func seedTokenEnv(t *testing.T, tokenJSON string) (tokenPath string, restore fun
 // scheduled (e.g. Gmail) sync. The flow must leave the old token intact when
 // re-auth does not succeed.
 func TestPromptScopeEscalation_PreservesTokenOnFailedReauth(t *testing.T) {
-	cfg := testConfigValue()
-
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -156,13 +154,15 @@ func TestPromptScopeEscalation_PreservesTokenOnFailedReauth(t *testing.T) {
 
 	// A cancelled context makes the browser flow fail immediately (no network,
 	// no hang) — standing in for "re-auth cannot complete on a headless host".
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 
+	mgr, err := oauth.NewManagerWithCredentials(t.Context(), config.OAuthApp{ClientSecrets: filepath.Join(filepath.Dir(filepath.Dir(tokenPath)), "client_secret.json")}, filepath.Dir(tokenPath), config.OAuthTokenCommands{}, nil, oauth.Scopes)
+	require.NoError(err)
 	getOutput := captureStdout(t)
 	escErr := promptScopeEscalation(ctx, scopeEscalationAccount, oauth.ScopesGmailCalendar,
 		"PERMISSION UPGRADE REQUIRED", []string{"upgrade needed"},
-		"Cancelled.", cfg.OAuth.ClientSecrets)
+		"Cancelled.", mgr)
 	out := getOutput()
 
 	require.Error(escErr, "a re-auth that cannot complete must surface as an error")
@@ -185,7 +185,7 @@ func TestDeletionEscalationScopesForAccountPreservesCalendarGrant(t *testing.T) 
 	cfg.OAuth.ClientSecrets = filepath.Join(cfg.HomeDir, "client_secret.json")
 	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
 
-	scopes, err := deletionEscalationScopesForAccount(scopeEscalationAccount, true, cfg.OAuth.ClientSecrets, invocationFromContext(testCtx))
+	scopes, err := deletionEscalationScopesForAccountWithState(testCtx, scopeEscalationAccount, true, config.OAuthApp{ClientSecrets: cfg.OAuth.ClientSecrets})
 
 	require.NoError(err)
 	assert.ElementsMatch([]string{
@@ -208,7 +208,7 @@ func TestCalendarEscalationScopesForAccountPreservesDriveGrant(t *testing.T) {
 	cfg.OAuth.ClientSecrets = filepath.Join(cfg.HomeDir, "client_secret.json")
 	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
 
-	scopes, err := calendarEscalationScopesForAccount(scopeEscalationAccount, cfg.OAuth.ClientSecrets, invocationFromContext(testCtx))
+	scopes, err := calendarEscalationScopesForAccount(t.Context(), scopeEscalationAccount, config.OAuthApp{ClientSecrets: cfg.OAuth.ClientSecrets}, invocationFromContext(testCtx))
 
 	require.NoError(err)
 	assert.ElementsMatch([]string{
@@ -231,7 +231,7 @@ func TestCalendarEscalationScopesForAccountDoesNotAddGmailToDriveOnlyToken(t *te
 	cfg.OAuth.ClientSecrets = filepath.Join(cfg.HomeDir, "client_secret.json")
 	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
 
-	scopes, err := calendarEscalationScopesForAccount(scopeEscalationAccount, cfg.OAuth.ClientSecrets, invocationFromContext(testCtx))
+	scopes, err := calendarEscalationScopesForAccount(t.Context(), scopeEscalationAccount, config.OAuthApp{ClientSecrets: cfg.OAuth.ClientSecrets}, invocationFromContext(testCtx))
 
 	require.NoError(err)
 	assert.ElementsMatch([]string{
@@ -252,7 +252,7 @@ func TestCalendarEscalationScopesForAccountPreservesLegacyTokenAsGmail(t *testin
 	cfg.OAuth.ClientSecrets = filepath.Join(cfg.HomeDir, "client_secret.json")
 	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
 
-	scopes, err := calendarEscalationScopesForAccount(scopeEscalationAccount, cfg.OAuth.ClientSecrets, invocationFromContext(testCtx))
+	scopes, err := calendarEscalationScopesForAccount(t.Context(), scopeEscalationAccount, config.OAuthApp{ClientSecrets: cfg.OAuth.ClientSecrets}, invocationFromContext(testCtx))
 
 	require.NoError(err)
 	assert.ElementsMatch([]string{
@@ -304,7 +304,7 @@ func TestDeletionEscalationScopesForAccountPreservesDriveGrant(t *testing.T) {
 	cfg.OAuth.ClientSecrets = filepath.Join(cfg.HomeDir, "client_secret.json")
 	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
 
-	scopes, err := deletionEscalationScopesForAccount(scopeEscalationAccount, true, cfg.OAuth.ClientSecrets, invocationFromContext(testCtx))
+	scopes, err := deletionEscalationScopesForAccountWithState(testCtx, scopeEscalationAccount, true, config.OAuthApp{ClientSecrets: cfg.OAuth.ClientSecrets})
 
 	require.NoError(err)
 	assert.ElementsMatch([]string{
@@ -328,7 +328,7 @@ func TestDeletionEscalationScopesForAccountPreservesGmailScopesWithoutCalendar(t
 	cfg.OAuth.ClientSecrets = filepath.Join(cfg.HomeDir, "client_secret.json")
 	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
 
-	scopes, err := deletionEscalationScopesForAccount(scopeEscalationAccount, true, cfg.OAuth.ClientSecrets, invocationFromContext(testCtx))
+	scopes, err := deletionEscalationScopesForAccountWithState(testCtx, scopeEscalationAccount, true, config.OAuthApp{ClientSecrets: cfg.OAuth.ClientSecrets})
 
 	require.NoError(err)
 	assert.ElementsMatch([]string{
@@ -389,10 +389,7 @@ func TestPlanCLIAddCalendarRequiresScopeEscalationForGmailOnlyToken(t *testing.T
 	cfg.OAuth.ClientSecrets = filepath.Join(cfg.HomeDir, "client_secret.json")
 	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
 
-	st, err := store.Open(cfg.DatabaseDSN())
-	require.NoError(err, "open store")
-	defer func() { _ = st.Close() }()
-	require.NoError(st.InitSchema(), "init schema")
+	st := testutil.NewSQLiteTestStoreAt(t, cfg.DatabaseDSN())
 
 	plan, err := planCLIAddCalendar(testCtx, st, api.CLIAddCalendarPlanRequest{
 		Email: scopeEscalationAccount,
@@ -423,10 +420,7 @@ func TestPlanCLIAddCalendarRequiresScopeEscalationForNonReusableGmailOnlyToken(t
 		"acme": {ClientSecrets: cfg.OAuth.ClientSecrets},
 	}
 
-	st, err := store.Open(cfg.DatabaseDSN())
-	require.NoError(err, "open store")
-	defer func() { _ = st.Close() }()
-	require.NoError(st.InitSchema(), "init schema")
+	st := testutil.NewSQLiteTestStoreAt(t, cfg.DatabaseDSN())
 
 	plan, err := planCLIAddCalendar(testCtx, st, api.CLIAddCalendarPlanRequest{
 		Email:            scopeEscalationAccount,

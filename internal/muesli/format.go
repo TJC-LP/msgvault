@@ -4,10 +4,12 @@ import (
 	"encoding/json/v2"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
 	"go.kenn.io/msgvault/internal/meetingarchive"
+	"go.kenn.io/msgvault/internal/meetingidentity"
 )
 
 const rawSchemaVersion = 1
@@ -106,8 +108,9 @@ type rawParticipant struct {
 	Phone  string `json:"phone,omitempty"`
 	Source string `json:"source,omitempty"`
 	// Emails and Phones are the participant's Contacts identities.
-	Emails []string `json:"emails,omitempty"`
-	Phones []string `json:"phones,omitempty"`
+	Emails              []string `json:"emails,omitempty"`
+	Phones              []string `json:"phones,omitempty"`
+	ContactReviewPhones []string `json:"contact_review_phones,omitempty"`
 }
 
 type rawMeeting struct {
@@ -159,6 +162,7 @@ type meetingMetadata struct {
 	Folder               string  `json:"folder,omitempty"`
 	CalendarEventID      string  `json:"calendar_event_id,omitempty"`
 	CalendarSource       string  `json:"calendar_source,omitempty"`
+	CalendarSeriesID     string  `json:"calendar_series_id,omitempty"` // Source-local; not an iCal UID.
 	FollowUpToID         int64   `json:"follow_up_to_id,omitzero"`
 	NameOnlyParticipants int     `json:"name_only_participants,omitzero"`
 	Contacts             string  `json:"contacts,omitempty"`
@@ -264,23 +268,23 @@ func (m Meeting) ArchiveSnapshot(sourceID int64, identifier, accountEmail string
 		HasSummary: summary != "", HasNotes: notes != "", HasTranscript: transcript != "",
 		TemplateName: m.TemplateName, Folder: m.Folder,
 		CalendarEventID: m.CalendarEventID, CalendarSource: m.CalendarSource,
-		FollowUpToID: m.FollowUpToID, NameOnlyParticipants: nameOnly,
-		Contacts: contactsState, ContactsResolved: resolved,
-		ContactsCarried: carried, ContactsUnresolved: unresolved,
-		ContactsPhoneSkipped: skippedPhones,
+		CalendarSeriesID: m.CalendarSeriesID, FollowUpToID: m.FollowUpToID,
+		NameOnlyParticipants: nameOnly, Contacts: contactsState,
+		ContactsResolved: resolved, ContactsCarried: carried,
+		ContactsUnresolved: unresolved, ContactsPhoneSkipped: skippedPhones,
 	}, json.Deterministic(true))
 	if err != nil {
 		return meetingarchive.Snapshot{}, fmt.Errorf("marshal Muesli meeting metadata: %w", err)
 	}
 
 	var organizer *meetingarchive.Person
-	if email := strings.ToLower(strings.TrimSpace(accountEmail)); email != "" {
+	if email := meetingidentity.Normalize(accountEmail); email != "" {
 		organizer = &meetingarchive.Person{Email: email}
 	}
 	return meetingarchive.Snapshot{
 		SourceID: sourceID, AccountEmail: accountEmail,
 		SourceMessageID: key, SourceConversationID: key,
-		Title: title, StartedAt: started, Body: body, Snippet: snippet(body),
+		Title: title, StartedAt: started, Body: body, Snippet: meetingarchive.Snippet(body),
 		Metadata: metadata, Raw: raw, RawFormat: RawFormat,
 		Organizer: organizer, Attendees: attendees,
 	}, nil
@@ -300,13 +304,14 @@ func (m Meeting) endedAt(started time.Time) time.Time {
 
 // dedupeParticipants drops repeated emails (Muesli can list the same person
 // from the calendar and from Contacts) and fully blank rows. The first row
-// keeps its place; a later duplicate only supplies a name the first lacks.
+// keeps its place; resolved Contacts evidence takes precedence over carried
+// evidence from an earlier sync.
 func dedupeParticipants(participants []Participant) []Participant {
 	out := make([]Participant, 0, len(participants))
 	index := map[string]int{}
 	for _, person := range participants {
 		person.Name = strings.TrimSpace(person.Name)
-		person.Email = strings.ToLower(strings.TrimSpace(person.Email))
+		person.Email = meetingidentity.Normalize(person.Email)
 		if person.Name == "" && person.Email == "" && len(person.ContactEmails) == 0 && len(person.ContactPhones) == 0 {
 			continue
 		}
@@ -315,10 +320,18 @@ func dedupeParticipants(participants []Participant) []Participant {
 				if out[at].Name == "" {
 					out[at].Name = person.Name
 				}
-				if out[at].Resolution == "" && person.Resolution != "" {
+				if (person.Resolution == resolutionResolved && out[at].Resolution != resolutionResolved) ||
+					(out[at].Resolution == "" && person.Resolution != "") {
 					out[at].ContactEmails, out[at].ContactPhones = person.ContactEmails, person.ContactPhones
 					out[at].Anchor, out[at].Resolution = person.Anchor, person.Resolution
 					out[at].LinkExcludedAddresses = person.LinkExcludedAddresses
+				}
+				if out[at].Resolution == resolutionResolved || person.Resolution == resolutionResolved {
+					out[at].ContactReviewPhones = nil
+				} else {
+					out[at].ContactReviewPhones = append(slices.Clone(out[at].ContactReviewPhones), person.ContactReviewPhones...)
+					slices.Sort(out[at].ContactReviewPhones)
+					out[at].ContactReviewPhones = slices.Compact(out[at].ContactReviewPhones)
 				}
 				continue
 			}
@@ -354,12 +367,4 @@ func formatOptionalTime(value time.Time) string {
 		return ""
 	}
 	return value.UTC().Format(time.RFC3339Nano)
-}
-
-func snippet(body string) string {
-	runes := []rune(strings.TrimSpace(body))
-	if len(runes) > 200 {
-		runes = runes[:200]
-	}
-	return string(runes)
 }

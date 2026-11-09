@@ -10,10 +10,10 @@ import (
 	"sync"
 	"testing"
 	"time"
-	"unicode/utf8"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/msgvault/internal/meetingarchive"
 	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/testutil"
 )
@@ -138,7 +138,7 @@ func TestImport_RoundTrip(t *testing.T) {
 	}}
 	imp, st := newTestImporter(t, api)
 
-	sum, err := imp.Import(context.Background(), ImportOptions{
+	sum, err := imp.Import(t.Context(), ImportOptions{
 		Identifier:   "alice@example.com",
 		AccountEmail: "alice@example.com",
 	})
@@ -248,7 +248,7 @@ func TestImport_TranscriptTimestampFallbacksRemainSearchable(t *testing.T) {
 			Owner:     User{Name: "Test User", Email: "user@example.com"},
 			CreatedAt: createdAt, UpdatedAt: createdAt,
 			Transcript: []TranscriptSegment{
-				{Speaker: Speaker{Name: "Untimed"}, Text: "No timestamp"},
+				{Speaker: Speaker{Source: "microphone"}, Text: "No timestamp"},
 				{Speaker: Speaker{Name: "Timed"}, Text: "First timestamp", StartTime: firstTranscriptAt},
 				{Speaker: Speaker{Name: "Later"}, Text: "Thirty seconds later", StartTime: firstTranscriptAt.Add(30 * time.Second), EndTime: firstTranscriptAt.Add(45 * time.Second)},
 			},
@@ -270,7 +270,7 @@ func TestImport_TranscriptTimestampFallbacksRemainSearchable(t *testing.T) {
 	}
 	imp, st := newTestImporter(t, api)
 
-	_, err := imp.Import(context.Background(), ImportOptions{
+	_, err := imp.Import(t.Context(), ImportOptions{
 		Identifier: "work", AccountEmail: "user@example.com",
 	})
 	require.NoError(err)
@@ -285,7 +285,7 @@ func TestImport_TranscriptTimestampFallbacksRemainSearchable(t *testing.T) {
 		&sparseSentAt, &sparseBody, &sparseMetadata,
 	))
 	assert.Equal(firstTranscriptAt, sparseSentAt.UTC())
-	assert.Contains(sparseBody, "[00:00] Untimed: No timestamp")
+	assert.Contains(sparseBody, "[00:00] Me: No timestamp")
 	assert.Contains(sparseBody, "[00:00] Timed: First timestamp")
 	assert.Contains(sparseBody, "[00:30] Later: Thirty seconds later")
 	var sparseMeta meetingMetadata
@@ -340,7 +340,7 @@ func TestImport_RejectsFetchedNoteWithInvalidID(t *testing.T) {
 			}
 			imp, st := newTestImporter(t, api)
 
-			sum, err := imp.Import(context.Background(), ImportOptions{
+			sum, err := imp.Import(t.Context(), ImportOptions{
 				Identifier: "work", AccountEmail: "user@example.com",
 			})
 
@@ -385,7 +385,7 @@ func TestImport_AccountIdentityControlsFromMe(t *testing.T) {
 	require.NoError(err)
 	require.NoError(st.AddAccountIdentity(source.ID, " User-B@Example.COM ", "manual"))
 
-	sum, err := imp.Import(context.Background(), ImportOptions{
+	sum, err := imp.Import(t.Context(), ImportOptions{
 		Identifier:   "work",
 		AccountEmail: " user-a@example.com ",
 	})
@@ -431,7 +431,7 @@ func TestImport_NormalizesSentAtToUTC(t *testing.T) {
 	api := &fakeAPI{notes: map[string][]byte{"not_Ab12Cd34Ef56Gh": []byte(raw)}}
 	imp, st := newTestImporter(t, api)
 
-	_, err := imp.Import(context.Background(), ImportOptions{Identifier: "alice@example.com"})
+	_, err := imp.Import(t.Context(), ImportOptions{Identifier: "alice@example.com"})
 	require.NoError(err)
 	// Instant equality proves the -05:00 source offset was normalized: the
 	// stored value IS 20:00 UTC. Comparing rendered text instead would tie
@@ -442,6 +442,31 @@ func TestImport_NormalizesSentAtToUTC(t *testing.T) {
 	assert.Equal(time.Date(2026, 6, 1, 20, 0, 0, 0, time.UTC), sentAt.UTC())
 }
 
+func TestImport_RefetchedUnchangedNoteIsNotAnUpdate(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	olderID, newerID := "not_OlderUnchanged", "not_NewerCursor"
+	// The fake ignores updated_after, so the older note is refetched unchanged.
+	api := &fakeAPI{notes: map[string][]byte{
+		olderID: noteFixtureAt(t, olderID, time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)),
+		newerID: noteFixtureAt(t, newerID, time.Date(2026, 6, 2, 0, 0, 0, 0, time.UTC)),
+	}}
+	imp, st := newTestImporter(t, api)
+
+	first, err := imp.Import(t.Context(), ImportOptions{Identifier: "alice@example.com"})
+	require.NoError(err)
+	require.EqualValues(2, first.NotesAdded)
+
+	second, err := imp.Import(t.Context(), ImportOptions{Identifier: "alice@example.com"})
+	require.NoError(err)
+	require.EqualValues(1, second.NotesProcessed, "the older note is refetched")
+	assert.Zero(second.NotesAdded)
+	assert.Zero(second.NotesUpdated, "an unchanged note must not count as a cache-invalidating update")
+	latest, err := st.GetLatestSync(second.SourceID)
+	require.NoError(err)
+	assert.Zero(latest.MessagesUpdated)
+}
+
 func TestImport_IdempotentAndRefresh(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
@@ -450,18 +475,37 @@ func TestImport_IdempotentAndRefresh(t *testing.T) {
 	}}
 	imp, st := newTestImporter(t, api)
 
-	_, err := imp.Import(context.Background(), ImportOptions{Identifier: "alice@example.com"})
+	_, err := imp.Import(t.Context(), ImportOptions{Identifier: "alice@example.com"})
 	require.NoError(err)
 
 	// Second run: the boundary overlap sees the same note but recognizes that
 	// its ID was already covered at that exact updated_at timestamp.
-	sum2, err := imp.Import(context.Background(), ImportOptions{Identifier: "alice@example.com"})
+	sum2, err := imp.Import(t.Context(), ImportOptions{Identifier: "alice@example.com"})
 	require.NoError(err)
 	assert.EqualValues(0, sum2.NotesAdded, "re-import must not add rows")
 	assert.EqualValues(0, sum2.NotesUpdated, "unchanged cursor-boundary notes are no-ops")
 	var count int
 	require.NoError(st.DB().QueryRow(`SELECT COUNT(*) FROM messages`).Scan(&count))
 	assert.Equal(1, count)
+
+	// An incremental sync leaves a stale derived preview alone when the
+	// evidence is unchanged; --full must rewrite it.
+	const noteID = "not_Ab12Cd34Ef56Gh"
+	const snippetQuery = `SELECT snippet FROM messages WHERE source_message_id = ?`
+	var snippet string
+	require.NoError(st.DB().QueryRow(st.Rebind(snippetQuery), noteID).Scan(&snippet))
+	_, err = st.DB().Exec(st.Rebind(
+		`UPDATE messages SET snippet = ? WHERE source_message_id = ?`), "stale", noteID)
+	require.NoError(err)
+	forced, err := imp.Import(
+		t.Context(),
+		ImportOptions{Identifier: "alice@example.com", Full: true})
+	require.NoError(err)
+	assert.EqualValues(0, forced.NotesAdded)
+	assert.EqualValues(1, forced.NotesUpdated)
+	var repaired string
+	require.NoError(st.DB().QueryRow(st.Rebind(snippetQuery), noteID).Scan(&repaired))
+	assert.Equal(snippet, repaired)
 
 	// Server-side edit with a newer updated_at: row refreshes in place.
 	edited := strings.ReplaceAll(string(api.notes["not_Ab12Cd34Ef56Gh"]),
@@ -476,7 +520,7 @@ func TestImport_IdempotentAndRefresh(t *testing.T) {
 	api.notes["not_Ab12Cd34Ef56Gh"] = editedBytes
 	api.mu.Unlock()
 
-	sum3, err := imp.Import(context.Background(), ImportOptions{Identifier: "alice@example.com"})
+	sum3, err := imp.Import(t.Context(), ImportOptions{Identifier: "alice@example.com"})
 	require.NoError(err)
 	assert.EqualValues(0, sum3.NotesAdded)
 	assert.EqualValues(1, sum3.NotesUpdated)
@@ -526,9 +570,9 @@ func TestIngestNote_RawFailureRollsBackCanonicalWrite(t *testing.T) {
 	require.NoError(json.Unmarshal(raw, &note))
 	note.Raw = append(json.RawMessage(nil), raw...)
 
-	added, err := imp.ingestNote(source.ID, "alice@example.com", nil, &note)
+	result, err := imp.ingestNote(t.Context(), meetingarchive.New(st), source.ID, ImportOptions{Identifier: "alice@example.com"}, &note)
 	require.Error(err)
-	assert.False(added)
+	assert.False(result.Created)
 	assert.Contains(err.Error(), "upsert raw")
 
 	for table, want := range map[string]int{
@@ -538,6 +582,7 @@ func TestIngestNote_RawFailureRollsBackCanonicalWrite(t *testing.T) {
 		"message_raw":        0,
 		"message_recipients": 0,
 		"messages_fts":       0,
+		"participants":       0,
 	} {
 		var got int
 		require.NoError(st.DB().QueryRow("SELECT COUNT(*) FROM "+table).Scan(&got), table)
@@ -557,7 +602,18 @@ func TestImport_FatalRunPersistsSuccessfulRefreshCounters(t *testing.T) {
 	}
 	imp, st := newTestImporter(t, api)
 
-	sum, err := imp.Import(context.Background(), ImportOptions{Identifier: "alice@example.com"})
+	// Edit the note after its first ingest so the repeated page refreshes it.
+	edited := false
+	sum, err := imp.Import(t.Context(), ImportOptions{Identifier: "alice@example.com", Progress: func(line string) {
+		if edited || !strings.HasPrefix(line, "imported ") {
+			return
+		}
+		edited = true
+		api.mu.Lock()
+		api.notes["not_Ab12Cd34Ef56Gh"] = []byte(strings.ReplaceAll(string(api.notes["not_Ab12Cd34Ef56Gh"]),
+			"Quarterly Planning Review", "Quarterly Planning Review v2"))
+		api.mu.Unlock()
+	}})
 	require.Error(err)
 	assert.EqualValues(2, sum.NotesProcessed)
 	assert.EqualValues(1, sum.NotesAdded)
@@ -587,7 +643,7 @@ func TestImport_CursorAdvancesOnlyOnCleanRuns(t *testing.T) {
 	imp, st := newTestImporter(t, api)
 
 	// Clean run: watermark = max updated_at across both notes.
-	sum, err := imp.Import(context.Background(), ImportOptions{Identifier: "alice@example.com"})
+	sum, err := imp.Import(t.Context(), ImportOptions{Identifier: "alice@example.com"})
 	require.NoError(err)
 	require.EqualValues(0, sum.Errors)
 
@@ -618,7 +674,7 @@ func TestImport_CursorAdvancesOnlyOnCleanRuns(t *testing.T) {
 	api.fail[failingID] = true
 	api.mu.Unlock()
 
-	sum2, err := imp.Import(context.Background(), ImportOptions{Identifier: "alice@example.com"})
+	sum2, err := imp.Import(t.Context(), ImportOptions{Identifier: "alice@example.com"})
 	require.Error(err)
 	assert.Contains(err.Error(), "partial")
 	assert.EqualValues(1, sum2.Errors)
@@ -638,7 +694,7 @@ func TestImport_CursorAdvancesOnlyOnCleanRuns(t *testing.T) {
 	api.mu.Lock()
 	api.fail[failingID] = false
 	api.mu.Unlock()
-	sum3, err := imp.Import(context.Background(), ImportOptions{Identifier: "alice@example.com"})
+	sum3, err := imp.Import(t.Context(), ImportOptions{Identifier: "alice@example.com"})
 	require.NoError(err)
 	require.EqualValues(0, sum3.Errors)
 	assert.Equal("2026-06-05T12:00:00Z", cursorOf())
@@ -659,7 +715,7 @@ func TestImport_IncrementalDiscoversLateNoteAtCursorTimestamp(t *testing.T) {
 	}
 	imp, st := newTestImporter(t, api)
 
-	first, err := imp.Import(context.Background(), ImportOptions{
+	first, err := imp.Import(t.Context(), ImportOptions{
 		Identifier:   "alice@example.com",
 		AccountEmail: "alice@example.com",
 	})
@@ -671,7 +727,7 @@ func TestImport_IncrementalDiscoversLateNoteAtCursorTimestamp(t *testing.T) {
 	api.orderedIDs = []string{firstID, lateID}
 	api.mu.Unlock()
 
-	second, err := imp.Import(context.Background(), ImportOptions{
+	second, err := imp.Import(t.Context(), ImportOptions{
 		Identifier:   "alice@example.com",
 		AccountEmail: "alice@example.com",
 	})
@@ -681,7 +737,7 @@ func TestImport_IncrementalDiscoversLateNoteAtCursorTimestamp(t *testing.T) {
 	assert.Zero(second.NotesUpdated,
 		"the already-covered boundary note must not become a false update")
 
-	third, err := imp.Import(context.Background(), ImportOptions{
+	third, err := imp.Import(t.Context(), ImportOptions{
 		Identifier:   "alice@example.com",
 		AccountEmail: "alice@example.com",
 	})
@@ -710,14 +766,14 @@ func TestImport_CoveredCursorBoundaryDoesNotConsumeLimit(t *testing.T) {
 	}
 	imp, _ := newTestImporter(t, api)
 
-	_, err := imp.Import(context.Background(), ImportOptions{Identifier: "alice@example.com"})
+	_, err := imp.Import(t.Context(), ImportOptions{Identifier: "alice@example.com"})
 	require.NoError(err)
 	api.mu.Lock()
 	api.notes[lateID] = noteFixtureAt(t, lateID, updatedAt)
 	api.orderedIDs = []string{firstID, lateID}
 	api.mu.Unlock()
 
-	sum, err := imp.Import(context.Background(), ImportOptions{
+	sum, err := imp.Import(t.Context(), ImportOptions{
 		Identifier: "alice@example.com",
 		Limit:      1,
 	})
@@ -743,7 +799,7 @@ func TestImport_LimitedRunsRememberNewCursorBoundaryIDs(t *testing.T) {
 	}
 	imp, st := newTestImporter(t, api)
 
-	_, err := imp.Import(context.Background(), ImportOptions{Identifier: "alice@example.com"})
+	_, err := imp.Import(t.Context(), ImportOptions{Identifier: "alice@example.com"})
 	require.NoError(err)
 	api.mu.Lock()
 	api.notes[lateFirstID] = noteFixtureAt(t, lateFirstID, updatedAt)
@@ -751,7 +807,7 @@ func TestImport_LimitedRunsRememberNewCursorBoundaryIDs(t *testing.T) {
 	api.orderedIDs = []string{firstID, lateFirstID, lateSecondID}
 	api.mu.Unlock()
 
-	firstLimited, err := imp.Import(context.Background(), ImportOptions{
+	firstLimited, err := imp.Import(t.Context(), ImportOptions{
 		Identifier: "alice@example.com",
 		Limit:      1,
 	})
@@ -759,7 +815,7 @@ func TestImport_LimitedRunsRememberNewCursorBoundaryIDs(t *testing.T) {
 	assert.EqualValues(1, firstLimited.NotesAdded)
 	assert.Zero(firstLimited.NotesUpdated)
 
-	secondLimited, err := imp.Import(context.Background(), ImportOptions{
+	secondLimited, err := imp.Import(t.Context(), ImportOptions{
 		Identifier: "alice@example.com",
 		Limit:      1,
 	})
@@ -795,7 +851,7 @@ func TestImport_LimitDoesNotAdvanceCursor(t *testing.T) {
 	}
 	imp, st := newTestImporter(t, api)
 
-	sum, err := imp.Import(context.Background(), ImportOptions{Identifier: "alice@example.com", Limit: 1})
+	sum, err := imp.Import(t.Context(), ImportOptions{Identifier: "alice@example.com", Limit: 1})
 	require.NoError(err)
 	require.EqualValues(1, sum.NotesProcessed)
 
@@ -808,7 +864,7 @@ func TestImport_LimitDoesNotAdvanceCursor(t *testing.T) {
 	require.NoError(json.Unmarshal([]byte(cursorJSON), &cursor))
 	assert.Empty(cursor.UpdatedAfter, "limited run must preserve the prior cursor")
 
-	_, err = imp.Import(context.Background(), ImportOptions{Identifier: "alice@example.com"})
+	_, err = imp.Import(t.Context(), ImportOptions{Identifier: "alice@example.com"})
 	require.NoError(err)
 	var count int
 	require.NoError(st.DB().QueryRow(`SELECT COUNT(*) FROM messages`).Scan(&count))
@@ -852,7 +908,7 @@ func TestImport_BoundedFullPreservesIncrementalCursor(t *testing.T) {
 			}
 			imp, st := newTestImporter(t, api)
 
-			first, err := imp.Import(context.Background(), ImportOptions{Identifier: "alice@example.com"})
+			first, err := imp.Import(t.Context(), ImportOptions{Identifier: "alice@example.com"})
 			require.NoError(err)
 			cursorOf := func() string {
 				var encoded string
@@ -878,7 +934,7 @@ func TestImport_BoundedFullPreservesIncrementalCursor(t *testing.T) {
 			api.mu.Unlock()
 
 			tt.opts.Identifier = "alice@example.com"
-			_, err = imp.Import(context.Background(), tt.opts)
+			_, err = imp.Import(t.Context(), tt.opts)
 			require.NoError(err)
 			assert.Equal(priorCursor, cursorOf(), "partial full traversal must retain the established incremental cursor")
 
@@ -886,10 +942,11 @@ func TestImport_BoundedFullPreservesIncrementalCursor(t *testing.T) {
 			api.respectCreatedAfter = false
 			api.respectUpdatedAfter = true
 			api.mu.Unlock()
-			incremental, err := imp.Import(context.Background(), ImportOptions{Identifier: "alice@example.com"})
+			incremental, err := imp.Import(t.Context(), ImportOptions{Identifier: "alice@example.com"})
 			require.NoError(err)
-			assert.EqualValues(2, incremental.NotesUpdated,
+			assert.EqualValues(2, incremental.NotesProcessed,
 				"the next incremental run must still see updates on both sides of the full-sync bound")
+			assert.EqualValues(1, incremental.NotesUpdated, "the note the bounded full run already rewrote is unchanged")
 			assert.Equal("2026-06-10T12:00:00Z", cursorOf())
 		})
 	}
@@ -905,7 +962,7 @@ func TestImport_IncompletePageWithoutCursorFails(t *testing.T) {
 	}
 	imp, _ := newTestImporter(t, api)
 
-	_, err := imp.Import(context.Background(), ImportOptions{Identifier: "alice@example.com"})
+	_, err := imp.Import(t.Context(), ImportOptions{Identifier: "alice@example.com"})
 	require.ErrorContains(err, "has more notes but no cursor")
 }
 
@@ -919,34 +976,9 @@ func TestImport_RepeatedPageCursorFails(t *testing.T) {
 		cursor:  "same-page",
 	}
 	imp, _ := newTestImporter(t, api)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 
 	_, err := imp.Import(ctx, ImportOptions{Identifier: "alice@example.com"})
 	require.ErrorContains(err, "repeated page cursor")
-}
-
-func TestFormatTranscriptLine(t *testing.T) {
-	assert := assert.New(t)
-	tests := []struct {
-		seconds int
-		want    string
-	}{
-		{0, "[00:00] A: x"},
-		{71, "[01:11] A: x"},
-		{3692, "[1:01:32] A: x"},
-	}
-	for _, tc := range tests {
-		assert.Equal(tc.want, formatTranscriptLine(time.Duration(tc.seconds)*time.Second, "A", "x"))
-	}
-}
-
-func TestSnippetPreservesUTF8(t *testing.T) {
-	assert := assert.New(t)
-	body := strings.Repeat("a", 199) + "é" + "tail"
-
-	got := snippet(body)
-
-	assert.True(utf8.ValidString(got))
-	assert.Equal(strings.Repeat("a", 199)+"é", got)
 }

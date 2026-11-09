@@ -1,7 +1,6 @@
 package query
 
 import (
-	"context"
 	"encoding/json"
 	"os"
 	"testing"
@@ -14,6 +13,7 @@ import (
 )
 
 func TestDuckDBTextSnapshotRevisionUsesCommittedCacheMarker(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 	b := NewTestDataBuilder(t)
@@ -24,7 +24,7 @@ func TestDuckDBTextSnapshotRevisionUsesCommittedCacheMarker(t *testing.T) {
 
 	analyticsDir, cleanup := b.Build()
 	t.Cleanup(cleanup)
-	engine, err := NewDuckDBEngine(analyticsDir, "", nil)
+	engine, err := NewDuckDBEngine(t.Context(), analyticsDir, "", nil)
 	require.NoError(err)
 	t.Cleanup(func() { require.NoError(engine.Close()) })
 
@@ -58,6 +58,7 @@ func TestDuckDBTextSnapshotRevisionUsesCommittedCacheMarker(t *testing.T) {
 }
 
 func TestDuckDBTextSnapshotRevisionTracksHybridSQLiteTimeline(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 	b := NewTestDataBuilder(t)
@@ -73,7 +74,7 @@ func TestDuckDBTextSnapshotRevisionTracksHybridSQLiteTimeline(t *testing.T) {
 	t.Cleanup(cleanup)
 
 	tdb := dbtest.NewTestDB(t, "../store/schema.sql")
-	_, err := tdb.DB.Exec(`
+	_, err := tdb.DB.ExecContext(t.Context(), `
 		INSERT INTO sources (id, source_type, identifier) VALUES (7, 'whatsapp', 'owner@chat.test');
 		INSERT INTO participants (id, phone_number, display_name) VALUES (11, '+15550000011', 'Alice');
 		INSERT INTO conversations (id, source_id, source_conversation_id, conversation_type, title)
@@ -83,7 +84,7 @@ func TestDuckDBTextSnapshotRevisionTracksHybridSQLiteTimeline(t *testing.T) {
 	`)
 	require.NoError(err)
 
-	engine, err := NewDuckDBEngine(analyticsDir, "", tdb.DB)
+	engine, err := NewDuckDBEngine(t.Context(), analyticsDir, "", tdb.DB)
 	require.NoError(err)
 	t.Cleanup(func() { require.NoError(engine.Close()) })
 
@@ -98,7 +99,7 @@ func TestDuckDBTextSnapshotRevisionTracksHybridSQLiteTimeline(t *testing.T) {
 	before, err := engine.TextSnapshotRevision(t.Context(), scope)
 	require.NoError(err)
 
-	_, err = tdb.DB.Exec(`
+	_, err = tdb.DB.ExecContext(t.Context(), `
 		INSERT INTO messages (id, conversation_id, source_id, source_message_id, message_type, sent_at, snippet, sender_id)
 			VALUES (802, 701, 7, 'message-802', 'whatsapp', '2026-08-20 11:00:00', 'second', 11)
 	`)
@@ -114,6 +115,7 @@ func TestDuckDBTextSnapshotRevisionTracksHybridSQLiteTimeline(t *testing.T) {
 }
 
 func TestDuckDBListConversationMessagesUsesIDTiebreakerForEqualTimestamps(t *testing.T) {
+	t.Parallel()
 	b := NewTestDataBuilder(t)
 	sourceID := b.AddSourceWithType("owner@chat.test", "whatsapp")
 	participantID := b.AddPhoneParticipant("+15550000011", "Alice")
@@ -192,8 +194,9 @@ func buildTextContactsEngine(t *testing.T) *DuckDBEngine {
 // clause, which DuckDB could not optimize over a large messages dataset; this
 // asserts the view returns the expected non-email contacts.
 func TestDuckDBTextAggregate_Contacts(t *testing.T) {
+	t.Parallel()
 	engine := buildTextContactsEngine(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	tests := []struct {
 		name     string
@@ -248,6 +251,7 @@ func TestDuckDBTextAggregate_Contacts(t *testing.T) {
 // In particular, an owner-authored latest message must not hide a conversation
 // that contains a selected cluster member.
 func TestDuckDBListConversationsParticipantMembership(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -298,7 +302,7 @@ func TestDuckDBListConversationsParticipantMembership(t *testing.T) {
 	b.AddTo(b.AddMessage(MessageOpt{SourceID: sourceID, ConversationID: unrelatedFallbackConversation, MessageType: "imessage", SenderID: &ownerID}), sameNameID, "Alice Cluster")
 
 	engine := b.BuildEngine()
-	rows, err := engine.ListConversations(context.Background(), TextFilter{
+	rows, err := engine.ListConversations(t.Context(), TextFilter{
 		SourceID:       &sourceID,
 		ParticipantIDs: []int64{aliceID, aliceAliasID},
 	})

@@ -10,8 +10,18 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/msgvault/internal/fileutil"
 	"golang.org/x/sys/windows"
 )
+
+func TestWindowsPrepareDirectoryUsesSecureMkdirAll(t *testing.T) {
+	require := require.New(t)
+	parent := t.TempDir()
+	dir := filepath.Join(parent, "tokens")
+	permissions := nativePermissions{}
+	require.NoError(permissions.prepareDirectory(dir))
+	require.NoError(permissions.verifyDirectory(dir))
+}
 
 func TestWindowsProviderCredentialErrorContext(t *testing.T) {
 	assertions := assert.New(t)
@@ -25,22 +35,6 @@ func TestWindowsProviderCredentialErrorContext(t *testing.T) {
 	requirements.Error(err)
 	requirements.ErrorIs(err, expectedErr)
 	assertions.Contains(err.Error(), "encode provider credential path:")
-
-	source := "source\x00credential"
-	_, expectedErr = windows.UTF16PtrFromString(source)
-	requirements.Error(expectedErr)
-	err = replaceStoreFile(source, filepath.Join(t.TempDir(), "target"))
-	requirements.Error(err)
-	requirements.ErrorIs(err, expectedErr)
-	assertions.Contains(err.Error(), "encode provider credential source:")
-
-	target := "target\x00credential"
-	_, expectedErr = windows.UTF16PtrFromString(target)
-	requirements.Error(expectedErr)
-	err = replaceStoreFile(filepath.Join(t.TempDir(), "source"), target)
-	requirements.Error(err)
-	requirements.ErrorIs(err, expectedErr)
-	assertions.Contains(err.Error(), "encode provider credential target:")
 
 	missing := filepath.Join(t.TempDir(), "missing.json")
 	missing16, encodeErr := windows.UTF16PtrFromString(missing)
@@ -124,7 +118,7 @@ func TestWindowsProviderCredentialACLValidation(t *testing.T) {
 				require.Equal(uint16(1), dacl.AceCount)
 				var ace *windows.ACCESS_ALLOWED_ACE
 				require.NoError(windows.GetAce(dacl, 0, &ace))
-				require.Equal(uint32(providerCredentialFileAllAccess), uint32(ace.Mask))
+				require.Equal(uint32(fileutil.FileAllAccess), uint32(ace.Mask))
 				require.NotZero(control & windows.SE_DACL_PROTECTED)
 			},
 		},
@@ -258,6 +252,50 @@ func TestWindowsReadSecretFileACL(t *testing.T) {
 	}
 }
 
+func TestWindowsCredentialWritesRepairReadOnlyDirectory(t *testing.T) {
+	for _, operation := range []string{"server key", "provider credential"} {
+		t.Run(operation, func(t *testing.T) {
+			assert := assert.New(t)
+			require := require.New(t)
+			dir := filepath.Join(t.TempDir(), "tokens")
+			require.NoError(os.Mkdir(dir, 0o700))
+			handle := setProviderCredentialTestACL(t, dir, []windows.EXPLICIT_ACCESS{
+				providerCredentialTestAccess(currentWindowsProviderCredentialSID(t), windows.GENERIC_READ, windows.TRUSTEE_IS_USER),
+			}, true)
+			// Restore write access even if the operation fails so TempDir can clean up.
+			t.Cleanup(func() { assert.NoError(secureOwnerOnlyHandle(handle)) })
+			entries, err := os.ReadDir(dir)
+			require.NoError(err)
+			require.Empty(entries, "repair must work before a lock file exists")
+			file, err := os.OpenFile(filepath.Join(dir, ".provider-credentials.lock"), os.O_RDWR|os.O_CREATE, 0o600)
+			if file != nil {
+				require.NoError(file.Close())
+			}
+			require.ErrorIs(err, os.ErrPermission, "the fixture must deny lock-file creation")
+
+			if operation == "server key" {
+				key, err := EnsureServerKey(dir)
+				require.NoError(err)
+				require.NotEmpty(key)
+				persisted, err := ReadSecretFile(filepath.Join(dir, ServerKeyFilename))
+				require.NoError(err)
+				assert.Equal(key, persisted)
+				return
+			}
+			empty, err := Read(dir)
+			require.NoError(err)
+			_, err = Put(dir, empty.ETag, VectorEmbeddingsID, "https://embeddings.example.test/v1", "stored-secret")
+			require.NoError(err)
+			stored, err := Read(dir)
+			require.NoError(err)
+			value, state, err := stored.Resolve(VectorEmbeddingsID, "https://embeddings.example.test/v1", "", nil)
+			require.NoError(err)
+			assert.Equal("stored-secret", value)
+			assert.Equal(State{Configured: true, Source: SourceStored}, state)
+		})
+	}
+}
+
 func TestWindowsProviderCredentialOwnerValidation(t *testing.T) {
 	assertions := assert.New(t)
 	requirements := require.New(t)
@@ -286,7 +324,7 @@ func TestWindowsProviderCredentialReparseRejection(t *testing.T) {
 	target := filepath.Join(root, "target")
 	junction := filepath.Join(root, "junction")
 	requirements.NoError(os.Mkdir(target, 0o700))
-	output, err := exec.Command("cmd.exe", "/d", "/c", "mklink", "/J", junction, target).CombinedOutput()
+	output, err := exec.CommandContext(t.Context(), "cmd.exe", "/d", "/c", "mklink", "/J", junction, target).CombinedOutput()
 	if err != nil {
 		t.Skipf("create directory junction: %v: %s", err, output)
 	}
@@ -298,6 +336,13 @@ func TestWindowsProviderCredentialReparseRejection(t *testing.T) {
 	_, err = openSecurityHandle(junction, true, windows.READ_CONTROL)
 	requirements.Error(err)
 	requirements.Contains(err.Error(), "reparse point")
+	_, err = EnsureServerKey(junction)
+	requirements.ErrorContains(err, "reparse point")
+	_, err = Put(junction, "", VectorEmbeddingsID, "https://embeddings.example.test/v1", "synthetic-secret")
+	requirements.ErrorContains(err, "reparse point")
+	entries, err := os.ReadDir(target)
+	requirements.NoError(err)
+	assert.Empty(t, entries, "reject the directory before creating a lock file")
 }
 
 func currentWindowsProviderCredentialSID(t *testing.T) *windows.SID {
@@ -341,7 +386,9 @@ func writeProviderCredentialTestFile(t *testing.T) string {
 func setProviderCredentialTestACL(t *testing.T, path string, entries []windows.EXPLICIT_ACCESS, protected bool) windows.Handle {
 	t.Helper()
 	requirements := require.New(t)
-	handle, err := openSecurityHandle(path, false, windows.READ_CONTROL|windows.WRITE_DAC)
+	info, err := os.Stat(path)
+	requirements.NoError(err)
+	handle, err := openSecurityHandle(path, info.IsDir(), windows.READ_CONTROL|windows.WRITE_DAC)
 	requirements.NoError(err)
 	t.Cleanup(func() { requirements.NoError(windows.CloseHandle(handle)) })
 	securityInfo := windows.DACL_SECURITY_INFORMATION

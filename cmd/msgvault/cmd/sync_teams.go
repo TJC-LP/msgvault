@@ -18,7 +18,7 @@ var (
 
 var syncTeamsCmd = &cobra.Command{
 	Use:   "sync-teams <email>",
-	Short: "Sync Microsoft Teams chats and channels (full or incremental)",
+	Short: "Sync Microsoft Teams chats and channels",
 	Long: `Sync Microsoft Teams chats and channels for a configured account.
 
 Full or incremental sync is auto-detected based on what has already been
@@ -47,7 +47,7 @@ Examples:
 
 		email := args[0]
 
-		s, cleanup, err := openWritableStoreAndInitForIngestInvocation(state)
+		s, cleanup, err := openWritableStoreAndInitForIngestInvocation(cmd.Context(), state)
 		if err != nil {
 			return err
 		}

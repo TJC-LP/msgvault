@@ -9,20 +9,34 @@ on:
     branches: [main]
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ (github.event_name == 'pull_request' && github.ref) || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
   docs:
-    runs-on: namespace-profile-linux-4cpu
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@v7.0.1
 
-      - name: Install documentation tools
-        run: sudo apt-get update && sudo apt-get install -y ripgrep
+      - uses: kenn-io/kit/.github/actions/kit-retry@v0.48.2
 
-      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+      - name: Install ripgrep
+        run: |
+          # CI only needs Ubuntu packages; runner-added repositories can fail independently.
+          kit-retry 3 5 sudo apt-get -o Dir::Etc::sourcelist=sources.list.d/ubuntu.sources -o Dir::Etc::sourceparts=- -o APT::Update::Error-Mode=any update
+          kit-retry 3 5 sudo apt-get install -y ripgrep
+
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          save-cache: ${{ github.event_name != 'pull_request' }}
 
       - name: Install documentation dependencies
         working-directory: docs
-        run: uv sync --frozen --no-dev
+        run: kit-retry 3 5 uv sync --frozen --no-dev
 
       - name: Check documentation
+        env:
+          DOWNLOAD_RETRY: kit-retry 3 5
         run: make docs-check

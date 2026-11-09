@@ -4,18 +4,19 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/hex"
 	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
 
 	"go.kenn.io/msgvault/internal/jsonexact"
+	"go.kenn.io/msgvault/internal/meetingarchive"
 	"go.kenn.io/msgvault/internal/meetingidentity"
 	"go.kenn.io/msgvault/internal/store"
 )
@@ -36,7 +37,7 @@ const (
 	unknownTranscriptRetrySpan = 48 * time.Hour
 	// Bump after a released canonical format changes so archived rows receive
 	// one repair refresh under the new rules.
-	circlebackSnapshotVersion = 1
+	circlebackSnapshotVersion = 2
 )
 
 // meetingSource is the narrow client surface the importer needs (satisfied
@@ -231,7 +232,9 @@ func (imp *Importer) Import(ctx context.Context, opts ImportOptions) (*ImportSum
 	); err != nil {
 		return nil, fmt.Errorf("confirm Circleback account identity: %w", err)
 	}
-	accountIdentities, err := meetingidentity.ForSource(imp.store, src.ID, opts.AccountEmail)
+	// The identity lookup ignores cancellation, as it did before, so a canceled
+	// import still starts and then fails a sync run the user can see.
+	accountIdentities, err := meetingidentity.ForSource(context.WithoutCancel(ctx), imp.store, src.ID, opts.AccountEmail)
 	if err != nil {
 		return nil, err
 	}
@@ -270,7 +273,7 @@ func (imp *Importer) Import(ctx context.Context, opts ImportOptions) (*ImportSum
 	}
 
 	var state syncState
-	prev, prevErr := imp.store.GetLastSuccessfulSync(src.ID)
+	prev, prevErr := imp.store.GetLastSuccessfulSyncContext(ctx, src.ID)
 	if prevErr == nil && prev != nil && prev.CursorAfter.Valid && prev.CursorAfter.String != "" {
 		if decodeErr := json.Unmarshal([]byte(prev.CursorAfter.String), &state); decodeErr != nil {
 			sum.Errors++
@@ -401,7 +404,7 @@ func (imp *Importer) Import(ctx context.Context, opts ImportOptions) (*ImportSum
 				existing := map[string]int64{}
 				if len(smids) > 0 {
 					var exErr error
-					existing, exErr = imp.store.MessageExistsBatch(src.ID, smids)
+					existing, exErr = imp.store.MessageExistsBatchContext(ctx, src.ID, smids)
 					if exErr != nil {
 						sum.Errors += int64(len(orderedMeetings))
 						hardErrors = append(hardErrors, fmt.Errorf("lookup existing meetings: %w", exErr))
@@ -422,7 +425,7 @@ func (imp *Importer) Import(ctx context.Context, opts ImportOptions) (*ImportSum
 					}
 					msgID, exists := existing["meeting:"+id]
 					if exists && !opts.Full {
-						archivedState, stateErr := imp.archivedTranscriptState(msgID)
+						archivedState, stateErr := imp.archivedTranscriptState(ctx, msgID)
 						if stateErr != nil {
 							hardErr := fmt.Errorf("meeting %s: read archived transcript state: %w", id, stateErr)
 							sum.Errors++
@@ -477,20 +480,21 @@ func (imp *Importer) Import(ctx context.Context, opts ImportOptions) (*ImportSum
 						if cancelIfDone(1) {
 							return err
 						}
-						added, changed, ingErr := imp.ingestMeeting(
-							src.ID, opts.Identifier, accountIdentities, m, nil, transcriptStateUnavailable, opts.Full,
+						result, ingErr := imp.ingestMeeting(
+							context.WithoutCancel(ctx), src.ID, opts, accountIdentities, m, nil,
+							transcriptStateUnavailable,
 						)
+						if result.Created {
+							sum.MeetingsAdded++
+						} else if result.Changed {
+							sum.MeetingsUpdated++
+						}
 						if ingErr != nil {
 							hardErr := fmt.Errorf("meeting %s: ingest unavailable refresh failed: %w", m.ID, ingErr)
 							sum.Errors++
 							hardErrors = append(hardErrors, hardErr)
 							progress(hardErr.Error())
 							continue
-						}
-						if added {
-							sum.MeetingsAdded++
-						} else if changed {
-							sum.MeetingsUpdated++
 						}
 						if ct := m.CreatedTime(); ct.After(maxCreated) {
 							maxCreated = ct
@@ -521,7 +525,7 @@ func (imp *Importer) Import(ctx context.Context, opts ImportOptions) (*ImportSum
 						continue
 					}
 					if exists && (tr == nil || tr.Classification() == TranscriptRecognizedEmpty) {
-						recovered, recoveredOK, recoveryErr := imp.recoverArchivedTranscript(msgID)
+						recovered, recoveredOK, recoveryErr := imp.recoverArchivedTranscript(ctx, msgID)
 						if recoveryErr != nil {
 							hardErr := fmt.Errorf("meeting %s: recover archived transcript: %w", m.ID, recoveryErr)
 							sum.Errors++
@@ -557,20 +561,21 @@ func (imp *Importer) Import(ctx context.Context, opts ImportOptions) (*ImportSum
 					if cancelIfDone(1) {
 						return err
 					}
-					added, changed, ingErr := imp.ingestMeeting(
-						src.ID, opts.Identifier, accountIdentities, m, tr, desiredState, opts.Full,
+					result, ingErr := imp.ingestMeeting(
+						context.WithoutCancel(ctx), src.ID, opts, accountIdentities, m, tr,
+						desiredState,
 					)
+					if result.Created {
+						sum.MeetingsAdded++
+					} else if result.Changed {
+						sum.MeetingsUpdated++
+					}
 					if ingErr != nil {
 						hardErr := fmt.Errorf("meeting %s: ingest failed: %w", m.ID, ingErr)
 						sum.Errors++
 						hardErrors = append(hardErrors, hardErr)
 						progress(hardErr.Error())
 						continue
-					}
-					if added {
-						sum.MeetingsAdded++
-					} else if changed {
-						sum.MeetingsUpdated++
 					}
 					if ct := m.CreatedTime(); ct.After(maxCreated) {
 						maxCreated = ct
@@ -621,7 +626,7 @@ func (imp *Importer) Import(ctx context.Context, opts ImportOptions) (*ImportSum
 				pageSMIDs = append(pageSMIDs, "meeting:"+id)
 			}
 		}
-		existingPage, lookupErr := imp.store.MessageMetadataBatch(src.ID, pageSMIDs)
+		existingPage, lookupErr := imp.store.MessageMetadataBatch(ctx, src.ID, pageSMIDs)
 		if lookupErr != nil {
 			sum.Errors++
 			hardErrors = append(hardErrors, fmt.Errorf("lookup search page %d meetings: %w", pageIndex, lookupErr))
@@ -698,7 +703,7 @@ func (imp *Importer) Import(ctx context.Context, opts ImportOptions) (*ImportSum
 	if cancelIfDone(1) {
 		return sum, err
 	}
-	if recomputeErr := imp.store.RecomputeConversationStats(src.ID); recomputeErr != nil {
+	if recomputeErr := imp.store.RecomputeConversationStatsContext(ctx, src.ID); recomputeErr != nil {
 		sum.Errors++
 		hardErrors = append(hardErrors, fmt.Errorf("recompute conversation stats: %w", recomputeErr))
 	}
@@ -731,8 +736,8 @@ func (imp *Importer) Import(ctx context.Context, opts ImportOptions) (*ImportSum
 	return sum, nil
 }
 
-func (imp *Importer) archivedTranscriptState(msgID int64) (transcriptState, error) {
-	metaNS, err := imp.store.GetMessageMetadata(msgID)
+func (imp *Importer) archivedTranscriptState(ctx context.Context, msgID int64) (transcriptState, error) {
+	metaNS, err := imp.store.GetMessageMetadataContext(ctx, msgID)
 	if err != nil {
 		return "", err
 	}
@@ -762,8 +767,8 @@ func decodeArchivedTranscriptState(encoded string) transcriptState {
 // refresh omits a transcript or returns a recognized-empty payload. Explicit
 // transcript state is authoritative: a present transcript must have a valid
 // archived payload, while pending and unavailable transcripts are not restored.
-func (imp *Importer) recoverArchivedTranscript(msgID int64) (Transcript, bool, error) {
-	metaNS, err := imp.store.GetMessageMetadata(msgID)
+func (imp *Importer) recoverArchivedTranscript(ctx context.Context, msgID int64) (Transcript, bool, error) {
+	metaNS, err := imp.store.GetMessageMetadataContext(ctx, msgID)
 	if err != nil {
 		return Transcript{}, false, err
 	}
@@ -784,7 +789,7 @@ func (imp *Importer) recoverArchivedTranscript(msgID int64) (Transcript, bool, e
 			"archived meeting has invalid transcript state %q", meta.TranscriptState)
 	}
 
-	raw, err := imp.store.GetMessageRaw(msgID)
+	raw, err := imp.store.GetMessageRawContext(ctx, msgID)
 	if err != nil {
 		return Transcript{}, false, fmt.Errorf("read composed raw: %w", err)
 	}
@@ -824,6 +829,7 @@ type meetingMetadata struct {
 	DurationSeconds    int64               `json:"duration_seconds,omitzero"`
 	OrganizerEmail     string              `json:"organizer_email,omitempty"`
 	MeetingURL         string              `json:"meeting_url,omitempty"`
+	JoinURL            string              `json:"join_url,omitempty"`
 	RecordingURL       string              `json:"recording_url,omitempty"`
 	RecordingFetchedAt string              `json:"recording_url_fetched_at,omitempty"`
 	Tags               []string            `json:"tags,omitempty"`
@@ -902,155 +908,82 @@ func canonicalProviderJSON(raw jsontext.Value, fallback any) (jsontext.Value, er
 	return json.Marshal(decoded, json.Deterministic(true))
 }
 
-// ingestMeeting persists one meeting through the canonical write path.
-// Idempotent via UpsertMessage's ON CONFLICT(source_id, source_message_id).
-// Returns whether the message row was newly inserted and whether the
-// persisted archive changed. Existing rows with an identical stable snapshot
-// are left untouched so no-op overlap reads do not invalidate derived caches.
+// ingestMeeting archives one meeting through meetingarchive. An archived row
+// whose snapshot hash matches is left untouched, so no-op overlap reads don't
+// invalidate derived caches; --full skips that check and forces a rewrite.
+// Any meeting that reaches Upsert must be written, so Upsert is always forced
+// rather than re-reading the stored raw snapshot to decide again.
 func (imp *Importer) ingestMeeting(
+	ctx context.Context,
 	sourceID int64,
-	identifier string,
+	opts ImportOptions,
 	accountIdentities meetingidentity.Set,
 	m *Meeting,
 	tr *Transcript,
 	desiredTranscriptState transcriptState,
-	force bool,
-) (bool, bool, error) {
+) (meetingarchive.Result, error) {
 	if string(m.ID) == "" {
-		return false, false, errors.New("meeting has no id")
+		return meetingarchive.Result{}, errors.New("meeting has no id")
 	}
 	smid := "meeting:" + string(m.ID)
 
-	existing, err := imp.store.MessageExistsBatch(sourceID, []string{smid})
+	existing, err := imp.store.MessageMetadataBatch(ctx, sourceID, []string{smid})
 	if err != nil {
-		return false, false, fmt.Errorf("lookup existing meeting: %w", err)
+		return meetingarchive.Result{}, fmt.Errorf("lookup existing meeting: %w", err)
 	}
-	existingID, existed := existing[smid]
 
 	organizerEmail, organizerName := "", ""
 	if m.Organizer != nil {
-		organizerEmail = normalizeEmail(m.Organizer.Email)
+		organizerEmail = meetingidentity.Normalize(m.Organizer.Email)
 		organizerName = m.Organizer.Name
 	}
 	fromMe := organizerEmail != "" && accountIdentities.Contains(organizerEmail)
 	snapshotHash, err := circlebackSnapshotHash(
-		m, tr, identifier, fromMe, desiredTranscriptState,
+		m, tr, opts.Identifier, fromMe, desiredTranscriptState,
 	)
 	if err != nil {
-		return false, false, fmt.Errorf("hash meeting snapshot: %w", err)
+		return meetingarchive.Result{}, fmt.Errorf("hash meeting snapshot: %w", err)
 	}
-	if existed && !force {
-		metadata, metadataErr := imp.store.GetMessageMetadata(existingID)
-		if metadataErr != nil {
-			return false, false, fmt.Errorf("read existing meeting metadata: %w", metadataErr)
+	if archived, ok := existing[smid]; ok && !opts.Full {
+		var meta meetingMetadata
+		decodeErr := json.Unmarshal([]byte(archived.Metadata.String), &meta)
+		if archived.Metadata.Valid && decodeErr == nil && meta.SnapshotHash == snapshotHash {
+			return meetingarchive.Result{MessageID: archived.ID}, nil
 		}
-		var archived meetingMetadata
-		if metadata.Valid && json.Unmarshal([]byte(metadata.String), &archived) == nil &&
-			archived.SnapshotHash == snapshotHash {
-			return false, false, nil
-		}
-	}
-
-	var senderID int64
-	if organizerEmail != "" {
-		id, err := imp.store.EnsureParticipant(organizerEmail, organizerName, emailDomain(organizerEmail))
-		if err != nil {
-			return false, false, fmt.Errorf("organizer participant: %w", err)
-		}
-		senderID = id
-	}
-
-	// Attendees WITH an email become participants/recipients; name-only
-	// attendees appear in the body's Attendees line only, so we don't mint
-	// phantom address-less participant rows.
-	var attendeeIDs []int64
-	var attendeeNames []string
-	var attendeeEmails []string
-	for _, a := range m.Attendees {
-		email := normalizeEmail(a.Email)
-		if email == "" {
-			continue
-		}
-		pid, err := imp.store.EnsureParticipant(email, a.Name, emailDomain(email))
-		if err != nil {
-			return false, false, fmt.Errorf("attendee participant: %w", err)
-		}
-		attendeeIDs = append(attendeeIDs, pid)
-		attendeeNames = append(attendeeNames, a.Name)
-		attendeeEmails = append(attendeeEmails, email)
-	}
-
-	title := meetingTitle(m)
-	participants := make([]store.ConversationParticipantRef, 0, len(attendeeIDs))
-	for _, participantID := range attendeeIDs {
-		participants = append(participants, store.ConversationParticipantRef{ParticipantID: participantID, Role: "member"})
-	}
-
-	body := buildBody(m, tr)
-	sentAt := m.StartedAt().UTC()
-
-	message := &store.Message{
-		SourceID:                sourceID,
-		SourceMessageID:         smid,
-		MessageType:             MessageType,
-		SentAt:                  sql.NullTime{Time: sentAt, Valid: !sentAt.IsZero()},
-		SenderID:                sql.NullInt64{Int64: senderID, Valid: senderID != 0},
-		IsFromMe:                fromMe,
-		IdentityDerivedIsFromMe: fromMe,
-		Subject:                 sql.NullString{String: title, Valid: title != ""},
-		Snippet:                 sql.NullString{String: snippet(body), Valid: body != ""},
-		SizeEstimate:            int64(len(body)),
 	}
 
 	metaJSON, err := json.Marshal(imp.buildMetadata(
-		m, tr, identifier, organizerEmail, desiredTranscriptState, snapshotHash,
+		m, tr, opts.Identifier, organizerEmail, desiredTranscriptState, snapshotHash,
 	), json.Deterministic(true))
 	if err != nil {
-		return false, false, fmt.Errorf("marshal metadata: %w", err)
+		return meetingarchive.Result{}, fmt.Errorf("marshal metadata: %w", err)
 	}
-	metadata := sql.NullString{String: string(metaJSON), Valid: true}
-
 	raw, err := composeRaw(m, tr)
 	if err != nil {
-		return false, false, fmt.Errorf("compose raw: %w", err)
+		return meetingarchive.Result{}, fmt.Errorf("compose raw: %w", err)
 	}
-	// Replace recipients unconditionally so re-syncs clear stale rows
-	// (calsync precedent).
-	var fromIDs []int64
-	var fromNames []string
-	if senderID != 0 {
-		fromIDs = []int64{senderID}
-		fromNames = []string{organizerName}
+	// Name-only attendees stay in the body's Attendees line; Upsert drops
+	// people without an address.
+	attendees := make([]meetingarchive.Person, 0, len(m.Attendees))
+	for _, a := range m.Attendees {
+		attendees = append(attendees, meetingarchive.Person{Name: a.Name, Email: a.Email})
 	}
-	fts := &store.FTSDoc{
-		Subject:  title,
-		Body:     body,
-		FromAddr: organizerEmail,
-		ToAddrs:  strings.Join(attendeeEmails, " "),
-	}
-	if _, err := imp.store.PersistMessage(&store.MessagePersistData{
-		Message: message,
-		Conversation: &store.ConversationPersistData{
-			SourceConversationID: smid,
-			ConversationType:     ConversationType,
-			Title:                title,
-			Participants:         participants,
-		},
-		Metadata:  &metadata,
-		BodyText:  sql.NullString{String: body, Valid: body != ""},
-		RawMIME:   raw,
-		RawFormat: RawFormat,
-		Recipients: []store.RecipientSet{
-			{Type: "from", ParticipantIDs: fromIDs, DisplayNames: fromNames},
-			{Type: "to", ParticipantIDs: attendeeIDs, DisplayNames: attendeeNames},
-		},
-		PreserveLabels: true,
-		FTS:            fts,
-	}); err != nil {
-		return false, false, fmt.Errorf("persist meeting: %w", err)
-	}
-
-	return !existed, true, nil
+	body := buildBody(m, tr)
+	return meetingarchive.New(imp.store).Upsert(ctx, meetingarchive.Snapshot{
+		SourceID:             sourceID,
+		AccountEmail:         opts.AccountEmail,
+		SourceMessageID:      smid,
+		SourceConversationID: smid,
+		Title:                meetingTitle(m),
+		StartedAt:            m.StartedAt().UTC(),
+		Body:                 body,
+		Snippet:              meetingarchive.Snippet(body),
+		Metadata:             metaJSON,
+		Raw:                  raw,
+		RawFormat:            RawFormat,
+		Organizer:            &meetingarchive.Person{Name: organizerName, Email: organizerEmail},
+		Attendees:            attendees,
+	}, meetingarchive.UpsertOptions{Force: true})
 }
 
 func (imp *Importer) buildMetadata(
@@ -1070,6 +1003,7 @@ func (imp *Importer) buildMetadata(
 		DurationSeconds: m.DurationSecs(),
 		OrganizerEmail:  organizerEmail,
 		MeetingURL:      m.PlatformURL(),
+		JoinURL:         knownJoinURL(m.MeetingURL),
 		RecordingURL:    m.RecordingURL,
 		Tags:            m.Tags,
 		TranscriptState: desiredTranscriptState,
@@ -1106,6 +1040,26 @@ func (imp *Importer) buildMetadata(
 	return meta
 }
 
+// knownJoinURL preserves the usable provider URL, including passcodes and
+// context parameters. Join-key normalization belongs to the link projection.
+func knownJoinURL(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	u, err := url.Parse(trimmed)
+	if err != nil || (u.Scheme != "https" && u.Scheme != "http") {
+		return ""
+	}
+	host := strings.ToLower(u.Hostname())
+	switch {
+	case host == "meet.google.com",
+		host == "teams.microsoft.com", host == "teams.live.com",
+		strings.HasSuffix(host, ".teams.microsoft.us"),
+		host == "zoom.us", strings.HasSuffix(host, ".zoom.us"),
+		host == "zoomgov.com", strings.HasSuffix(host, ".zoomgov.com"):
+		return trimmed
+	}
+	return ""
+}
+
 // composeRaw archives both tool payloads verbatim in one JSON object.
 func composeRaw(m *Meeting, tr *Transcript) ([]byte, error) {
 	payload := map[string]jsontext.Value{"meeting": m.Raw}
@@ -1129,13 +1083,4 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
-}
-
-func normalizeEmail(email string) string {
-	return strings.ToLower(strings.TrimSpace(email))
-}
-
-func emailDomain(email string) string {
-	_, domain, _ := strings.CutLast(email, "@")
-	return domain
 }

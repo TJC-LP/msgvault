@@ -3,13 +3,15 @@ package muesli
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 
-	_ "github.com/mattn/go-sqlite3" // registers the "sqlite3" database/sql driver
+	"go.kenn.io/msgvault/internal/meetingidentity"
+	"go.kenn.io/msgvault/internal/sqliteutil"
 )
 
 // maxFolderDepth bounds folder-path resolution so a corrupt parent cycle
@@ -29,6 +31,9 @@ type Reader struct {
 // Muesli database. SQLite may use the WAL sidecar files to coordinate with a
 // running Muesli app; query_only prevents this connection from changing data.
 func Open(ctx context.Context, path string) (*Reader, error) {
+	if !sqliteutil.Available {
+		return nil, errors.New("reading a Muesli database requires a msgvault build with CGO enabled")
+	}
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		return nil, fmt.Errorf("open Muesli database %s: %w", path, err)
@@ -144,6 +149,12 @@ func (r *Reader) column(table, alias, column string) string {
 // deleted and in-progress rows; callers decide what to archive. All reads
 // share one transaction so they see a single WAL snapshot.
 func (r *Reader) ListMeetings(ctx context.Context) ([]Meeting, error) {
+	return r.listMeetings(ctx, 0)
+}
+
+// listMeetings reads every meeting, or only the one with id when it is
+// positive, so a completion hook does not load every transcript.
+func (r *Reader) listMeetings(ctx context.Context, id int64) ([]Meeting, error) {
 	tx, err := r.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return nil, fmt.Errorf("read Muesli meetings: %w", err)
@@ -154,11 +165,11 @@ func (r *Reader) ListMeetings(ctx context.Context) ([]Meeting, error) {
 	if err != nil {
 		return nil, err
 	}
-	meetings, err := r.meetings(ctx, tx, folders)
+	meetings, err := r.meetings(ctx, tx, folders, id)
 	if err != nil {
 		return nil, err
 	}
-	participants, err := r.participants(ctx, tx)
+	participants, err := r.participants(ctx, tx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -168,7 +179,7 @@ func (r *Reader) ListMeetings(ctx context.Context) ([]Meeting, error) {
 	return meetings, nil
 }
 
-func (r *Reader) meetings(ctx context.Context, tx *sql.Tx, folders map[int64]string) ([]Meeting, error) {
+func (r *Reader) meetings(ctx context.Context, tx *sql.Tx, folders map[int64]string, id int64) ([]Meeting, error) {
 	col := func(name string) string { return r.column("meetings", "m", name) }
 	query := `SELECT m.id, m.title, m.start_time, ` +
 		col("end_time") + `, ` +
@@ -187,9 +198,10 @@ func (r *Reader) meetings(ctx context.Context, tx *sql.Tx, folders map[int64]str
 		col("calendar_series_id") + `, ` +
 		col("folder_id") + `, ` +
 		col("follow_up_to_id") + `, ` +
+		col("saved_recording_path") + `, ` +
 		col("deleted_at") + ` IS NOT NULL
-		FROM meetings m ORDER BY m.id`
-	rows, err := tx.QueryContext(ctx, query)
+		FROM meetings m WHERE (? = 0 OR m.id = ?) ORDER BY m.id`
+	rows, err := tx.QueryContext(ctx, query, id, id)
 	if err != nil {
 		return nil, fmt.Errorf("read Muesli meetings: %w", err)
 	}
@@ -203,12 +215,13 @@ func (r *Reader) meetings(ctx context.Context, tx *sql.Tx, folders map[int64]str
 			end, created, status, source, transcript, notes sql.NullString
 			manual, templateName, templateKind, eventID     sql.NullString
 			calendarSource, seriesID                        sql.NullString
+			recording                                       sql.NullString
 			duration                                        sql.NullFloat64
 			wordCount, folderID, followUpID                 sql.NullInt64
 		)
 		if err := rows.Scan(&m.ID, &title, &start, &end, &created, &duration, &status, &source,
 			&transcript, &notes, &manual, &wordCount, &templateName, &templateKind,
-			&eventID, &calendarSource, &seriesID, &folderID, &followUpID, &m.Deleted); err != nil {
+			&eventID, &calendarSource, &seriesID, &folderID, &followUpID, &recording, &m.Deleted); err != nil {
 			return nil, fmt.Errorf("read Muesli meeting row: %w", err)
 		}
 		m.Title, m.StartTime, m.EndTime, m.CreatedAt = title.String, start.String, end.String, created.String
@@ -217,6 +230,7 @@ func (r *Reader) meetings(ctx context.Context, tx *sql.Tx, folders map[int64]str
 		m.WordCount, m.TemplateName, m.TemplateKind = wordCount.Int64, templateName.String, templateKind.String
 		m.CalendarEventID, m.CalendarSource, m.CalendarSeriesID = eventID.String, calendarSource.String, seriesID.String
 		m.FollowUpToID = followUpID.Int64
+		m.SavedRecordingPath = recording.String
 		if folderID.Valid {
 			m.Folder = folders[folderID.Int64]
 		}
@@ -231,7 +245,7 @@ func (r *Reader) meetings(ctx context.Context, tx *sql.Tx, folders map[int64]str
 // participants returns non-suppressed participants keyed by meeting id, in
 // Muesli's display order. Older databases kept suppressions in a separate
 // table that Muesli later folded into is_suppressed.
-func (r *Reader) participants(ctx context.Context, tx *sql.Tx) (map[int64][]Participant, error) {
+func (r *Reader) participants(ctx context.Context, tx *sql.Tx, id int64) (map[int64][]Participant, error) {
 	out := map[int64][]Participant{}
 	if !r.has("meeting_participants", "meeting_id") {
 		return out, nil
@@ -250,9 +264,9 @@ func (r *Reader) participants(ctx context.Context, tx *sql.Tx) (map[int64][]Part
 		r.column("meeting_participants", "p", "email_address") + `, ` +
 		r.column("meeting_participants", "p", "source") + `
 		FROM meeting_participants p
-		WHERE ` + suppressed + `
+		WHERE ` + suppressed + ` AND (? = 0 OR p.meeting_id = ?)
 		ORDER BY p.meeting_id, p.insertion_order, p.participant_identifier`
-	rows, err := tx.QueryContext(ctx, query)
+	rows, err := tx.QueryContext(ctx, query, id, id)
 	if err != nil {
 		return nil, fmt.Errorf("read Muesli participants: %w", err)
 	}
@@ -266,10 +280,10 @@ func (r *Reader) participants(ctx context.Context, tx *sql.Tx) (map[int64][]Part
 		if err := rows.Scan(&meetingID, &identifier, &name, &emailAddress, &participantOf); err != nil {
 			return nil, fmt.Errorf("read Muesli participant row: %w", err)
 		}
-		email := strings.ToLower(strings.TrimSpace(emailAddress.String))
+		email := meetingidentity.Normalize(emailAddress.String)
 		if email == "" {
 			if rest, ok := strings.CutPrefix(identifier.String, "email:"); ok {
-				email = strings.ToLower(strings.TrimSpace(rest))
+				email = meetingidentity.Normalize(rest)
 			}
 		}
 		out[meetingID] = append(out[meetingID], Participant{

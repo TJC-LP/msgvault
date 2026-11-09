@@ -28,37 +28,41 @@ func skipUnlessPostgresInternal(t *testing.T) string {
 	return testDB
 }
 
-// newPGStoreInternal opens a schema-isolated PostgreSQL store for an internal
-// (package store) test. It mirrors testutil.newPostgresTestStore but lives in
-// package store so tests can reach unexported symbols. The schema is dropped
-// on cleanup.
-func newPGStoreInternal(t *testing.T, dbURL string) *Store {
+// newPGStoreInternal returns a private PostgreSQL archive cloned from the
+// test binary's template, or initialized in a private schema when cloning is off.
+// The fixture is dropped on cleanup.
+func newPGStoreInternal(t *testing.T) *Store {
 	t.Helper()
-	st := newUninitializedPGStoreInternal(t, dbURL)
-	require.NoError(t, st.InitSchema(), "init schema")
-	return st
+	return pgTestStore(t)
+}
+
+func replaceTestStoreDB(t *testing.T, st *Store, db *sql.DB) {
+	t.Helper()
+	old := st.db.DB
+	st.db = newLoggedDB(db, st.dialect.Rebind)
+	require.NoError(t, old.Close())
 }
 
 // newUninitializedPGStoreInternal opens an empty schema-isolated PostgreSQL
 // store without running InitSchema. Tests that need to observe a specific
 // schema-initialization boundary use this; ordinary tests use
 // newPGStoreInternal above.
-func newUninitializedPGStoreInternal(t *testing.T, dbURL string) *Store {
-	t.Helper()
+func newUninitializedPGStoreInternal(tb testing.TB, dbURL string) *Store {
+	tb.Helper()
 
 	buf := make([]byte, 8)
 	_, err := rand.Read(buf)
-	require.NoError(t, err, "random schema name")
+	require.NoError(tb, err, "random schema name")
 	schemaName := "msgvault_test_" + hex.EncodeToString(buf)
 
 	setupDB, err := sql.Open("pgx", dbURL)
-	require.NoError(t, err, "open setup connection")
-	_, schemaErr := setupDB.Exec("CREATE SCHEMA " + schemaName)
+	require.NoError(tb, err, "open setup connection")
+	_, schemaErr := setupDB.ExecContext(tb.Context(), "CREATE SCHEMA "+schemaName)
 	_ = setupDB.Close()
-	require.NoErrorf(t, schemaErr, "create schema %s", schemaName)
+	require.NoErrorf(tb, schemaErr, "create schema %s", schemaName)
 
 	var st *Store
-	t.Cleanup(func() {
+	tb.Cleanup(func() {
 		if st != nil {
 			_ = st.Close()
 		}
@@ -67,7 +71,7 @@ func newUninitializedPGStoreInternal(t *testing.T, dbURL string) *Store {
 			return
 		}
 		defer func() { _ = cleanupDB.Close() }()
-		_, _ = cleanupDB.Exec(fmt.Sprintf("DROP SCHEMA %s CASCADE", schemaName))
+		_, _ = cleanupDB.ExecContext(context.WithoutCancel(tb.Context()), fmt.Sprintf("DROP SCHEMA %s CASCADE", schemaName))
 	})
 
 	sep := "?"
@@ -77,7 +81,7 @@ func newUninitializedPGStoreInternal(t *testing.T, dbURL string) *Store {
 	testURL := dbURL + sep + "search_path=" + schemaName
 
 	st, err = Open(testURL)
-	require.NoError(t, err, "open store")
+	require.NoError(tb, err, "open store")
 	return st
 }
 
@@ -95,13 +99,13 @@ func newUninitializedPGStoreInternal(t *testing.T, dbURL string) *Store {
 func TestExclusiveLockTablesCoverCascade(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
-	dbURL := skipUnlessPostgresInternal(t)
-	st := newPGStoreInternal(t, dbURL)
+	skipUnlessPostgresInternal(t)
+	st := newPGStoreInternal(t)
 
 	// Tables with a direct ON DELETE CASCADE FK to sources(id), read from the
 	// catalog (scoped to the test's current schema so sibling schemas can't
 	// leak in).
-	rows, err := st.DB().Query(`
+	rows, err := st.DB().QueryContext(t.Context(), `
 		SELECT DISTINCT c.conrelid::regclass::text
 		FROM pg_constraint c
 		JOIN pg_class child ON child.oid = c.conrelid
@@ -160,9 +164,6 @@ func TestExclusiveLockTablesCoverCascade(t *testing.T) {
 		"identity_match_evidence must be locked for candidate cascade cleanup")
 }
 
-// TestMaintenanceTimeoutResetSQL pins the exact statement the PG dialect uses
-// to lift the per-statement timeout — the mechanism finding S1's hatch relies
-// on. SQLite returns "" so runMaintenance issues no reset.
 // TestRemoveSourceSerializedDoesNotDeadlockWithPersonMerge pins the lock
 // ordering documented on BeginExclusive: MergeParticipants writes person
 // tables BEFORE participants/messages, the opposite of exclusiveLockTables'
@@ -174,9 +175,9 @@ func TestExclusiveLockTablesCoverCascade(t *testing.T) {
 // deadlock_timeout, so the loop requires every racing pair to succeed.
 func TestRemoveSourceSerializedDoesNotDeadlockWithPersonMerge(t *testing.T) {
 	require := require.New(t)
-	dbURL := skipUnlessPostgresInternal(t)
-	st := newPGStoreInternal(t, dbURL)
-	ctx := context.Background()
+	skipUnlessPostgresInternal(t)
+	st := newPGStoreInternal(t)
+	ctx := t.Context()
 
 	for i := range 15 {
 		source, err := st.GetOrCreateSource("gmail", fmt.Sprintf("race%d@example.com", i))
@@ -218,9 +219,9 @@ func TestRemoveSourceSerializedDoesNotDeadlockWithPersonMerge(t *testing.T) {
 // identities for a source that is concurrently deleted.
 func TestRemoveSourceSerializedDoesNotDeadlockWithLegacyIdentityMigration(t *testing.T) {
 	require := require.New(t)
-	dbURL := skipUnlessPostgresInternal(t)
-	st := newPGStoreInternal(t, dbURL)
-	ctx := context.Background()
+	skipUnlessPostgresInternal(t)
+	st := newPGStoreInternal(t)
+	ctx := t.Context()
 
 	_, err := st.GetOrCreateSource("gmail", "stable@example.com")
 	require.NoError(err, "create eligible source")
@@ -228,7 +229,7 @@ func TestRemoveSourceSerializedDoesNotDeadlockWithLegacyIdentityMigration(t *tes
 	for i := range 15 {
 		source, err := st.GetOrCreateSource("imessage", fmt.Sprintf("+1555010%04d", i))
 		require.NoError(err, "iteration %d: create removable source", i)
-		_, err = st.DB().Exec(st.Rebind(
+		_, err = st.DB().ExecContext(t.Context(), st.Rebind(
 			`DELETE FROM applied_migrations WHERE name = ?`), migrationLegacyIdentity)
 		require.NoError(err, "iteration %d: clear migration marker", i)
 		address := fmt.Sprintf("me%d@example.com", i)
@@ -261,13 +262,14 @@ func TestRemoveSourceSerializedDoesNotDeadlockWithLegacyIdentityMigration(t *tes
 // participants each iteration so every call takes the write path.
 func TestRemoveSourceSerializedDoesNotDeadlockWithSetParticipantIdentifier(t *testing.T) {
 	require := require.New(t)
-	dbURL := skipUnlessPostgresInternal(t)
-	st := newPGStoreInternal(t, dbURL)
-	ctx := context.Background()
+	skipUnlessPostgresInternal(t)
+	st := newPGStoreInternal(t)
+	ctx := t.Context()
 
 	stable, err := st.GetOrCreateSource("gmail", "stable@example.com")
 	require.NoError(err, "create stable source")
-	_, err = st.DB().Exec(
+	_, err = st.DB().ExecContext(
+		t.Context(),
 		`INSERT INTO account_identities (source_id, address, source_signal)
 		 VALUES ($1, $2, $3)`,
 		stable.ID, "me@example.com", "test")
@@ -303,9 +305,92 @@ func TestRemoveSourceSerializedDoesNotDeadlockWithSetParticipantIdentifier(t *te
 	}
 }
 
-func TestMaintenanceTimeoutResetSQL(t *testing.T) {
-	assert.Equal(t, "SET LOCAL statement_timeout = 0", (&PostgreSQLDialect{}).MaintenanceTimeoutResetSQL())
-	assert.Empty(t, (&SQLiteDialect{}).MaintenanceTimeoutResetSQL())
+func TestMergeSourcesDoesNotDeadlockWithSerializedSourceRemoval(t *testing.T) {
+	require := require.New(t)
+	skipUnlessPostgresInternal(t)
+	st := newPGStoreInternal(t)
+	ctx := t.Context()
+	from, err := st.GetOrCreateSource("gmail", "merge-history@example.test")
+	require.NoError(err)
+	into, err := st.GetOrCreateSource("gmail", "merge-live@example.test")
+	require.NoError(err)
+	removable, err := st.GetOrCreateSource("gmail", "remove-unrelated@example.test")
+	require.NoError(err)
+
+	beforeLock := make(chan struct{})
+	continueMerge := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(continueMerge) }) }
+	defer release()
+	st.sourceMergeBeforeIdentityLockHook = func() {
+		close(beforeLock)
+		<-continueMerge
+	}
+	defer func() { st.sourceMergeBeforeIdentityLockHook = nil }()
+
+	mergeDone := make(chan error, 1)
+	go func() {
+		_, err := st.MergeSourcesContext(ctx, MergeSourcesRequest{FromSourceID: from.ID, IntoSourceID: into.ID})
+		mergeDone <- err
+	}()
+	select {
+	case <-beforeLock:
+	case <-time.After(10 * time.Second):
+		require.FailNow("merge did not reach the identity-lock barrier")
+	}
+
+	removeDone := make(chan error, 1)
+	go func() {
+		_, _, err := st.RemoveSourceSerialized(ctx, removable.ID)
+		removeDone <- err
+	}()
+
+	// BeginExclusive takes the identity-revision row lock before it requests an
+	// EXCLUSIVE lock on sources. In the broken order, the merge already owns a
+	// source row lock and then waits for that revision row; observing the
+	// waiting table lock lets this test release the merge at exactly that edge.
+	deadline := time.NewTimer(10 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	removeFinished := false
+	var removeErr error
+	waitingForSources := false
+	for !removeFinished && !waitingForSources {
+		select {
+		case removeErr = <-removeDone:
+			removeFinished = true
+		case <-ticker.C:
+			var waiting bool
+			err := st.DB().QueryRowContext(ctx, `SELECT EXISTS (
+				SELECT 1 FROM pg_locks l
+				JOIN pg_class c ON c.oid = l.relation
+				JOIN pg_namespace n ON n.oid = c.relnamespace
+				WHERE n.nspname = current_schema() AND c.relname = 'sources'
+				  AND l.mode = 'ExclusiveLock' AND NOT l.granted
+			)`).Scan(&waiting)
+			require.NoError(err, "observe serialized removal's source-table lock")
+			waitingForSources = waiting
+		case <-deadline.C:
+			require.FailNow("serialized removal neither completed nor exposed its waiting sources lock")
+		}
+	}
+	release()
+
+	select {
+	case err := <-mergeDone:
+		require.NoError(err, "merge must succeed after lock ordering is respected")
+	case <-time.After(15 * time.Second):
+		require.FailNow("merge did not finish after releasing the identity-lock barrier")
+	}
+	if !removeFinished {
+		select {
+		case removeErr = <-removeDone:
+		case <-time.After(15 * time.Second):
+			require.FailNow("serialized source removal did not finish")
+		}
+	}
+	require.NoError(removeErr, "unrelated serialized source removal must succeed")
 }
 
 // is57014 reports whether err is the PostgreSQL query_canceled SQLSTATE raised
@@ -326,9 +411,9 @@ func is57014(err error) bool { return isPgError(err, "57014") }
 //     statement_timeout is 100ms runs pg_sleep(0.3) to completion, because the
 //     hatch resets the timeout to 0 inside the maintenance tx.
 func TestMaintenanceHatchLiftsStatementTimeout(t *testing.T) {
-	dbURL := skipUnlessPostgresInternal(t)
-	st := newPGStoreInternal(t, dbURL)
-	ctx := context.Background()
+	skipUnlessPostgresInternal(t)
+	st := newPGStoreInternal(t)
+	ctx := t.Context()
 
 	d := &PostgreSQLDialect{}
 
@@ -402,24 +487,24 @@ func TestMaintenanceHatchLiftsStatementTimeout(t *testing.T) {
 func TestRepackMetadataMaintenanceLiftsStatementTimeout(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
-	dbURL := skipUnlessPostgresInternal(t)
-	st := newPGStoreInternal(t, dbURL)
-	ctx := context.Background()
+	skipUnlessPostgresInternal(t)
+	st := newPGStoreInternal(t)
+	ctx := t.Context()
 	const (
 		packID = "01hzy3v7q8r9s0t1a2v3w4x6j1"
 		hash   = "aa11223344556677889900aabbccddeeff00112233445566778899aabbccddee"
 	)
 
-	_, err := st.DB().Exec(`
+	_, err := st.DB().ExecContext(t.Context(), `
 		INSERT INTO attachment_packs (pack_id, entry_count, stored_bytes, created_at)
 		VALUES ($1, 1, 64, $2)`, packID, time.Now().UTC().Format(time.RFC3339))
 	require.NoError(err, "insert zero-live pack record")
-	_, err = st.DB().Exec(`
+	_, err = st.DB().ExecContext(t.Context(), `
 		INSERT INTO attachment_pack_index
 		    (blob_hash, pack_id, pack_offset, stored_len, raw_len, flags, crc32c)
 		VALUES ($1, $2, 6, 64, 64, 0, 0)`, hash, packID)
 	require.NoError(err, "insert stale mapping")
-	_, err = st.DB().Exec(`
+	_, err = st.DB().ExecContext(t.Context(), `
 		CREATE FUNCTION slow_repack_maintenance_delete() RETURNS trigger
 		LANGUAGE plpgsql AS $$
 		BEGIN
@@ -427,12 +512,12 @@ func TestRepackMetadataMaintenanceLiftsStatementTimeout(t *testing.T) {
 		    RETURN OLD;
 		END $$`)
 	require.NoError(err, "create slow maintenance trigger function")
-	_, err = st.DB().Exec(`
+	_, err = st.DB().ExecContext(t.Context(), `
 		CREATE TRIGGER slow_repack_mapping_delete
 		BEFORE DELETE ON attachment_pack_index
 		FOR EACH ROW EXECUTE FUNCTION slow_repack_maintenance_delete()`)
 	require.NoError(err, "create slow mapping trigger")
-	_, err = st.DB().Exec(`
+	_, err = st.DB().ExecContext(t.Context(), `
 		CREATE TRIGGER slow_repack_record_delete
 		BEFORE DELETE ON attachment_packs
 		FOR EACH ROW EXECUTE FUNCTION slow_repack_maintenance_delete()`)
@@ -464,4 +549,24 @@ func TestRepackMetadataMaintenanceLiftsStatementTimeout(t *testing.T) {
 	deleted, err := st.DeleteEmptyPackRecord(ctx, packID)
 	require.NoError(err, "slow cleanup must run with maintenance timeout disabled")
 	assert.True(deleted)
+}
+
+// TestConversationPolicyMaintenanceLock checks the real maintenance transaction,
+// including this table's indirect cascade through conversations.
+func TestConversationPolicyMaintenanceLock(t *testing.T) {
+	requirements := require.New(t)
+	skipUnlessPostgresInternal(t)
+	st := newPGStoreInternal(t)
+	conn, err := st.DB().Conn(t.Context())
+	requirements.NoError(err)
+	defer func() { _ = conn.Close() }()
+	requirements.NoError(st.dialect.BeginExclusive(t.Context(), conn))
+	defer func() { _, _ = conn.ExecContext(context.WithoutCancel(t.Context()), "ROLLBACK") }()
+	var locked bool
+	requirements.NoError(conn.QueryRowContext(t.Context(), `
+ SELECT EXISTS (SELECT 1 FROM pg_locks
+ WHERE pid=pg_backend_pid() AND relation='conversation_policy'::regclass
+ AND mode='ExclusiveLock' AND granted)
+ `).Scan(&locked))
+	assert.True(t, locked, "account removal must fence conversation policy writers")
 }

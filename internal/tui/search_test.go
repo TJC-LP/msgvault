@@ -166,19 +166,6 @@ func TestSearchResultsDisplay(t *testing.T) {
 	assertLoading(t, m, false, false)
 }
 
-// TestSearchResultsStale verifies stale search results are ignored.
-func TestSearchResultsStale(t *testing.T) {
-	model := NewBuilder().WithPageSize(10).WithSize(100, 20).Build()
-	model.searchRequestID = 2 // Current request is 2
-
-	m := applySearchResults(t, model, 1, []query.MessageSummary{
-		{ID: 1, Subject: "Stale Result"},
-	}, 0)
-
-	// Messages should not be updated (still nil/empty)
-	assert.Empty(t, m.messages, "stale ignored")
-}
-
 // TestInlineSearchTabToggle verifies Tab key behavior across different search states.
 func TestInlineSearchTabToggle(t *testing.T) {
 	tests := []struct {
@@ -1385,19 +1372,6 @@ func TestDrillDownSearchBreadcrumbRoundTrip(t *testing.T) {
 	assertSearchQuery(t, m2, "important")
 }
 
-// TestDrillDownPreservesSearchQuery verifies that searchQuery persists
-// after drill-down so highlighting and filtering remain active.
-func TestDrillDownPreservesSearchQuery(t *testing.T) {
-	model := newTestModelWithRows(testAggregateRows)
-	model.level = levelAggregates
-	model.searchQuery = "alice"
-	model.cursor = 0
-
-	m := applyAggregateKey(t, model, keyEnter())
-
-	assertSearchQuery(t, m, "alice")
-}
-
 // TestSubAggregateDrillDownSearchBreadcrumbRoundTrip verifies the breadcrumb
 // round-trip through a sub-aggregate drill-down with active search.
 func TestSubAggregateDrillDownSearchBreadcrumbRoundTrip(t *testing.T) {
@@ -1817,5 +1791,223 @@ func TestSearchClearsStaleMessages(t *testing.T) {
 	assert.Nil(t, model.messages, "expected messages to be nil after search starts")
 }
 
-// TestHighlightedColumnsAligned verifies that highlighting search terms in
-// aggregate rows doesn't break column alignment.
+func TestAcceptedSearchActions(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mode   tuiMode
+		search searchModeKind
+		msg    tea.Msg
+		want   []string
+	}{
+		{"fast", modeEmail, searchModeFast, searchResultsMsg{requestID: 2, query: "needle"}, []string{"search_run:search_type:text"}},
+		{"deep", modeEmail, searchModeDeep, searchResultsMsg{requestID: 2, query: "needle", searchMode: searchModeDeep}, []string{"search_run:search_type:text"}},
+		{"semantic request keeps its type during fast editing", modeEmail, searchModeSemantic, searchResultsMsg{requestID: 2, query: "needle"}, []string{"search_run:search_type:hybrid"}},
+		{"stale matching query", modeEmail, searchModeFast, searchResultsMsg{requestID: 1, query: "needle"}, nil},
+		{"failed", modeEmail, searchModeFast, searchResultsMsg{requestID: 2, query: "needle", err: errors.New("offline")}, nil},
+		{"continuation", modeEmail, searchModeFast, searchResultsMsg{requestID: 2, query: "needle", append: true}, nil},
+		{"texts conversation", modeTexts, searchModeFast, textMessagesLoadedMsg{requestID: 2, query: "needle"}, []string{"search_run:search_type:text"}},
+		{"meetings", modeMeetings, searchModeFast, meetingSearchLoadedMsg{requestID: 2, query: "needle"}, []string{"search_run:search_type:text"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert, m, events := assert.New(t), NewBuilder().Build(), []string(nil)
+			m.width, m.height, m.mode, m.searchMode = 100, 24, tc.mode, tc.search
+			m.searchRequestID, m.textRequestID, m.meetingState.searchRequestID = 2, 2, 2
+			m.reportAction = func(_ context.Context, e, p, v string) error {
+				if e == "search_run" || e == "search_empty" {
+					events = append(events, e+":"+p+":"+v)
+				}
+				return nil
+			}
+			if tc.search == searchModeSemantic {
+				m.level, m.semanticSearch = levelMessageList, &recordingSemanticSearcher{response: &query.SemanticMessageSearchResult{}}
+				pending := m.loadSearch("needle")
+				m, _ = sendKey(t, m, key('/'))
+				assert.Equal(searchModeFast, m.searchMode)
+				tc.msg = pending()
+			}
+			_, cmd := m.Update(tc.msg)
+			if cmd != nil {
+				_ = runBatchCommand(t, cmd)
+			}
+			assert.Equal(tc.want, events)
+		})
+	}
+}
+
+func TestSubmittedSearchActions(t *testing.T) {
+	for _, tc := range []struct {
+		name                    string
+		mode                    tuiMode
+		loadedPreview, nonempty bool
+		query                   string
+		want                    []string
+	}{
+		{name: "submitted pending", want: []string{"search_run:search_type:text", "search_empty:search_type:text"}},
+		{name: "whitespace on empty aggregate", loadedPreview: true, query: " "},
+		{name: "submitted preview already loaded", loadedPreview: true, want: []string{"search_empty:search_type:text"}},
+		{name: "submitted texts", mode: modeTexts, want: []string{"search_run:search_type:text", "search_empty:search_type:text"}},
+		{name: "submitted meetings", mode: modeMeetings, want: []string{"search_run:search_type:text", "search_empty:search_type:text"}},
+		{name: "submitted nonempty", nonempty: true, want: []string{"search_run:search_type:text"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m, events, apply := submittedSearchModel(t)
+			m.mode = tc.mode
+			if tc.query != "" {
+				m.searchInput.SetValue(tc.query)
+			}
+			if tc.loadedPreview {
+				m.searchQuery = m.searchInput.Value()
+			}
+			if tc.mode == modeMeetings {
+				m.inlineSearchActive = false
+				m.meetingState.searchActive = true
+				m.meetingState.searchInput.SetValue("needle")
+			}
+			m = apply(m, keyEnter())
+			require.False(t, m.inlineSearchActive)
+			if !tc.loadedPreview {
+				switch tc.mode {
+				case modeTexts:
+					m = apply(m, textSearchResultMsg{requestID: m.textRequestID, query: "needle"})
+				case modeMeetings:
+					m = apply(m, meetingSearchLoadedMsg{requestID: m.meetingState.searchRequestID, query: "needle"})
+				default:
+					var rows []query.AggregateRow
+					if tc.nonempty {
+						rows = []query.AggregateRow{{Key: "synthetic"}}
+					}
+					m = apply(m, dataLoadedMsg{requestID: m.aggregateRequestID, searchQuery: "needle", rows: rows})
+				}
+			}
+			assert.Equal(t, tc.want, *events)
+		})
+	}
+}
+
+func submittedSearchModel(t *testing.T) (Model, *[]string, func(Model, tea.Msg) Model) {
+	t.Helper()
+	m := NewBuilder().Build()
+	m.width, m.height, m.level, m.inlineSearchActive = 100, 24, levelAggregates, true
+	m.searchInput.SetValue("needle")
+	var events []string
+	m.reportAction = func(_ context.Context, e, p, v string) error {
+		if e == "search_run" || e == "search_empty" {
+			events = append(events, e+":"+p+":"+v)
+		}
+		return nil
+	}
+	apply := func(m Model, msg tea.Msg) Model {
+		updated, cmd := m.Update(msg)
+		m = asModel(t, updated)
+		if cmd != nil {
+			_ = runBatchCommand(t, cmd)
+		}
+		return m
+	}
+	return m, &events, apply
+}
+
+func TestSubmittedSearchLifecycle(t *testing.T) {
+	t.Run("failed preview then Enter", func(t *testing.T) {
+		m, events, apply := submittedSearchModel(t)
+		m.searchQuery = "needle"
+		m = apply(m, dataLoadedMsg{err: errors.New("synthetic preview failure")})
+		require.Equal(t, modalError, m.modal)
+		m, _ = sendKey(t, m, keyEsc())
+		m = apply(m, keyEnter())
+		require.False(t, m.inlineSearchActive)
+		assert.Empty(t, *events)
+	})
+	t.Run("error clears submission", func(t *testing.T) {
+		m, events, apply := submittedSearchModel(t)
+		m = apply(m, keyEnter())
+		m = apply(m, dataLoadedMsg{requestID: m.aggregateRequestID, searchQuery: "needle", err: errors.New("synthetic")})
+		m, _ = sendKey(t, m, keyEsc())
+		m, _ = sendKey(t, m, keyTab())
+		apply(m, dataLoadedMsg{requestID: m.aggregateRequestID, searchQuery: "needle"})
+		assert.Equal(t, []string{"search_run:search_type:text"}, *events)
+	})
+	t.Run("superseding preview", func(t *testing.T) {
+		m, events, apply := submittedSearchModel(t)
+		m = apply(m, keyEnter())
+		oldID := m.aggregateRequestID
+		m, _ = sendKey(t, m, key('/'))
+		m.searchInput.SetValue("needle")
+		updated, _ := m.Update(searchDebounceMsg{query: "needle", debounceID: m.inlineSearchDebounce})
+		m = asModel(t, updated)
+		m = apply(m, dataLoadedMsg{requestID: oldID, searchQuery: "needle"})
+		apply(m, dataLoadedMsg{requestID: m.aggregateRequestID, searchQuery: "needle"})
+		assert.Equal(t, []string{"search_run:search_type:text"}, *events)
+	})
+	t.Run("mode switch restores text query", func(t *testing.T) {
+		require := require.New(t)
+		m, events, apply := submittedSearchModel(t)
+		m = apply(m, keyEnter())
+		m.textEngine = meetingModeTextEngine{}
+		m.textState.level, m.textState.selectedConvID = textLevelTimeline, 701
+		m.textState.filter = query.TextFilter{SearchQuery: "needle"}
+		m, cmd := sendKey(t, m, key('m'))
+		require.Equal(modeTexts, m.mode)
+		require.NotNil(cmd)
+		for _, msg := range runBatchCommand(t, cmd) {
+			if reply, ok := msg.(textMessagesLoadedMsg); ok {
+				require.NoError(reply.err)
+				m = apply(m, reply)
+			}
+		}
+		assert.Equal(t, []string{"search_run:search_type:text"}, *events)
+	})
+	t.Run("reload after consumption", func(t *testing.T) {
+		m, events, apply := submittedSearchModel(t)
+		m = apply(m, keyEnter())
+		m = apply(m, dataLoadedMsg{requestID: m.aggregateRequestID, searchQuery: "needle"})
+		m, _ = sendKey(t, m, keyTab())
+		apply(m, dataLoadedMsg{requestID: m.aggregateRequestID, searchQuery: "needle"})
+		assert.Equal(t, []string{"search_run:search_type:text", "search_empty:search_type:text", "search_run:search_type:text"}, *events)
+	})
+}
+
+func TestSearchFilterRetryReportsAcceptedResults(t *testing.T) {
+	for _, level := range []viewLevel{levelAggregates, levelMessageList} {
+		t.Run(fmt.Sprint(level), func(t *testing.T) {
+			assert, require, m := assert.New(t), require.New(t), newTestModelWithRows(testAggregateRows)
+			m.level, m.searchMode, m.searchQuery = level, searchModeSemantic, "needle"
+			m.semanticSearch = &recordingSemanticSearcher{response: &query.SemanticMessageSearchResult{}}
+			calls := 0
+			m.reportAction = func(context.Context, string, string, string) error { calls++; return nil }
+			var failed tea.Msg = searchResultsMsg{query: "needle", err: errors.New("offline")}
+			if level == levelAggregates {
+				failed = dataLoadedMsg{searchQuery: "needle", err: errors.New("offline")}
+			}
+			m = sendMsg(t, m, failed)
+			require.Equal(modalError, m.modal)
+			m, _ = sendKey(t, m, keyEsc())
+			m, _ = sendKey(t, m, key('f'))
+			require.Equal(modalFilterToggle, m.modal)
+			m, _ = sendKey(t, m, key(' '))
+			m, cmd := sendKey(t, m, keyEnter())
+			require.True(m.filters.attachmentsOnly)
+			for _, result := range runBatchCommand(t, cmd) {
+				updated, report := m.Update(result)
+				m = asModel(t, updated)
+				if report != nil {
+					_ = runBatchCommand(t, report)
+				}
+			}
+			require.NoError(m.err)
+			assert.Equal(1, calls)
+		})
+	}
+}
+
+func TestSearchLiteralORWarning(t *testing.T) {
+	model := NewBuilder().WithLevel(levelMessageList).WithPageSize(20).WithSize(120, 30).Build()
+	model = resizeModel(t, model, 120, 30)
+	model.searchQuery = "from:@a.example OR from:@b.example"
+	assert.Contains(t, model.View().Content, "OR was matched as a literal word")
+	model.searchQuery = `"OR"`
+	assert.NotContains(t, model.View().Content, "OR was matched as a literal word")
+	model.searchQuery = "OR"
+	model.searchMode = searchModeSemantic
+	assert.NotContains(t, model.View().Content, "OR was matched as a literal word")
+}

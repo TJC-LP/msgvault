@@ -7,7 +7,9 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -19,48 +21,99 @@ import (
 	"go.kenn.io/msgvault/internal/documentindex"
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/tasklinks"
 	"go.kenn.io/msgvault/internal/testutil"
 	"go.kenn.io/msgvault/internal/testutil/storetest"
 )
 
-func TestPersonRenameHTTPRefreshesCachedPeople(t *testing.T) {
+type wiringTaskOperations struct {
+	api.TaskLinkOperations
+
+	identities []tasklinks.MessageIdentity
+}
+
+func (o *wiringTaskOperations) Lookup(_ context.Context, identity tasklinks.MessageIdentity) tasklinks.LookupResult {
+	o.identities = append(o.identities, identity)
+	return tasklinks.LookupResult{State: tasklinks.StateReady, Complete: true, Tasks: []tasklinks.TaskSummary{}}
+}
+
+func TestStoreAPIAdapterResolvesTaskMessageIdentity(t *testing.T) {
+	f := storetest.New(t)
+	id := f.CreateMessage("task-wiring-email")
+	ops := &wiringTaskOperations{}
+	srv := api.NewServerWithOptions(api.ServerOptions{
+		Config: &config.Config{}, Store: &storeAPIAdapter{store: f.Store},
+		Logger: slog.New(slog.DiscardHandler), TaskLinkOperations: ops,
+	})
+	path := fmt.Sprintf("/api/v1/messages/%d/tasks", id)
+	response := httptest.NewRecorder()
+	srv.Router().ServeHTTP(response, httptest.NewRequestWithContext(t.Context(), http.MethodGet, path, nil))
+	assertions := assert.New(t)
+	requirements := require.New(t)
+	requirements.Equal(http.StatusOK, response.Code, response.Body.String())
+	requirements.Len(ops.identities, 1)
+	uid, err := f.Store.ArchiveUID()
+	requirements.NoError(err)
+	identity := ops.identities[0]
+	assertions.Equal(uid, identity.ArchiveUID)
+}
+
+func testPersonRenameHTTPRefreshesCachedPeople(t *testing.T, binary string) {
+	t.Helper()
 	require := require.New(t)
 	assert := assert.New(t)
 	tmp := t.TempDir()
-	dbPath := filepath.Join(tmp, "test.db")
+	dbPath := filepath.Join(tmp, "msgvault.db")
 	analyticsDir := filepath.Join(tmp, "analytics")
-	st, err := store.Open(dbPath)
-	require.NoError(err)
-	t.Cleanup(func() { require.NoError(st.Close()) })
-	require.NoError(st.InitSchema())
+	st := testutil.NewSQLiteTestStoreAt(t, dbPath)
 	alice, err := st.EnsureParticipant("alice@example.com", "Alice Observed", "example.com")
 	require.NoError(err)
 	source, err := st.GetOrCreateSource("gmail", "user@example.com")
 	require.NoError(err)
 	conv := insertExportMessagesConversation(t, st, source.ID, "conversation", "Test")
 	insertExportMessagesMessage(t, st, source.ID, conv, "message", time.Now().UTC(), "body")
-	_, err = st.DB().Exec(st.Rebind(`UPDATE messages SET sender_id = ? WHERE source_id = ?`), alice, source.ID)
+	_, err = st.DB().ExecContext(t.Context(), st.Rebind(`UPDATE messages SET sender_id = ? WHERE source_id = ?`), alice, source.ID)
 	require.NoError(err)
 	person, _, err := st.CreatePersonFromParticipant(alice)
 	require.NoError(err)
-	_, err = buildCache(dbPath, analyticsDir, true)
+	_, err = buildCache(t.Context(), dbPath, analyticsDir, true)
 	require.NoError(err)
 	messagesBefore := snapshotMessagesDatasetBytes(t, analyticsDir)
-	engine, err := query.NewDuckDBEngine(analyticsDir, "", nil)
+	engine, err := query.NewDuckDBEngine(t.Context(), analyticsDir, "", nil)
 	require.NoError(err)
 	t.Cleanup(func() { require.NoError(engine.Close()) })
 
-	// Keep the real refresh builder and publication path, running it in this
-	// process so the HTTP fixture needs no separately installed daemon binary.
-	old := runDerivedCacheSubprocess
-	runDerivedCacheSubprocess = func(_ context.Context, dir string) error {
-		_, refreshErr := buildCacheDerivedOnly(dbPath, dir)
-		return refreshErr
+	// A lost invocation must fail in an owned fallback, never open the
+	// operator's default archive. A separate config directory also detects
+	// losing --home while retaining --config.
+	fallback := t.TempDir()
+	for _, home := range []string{fallback, tmp} {
+		require.NoError(os.WriteFile(filepath.Join(home, "config.toml"), []byte("invalid = ["), 0o600))
 	}
-	t.Cleanup(func() { runDerivedCacheSubprocess = old })
+	t.Setenv("MSGVAULT_HOME", fallback)
+	configPath := filepath.Join(t.TempDir(), "custom.toml")
+	require.NoError(os.WriteFile(configPath, []byte("[analytics]\nengine = 'duckdb'\nauto_build_cache = false\n"), 0o600))
+	cfg, err := config.Load(configPath, tmp)
+	require.NoError(err)
+
+	old := executeBuildCacheSubprocessMode
+	executeBuildCacheSubprocessMode = func(ctx context.Context, mode buildCacheMode) error {
+		command, commandErr := newBuildCacheSubprocessCommand(ctx, mode)
+		if commandErr != nil {
+			return commandErr
+		}
+		// os.Executable returns the test runner; retain production arguments
+		// and environment, substituting only the freshly built native CLI.
+		command.Path, command.Args[0] = binary, binary
+		return runBuildCacheSubprocessCommand(command, nil)
+	}
+	t.Cleanup(func() { executeBuildCacheSubprocessMode = old })
 	srv := api.NewServerWithOptions(api.ServerOptions{
-		Config: &config.Config{},
-		Store:  &storeAPIAdapter{store: st, analyticsDir: analyticsDir},
+		Config: cfg,
+		Store: &storeAPIAdapter{
+			store: st, config: cfg, analyticsDir: analyticsDir,
+			options: invocationOptions{homeDir: tmp, cfgFile: configPath},
+		},
 		Logger: slog.New(slog.DiscardHandler),
 	})
 	for _, test := range []struct {
@@ -70,7 +123,7 @@ func TestPersonRenameHTTPRefreshesCachedPeople(t *testing.T) {
 		{`{"display_name":"  Alice Curated  "}`, "Alice Curated"},
 		{`{"display_name":null}`, "Alice Observed"},
 	} {
-		request := httptest.NewRequest(http.MethodPatch,
+		request := httptest.NewRequestWithContext(t.Context(), http.MethodPatch,
 			fmt.Sprintf("/api/v1/people/%d", person.ID), strings.NewReader(test.body))
 		request.Header.Set("Content-Type", "application/json")
 		request.Header.Set("If-Match", fmt.Sprintf(`"person-%d-r%d"`, person.ID, person.Revision))
@@ -133,14 +186,14 @@ func TestStoreAPIAdapterServesPersonMatchScoringRun(t *testing.T) {
 	require.NoError(err)
 	fingerprint, err := disclosure.Fingerprint()
 	require.NoError(err)
-	consentRequest := httptest.NewRequest(http.MethodPost, "/api/v1/identity/scoring/consent",
+	consentRequest := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/identity/scoring/consent",
 		strings.NewReader(fmt.Sprintf(`{"disclosure_fingerprint":%q}`, fingerprint)))
 	consentRequest.Header.Set("Content-Type", "application/json")
 	consentResponse := httptest.NewRecorder()
 	srv.Router().ServeHTTP(consentResponse, consentRequest)
 	require.Equal(http.StatusOK, consentResponse.Code, consentResponse.Body.String())
 
-	runRequest := httptest.NewRequest(http.MethodPost, "/api/v1/identity/scoring/run",
+	runRequest := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/identity/scoring/run",
 		strings.NewReader(`{"limit":1}`))
 	runRequest.Header.Set("Content-Type", "application/json")
 	runResponse := httptest.NewRecorder()
@@ -232,7 +285,8 @@ func TestStoreAPIAdapterRecreatesConsentedDocumentSearchConsumer(t *testing.T) {
 	require.NoError(err)
 	assert.True(consumer.ReconciliationComplete)
 	var occurrences int
-	require.NoError(fixture.Store.DB().QueryRow(
+	require.NoError(fixture.Store.DB().QueryRowContext(
+		t.Context(),
 		`SELECT COUNT(*) FROM document_occurrences`,
 	).Scan(&occurrences))
 	assert.Equal(1, occurrences)
@@ -263,7 +317,7 @@ func TestStoreAPIAdapterServesProfileAndCommunicationServiceRoutes(t *testing.T)
 		{"person network", fmt.Sprintf("/api/v1/people/%d/network", person.ID)},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			request := httptest.NewRequest(http.MethodGet, test.path, nil)
+			request := httptest.NewRequestWithContext(t.Context(), http.MethodGet, test.path, nil)
 			response := httptest.NewRecorder()
 
 			srv.Router().ServeHTTP(response, request)
@@ -286,7 +340,7 @@ func TestStoreAPIAdapterServesPersonTracking(t *testing.T) {
 		Config: &config.Config{}, Store: &storeAPIAdapter{store: st},
 		Logger: slog.New(slog.DiscardHandler),
 	})
-	request := httptest.NewRequest(http.MethodPut,
+	request := httptest.NewRequestWithContext(t.Context(), http.MethodPut,
 		fmt.Sprintf("/api/v1/people/%d/tracking", person.ID),
 		strings.NewReader(`{"tracked":true}`))
 	request.Header.Set("Content-Type", "application/json")
@@ -306,7 +360,7 @@ func TestStoreAPIAdapterServesPersonRelationshipRoutes(t *testing.T) {
 		Store:  &storeAPIAdapter{store: st},
 		Logger: slog.New(slog.DiscardHandler),
 	})
-	request := httptest.NewRequest(http.MethodGet, "/api/v1/relationship-types", nil)
+	request := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/relationship-types", nil)
 	response := httptest.NewRecorder()
 
 	srv.Router().ServeHTTP(response, request)
@@ -338,12 +392,52 @@ func TestStoreAPIAdapterServesOrganizationAndEmploymentRoutes(t *testing.T) {
 		{"employments", fmt.Sprintf("/api/v1/people/%d/employments", person.ID)},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			request := httptest.NewRequest(http.MethodGet, test.path, nil)
+			request := httptest.NewRequestWithContext(t.Context(), http.MethodGet, test.path, nil)
 			response := httptest.NewRecorder()
 
 			srv.Router().ServeHTTP(response, request)
 
 			require.Equal(t, http.StatusOK, response.Code, response.Body.String())
 		})
+	}
+}
+
+func TestServeFilenameDiscoveryWiring(t *testing.T) {
+	require := require.New(t)
+
+	f := storetest.New(t)
+	member, err := f.Store.EnsureParticipant("member@example.test", "Member Example", "example.test")
+	require.NoError(err)
+	person, _, err := f.Store.CreatePersonFromParticipant(member)
+	require.NoError(err)
+	message := f.CreateMessage("suggestion-wire")
+	require.NoError(f.Store.ReplaceMessageRecipients(message, "to", []int64{member}, []string{"Member Example"}))
+	var attachment int64
+	require.NoError(f.Store.DB().QueryRowContext(t.Context(), f.Store.Rebind(`INSERT INTO attachments(message_id,filename,storage_path) VALUES(?,'report.pdf','') RETURNING id`), message).Scan(&attachment))
+	for range 100 {
+		batch, err := f.Store.FilenameDiscoveryBatchContext(t.Context())
+		require.NoError(err)
+		if batch.Status.Phase == "ready" && !batch.More {
+			break
+		}
+	}
+	f.Store.DB().SetMaxOpenConns(1)
+	srv := api.NewServerWithOptions(api.ServerOptions{Config: &config.Config{}, Store: &storeAPIAdapter{store: f.Store}, Logger: slog.New(slog.DiscardHandler)})
+	for _, path := range []string{"/api/v1/files/suggest", fmt.Sprintf("/api/v1/people/%d/files/suggest", person.ID)} {
+		w := httptest.NewRecorder()
+		r := httptest.NewRequestWithContext(t.Context(), http.MethodPost, path, strings.NewReader(`{"filename_query":"report.pdf"}`))
+		r.Header.Set("Content-Type", "application/json")
+		srv.Router().ServeHTTP(w, r)
+		require.Equal(200, w.Code, w.Body.String())
+		var body map[string]any
+		decoder := json.NewDecoder(w.Body)
+		decoder.UseNumber()
+		require.NoError(decoder.Decode(&body))
+		rows, ok := body["suggestions"].([]any)
+		require.True(ok)
+		require.Len(rows, 1)
+		row, ok := rows[0].(map[string]any)
+		require.True(ok)
+		assert.Equal(t, json.Number(strconv.FormatInt(attachment, 10)), row["id"])
 	}
 }

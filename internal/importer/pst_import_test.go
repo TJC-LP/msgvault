@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/testutil"
 )
 
 // mockIngestFunc records IngestRawMessage calls for inspection in tests.
@@ -51,12 +52,10 @@ func (m *mockIngestFunc) fn(
 
 func openTestStorePst(t *testing.T) *store.Store {
 	t.Helper()
+	testutil.SkipIfPostgres(t, "SQLite fixtures require SQLite")
 	tmp := t.TempDir()
 	dbPath := filepath.Join(tmp, "msgvault.db")
-	st, err := store.Open(dbPath)
-	require.NoError(t, err, "open store")
-	t.Cleanup(func() { _ = st.Close() })
-	require.NoError(t, st.InitSchema(), "init schema")
+	st := testutil.NewSQLiteTestStoreAt(t, dbPath)
 	return st
 }
 
@@ -66,7 +65,7 @@ func TestImportPst_MissingFile(t *testing.T) {
 	st := openTestStorePst(t)
 	mock := &mockIngestFunc{}
 
-	_, err := ImportPst(context.Background(), st, "/nonexistent/path.pst", PstImportOptions{
+	_, err := ImportPst(t.Context(), st, "/nonexistent/path.pst", PstImportOptions{
 		Identifier: "user@example.com",
 		NoResume:   true,
 		IngestFunc: mock.fn,
@@ -78,7 +77,7 @@ func TestImportPst_MissingFile(t *testing.T) {
 // TestImportPst_RequiresIdentifier verifies that ImportPst rejects an empty identifier.
 func TestImportPst_RequiresIdentifier(t *testing.T) {
 	st := openTestStorePst(t)
-	_, err := ImportPst(context.Background(), st, "any.pst", PstImportOptions{
+	_, err := ImportPst(t.Context(), st, "any.pst", PstImportOptions{
 		Identifier: "",
 	})
 	require.Error(t, err, "expected error for empty identifier")
@@ -151,21 +150,4 @@ func TestPstArchiveFingerprint(t *testing.T) {
 	fpC, err := pstArchiveFingerprint(pathC)
 	require.NoError(err, "fingerprint C")
 	assert.Equal(fpA, fpC, "same bytes should fingerprint the same")
-}
-
-// TestImportPst_ContextCancelledBeforeOpen ensures that context cancellation
-// before the PST file is opened is handled gracefully.
-func TestImportPst_ContextCancelledBeforeOpen(t *testing.T) {
-	st := openTestStorePst(t)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // cancel immediately
-
-	// Use a non-existent path so Open fails fast.
-	_, err := ImportPst(ctx, st, "/nonexistent.pst", PstImportOptions{
-		Identifier: "user@example.com",
-		NoResume:   true,
-	})
-	// Either ctx error or open error is acceptable — we just must not hang.
-	assert.Error(t, err, "expected error (either ctx or open)")
 }

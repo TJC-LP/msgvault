@@ -56,6 +56,11 @@ type attachmentMaintenance struct {
 	// for the job's schedule.
 	requestPackJob   func() error
 	packJobLastError func() string
+	// verifyPending records that the indexed-blob verification window has
+	// more slices to walk. It is deliberately separate from packPending: a
+	// verification follow-up needs no loose-candidate scan, and conflating
+	// the two made every follow-up re-enumerate every attachment row.
+	verifyPending atomic.Bool
 }
 
 func newAttachmentMaintenance(
@@ -246,29 +251,36 @@ func (m *attachmentMaintenance) logAutomaticRepackSummary(message string, stats 
 // byte budget and verifies only the next window of existing packed blobs.
 // The pass still lists every referenced hash and checks every pack file, so
 // part of its cost grows with the archive. A pass that stops at its byte
-// budget leaves packPending set. verifyMore reports that the durable
-// verification cursor has further windows.
-func (m *attachmentMaintenance) runScheduledPack(ctx context.Context) (verifyMore bool, err error) {
+// budget leaves packPending set; one that leaves verification windows sets
+// verifyPending. enumerateLoose reports whether this pass should look for
+// loose blobs to pack. A pass that only advances the verification window
+// passes false, which skips a scan of every attachment row for candidates it
+// cannot find.
+func (m *attachmentMaintenance) runScheduledPack(ctx context.Context, enumerateLoose bool) error {
 	if !m.packCreationEnabled {
-		return false, nil
+		return nil
 	}
 	packCtx, pass, err := m.store.BeginPackVerification(ctx, 128, 32<<20)
 	if err != nil {
-		return false, err
+		return err
+	}
+	if !enumerateLoose {
+		pass.SkipLooseEnumeration()
 	}
 	if err := m.runAutomaticPack(packCtx); err != nil {
-		return false, err
+		return err
 	}
 	more, err := m.store.FinishPackVerification(ctx, pass)
 	if err != nil {
-		return false, err
+		return err
 	}
 	if more {
 		// A completed verification cycle restarts on the next request. Only an
 		// unfinished window provides a resume point for a budgeted follow-up.
 		jobctx.RecordProgress(ctx)
+		m.verifyPending.Store(true)
 	}
-	return more, nil
+	return nil
 }
 
 // daily runs the two bounded phases in order. Follow-ups finish the loose
@@ -276,13 +288,16 @@ func (m *attachmentMaintenance) runScheduledPack(ctx context.Context) (verifyMor
 // pack phase stops the job so the scheduler records the failure instead of
 // obscuring it with a second maintenance result.
 func (m *attachmentMaintenance) daily(ctx context.Context) error {
-	m.packPending.Store(false)
-	verifyMore, err := m.runScheduledPack(ctx)
-	if err != nil {
+	// Look for loose blobs when a sync queued a pass or nothing is queued.
+	// A pass queued only to continue verification skips loose enumeration.
+	loose := m.packPending.Swap(false)
+	verify := m.verifyPending.Swap(false)
+	enumerateLoose := loose || !verify
+	if err := m.runScheduledPack(ctx, enumerateLoose); err != nil {
 		m.markPackPending()
 		return err
 	}
-	if verifyMore || m.packPending.Load() {
+	if m.packPending.Load() || m.verifyPending.Load() {
 		return scheduler.ErrReschedule
 	}
 	return m.runAutomaticRepack(ctx, nil)
@@ -300,12 +315,12 @@ func (m *attachmentMaintenance) markPackPending() {
 // exhausted byte budget queues another pass behind waiting work. Each pass
 // advances verification by one window but does not chain a whole
 // verification cycle: on a large archive that is hundreds of passes, and the
-// daily attachment-maintenance job completes cycles.
+// daily attachment-maintenance job completes cycles from verifyPending.
 func (m *attachmentMaintenance) runPendingPack(ctx context.Context) error {
 	if m == nil || !m.packPending.Swap(false) {
 		return nil
 	}
-	if _, err := m.runScheduledPack(ctx); err != nil {
+	if err := m.runScheduledPack(ctx, true); err != nil {
 		m.packPending.Store(true)
 		return err
 	}
@@ -418,7 +433,12 @@ func runWithAttachmentMutation(
 	if err != nil {
 		return fmt.Errorf("acquire attachment mutation lease: %w", err)
 	}
-	return errors.Join(run(ctx), lease.Release())
+	runErr := run(ctx)
+	if releaseErr := lease.Release(); releaseErr != nil {
+		return errors.Join(runErr, releaseErr)
+	}
+	// Keep a bare deferral unchanged when release succeeds; the scheduler compares it directly.
+	return runErr
 }
 
 // runScheduledSource distinguishes attachment-producing provider/SyncTech
@@ -468,7 +488,10 @@ func registerAttachmentPackJob(sched *scheduler.Scheduler, maintenance *attachme
 	}
 	// A daemon started on demand may idle out long before the next cron
 	// tick, so ingests start the job themselves and report its failures.
-	maintenance.requestPackJob = func() error { return sched.RequestJob(attachmentPackJob) }
+	maintenance.requestPackJob = func() error {
+		_, err := sched.StartJob(attachmentPackJob, false)
+		return err
+	}
 	maintenance.packJobLastError = func() string {
 		for _, status := range sched.JobStatus() {
 			if status.Name == attachmentPackJob {
@@ -508,6 +531,7 @@ func attachmentProducingCommand(args []string) bool {
 	case "archive-remote-images",
 		"backfill-beeper-media",
 		"backfill-discord-media",
+		"backfill-inline-media",
 		"backfill-slack-media",
 		"backfill-teams-media",
 		"import",
@@ -521,13 +545,17 @@ func attachmentProducingCommand(args []string) bool {
 		"import-messenger",
 		"import-pst",
 		"import-slackdump",
+		"import-telegram",
 		"import-synctech-sms",
 		"import-whatsapp",
 		"sync-beeper",
+		"sync-chatwoot",
 		"sync-discord",
+		"sync-inline",
 		"sync-slack",
 		"sync-synctech-sms",
-		"sync-teams":
+		"sync-teams",
+		"sync-twilio":
 		return true
 	default:
 		return false

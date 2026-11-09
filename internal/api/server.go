@@ -21,6 +21,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"go.kenn.io/kit/daemon"
+	"go.kenn.io/kit/telemetry/posthog"
 	"go.kenn.io/msgvault/internal/agentgrant"
 	"go.kenn.io/msgvault/internal/apiprotocol"
 	"go.kenn.io/msgvault/internal/config"
@@ -41,6 +43,7 @@ import (
 	"go.kenn.io/msgvault/internal/vector/hybrid"
 	"go.kenn.io/msgvault/internal/vector/visual"
 	webapp "go.kenn.io/msgvault/internal/web"
+	"golang.org/x/sync/singleflight"
 )
 
 // MessageStore defines the store operations the API needs.
@@ -103,7 +106,7 @@ type ctxMessageSearcher interface {
 // it fall back to the non-context methods.
 type CtxMessageStore interface {
 	GetStatsContext(ctx context.Context) (*StoreStats, error)
-	ListMessagesContext(ctx context.Context, offset, limit int) ([]APIMessage, int64, error)
+	ListMessagesContext(ctx context.Context, offset, limit int, sourceIDs []int64) ([]APIMessage, int64, error)
 	GetMessageContext(ctx context.Context, id int64) (*APIMessage, error)
 	GetMessagesSummariesByIDsContext(ctx context.Context, ids []int64) ([]APIMessage, error)
 }
@@ -118,9 +121,12 @@ func (s *Server) getStats(ctx context.Context) (*StoreStats, error) {
 }
 
 // listMessages calls the context-aware store variant when available.
-func (s *Server) listMessages(ctx context.Context, offset, limit int) ([]APIMessage, int64, error) {
+func (s *Server) listMessages(ctx context.Context, offset, limit int, sourceIDs []int64) ([]APIMessage, int64, error) {
 	if cs, ok := s.store.(CtxMessageStore); ok {
-		return cs.ListMessagesContext(ctx, offset, limit)
+		return cs.ListMessagesContext(ctx, offset, limit, sourceIDs)
+	}
+	if sourceIDs != nil {
+		return nil, 0, errors.New("store does not support scoped message lists")
 	}
 	return s.store.ListMessages(offset, limit)
 }
@@ -192,7 +198,7 @@ type SourceStatusStore interface {
 	ListSources(sourceType string) ([]*store.Source, error)
 	ListSourcesContext(ctx context.Context, sourceType string) ([]*store.Source, error)
 	GetActiveSyncReadOnly(ctx context.Context, sourceID int64) (*store.SyncRun, error)
-	GetLatestSyncContext(ctx context.Context, sourceID int64) (*store.SyncRun, error)
+	GetLatestSyncContext(ctx context.Context, sourceID, excludeID int64) (*store.SyncRun, error)
 	GetLastSuccessfulSyncContext(ctx context.Context, sourceID int64) (*store.SyncRun, error)
 	CountSyncRunItemsContext(ctx context.Context, syncRunID int64, status string) (int64, error)
 	ListSyncRunItemsContext(ctx context.Context, syncRunID int64, status string, limit int) ([]store.SyncRunItem, error)
@@ -204,7 +210,7 @@ type StoreStats = store.Stats
 // SyncScheduler defines the scheduler operations the API needs.
 type SyncScheduler interface {
 	IsScheduled(email string) bool
-	TriggerSync(email string) error
+	TriggerSync(email string, manual bool) error
 	AddAccount(email, schedule string) error
 	Status() []AccountStatus
 	IsRunning() bool
@@ -220,7 +226,7 @@ type SyncScheduler interface {
 	// acquires the daemon's operation gate, avoiding a self-deadlock when
 	// the request itself is holding that gate.
 	IsJobScheduled(name string) bool
-	StartJob(name string) error
+	StartJob(name string, manual bool) (scheduler.JobDisposition, error)
 	TriggerJob(name string) error
 }
 
@@ -249,15 +255,20 @@ type analyticsEngineContextKey struct{}
 
 // Server represents the HTTP API server.
 type Server struct {
+	nativeMCP nativeMCPHandlers
+
 	// statsSnapshots and accountCountSnapshots bound /stats and
 	// /cli/accounts latency under load (see snapshotCache). Background
 	// computations run on importContext, the server-lifetime context that
 	// Shutdown cancels.
 	statsSnapshots        snapshotCache[*StoreStats]
 	accountCountSnapshots snapshotCache[map[int64]store.SourceMessageCounts]
-	statsSnapshotWait     time.Duration
-	vectorStatsTimeout    time.Duration
+	// virtualAccountSnapshots bounds the account picker catalog the same way.
+	virtualAccountSnapshots snapshotCache[map[int64][]store.VirtualAccount]
+	statsSnapshotWait       time.Duration
+	vectorStatsTimeout      time.Duration
 
+	senderAuthPins         map[int64][]string
 	cfg                    *config.Config
 	store                  MessageStore
 	analyticsState         atomic.Pointer[analyticsEngineState]
@@ -310,6 +321,8 @@ type Server struct {
 	importMu                  sync.Mutex
 	importsClosed             bool
 	importWG                  sync.WaitGroup
+	localEmbeddings           LocalEmbeddingsController
+	localSetup                LocalEmbeddingsStatus
 	// ftsIndexComplete memoizes that the FTS index is fully populated so
 	// handleCLISearch stops probing on every request. NeedsFTSBackfill runs an
 	// anti-join that scans every message when the index is complete (the
@@ -322,10 +335,15 @@ type Server struct {
 	ftsIndexComplete atomic.Bool
 	// ftsEnsureRunning guards the single background probe/backfill worker
 	// spawned by CLI searches; ftsIndexState is what that worker is doing
-	// ("checking", "building", or "" when idle/complete) so search responses
+	// (checking, building, awaiting_owner, or empty when complete) so search responses
 	// can report it. See ensureCLISearchIndexAsync.
-	ftsEnsureRunning atomic.Bool
-	ftsIndexState    atomic.Value
+	ftsEnsureRunning   atomic.Bool
+	ftsIndexState      atomic.Value
+	ftsEnsureMu        sync.Mutex
+	ftsEnsureMayRepair bool
+	// readSnapshotSlots bounds concurrent agent and caller-scoped read snapshots;
+	// see readSnapshotConcurrency.
+	readSnapshotSlots chan struct{}
 	// changesStallLoggedAt throttles the WARN handleMessageChanges emits when
 	// the content-change feed is held back by a long-lived write transaction.
 	// Unix nanoseconds of the last such line, so a consumer polling once a
@@ -374,6 +392,8 @@ type Server struct {
 	visualRun          func(context.Context, operations.PassScope) error
 	visualRetry        func(context.Context, operations.PassScope, int64, string) error
 	visualStatus       func(context.Context, bool) (visual.Status, error)
+	embeddingStatus    func(context.Context, int64) (vector.EmbeddingStatus, error)
+	embeddingETAWindow int
 	// visualAction prevents concurrent HTTP build/resume requests from both
 	// passing the active-run check before either worker records its run.
 	visualAction sync.Mutex
@@ -396,8 +416,11 @@ type Server struct {
 	// vector-search preflight path (throttled by vectorScopeNextCheck) so
 	// drift is detected even when no embed job ever runs. Wired by the
 	// daemon; see SetVectorScopeCheck.
-	vectorScopeCheck     func(ctx context.Context) (string, error)
-	vectorScopeNextCheck time.Time
+	vectorScopeCheck         func(ctx context.Context) (string, error)
+	vectorScopeNextCheck     time.Time
+	vectorRestartFingerprint func(context.Context) (string, error)
+	// vectorStaleFlight shares one stale-index diagnosis across concurrent mismatches.
+	vectorStaleFlight singleflight.Group
 	// vectorFreshNextCheck throttles maybeRefreshVectorFreshness, the
 	// ready→stale counterpart of refreshVectorStatusIfStale: a
 	// daemon-proxied one-off scoped build can activate a generation whose
@@ -411,6 +434,10 @@ type Server struct {
 	// and embedded callers that construct a Server without options, which
 	// fall back to the legacy loose-file open.
 	blobStore AttachmentBlobStore
+	// messageRecordings joins recordings with Docbank transcripts. Nil serves
+	// an empty list.
+	messageRecordings  *MessageRecordingReader
+	docbankAttachments *DocbankAttachmentReader
 	// remoteImages is the SSRF-hardened fetcher behind
 	// POST /api/v1/content/remote-image. Tests replace it to inject a fake
 	// resolver and dialer.
@@ -419,8 +446,10 @@ type Server struct {
 	// that result, collapsing the per-cid fan-out (see inline_cache.go).
 	inlineCache *inlineParseCache
 	spaHandler  http.Handler
-	sessions    *sessionStore
-	agentGrants *agentgrant.Registry
+	// telemetryCapture serves POST /api/v1/telemetry/events.
+	telemetryCapture http.Handler
+	sessions         *sessionStore
+	agentGrants      *agentgrant.Registry
 	// trustedProxies contains only explicitly configured direct proxy peers.
 	// Forwarded scheme/host data is ignored for every other RemoteAddr.
 	trustedProxies   []netip.Prefix
@@ -435,6 +464,7 @@ type Server struct {
 	taskIntegrationProbe     TaskIntegrationProbe
 	taskLinkOperations       TaskLinkOperations
 	personAgendaOperations   PersonAgendaOperations
+	kataIssueOperations      KataIssueOperations
 	taskIdentityResolver     TaskIdentityResolver
 	fastmailInventoryFactory provideridentity.Factory
 	gmailProfileAddress      func(context.Context, *store.Source) (string, error)
@@ -548,6 +578,10 @@ type ServerOptions struct {
 	// packed CAS storage with a loose-file fallback. Nil keeps the legacy
 	// loose-file-only read path.
 	BlobStore AttachmentBlobStore
+	// MessageRecordings reads recordings and their Docbank transcripts for
+	// GET /api/v1/messages/{id}/recordings. Nil serves an empty list.
+	MessageRecordings  *MessageRecordingReader
+	DocbankAttachments *DocbankAttachmentReader
 	// RequestTimeout caps each request by adding a deadline to the request
 	// context. Zero defaults to 60s. The underlying http.Server's WriteTimeout
 	// is set to RequestTimeout + 5s so handlers that honor cancellation can
@@ -570,12 +604,15 @@ type ServerOptions struct {
 	// internal/web.Handler and is the production default. Tests may inject a
 	// handler built over an in-memory filesystem.
 	SPAHandler http.Handler
+	// TelemetryCapture serves POST /api/v1/telemetry/events. Nil admits no event.
+	TelemetryCapture http.Handler
 	// TaskIntegrationProbe overrides provider-neutral task discovery for tests.
 	// Nil uses taskclient.Evaluate.
 	TaskIntegrationProbe   TaskIntegrationProbe
 	TaskLinkOperations     TaskLinkOperations
 	TaskIdentityResolver   TaskIdentityResolver
 	PersonAgendaOperations PersonAgendaOperations
+	KataIssueOperations    KataIssueOperations
 	// FastmailInventoryFactory is the provider-read seam used by identity
 	// discovery. Nil constructs the production JMAP client.
 	FastmailInventoryFactory provideridentity.Factory
@@ -596,6 +633,11 @@ func NewServer(cfg *config.Config, store MessageStore, sched SyncScheduler, logg
 
 // NewServerWithOptions creates a new API server with full options including query engine.
 func NewServerWithOptions(opts ServerOptions) *Server {
+	// Before vector initialization, configuration still describes which lanes
+	// are enabled. A supplied runtime keeps its resolved configuration.
+	if opts.Backend == nil && !opts.VectorCfg.AnyLaneEnabled() {
+		opts.VectorCfg = opts.Config.Vector
+	}
 	timeout := opts.RequestTimeout
 	if timeout <= 0 {
 		timeout = 60 * time.Second
@@ -611,6 +653,7 @@ func NewServerWithOptions(opts ServerOptions) *Server {
 	importContext, cancelImports := context.WithCancel(context.Background())
 	s := &Server{
 		cfg:                    opts.Config,
+		senderAuthPins:         opts.Config.SenderAuth.Pins(),
 		store:                  opts.Store,
 		savedViewStore:         opts.SavedViewStore,
 		sqlQueryRunner:         opts.SQLQueryRunner,
@@ -637,14 +680,22 @@ func NewServerWithOptions(opts ServerOptions) *Server {
 		importContext:          importContext,
 		cancelImports:          cancelImports,
 		statsSnapshots:         snapshotCache[*StoreStats]{logger: opts.Logger},
-		accountCountSnapshots:  snapshotCache[map[int64]store.SourceMessageCounts]{logger: opts.Logger},
-		statsSnapshotWait:      statsSnapshotWait,
-		vectorStatsTimeout:     vectorStatsTimeout,
-		blobStore:              opts.BlobStore,
-		remoteImages:           remoteimage.NewFetcher(),
-		inlineCache:            newInlineParseCache(inlineCacheMaxEntries, inlineCacheMaxBytes),
-		spaHandler:             opts.SPAHandler,
-		sessions:               newSessionStore(defaultSessionTTL),
+		accountCountSnapshots: snapshotCache[map[int64]store.SourceMessageCounts]{
+			logger: opts.Logger, staleWait: 500 * time.Millisecond,
+		},
+		virtualAccountSnapshots: snapshotCache[map[int64][]store.VirtualAccount]{
+			logger: opts.Logger, freshFor: virtualAccountCatalogFreshFor,
+		},
+		statsSnapshotWait:  statsSnapshotWait,
+		vectorStatsTimeout: vectorStatsTimeout,
+		blobStore:          opts.BlobStore,
+		messageRecordings:  opts.MessageRecordings,
+		docbankAttachments: opts.DocbankAttachments,
+		remoteImages:       remoteimage.NewFetcher(),
+		inlineCache:        newInlineParseCache(inlineCacheMaxEntries, inlineCacheMaxBytes),
+		spaHandler:         opts.SPAHandler,
+		telemetryCapture:   opts.TelemetryCapture,
+		sessions:           newSessionStore(defaultSessionTTL),
 		agentGrants: func() *agentgrant.Registry {
 			if opts.Config != nil && opts.Config.Server.AgentAccess {
 				return agentgrant.NewRegistry()
@@ -658,15 +709,21 @@ func NewServerWithOptions(opts ServerOptions) *Server {
 		taskIntegrationProbe:     taskProbe,
 		taskLinkOperations:       opts.TaskLinkOperations,
 		personAgendaOperations:   opts.PersonAgendaOperations,
+		kataIssueOperations:      opts.KataIssueOperations,
 		taskIdentityResolver:     opts.TaskIdentityResolver,
 		fastmailInventoryFactory: fastmailInventoryFactory,
 		gmailProfileAddress:      opts.GmailProfileAddress,
 		started:                  make(chan struct{}),
+		readSnapshotSlots:        make(chan struct{}, readSnapshotConcurrency),
 	}
 	s.analyticsState.Store(&analyticsEngineState{
 		engine: opts.Engine, mode: opts.AnalyticsMode,
 		analyticsInitializationActive: opts.AnalyticsInitializationActive,
 	})
+	if s.telemetryCapture == nil {
+		// kit's nil-reporter handler admits no event.
+		s.telemetryCapture = posthog.NewCaptureHandler(nil)
+	}
 	if s.taskIdentityResolver == nil {
 		s.taskIdentityResolver = s.resolveTaskMessageIdentity
 	}
@@ -675,6 +732,9 @@ func NewServerWithOptions(opts ServerOptions) *Server {
 	}
 	if s.personAgendaOperations == nil {
 		s.personAgendaOperations = newPersonAgendaBackend(opts.Config, opts.Store)
+	}
+	if s.kataIssueOperations == nil {
+		s.kataIssueOperations = newKataIssueBackend(opts.Config, opts.Store, s.logger)
 	}
 	s.vectorStatus = opts.VectorStatus
 	if s.vectorStatus == "" {
@@ -706,6 +766,7 @@ func (s *Server) setupRouter() http.Handler {
 	apiV1 := s.setupAPIV1Group(api)
 	s.registerHumaRoutes(api, apiV1)
 	s.registerPprofHandlers(mux)
+	s.mountNativeMCP(mux)
 
 	// Registered API, debug, OpenAPI, and docs routes retain priority over the
 	// root handler. The root serves exact embedded assets and safe navigation;
@@ -782,13 +843,13 @@ func (s *Server) registerPprofHandlers(mux *http.ServeMux) {
 
 // Start begins listening for HTTP requests.
 // Returns an error if the security posture is invalid.
-func (s *Server) Start() error {
+func (s *Server) Start(ctx context.Context) error {
 	bindAddr := s.cfg.Server.BindAddr
 	if bindAddr == "" {
 		bindAddr = defaultBindAddr
 	}
 	addr := net.JoinHostPort(bindAddr, strconv.Itoa(s.cfg.Server.APIPort))
-	ln, err := net.Listen("tcp", addr)
+	ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", addr)
 	if err != nil {
 		listenErr := fmt.Errorf("listen %s: %w", addr, err)
 		s.signalStarted(listenErr)
@@ -927,10 +988,15 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	server := s.server
 	s.serverMu.RUnlock()
 	if server == nil {
+		s.closeNativeMCP()
 		return importJobsErr
 	}
 	s.logger.Info("shutting down API server")
-	return errors.Join(importJobsErr, server.Shutdown(ctx))
+	drainErr := server.Shutdown(ctx)
+	if drainErr == nil {
+		s.closeNativeMCP()
+	}
+	return errors.Join(importJobsErr, drainErr)
 }
 
 // Router returns the HTTP router for testing.
@@ -945,6 +1011,11 @@ func (s *Server) analyticsEngineMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		state := s.analyticsState.Load()
 		ctx := context.WithValue(r.Context(), analyticsEngineContextKey{}, state)
+		if r.Header.Get(apiprotocol.AgentTokenHeader) != "" {
+			boundary := &readResponseWriter{ResponseWriter: w}
+			ctx = context.WithValue(ctx, readResponseKey{}, boundary)
+			w = boundary
+		}
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
@@ -1128,7 +1199,7 @@ func serveWithProtectiveRequestDeadline(
 func (s *Server) timeoutMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost &&
-			r.URL.Path == meetingImportEndpointPath &&
+			(isNativeMCPPath(r.URL.Path) || r.URL.Path == meetingImportEndpointPath || r.URL.Path == muesliImportEndpointPath || r.URL.Path == muesliRecordingEndpointPath) &&
 			s.apiRequestAuthorized(r) {
 			serveMeetingImportWithReadDeadline(w, r, next)
 			return
@@ -1148,6 +1219,9 @@ func (s *Server) timeoutMiddleware(next http.Handler) http.Handler {
 		}
 
 		timeout, bounded := s.requestTimeoutForPath(r.URL.Path)
+		if !bounded && (r.Method == http.MethodGet || r.Method == http.MethodHead) && s.requestAuthentication(r).Grant != nil {
+			timeout, bounded = s.requestTimeout, true
+		}
 		if !bounded {
 			serveWithoutWriteDeadline(w, r, next)
 			return
@@ -1222,10 +1296,13 @@ func (s *Server) requestTimeoutForPath(path string) (time.Duration, bool) {
 func isLongDaemonRequest(path string) bool {
 	switch path {
 	case "/api/v1/cli/build-cache",
+		"/api/v1/cli/account/merge",
 		importJobsEndpointPath,
 		"/api/v1/carddav/sync",
 		"/api/v1/cli/deduplicate/plan",
 		meetingImportEndpointPath,
+		muesliImportEndpointPath,
+		muesliRecordingEndpointPath,
 		"/api/v1/cli/identities/discover",
 		"/api/v1/cli/rebuild-fts",
 		"/api/v1/cli/repair-encoding",
@@ -1276,6 +1353,8 @@ func (s *Server) loggerMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		ww := newTrackingResponseWriter(w)
+		queryShape := requestQueryShape(r.URL.Query())
+		r = r.WithContext(context.WithValue(r.Context(), requestQueryShapeKey{}, queryShape))
 
 		stopWatch := s.watchInProgressRequest(r, start)
 
@@ -1283,6 +1362,8 @@ func (s *Server) loggerMiddleware(next http.Handler) http.Handler {
 			stopWatch()
 			s.logger.Info("http request",
 				"method", r.Method,
+				"remote_addr", r.RemoteAddr,
+				"query_shape", queryShape,
 				pathKey, r.URL.Path,
 				"status", ww.Status(),
 				"bytes", ww.BytesWritten(),
@@ -1306,6 +1387,8 @@ func (s *Server) watchInProgressRequest(r *http.Request, start time.Time) func()
 	}
 	done := make(chan struct{})
 	method, path := r.Method, r.URL.Path
+	remoteAddr := r.RemoteAddr
+	queryShape := queryShapeForRequest(r)
 	requestID := requestIDFromContext(r.Context())
 	go func() {
 		timer := time.NewTimer(threshold)
@@ -1317,6 +1400,8 @@ func (s *Server) watchInProgressRequest(r *http.Request, start time.Time) func()
 			case <-timer.C:
 				s.logger.Warn("http request in progress",
 					"method", method,
+					"remote_addr", remoteAddr,
+					"query_shape", queryShape,
 					pathKey, path,
 					"request_id", requestID,
 					"elapsed", time.Since(start),
@@ -1435,16 +1520,24 @@ func (w *trackingResponseWriter) WroteHeader() bool {
 // limiter. Loopback origin alone is not sufficient: a same-host reverse proxy,
 // SSH tunnel, or TLS terminator forwarding to loopback makes remote traffic
 // arrive as 127.0.0.1, which would otherwise brute-force the API key
-// unthrottled. A loopback request is exempt only when it is trusted — either
+// unthrottled. Credential-free GET discovery probes for ping and daemon identity
+// are exempt on loopback so clients can find a busy daemon. Other
+// loopback requests are exempt only when trusted — either
 // no API key is configured (pure local mode, the TUI/CLI autostart case) or it
 // carries a valid API key (an authenticated local client). apiRequestAuthorized
 // returns true in exactly those two cases, so it is reused here to avoid the
-// auth logic drifting.
+// auth logic drifting. A valid remote client key is trusted the same way.
 func (s *Server) loopbackRateLimitExempt(r *http.Request) bool {
 	if r.Method == http.MethodPost && r.URL.Path == sessionLoginPath {
 		return false
 	}
-	return isLoopbackRequest(r) && s.apiRequestAuthorized(r)
+	_, agentTokenPresented := agentTokenHeaderValue(r)
+	if isLoopbackRequest(r) && r.Method == http.MethodGet &&
+		(r.URL.Path == daemon.DefaultPingPath || r.URL.Path == DaemonIdentityPath) &&
+		!ownerCredentialPresented(r) && !agentTokenPresented {
+		return true
+	}
+	return isLoopbackRequest(r) && (s.apiRequestAuthorized(r) || s.remoteClientRequest(r))
 }
 
 func (s *Server) logUnauthorizedAPIRequest(r *http.Request) {
@@ -1455,13 +1548,14 @@ func (s *Server) logUnauthorizedAPIRequest(r *http.Request) {
 }
 
 func (s *Server) handleDaemonShutdown(w http.ResponseWriter, r *http.Request) {
-	if s.shutdownToken == "" || s.shutdownFunc == nil {
+	callerAuthorized := s.requestAuthentication(r).Mode == AuthModeCaller
+	if s.shutdownFunc == nil || (!callerAuthorized && s.shutdownToken == "") {
 		writeError(w, http.StatusNotFound, "shutdown_unavailable", "Daemon shutdown is not available")
 		return
 	}
 
 	got := r.Header.Get(DaemonShutdownTokenHeader)
-	if subtle.ConstantTimeCompare([]byte(got), []byte(s.shutdownToken)) != 1 {
+	if !callerAuthorized && subtle.ConstantTimeCompare([]byte(got), []byte(s.shutdownToken)) != 1 {
 		s.logger.Warn("unauthorized daemon shutdown request", "remote_addr", r.RemoteAddr)
 		writeError(w, http.StatusUnauthorized, "unauthorized", "Invalid or missing daemon shutdown token")
 		return
@@ -1505,13 +1599,13 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleAuthenticatedHealth returns health details that are safe behind the
-// API-key boundary. Delegated callers receive the public projection plus
+// API-key boundary. Delegated callers and remote clients receive the public projection plus
 // APISchemaVersion only, so they can verify version compatibility without
 // seeing internal operation labels that name configured account identifiers.
 func (s *Server) handleAuthenticatedHealth(w http.ResponseWriter, r *http.Request) {
 	s.refreshVectorStatus(r.Context())
 	auth := s.requestAuthentication(r)
-	if auth.Mode == AuthModeDelegated {
+	if auth.Mode == AuthModeDelegated || auth.Mode == AuthModeRemoteClient {
 		writeJSON(w, http.StatusOK, HealthResponse{
 			Status:           "ok",
 			Vector:           s.vectorHealthPublic(),

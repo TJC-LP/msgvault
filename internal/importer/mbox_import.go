@@ -18,6 +18,7 @@ import (
 
 	"go.kenn.io/msgvault/internal/mbox"
 	"go.kenn.io/msgvault/internal/mime"
+	"go.kenn.io/msgvault/internal/rederive"
 	"go.kenn.io/msgvault/internal/remoteimage"
 	"go.kenn.io/msgvault/internal/store"
 )
@@ -143,6 +144,7 @@ func ImportMbox(
 	defer func() {
 		retErr = errors.Join(retErr, execution.Release())
 	}()
+	rederive.Heal(ctx, slog.Default(), st, src)
 
 	// Resume from a recovered checkpoint, then create a new run under the
 	// source ownership held for this import.
@@ -154,7 +156,7 @@ func ImportMbox(
 	)
 
 	if !opts.NoResume {
-		active, err := st.GetLatestCheckpointedSyncByType(src.ID, "import-mbox")
+		active, err := st.GetLatestCheckpointedSyncByType(ctx, src.ID, "import-mbox")
 		if err != nil && !errors.Is(err, store.ErrSyncRunNotFound) {
 			return nil, fmt.Errorf("check resumable sync: %w", err)
 		}
@@ -220,7 +222,7 @@ func ImportMbox(
 			continue
 		}
 		seen[lbl] = true
-		labelID, err := st.EnsureLabel(src.ID, lbl, lbl, "user")
+		labelID, err := st.EnsureLabel(ctx, src.ID, lbl, lbl, "user")
 		if err != nil {
 			failSync(err.Error())
 			return nil, fmt.Errorf("ensure label %q: %w", lbl, err)
@@ -310,7 +312,7 @@ func ImportMbox(
 			ids[i] = p.SourceMsg
 		}
 
-		existingWithRaw, err := st.MessageExistsWithRawBatch(src.ID, ids)
+		existingWithRaw, err := st.MessageExistsWithRawBatchContext(ctx, src.ID, ids)
 		batchOK := err == nil
 		if err != nil {
 			cp.ErrorsCount++
@@ -318,7 +320,7 @@ func ImportMbox(
 			log.Warn("existence check failed", "error", err)
 		}
 
-		existingAny, err := st.MessageExistsBatch(src.ID, ids)
+		existingAny, err := st.MessageExistsBatchContext(ctx, src.ID, ids)
 		anyOK := err == nil
 		if err != nil {
 			cp.ErrorsCount++
@@ -326,16 +328,21 @@ func ImportMbox(
 			log.Warn("existence check failed (any)", "error", err)
 		}
 
+		// stopCancelled saves the last safe offset and reports the stop.
+		stopCancelled := func() bool {
+			summary.FinalOffset = lastCheckpointOffset
+			summary.Duration = time.Since(start)
+			if err := saveMboxCheckpoint(st, syncID, cpFile, lastCheckpointOffset, lastCheckpointSeq, &cp); err != nil {
+				cp.ErrorsCount++
+				summary.Errors++
+				log.Warn("failed to save checkpoint", "error", err)
+			}
+			return true
+		}
+
 		for _, p := range pending {
-			if err := ctx.Err(); err != nil {
-				summary.FinalOffset = lastCheckpointOffset
-				summary.Duration = time.Since(start)
-				if err := saveMboxCheckpoint(st, syncID, cpFile, lastCheckpointOffset, lastCheckpointSeq, &cp); err != nil {
-					cp.ErrorsCount++
-					summary.Errors++
-					log.Warn("failed to save checkpoint", "error", err)
-				}
-				return true
+			if ctx.Err() != nil {
+				return stopCancelled()
 			}
 
 			cp.MessagesProcessed++
@@ -351,7 +358,7 @@ func ImportMbox(
 			for _, name := range metadata.Labels {
 				id, ok := groupLabelIDs[name]
 				if !ok {
-					id, labelErr = st.EnsureLabel(src.ID, name, name, "user")
+					id, labelErr = st.EnsureLabel(ctx, src.ID, name, name, "user")
 					if labelErr != nil {
 						break
 					}
@@ -373,7 +380,7 @@ func ImportMbox(
 			if batchOK {
 				_, exists = existingWithRaw[p.SourceMsg]
 			} else {
-				one, err := st.MessageExistsWithRawBatch(src.ID, []string{p.SourceMsg})
+				one, err := st.MessageExistsWithRawBatchContext(ctx, src.ID, []string{p.SourceMsg})
 				if err != nil {
 					cp.ErrorsCount++
 					summary.Errors++
@@ -394,7 +401,12 @@ func ImportMbox(
 				// Add labels to existing message (same pattern as emlx importer).
 				if len(messageLabelIDs) > 0 {
 					if msgID, ok := existingWithRaw[p.SourceMsg]; ok && msgID > 0 {
-						if err := st.AddMessageLabels(msgID, messageLabelIDs); err != nil {
+						if err := st.AddMessageLabels(ctx, msgID, messageLabelIDs); err != nil {
+							// A cancelled label write must not move the offset
+							// past this message; the next run retries it.
+							if ctx.Err() != nil {
+								return stopCancelled()
+							}
 							log.Warn("failed to add labels to existing message",
 								"source_message_id", p.SourceMsg, "error", err)
 						} else {
@@ -422,7 +434,7 @@ func ImportMbox(
 			if anyOK {
 				_, alreadyExists = existingAny[p.SourceMsg]
 			} else {
-				one, err := st.MessageExistsBatch(src.ID, []string{p.SourceMsg})
+				one, err := st.MessageExistsBatchContext(ctx, src.ID, []string{p.SourceMsg})
 				if err != nil {
 					cp.ErrorsCount++
 					summary.Errors++

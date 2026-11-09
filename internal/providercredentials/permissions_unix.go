@@ -14,6 +14,24 @@ import (
 
 type nativePermissions struct{}
 
+func (nativePermissions) prepareDirectory(path string) error {
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		return err
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("provider credential directory must be a real directory")
+	}
+	if err := verifyCurrentOwner(info); err != nil {
+		return err
+	}
+	// Unix chmod only affects this directory; restore write access before locking.
+	return os.Chmod(path, 0o700) // #nosec G302 -- exact private directory mode.
+}
+
 func (nativePermissions) secureDirectory(path string) error {
 	if err := os.MkdirAll(path, 0o700); err != nil {
 		return err
@@ -123,8 +141,4 @@ func withStoreLock(tokenDir string, fn func() error) error {
 	}
 	defer unix.Flock(fd, unix.LOCK_UN) //nolint:errcheck // closing also releases the lock
 	return fn()
-}
-
-func replaceStoreFile(source, target string) error {
-	return os.Rename(source, target)
 }

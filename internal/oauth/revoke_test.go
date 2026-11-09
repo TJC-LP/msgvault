@@ -1,7 +1,6 @@
 package oauth
 
 import (
-	"context"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -10,6 +9,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/msgvault/internal/config"
 	"golang.org/x/oauth2"
 )
 
@@ -85,7 +85,7 @@ func TestRevokeToken(t *testing.T) {
 				Expiry:       time.Now().Add(time.Hour),
 			}, Scopes)
 
-			err := mgr.RevokeToken(context.Background(), email)
+			err := mgr.RevokeToken(t.Context(), email)
 
 			if tt.wantErr {
 				require.Error(err)
@@ -117,7 +117,7 @@ func TestRevokeToken_FallsBackToAccessToken(t *testing.T) {
 		Expiry:      time.Now().Add(time.Hour),
 	}, Scopes)
 
-	require.NoError(t, mgr.RevokeToken(context.Background(), "user@example.com"))
+	require.NoError(t, mgr.RevokeToken(t.Context(), "user@example.com"))
 	assert.Equal(t, []string{"access-only"}, *revoked)
 }
 
@@ -126,13 +126,13 @@ func TestRevokeToken_FallsBackToAccessToken(t *testing.T) {
 // which removal treats as nothing-to-revoke. The revocation body itself is
 // covered by TestRevokeToken.
 func TestRevokeStoredCredential_NoTokenFile(t *testing.T) {
-	err := RevokeStoredCredential(context.Background(), t.TempDir(), "missing@example.com")
+	err := NewStoredTokenManager(t.TempDir(), config.OAuthTokenCommands{}).RevokeToken(t.Context(), "missing@example.com")
 
 	require.Error(t, err)
 	assert.ErrorIs(t, err, os.ErrNotExist)
 }
 
-// TestFindEquivalentTokenEmails covers the Gmail alias rules the read-only
+// TestEquivalentTokenEmails covers the Gmail alias rules the read-only
 // decision must honor: authorization accepts these variants as the same
 // account, so token lookup has to as well or a --readonly run through an
 // alias spelling reads as a fresh account while the stored spelling keeps
@@ -143,7 +143,7 @@ func TestRevokeStoredCredential_NoTokenFile(t *testing.T) {
 // os.SameFile, matching what HasToken sees), while on a case-sensitive one
 // they are distinct files that do match — the dot/plus/googlemail cases
 // below behave identically everywhere.
-func TestFindEquivalentTokenEmails(t *testing.T) {
+func TestEquivalentTokenEmails(t *testing.T) {
 	mgr := setupTestManager(t, Scopes)
 	writeTokenFile(t, mgr, "username@gmail.com", testToken, Scopes)
 	writeTokenFile(t, mgr, "user.name@googlemail.com", testToken, Scopes)
@@ -181,7 +181,9 @@ func TestFindEquivalentTokenEmails(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assert.ElementsMatch(t, tt.want, mgr.FindEquivalentTokenEmails(tt.email))
+			aliases, err := mgr.EquivalentTokenEmails(t.Context(), tt.email)
+			require.NoError(t, err)
+			assert.ElementsMatch(t, tt.want, aliases)
 		})
 	}
 }
@@ -198,10 +200,19 @@ func TestEquivalentStoredGrantInUse(t *testing.T) {
 	require.NoError(mgr.saveToken("username+different@gmail.com", &testToken, Scopes))
 	writeLegacyTokenFile(t, mgr, "username+legacy@gmail.com", testToken)
 
-	assert.True(EquivalentStoredGrantInUse(
-		mgr.tokensDir, "username@gmail.com", []string{"user.name@gmail.com"}))
-	assert.False(EquivalentStoredGrantInUse(
-		mgr.tokensDir, "username@gmail.com", []string{"username+different@gmail.com"}))
-	assert.True(EquivalentStoredGrantInUse(
-		mgr.tokensDir, "username@gmail.com", []string{"username+legacy@gmail.com"}))
+	shared, err := mgr.EquivalentGrantInUse(t.Context(), "username@gmail.com", []string{"user.name@gmail.com"})
+	require.NoError(err)
+	assert.True(shared)
+	shared, err = mgr.EquivalentGrantInUse(t.Context(), "username@gmail.com", []string{"username+different@gmail.com"})
+	require.NoError(err)
+	assert.False(shared)
+	shared, err = mgr.EquivalentGrantInUse(t.Context(), "username@gmail.com", []string{"username+legacy@gmail.com"})
+	require.NoError(err)
+	assert.True(shared)
+
+	broken := setupTestManager(t, Scopes)
+	brokenEmail := "reader@example.com"
+	require.NoError(os.WriteFile(broken.TokenPath(brokenEmail), []byte("{"), 0600))
+	_, err = broken.EquivalentGrantInUse(t.Context(), brokenEmail, []string{brokenEmail})
+	assert.Error(err, "an unreadable token must abort cleanup and keep the grant")
 }

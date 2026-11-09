@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"go.kenn.io/msgvault/internal/sqliteutil"
 	"go.kenn.io/msgvault/internal/store"
 )
 
@@ -141,10 +142,10 @@ func Generate(ctx context.Context, opts Options) (*Summary, error) {
 	if err := checkTargetState(dbPath, opts.Append); err != nil {
 		return nil, err
 	}
-	if err := initSchema(dbPath); err != nil {
+	if err := initSchema(ctx, dbPath); err != nil {
 		return nil, err
 	}
-	db, err := sql.Open("sqlite3", dbPath+"?_journal_mode=WAL&_synchronous=OFF&_foreign_keys=ON")
+	db, err := sql.Open(sqliteutil.DriverName(), dbPath+"?_journal_mode=WAL&_synchronous=OFF&_foreign_keys=ON")
 	if err != nil {
 		return nil, fmt.Errorf("fakevault: opening database: %w", err)
 	}
@@ -240,12 +241,12 @@ func checkTargetState(dbPath string, appendMode bool) error {
 // initSchema creates or migrates the database through the real store layer,
 // so generated vaults always carry the schema shipped msgvault binaries
 // expect — including index and trigger definitions.
-func initSchema(dbPath string) error {
-	st, err := store.Open(dbPath)
+func initSchema(ctx context.Context, dbPath string) error {
+	st, err := store.OpenContext(ctx, dbPath)
 	if err != nil {
 		return fmt.Errorf("fakevault: opening store: %w", err)
 	}
-	if err := st.InitSchema(); err != nil {
+	if err := st.InitSchemaContext(ctx); err != nil {
 		_ = st.Close()
 		return fmt.Errorf("fakevault: initializing schema: %w", err)
 	}
@@ -739,6 +740,12 @@ func (g *generator) convMember(convID int64, j int) int64 {
 // finalize backfills the denormalized conversation stats and checkpoints
 // the WAL so the finished vault is a compact, self-contained database file.
 func (g *generator) finalize(ctx context.Context) error {
+	// Direct inserts bypass the Store paths that queue chats for discovery;
+	// the first search rebuilds every queued conversation that is a chat.
+	if _, err := g.db.ExecContext(ctx, `INSERT OR IGNORE INTO chat_members_dirty (conversation_id)
+		SELECT id FROM conversations`); err != nil {
+		return fmt.Errorf("fakevault: queueing chat members: %w", err)
+	}
 	if g.opts.ParticipantEdges > 0 {
 		if _, err := g.db.ExecContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
 			return fmt.Errorf("fakevault: checkpointing WAL: %w", err)

@@ -2,7 +2,6 @@ package muesli
 
 import (
 	"bytes"
-	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -52,12 +51,12 @@ func TestReaderReadsCurrentSchema(t *testing.T) {
 	})
 	var beforeCount int
 	var beforeUpdated float64
-	require.NoError(db.QueryRow(`SELECT count(*), max(updated_at) FROM meetings`).Scan(&beforeCount, &beforeUpdated))
+	require.NoError(db.QueryRowContext(t.Context(), `SELECT count(*), max(updated_at) FROM meetings`).Scan(&beforeCount, &beforeUpdated))
 
-	reader, err := Open(context.Background(), path)
+	reader, err := Open(t.Context(), path)
 	require.NoError(err)
 	t.Cleanup(func() { _ = reader.Close() })
-	meetings, err := reader.ListMeetings(context.Background())
+	meetings, err := reader.ListMeetings(t.Context())
 	require.NoError(err)
 
 	require.Len(meetings, 2)
@@ -82,9 +81,40 @@ func TestReaderReadsCurrentSchema(t *testing.T) {
 
 	var afterCount int
 	var afterUpdated float64
-	require.NoError(db.QueryRow(`SELECT count(*), max(updated_at) FROM meetings`).Scan(&afterCount, &afterUpdated))
+	require.NoError(db.QueryRowContext(t.Context(), `SELECT count(*), max(updated_at) FROM meetings`).Scan(&afterCount, &afterUpdated))
 	assert.Equal(beforeCount, afterCount)
 	assert.InDelta(beforeUpdated, afterUpdated, 0)
+}
+
+func TestReaderReadsOneMeetingByID(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	path := filepath.Join(t.TempDir(), "muesli.db")
+	db := newFixtureDB(t, path, currentSchemaDDL)
+	first := insertRow(t, db, "meetings", completedMeeting(nil))
+	second := insertRow(t, db, "meetings", completedMeeting(map[string]any{"title": "Second", "created_at": "2026-09-02 09:00:00"}))
+	insertRow(t, db, "meeting_participants", map[string]any{
+		"meeting_id": first, "participant_identifier": "email:alice@example.com",
+		"display_name": "Alice Example", "insertion_order": 0, "source": "calendar",
+	})
+	insertRow(t, db, "meeting_participants", map[string]any{
+		"meeting_id": second, "participant_identifier": "email:bob@example.com",
+		"display_name": "Bob Example", "insertion_order": 0, "source": "calendar",
+	})
+	reader, err := Open(t.Context(), path)
+	require.NoError(err)
+	t.Cleanup(func() { _ = reader.Close() })
+
+	meetings, err := reader.listMeetings(t.Context(), second)
+	require.NoError(err)
+	require.Len(meetings, 1, "a completion hook reads only the named meeting")
+	assert.Equal("Second", meetings[0].Title)
+	require.Len(meetings[0].Participants, 1)
+	assert.Equal("bob@example.com", meetings[0].Participants[0].Email)
+
+	missing, err := reader.listMeetings(t.Context(), second+100)
+	require.NoError(err)
+	assert.Empty(missing)
 }
 
 func TestReaderReadsLegacySchema(t *testing.T) {
@@ -108,10 +138,10 @@ func TestReaderReadsLegacySchema(t *testing.T) {
 		"meeting_id": id, "participant_identifier": "email:hidden@example.com",
 	})
 
-	reader, err := Open(context.Background(), path)
+	reader, err := Open(t.Context(), path)
 	require.NoError(err)
 	t.Cleanup(func() { _ = reader.Close() })
-	meetings, err := reader.ListMeetings(context.Background())
+	meetings, err := reader.ListMeetings(t.Context())
 	require.NoError(err)
 
 	require.Len(meetings, 1)
@@ -130,10 +160,10 @@ func TestReaderMarksDeletedMeetings(t *testing.T) {
 	db := newFixtureDB(t, path, currentSchemaDDL)
 	insertRow(t, db, "meetings", completedMeeting(map[string]any{"deleted_at": 1788271503.0}))
 
-	reader, err := Open(context.Background(), path)
+	reader, err := Open(t.Context(), path)
 	require.NoError(err)
 	t.Cleanup(func() { _ = reader.Close() })
-	meetings, err := reader.ListMeetings(context.Background())
+	meetings, err := reader.ListMeetings(t.Context())
 	require.NoError(err)
 
 	require.Len(meetings, 1)
@@ -144,17 +174,17 @@ func TestReaderReadsCommittedRowsStillInTheWAL(t *testing.T) {
 	require := require.New(t)
 	path := filepath.Join(t.TempDir(), "muesli.db")
 	db := newFixtureDB(t, path, currentSchemaDDL)
-	_, err := db.Exec(`PRAGMA wal_autocheckpoint=0`)
+	_, err := db.ExecContext(t.Context(), `PRAGMA wal_autocheckpoint=0`)
 	require.NoError(err)
 	insertRow(t, db, "meetings", completedMeeting(map[string]any{"title": "Only in WAL"}))
 	walInfo, err := os.Stat(path + "-wal")
 	require.NoError(err)
 	require.Positive(walInfo.Size(), "the fixture row must still be in the WAL")
 
-	reader, err := Open(context.Background(), path)
+	reader, err := Open(t.Context(), path)
 	require.NoError(err)
 	t.Cleanup(func() { _ = reader.Close() })
-	meetings, err := reader.ListMeetings(context.Background())
+	meetings, err := reader.ListMeetings(t.Context())
 	require.NoError(err)
 
 	require.Len(meetings, 1)
@@ -166,7 +196,7 @@ func TestReaderOpensWALWithoutSharedMemorySidecar(t *testing.T) {
 	const writerDBEnv = "MSGVAULT_TEST_WAL_WRITER_DB"
 	if path := os.Getenv(writerDBEnv); path != "" {
 		db := newFixtureDB(t, path, currentSchemaDDL)
-		_, err := db.Exec(`PRAGMA wal_autocheckpoint=0`)
+		_, err := db.ExecContext(t.Context(), `PRAGMA wal_autocheckpoint=0`)
 		require.NoError(err)
 		insertRow(t, db, "meetings", completedMeeting(map[string]any{"title": "Only in WAL"}))
 		// Exit without closing the database so the committed WAL remains for the
@@ -177,7 +207,7 @@ func TestReaderOpensWALWithoutSharedMemorySidecar(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "muesli.db")
 	executable, err := os.Executable()
 	require.NoError(err)
-	cmd := exec.Command(executable, "-test.run=^TestReaderOpensWALWithoutSharedMemorySidecar$")
+	cmd := exec.CommandContext(t.Context(), executable, "-test.run=^TestReaderOpensWALWithoutSharedMemorySidecar$")
 	cmd.Env = append(os.Environ(), writerDBEnv+"="+path)
 	output, err := cmd.CombinedOutput()
 	require.NoError(err, string(output))
@@ -187,10 +217,10 @@ func TestReaderOpensWALWithoutSharedMemorySidecar(t *testing.T) {
 	before, err := os.ReadFile(path)
 	require.NoError(err)
 
-	reader, err := Open(context.Background(), path)
+	reader, err := Open(t.Context(), path)
 	require.NoError(err)
 	t.Cleanup(func() { _ = reader.Close() })
-	meetings, err := reader.ListMeetings(context.Background())
+	meetings, err := reader.ListMeetings(t.Context())
 	require.NoError(err)
 	require.Len(meetings, 1)
 	assert.Equal(t, "Only in WAL", meetings[0].Title)
@@ -206,13 +236,13 @@ func TestReaderConnectionRejectsWriteQueries(t *testing.T) {
 	db := newFixtureDB(t, path, currentSchemaDDL)
 	insertRow(t, db, "meetings", completedMeeting(nil))
 
-	reader, err := Open(context.Background(), path)
+	reader, err := Open(t.Context(), path)
 	require.NoError(err)
 	t.Cleanup(func() { _ = reader.Close() })
-	_, err = reader.db.ExecContext(context.Background(), `UPDATE meetings SET title = 'Changed'`)
+	_, err = reader.db.ExecContext(t.Context(), `UPDATE meetings SET title = 'Changed'`)
 	require.Error(err)
 
-	meetings, err := reader.ListMeetings(context.Background())
+	meetings, err := reader.ListMeetings(t.Context())
 	require.NoError(err)
 	require.Len(meetings, 1)
 	assert.Equal(t, "Weekly sync", meetings[0].Title)
@@ -226,10 +256,10 @@ func TestReaderOpensPathsWithURISpecialCharacters(t *testing.T) {
 	db := newFixtureDB(t, path, currentSchemaDDL)
 	insertRow(t, db, "meetings", completedMeeting(nil))
 
-	reader, err := Open(context.Background(), path)
+	reader, err := Open(t.Context(), path)
 	require.NoError(err)
 	t.Cleanup(func() { _ = reader.Close() })
-	meetings, err := reader.ListMeetings(context.Background())
+	meetings, err := reader.ListMeetings(t.Context())
 	require.NoError(err)
 
 	assert.Len(t, meetings, 1)
@@ -252,7 +282,7 @@ func TestReaderRejectsMissingOrForeignDatabases(t *testing.T) {
 		{name: "missing start_time", path: incomplete, want: "not a Muesli database"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			reader, err := Open(context.Background(), tt.path)
+			reader, err := Open(t.Context(), tt.path)
 			if reader != nil {
 				_ = reader.Close()
 			}

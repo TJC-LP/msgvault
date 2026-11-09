@@ -1,14 +1,18 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -112,13 +116,13 @@ func overrideSetupVectorFeatures(t *testing.T, fn func(context.Context, *store.S
 func TestVectorInitHandleWaitContextReturnsTrueWhenFinished(t *testing.T) {
 	h := &vectorInitHandle{done: make(chan struct{})}
 	close(h.done)
-	assert.True(t, h.WaitContext(context.Background()),
+	assert.True(t, h.WaitContext(t.Context()),
 		"finished init should report done")
 }
 
 func TestVectorInitHandleWaitContextReturnsFalseWhenCancelled(t *testing.T) {
 	h := &vectorInitHandle{done: make(chan struct{})}
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 	assert.False(t, h.WaitContext(ctx),
 		"a done context must stop the wait before init finishes")
@@ -133,7 +137,7 @@ func TestVectorInitHandleWaitContextPrefersDoneWhenBothReady(t *testing.T) {
 	for range 200 {
 		h := &vectorInitHandle{done: make(chan struct{})}
 		close(h.done)
-		ctx, cancel := context.WithCancel(context.Background())
+		ctx, cancel := context.WithCancel(t.Context())
 		cancel()
 		require.True(t, h.WaitContext(ctx),
 			"finished init must report done even when ctx is also ready")
@@ -201,7 +205,7 @@ func TestStartVectorInitInstallsFeaturesOnSuccess(t *testing.T) {
 	requirements.True(h.WaitTimeout(5 * time.Second))
 	status, _ := srv.VectorStatus()
 	requirements.Equal(api.VectorStatusReady, status)
-	request := httptest.NewRequest(http.MethodPost, "/api/v1/people/search",
+	request := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/people/search",
 		strings.NewReader(`{"query":"synthetic"}`))
 	request.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()
@@ -271,6 +275,10 @@ func (startupDocumentSemanticClient) EmbedDocuments(context.Context, []vector.Do
 }
 
 type startupDocumentBackend struct{}
+
+func (startupDocumentBackend) UnpublishedTokens(context.Context, vectordocument.GenerationID, int, []string) (map[string]bool, error) {
+	return map[string]bool{}, nil
+}
 
 func (startupDocumentBackend) PutUnpublished(context.Context, vectordocument.GenerationID, int, []vectordocument.Embedding) error {
 	return nil
@@ -356,7 +364,7 @@ func TestStartVectorInitInstallsOnlyConsentedDocumentSearch(t *testing.T) {
 			h := startVectorInit(testCtx, mainStore, "/tmp/msgvault.db", nil, srv, scheduler.New(nil))
 			require.True(t, h.WaitTimeout(5*time.Second))
 
-			request := httptest.NewRequest(http.MethodGet, "/api/v1/documents/search?q=bounded&mode=semantic&candidate_limit=10", nil)
+			request := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/documents/search?q=bounded&mode=semantic&candidate_limit=10", nil)
 			response := httptest.NewRecorder()
 			srv.Router().ServeHTTP(response, request)
 			assert.Equal(t, test.wantStatus, response.Code, response.Body.String())
@@ -368,9 +376,11 @@ func TestStartVectorInitInstallsOnlyConsentedDocumentSearch(t *testing.T) {
 
 func TestStartVectorInitFlagsStaleIndex(t *testing.T) {
 	c := config.NewDefaultConfig()
+	c.HomeDir = t.TempDir()
 	c.Vector.Enabled = true
 	testCtx := withTestConfig(t, c)
-	_ = testCtx
+	var logs bytes.Buffer
+	invocationFromContext(testCtx).logger = slog.New(slog.NewJSONHandler(&logs, nil))
 
 	// Active generation's fingerprint differs from the configured one, so
 	// the same check the query path runs (ResolveActiveForFingerprint)
@@ -395,6 +405,25 @@ func TestStartVectorInitFlagsStaleIndex(t *testing.T) {
 	assert.Contains(detail, "old-model:384:c6000:e1", "detail names the stored fingerprint")
 	assert.Contains(detail, c.Vector.GenerationFingerprint(), "detail names the configured fingerprint")
 	assert.Contains(detail, "msgvault embeddings build --full-rebuild", "detail names the rebuild command")
+
+	decoder := json.NewDecoder(&logs)
+	foundWarning := false
+	for decoder.More() {
+		var record struct {
+			Level  string `json:"level"`
+			Msg    string `json:"msg"`
+			Error  string `json:"error"`
+			Detail string `json:"detail"`
+		}
+		require.NoError(t, decoder.Decode(&record))
+		if record.Level == "WARN" && record.Msg == "vector index does not match configured embedding settings; vector search unavailable" {
+			foundWarning = true
+			assert.Contains(record.Error, `active="old-model:384:c6000:e1"`)
+			assert.Contains(record.Error, `configured="`+c.Vector.GenerationFingerprint()+`"`)
+			assert.Contains(record.Detail, "msgvault embeddings build --full-rebuild")
+		}
+	}
+	assert.True(foundWarning, "startup logs a stale-index warning")
 }
 
 func TestStartVectorInitReportsError(t *testing.T) {
@@ -435,17 +464,18 @@ func TestStartVectorInitHoldsWorkTracker(t *testing.T) {
 		srv := newVectorInitTestServer(t)
 		testCtx := withTestConfig(t, c)
 		h := startVectorInit(testCtx, nil, "/tmp/msgvault.db", gate, srv, scheduler.New(nil))
+		// Cleanup runs after t.Context() is canceled.
 		t.Cleanup(func() {
 			releaseWork()
 			require.True(h.WaitTimeout(5 * time.Second))
-			require.NoError(srv.Shutdown(context.Background()), "shutdown")
+			require.NoError(srv.Shutdown(context.WithoutCancel(t.Context())), "shutdown")
 			synctest.Wait()
 		})
 
 		synctest.Wait()
 		_, _, held := gate.Holder()
 		require.True(held, "gate should be held during init")
-		probeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
+		probeCtx, cancel := context.WithTimeout(t.Context(), 5*time.Millisecond)
 		defer cancel()
 		probeDone := make(chan bool, 1)
 		go func() {
@@ -611,7 +641,7 @@ func runRegisteredContextJob(
 	}
 	require.NoError(t, registerEmbedJob(capture, vf, nil, nil, testCfg, testDiscardLogger()))
 	require.NotNil(t, capture.job)
-	capture.job.Run(testCtx)
+	require.NoError(t, capture.job.Run(testCtx))
 	return backend, runner
 }
 
@@ -1060,7 +1090,7 @@ func serveVisualOperationRequest(
 	t *testing.T, handler http.Handler, path, body string,
 ) *httptest.ResponseRecorder {
 	t.Helper()
-	request := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+	request := httptest.NewRequestWithContext(t.Context(), http.MethodPost, path, strings.NewReader(body))
 	if body != "" {
 		request.Header.Set("Content-Type", "application/json")
 	}
@@ -1084,4 +1114,76 @@ func visualInvocationKeys(t *testing.T, st *store.Store) []string {
 	}
 	require.NoError(t, rows.Err())
 	return keys
+}
+
+func TestRestartVectorFingerprintMatchesStartup(t *testing.T) {
+	t.Parallel()
+	must := require.New(t)
+	st := testutil.NewTestStore(t)
+	_, err := st.GetOrCreateSource("gmail", "a@example.com")
+	must.NoError(err)
+	_, err = st.GetOrCreateSource("gmail", "b@example.com")
+	must.NoError(err)
+	home := t.TempDir()
+	path := filepath.Join(home, "config.toml")
+	writeConfig := func(accounts, model string) {
+		t.Helper()
+		content := fmt.Sprintf(`[vector]
+enabled = true
+[vector.embeddings]
+endpoint = "http://127.0.0.1:11434/v1"
+model = %q
+dimension = 4
+[vector.embed.scope]
+accounts = %s
+message_types = ["email"]
+`, model, accounts)
+		must.NoError(os.WriteFile(path, []byte(content), 0600))
+	}
+	writeConfig(`["a@example.com", "b@example.com"]`, "model-a")
+	cfg, err := config.Load(path, home)
+	must.NoError(err)
+	resolve := restartVectorFingerprint(st, &invocation{cfg: cfg})
+	initial, err := resolve(t.Context())
+	must.NoError(err)
+	cancelledCtx, cancel := context.WithCancel(t.Context())
+	cancel()
+	for _, test := range []struct {
+		name, accounts, model string
+		ctx                   context.Context
+		same                  bool
+		wantErr               error
+	}{
+		{name: "reordered accounts", accounts: `["b@example.com", "a@example.com"]`, model: "model-a", ctx: t.Context(), same: true},
+		{name: "model", accounts: `["a@example.com", "b@example.com"]`, model: "model-b", ctx: t.Context()},
+		{name: "disabled", ctx: t.Context(), wantErr: vector.ErrNotEnabled},
+		{name: "cancelled context", accounts: `["a@example.com"]`, model: "model-a", ctx: cancelledCtx, wantErr: context.Canceled},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			assert := assert.New(t)
+			require := require.New(t)
+			if errors.Is(test.wantErr, vector.ErrNotEnabled) {
+				require.NoError(os.WriteFile(path, []byte("[vector]\nenabled = false\n"), 0600))
+			} else {
+				writeConfig(test.accounts, test.model)
+			}
+			got, err := resolve(test.ctx)
+			if test.wantErr != nil {
+				require.ErrorIs(err, test.wantErr)
+				assert.Empty(got)
+				return
+			}
+			require.NoError(err)
+			startup, err := config.Load(path, home)
+			require.NoError(err)
+			resolved, err := resolvedVectorConfig(t.Context(), st, startup.Vector)
+			require.NoError(err)
+			assert.Equal(resolved.GenerationFingerprint(), got)
+			if test.same {
+				assert.Equal(initial, got)
+			} else {
+				assert.NotEqual(initial, got)
+			}
+		})
+	}
 }

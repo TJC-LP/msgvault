@@ -66,6 +66,7 @@ type PersonFileSearchHTTPRequest struct {
 }
 
 type FileSearchRow struct {
+	SenderLabel        string               `json:"sender_label,omitempty"`
 	ID                 int64                `json:"id"`
 	Key                string               `json:"key"`
 	EntryKey           string               `json:"entry_key"`
@@ -138,17 +139,18 @@ type FileGroupsHTTPResponse struct {
 }
 
 type FileMetadataResponse struct {
-	ID               int64            `json:"id"`
-	MessageID        int64            `json:"message_id"`
-	ConversationID   int64            `json:"conversation_id"`
-	EntryKey         string           `json:"entry_key"`
-	Filename         string           `json:"filename"`
-	MimeType         string           `json:"mime_type"`
-	Size             int64            `json:"size_bytes"`
-	ContentHash      string           `json:"content_hash,omitempty"`
-	URL              string           `json:"url,omitempty"`
-	ContentState     FileContentState `json:"content_state" enum:"metadata_only,url_only,missing_blob,local_content"`
-	ContentAvailable bool             `json:"content_available"`
+	Docbank          []store.DocbankAttachmentRef `json:"docbank,omitempty"`
+	ID               int64                        `json:"id"`
+	MessageID        int64                        `json:"message_id"`
+	ConversationID   int64                        `json:"conversation_id"`
+	EntryKey         string                       `json:"entry_key"`
+	Filename         string                       `json:"filename"`
+	MimeType         string                       `json:"mime_type"`
+	Size             int64                        `json:"size_bytes"`
+	ContentHash      string                       `json:"content_hash,omitempty"`
+	URL              string                       `json:"url,omitempty"`
+	ContentState     FileContentState             `json:"content_state" enum:"metadata_only,url_only,missing_blob,local_content"`
+	ContentAvailable bool                         `json:"content_available"`
 }
 
 type visualRevisionSource interface {
@@ -180,6 +182,7 @@ type fileMetadataCatalog interface {
 }
 
 func (s *Server) registerFilesRoutes(api huma.API) {
+	s.registerFileSuggestionRoutes(api)
 	registerExploreRoute[FileSearchHTTPRequest, FileSearchHTTPResponse](
 		api, "searchFiles", "/files/search", "Search analytical files", s.handleSearchFiles,
 	)
@@ -434,6 +437,9 @@ func (s *Server) handleSearchFilesRequest(
 		return
 	}
 	predicate.query.Search = searchSpec
+	if scope != nil || person != nil {
+		predicate.query.SentOnly = true
+	}
 	if scope != nil {
 		if err := applyIdentityScope(&predicate.query.Context, *scope); err != nil {
 			writeError(w, http.StatusConflict, "identity_scope_conflict", err.Error())
@@ -544,6 +550,7 @@ func (s *Server) handleSearchFilesRequest(
 		state, available := s.fileContentState(r.Context(), authority)
 		response.Files = append(response.Files, FileSearchRow{
 			ID: file.ID, Key: file.Key, EntryKey: file.EntryKey, MessageID: file.MessageID,
+			SenderLabel:    file.SenderLabel,
 			ConversationID: file.ConversationID, OccurredAt: file.OccurredAt,
 			SourceID: file.SourceID, SourceType: file.SourceType, SourceIdentifier: file.SourceIdentifier,
 			ContainingTitle: file.ContainingTitle, Filename: file.Filename, MimeType: file.MimeType,
@@ -857,7 +864,7 @@ func (s *Server) handleGetFile(w http.ResponseWriter, r *http.Request) {
 		ID: file.ID, MessageID: file.MessageID, ConversationID: file.ConversationID,
 		EntryKey: fileEntryKey(*file),
 		Filename: file.Filename, MimeType: file.MimeType, Size: file.Size,
-		ContentHash: file.ContentHash, URL: file.URL, ContentState: state, ContentAvailable: available,
+		ContentHash: file.ContentHash, URL: file.URL, ContentState: state, ContentAvailable: available, Docbank: file.Docbank,
 	})
 }
 

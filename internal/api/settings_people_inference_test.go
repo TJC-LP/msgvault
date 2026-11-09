@@ -19,6 +19,7 @@ import (
 	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/peoplesweep"
 	"go.kenn.io/msgvault/internal/personenrollment"
+	"go.kenn.io/msgvault/internal/providercredentials"
 	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/testutil"
 )
@@ -116,16 +117,16 @@ func TestPeopleInferenceSelectionRequiresCheckAndConsent(t *testing.T) {
 	selected.Provider.Name = "remote"
 	profile, err := selected.Profile()
 	require.NoError(err)
-	_, err = st.EnsurePersonInferenceProfile(context.Background(), profile)
+	_, err = st.EnsurePersonInferenceProfile(t.Context(), profile)
 	require.NoError(err)
-	require.NoError(st.RecordPersonInferenceCheck(context.Background(), store.PersonInferenceCheck{
+	require.NoError(st.RecordPersonInferenceCheck(t.Context(), store.PersonInferenceCheck{
 		ProfileFingerprint: profile.Fingerprint, CheckedAt: time.Now(),
 		DriverVersion: profile.DriverVersion, OutputMode: profile.OutputMode,
 		ModelVersion: profile.Model,
 	}))
 	resp = performSettingsRequest(t, srv, http.MethodPost, selectPath, request, created.ETag, "")
 	assert.Equal(http.StatusConflict, resp.Code, resp.Body.String())
-	_, _, err = st.GrantPersonInferenceConsent(context.Background(), profile.Fingerprint, "test")
+	_, _, err = st.GrantPersonInferenceConsent(t.Context(), profile.Fingerprint, "test")
 	require.NoError(err)
 	resp = performSettingsRequest(t, srv, http.MethodPost, selectPath, request, created.ETag, "")
 	require.Equal(http.StatusOK, resp.Code, resp.Body.String())
@@ -138,7 +139,7 @@ func TestPeopleInferenceSelectionRequiresCheckAndConsent(t *testing.T) {
 	assert.NotEmpty(resp.Header().Get("ETag"))
 }
 
-func TestPeopleInferencePresetCreationRequiresSupportedStorage(t *testing.T) {
+func TestPeopleInferencePresetCreationUsesStoredKeys(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
 	srv, _ := newSettingsTestServer(t, "")
@@ -147,22 +148,9 @@ func TestPeopleInferencePresetCreationRequiresSupportedStorage(t *testing.T) {
 	request := []byte(`{"preset_id":"openrouter","model":"example/model","retention_posture":"operator-confirmed","training_posture":"operator-confirmed","allowed_sources":["conversation_text"],"source_since":"2025-01-01","allow_sensitive":false}`)
 	created := performSettingsRequest(t, srv, http.MethodPut,
 		peopleInferenceSettingsPath+"/providers/remote", request, read.Header().Get("ETag"), "")
-	if !peoplesweep.StoredCredentialsSupported() {
-		require.Equal(http.StatusServiceUnavailable, created.Code, created.Body.String())
-		assert.Contains(created.Body.String(), "--credential-env on the daemon host")
-		after := performSettingsRequest(t, srv, http.MethodGet, peopleInferenceSettingsPath, nil, "", "")
-		require.Equal(http.StatusOK, after.Code, after.Body.String())
-		assert.Equal(read.Header().Get("ETag"), after.Header().Get("ETag"))
-		var body PeopleInferenceSettingsResponse
-		require.NoError(json.Unmarshal(after.Body.Bytes(), &body))
-		assert.False(body.StoredCredentialsSupported)
-		assert.JSONEq(read.Body.String(), after.Body.String())
-		return
-	}
 	require.Equal(http.StatusOK, created.Code, created.Body.String())
 	var body PeopleInferenceSettingsResponse
 	require.NoError(json.Unmarshal(created.Body.Bytes(), &body))
-	assert.True(body.StoredCredentialsSupported)
 	assert.False(body.ConfiguredEnabled)
 	assert.True(body.PendingRestart)
 	require.Len(body.Profiles, 1)
@@ -199,7 +187,10 @@ func TestPeopleInferencePresetRejectsDaemonEnvironmentReference(t *testing.T) {
 	assert.Equal(read.Header().Get("ETag"), after.Header().Get("ETag"))
 }
 
-type failingPeopleInferenceStore struct{ *store.Store }
+type failingPeopleInferenceStore struct {
+	MessageStore
+	peoplesweep.ProviderAuthority
+}
 
 func (f failingPeopleInferenceStore) HasSuccessfulPersonInferenceCheck(context.Context, string) (bool, error) {
 	return false, errors.New("database unavailable")
@@ -209,7 +200,8 @@ func TestPeopleInferenceSelectionReportsStoreFailureAsServerError(t *testing.T) 
 	assert := assert.New(t)
 	require := require.New(t)
 	srv, path := newSettingsTestServer(t, "")
-	srv.store = failingPeopleInferenceStore{Store: testutil.NewTestStore(t)}
+	st := testutil.NewTestStore(t)
+	srv.store = failingPeopleInferenceStore{MessageStore: st, ProviderAuthority: st}
 	before, err := config.ReadConfigFile(path)
 	require.NoError(err)
 	service := personenrollment.NewService(path, nil)
@@ -222,9 +214,6 @@ func TestPeopleInferenceSelectionReportsStoreFailureAsServerError(t *testing.T) 
 }
 
 func TestPeopleInferenceKeyWriteUsesSeparateRevisionAndInvalidatesAuthority(t *testing.T) {
-	if !peoplesweep.StoredCredentialsSupported() {
-		t.Skip("stored people provider credentials are unsupported on this platform")
-	}
 	assert := assert.New(t)
 	require := require.New(t)
 	srv, path := newSettingsTestServer(t, "")
@@ -253,7 +242,7 @@ func TestPeopleInferenceKeyWriteUsesSeparateRevisionAndInvalidatesAuthority(t *t
 
 	pathKey := peopleInferenceSettingsPath + "/providers/remote/key"
 	write := func(revision, secret string) *httptest.ResponseRecorder {
-		request := httptest.NewRequest(http.MethodPut, pathKey, strings.NewReader(`{"value":"`+secret+`"}`))
+		request := httptest.NewRequestWithContext(t.Context(), http.MethodPut, pathKey, strings.NewReader(`{"value":"`+secret+`"}`))
 		request.RemoteAddr = "127.0.0.1:12345"
 		request.Header.Set("Content-Type", "application/json")
 		request.Header.Set("If-Match", revision)
@@ -271,9 +260,13 @@ func TestPeopleInferenceKeyWriteUsesSeparateRevisionAndInvalidatesAuthority(t *t
 	assert.True(firstStatus.Profiles[0].CredentialConfigured)
 	stale := write(initialRevision, "stale-secret")
 	assert.Equal(http.StatusPreconditionFailed, stale.Code)
-	credential, err := peoplesweep.NewFileCredentialStore(srv.cfg.TokensDir()).Load("remote")
+	assert.Contains(stale.Body.String(), "credential_conflict")
+	staleDelete := performSettingsRequest(t, srv, http.MethodDelete, pathKey, nil, initialRevision, "")
+	assert.Equal(http.StatusPreconditionFailed, staleDelete.Code)
+	assert.Contains(staleDelete.Body.String(), "credential_conflict")
+	value, err := peoplesweep.NewStoredCredentials(srv.cfg.TokensDir()).Load("remote", provider.Endpoint)
 	require.NoError(err)
-	assert.Equal("first-secret", credential.Value())
+	assert.Equal("first-secret", value)
 
 	configured, err := config.Load(path, "")
 	require.NoError(err)
@@ -343,7 +336,7 @@ func TestPeopleInferenceKeyWriteUsesSeparateRevisionAndInvalidatesAuthority(t *t
 	require.NoError(json.Unmarshal(removed.Body.Bytes(), &removedStatus))
 	assert.False(removedStatus.Profiles[0].CredentialConfigured)
 	assert.NotEqual(secondRevision, removedStatus.Profiles[0].CredentialRevision)
-	_, err = peoplesweep.NewFileCredentialStore(srv.cfg.TokensDir()).Load("remote")
+	_, err = peoplesweep.NewStoredCredentials(srv.cfg.TokensDir()).Load("remote", provider.Endpoint)
 	require.ErrorIs(err, peoplesweep.ErrCredentialNotFound)
 	checked, err = st.HasSuccessfulPersonInferenceCheck(t.Context(), profile.Fingerprint)
 	require.NoError(err)
@@ -367,9 +360,6 @@ func (t peopleInferenceRewriteTransport) RoundTrip(request *http.Request) (*http
 func TestPeopleInferenceCheckRejectsKeyChangedDuringRequest(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
-	if !peoplesweep.StoredCredentialsSupported() {
-		t.Skip("stored credentials require Unix permissions")
-	}
 	arrived, respond := make(chan struct{}), make(chan struct{})
 	providerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		close(arrived)
@@ -398,8 +388,8 @@ func TestPeopleInferenceCheckRejectsKeyChangedDuringRequest(t *testing.T) {
 	provider.SourceSince = "2025-01-01"
 	created, err := personenrollment.NewService(path, st).CreateProfile(before.ETag, "remote", provider)
 	require.NoError(err)
-	credentials := peoplesweep.NewFileCredentialStore(srv.cfg.TokensDir())
-	revision, _, err := credentials.Revision("remote")
+	credentials := peoplesweep.NewStoredCredentials(srv.cfg.TokensDir())
+	revision, _, err := credentials.Revision("remote", provider.Endpoint)
 	require.NoError(err)
 	keyPath := peopleInferenceSettingsPath + "/providers/remote/key"
 	saved := performSettingsRequest(t, srv, http.MethodPut, keyPath, []byte(`{"value":"first-key"}`), revision, "")
@@ -414,7 +404,7 @@ func TestPeopleInferenceCheckRejectsKeyChangedDuringRequest(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		require.FailNow("provider did not receive the check")
 	}
-	revision, _, err = credentials.Revision("remote")
+	revision, _, err = credentials.Revision("remote", provider.Endpoint)
 	require.NoError(err)
 	changed := performSettingsRequest(t, srv, http.MethodPut, keyPath, []byte(`{"value":"second-key"}`), revision, "")
 	require.Equal(http.StatusOK, changed.Code, changed.Body.String())
@@ -428,9 +418,6 @@ func TestPeopleInferenceCheckRejectsKeyChangedDuringRequest(t *testing.T) {
 }
 
 func TestPeopleInferenceAPICheckConsentAndSelectUsesSyntheticProviderPath(t *testing.T) {
-	if !peoplesweep.StoredCredentialsSupported() {
-		t.Skip("stored people provider credentials are unsupported on this platform")
-	}
 	assert := assert.New(t)
 	require := require.New(t)
 	var seen atomic.Bool
@@ -474,7 +461,7 @@ func TestPeopleInferenceAPICheckConsentAndSelectUsesSyntheticProviderPath(t *tes
 	require.NoError(json.Unmarshal(get.Body.Bytes(), &status))
 	require.Len(status.Profiles, 1)
 	revision := status.Profiles[0].CredentialRevision
-	keyRequest := httptest.NewRequest(http.MethodPut,
+	keyRequest := httptest.NewRequestWithContext(t.Context(), http.MethodPut,
 		peopleInferenceSettingsPath+"/providers/remote/key", strings.NewReader(`{"value":"synthetic-key"}`))
 	keyRequest.RemoteAddr = "127.0.0.1:12345"
 	keyRequest.Header.Set("Content-Type", "application/json")
@@ -552,18 +539,41 @@ func TestPeopleInferenceAPICheckConsentAndSelectUsesSyntheticProviderPath(t *tes
 	require.NoError(json.Unmarshal(removed.Body.Bytes(), &removedStatus))
 	require.Len(removedStatus.Profiles, 1)
 	assert.Equal("backup", removedStatus.Profiles[0].Name)
-	credentials := peoplesweep.NewFileCredentialStore(srv.cfg.TokensDir())
-	_, err = credentials.Load("remote")
+	_, err = peoplesweep.NewStoredCredentials(srv.cfg.TokensDir()).Load("remote", provider.Endpoint)
 	assert.ErrorIs(err, peoplesweep.ErrCredentialNotFound)
 }
 
 func TestPeopleInferenceKeyMutationDoesNotRequireRestart(t *testing.T) {
-	if !peoplesweep.StoredCredentialsSupported() {
-		t.Skip("stored people provider credentials are unsupported on this platform")
-	}
 	assert := assert.New(t)
 	require := require.New(t)
-	srv, _ := newSettingsTestServer(t, `[people.sweep]
+	srv, _ := newSettingsTestServer(t, storedRemotePeopleProviderTOML)
+	srv.store = testutil.NewTestStore(t)
+	get := performSettingsRequest(t, srv, http.MethodGet, peopleInferenceSettingsPath, nil, "", "")
+	require.Equal(http.StatusOK, get.Code, get.Body.String())
+	var initial PeopleInferenceSettingsResponse
+	require.NoError(json.Unmarshal(get.Body.Bytes(), &initial))
+	require.Len(initial.Profiles, 1)
+	assert.False(initial.PendingRestart)
+	pathKey := peopleInferenceSettingsPath + "/providers/remote/key"
+	request := httptest.NewRequestWithContext(t.Context(), http.MethodPut, pathKey, strings.NewReader(`{"value":"synthetic-key"}`))
+	request.RemoteAddr = "127.0.0.1:12345"
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("If-Match", initial.Profiles[0].CredentialRevision)
+	written := httptest.NewRecorder()
+	srv.Router().ServeHTTP(written, request)
+	require.Equal(http.StatusOK, written.Code, written.Body.String())
+	var afterWrite PeopleInferenceSettingsResponse
+	require.NoError(json.Unmarshal(written.Body.Bytes(), &afterWrite))
+	assert.False(afterWrite.PendingRestart)
+	removed := performSettingsRequest(t, srv, http.MethodDelete, pathKey, nil,
+		afterWrite.Profiles[0].CredentialRevision, "")
+	require.Equal(http.StatusOK, removed.Code, removed.Body.String())
+	var afterDelete PeopleInferenceSettingsResponse
+	require.NoError(json.Unmarshal(removed.Body.Bytes(), &afterDelete))
+	assert.False(afterDelete.PendingRestart)
+}
+
+const storedRemotePeopleProviderTOML = `[people.sweep]
 enabled = false
 provider = "remote"
 
@@ -581,31 +591,37 @@ training_posture = "operator-confirmed"
 allowed_sources = ["conversation_text"]
 source_since = "2025-01-01"
 request_timeout = "1m"
-`)
+`
+
+func TestPeopleInferenceKeyRevisionIgnoresOtherCredentialWrites(t *testing.T) {
+	require := require.New(t)
+	srv, _ := newSettingsTestServer(t, `[vector.embeddings]
+endpoint = "https://embeddings.example.test/v1"
+model = "synthetic-model"
+dimension = 8
+
+`+storedRemotePeopleProviderTOML)
 	srv.store = testutil.NewTestStore(t)
 	get := performSettingsRequest(t, srv, http.MethodGet, peopleInferenceSettingsPath, nil, "", "")
 	require.Equal(http.StatusOK, get.Code, get.Body.String())
 	var initial PeopleInferenceSettingsResponse
 	require.NoError(json.Unmarshal(get.Body.Bytes(), &initial))
 	require.Len(initial.Profiles, 1)
-	assert.False(initial.PendingRestart)
-	pathKey := peopleInferenceSettingsPath + "/providers/remote/key"
-	request := httptest.NewRequest(http.MethodPut, pathKey, strings.NewReader(`{"value":"synthetic-key"}`))
-	request.RemoteAddr = "127.0.0.1:12345"
-	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("If-Match", initial.Profiles[0].CredentialRevision)
-	written := httptest.NewRecorder()
-	srv.Router().ServeHTTP(written, request)
-	require.Equal(http.StatusOK, written.Code, written.Body.String())
-	var afterWrite PeopleInferenceSettingsResponse
-	require.NoError(json.Unmarshal(written.Body.Bytes(), &afterWrite))
-	assert.False(afterWrite.PendingRestart)
-	removed := performSettingsRequest(t, srv, http.MethodDelete, pathKey, nil,
-		afterWrite.Profiles[0].CredentialRevision, "")
-	require.Equal(http.StatusOK, removed.Code, removed.Body.String())
-	var afterDelete PeopleInferenceSettingsResponse
-	require.NoError(json.Unmarshal(removed.Body.Bytes(), &afterDelete))
-	assert.False(afterDelete.PendingRestart)
+	peopleRevision := initial.Profiles[0].CredentialRevision
+
+	credentials, err := providercredentials.Read(srv.cfg.TokensDir())
+	require.NoError(err)
+	vector := performSettingsRequest(t, srv, http.MethodPut,
+		"/api/v1/settings/provider-credentials/vector.embeddings",
+		[]byte(`{"value":"synthetic-vector-key"}`), credentials.ETag, "")
+	require.Equal(http.StatusOK, vector.Code, vector.Body.String())
+
+	people := performSettingsRequest(t, srv, http.MethodPut, peopleInferenceSettingsPath+"/providers/remote/key",
+		[]byte(`{"value":"synthetic-people-key"}`), peopleRevision, "")
+	require.Equal(http.StatusOK, people.Code, people.Body.String())
+	value, err := peoplesweep.NewStoredCredentials(srv.cfg.TokensDir()).Load("remote", "https://openrouter.ai/api/v1")
+	require.NoError(err)
+	assert.Equal(t, "synthetic-people-key", value)
 }
 
 func peopleInferenceSettingsConfig(model string, enabled bool) string {

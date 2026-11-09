@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"strings"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"go.kenn.io/msgvault/internal/peoplebrowser"
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/search"
+	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/update"
 )
 
@@ -43,9 +45,16 @@ const defaultThreadMessageLimit = 1000
 
 // Options configuration for TUI.
 type Options struct {
-	DataDir   string
-	ExportDir string
-	Version   string
+	// ReportScreen posts a fixed screen name through the selected daemon.
+	ReportScreen func(context.Context, string) error
+	// ReportAction posts fixed action properties through the selected daemon.
+	ReportAction func(context.Context, string, string, string) error
+	DataDir      string
+	ExportDir    string
+	Version      string
+	// Distribution names who distributes the binary. When a package manager
+	// owns it, the update notice points at that package manager.
+	Distribution string
 
 	// AggregateLimit overrides the maximum number of aggregate rows to load.
 	// Zero uses the default (50,000).
@@ -62,6 +71,10 @@ type Options struct {
 	// PeopleBackend provides the People directory and contact workspace.
 	// When nil, embedders retain the three existing modes.
 	PeopleBackend peoplebrowser.Backend
+
+	// LocalTimezone is the IANA name of the system zone that Go reports as
+	// "Local"; empty when unknown.
+	LocalTimezone string
 
 	// ManifestSaver saves staged deletion manifests. When nil, manifests are
 	// saved under DataDir for tests or direct embedding.
@@ -96,9 +109,12 @@ const (
 	sourceScopeAll sourceScopeKind = iota
 	sourceScopeAccount
 	sourceScopeCollection
+	sourceScopeVirtual
 )
 
 type sourceScope struct {
+	virtualAccount *store.VirtualAccount
+
 	kind           sourceScopeKind
 	accountID      *int64
 	collectionName string
@@ -111,9 +127,12 @@ const (
 	scopeOptionAll scopeOptionKind = iota
 	scopeOptionAccount
 	scopeOptionCollection
+	scopeOptionVirtual
 )
 
 type scopeOption struct {
+	virtualAccount *store.VirtualAccount
+
 	kind       scopeOptionKind
 	label      string
 	accountID  *int64
@@ -130,6 +149,58 @@ func accountSourceScope(id *int64) sourceScope {
 	return sourceScope{kind: sourceScopeAccount, accountID: &idCopy}
 }
 
+func virtualSourceScope(v store.VirtualAccount) sourceScope {
+	id := v.SourceID
+	return sourceScope{kind: sourceScopeVirtual, accountID: &id, virtualAccount: &v}
+}
+
+func virtualAccountLabel(v store.VirtualAccount) string {
+	if !v.Unattributed {
+		return v.AccountAddress
+	}
+	if v.PendingCount > 0 {
+		return fmt.Sprintf("Unattributed (%d awaiting repair)", v.PendingCount)
+	}
+	return "Unattributed"
+}
+
+// showVirtualChildren reports whether a source's picker entry should list
+// its identities and unattributed rows: when they divide its mail, or when
+// some of it has no confirmed account or is still waiting for repair.
+func showVirtualChildren(account query.AccountInfo) bool {
+	named := 0
+	for _, v := range account.VirtualAccounts {
+		switch {
+		case v.Unattributed:
+			if v.MessageCount+v.SourceDeletedCount > 0 || v.PendingCount > 0 {
+				return true
+			}
+		case !strings.EqualFold(v.AccountAddress, sourceMailbox(account.Identifier)):
+			return true
+		default:
+			named++
+		}
+	}
+	return named > 1
+}
+
+// sourceMailbox returns the mailbox of a source identifier, reading the
+// username of an "imaps://user@host" identifier.
+func sourceMailbox(identifier string) string {
+	_, rest, ok := strings.Cut(identifier, "://")
+	if !ok {
+		return identifier
+	}
+	at := strings.LastIndex(rest, "@")
+	if at <= 0 {
+		return identifier
+	}
+	if user, err := url.PathUnescape(rest[:at]); err == nil {
+		return user
+	}
+	return rest[:at]
+}
+
 func collectionSourceScope(collection query.CollectionScope) sourceScope {
 	return sourceScope{
 		kind:           sourceScopeCollection,
@@ -139,6 +210,9 @@ func collectionSourceScope(collection query.CollectionScope) sourceScope {
 }
 
 func (s sourceScope) title(accounts []query.AccountInfo) string {
+	if s.virtualAccount != nil {
+		return virtualAccountLabel(*s.virtualAccount)
+	}
 	if s.kind == sourceScopeCollection {
 		return "Collection: " + s.collectionName
 	}
@@ -156,9 +230,20 @@ func (s sourceScope) title(accounts []query.AccountInfo) string {
 func (s sourceScope) apply(filter *query.MessageFilter) {
 	filter.SourceID = nil
 	filter.SourceIDs = nil
+	filter.AccountScopes = nil
 	switch s.kind {
 	case sourceScopeAll:
 		return
+	case sourceScopeVirtual:
+		if s.virtualAccount != nil {
+			id := s.virtualAccount.SourceID
+			filter.SourceID = &id
+			scope := search.AccountScope{SourceID: &id, Unattributed: s.virtualAccount.Unattributed}
+			if !s.virtualAccount.Unattributed {
+				scope.Addresses = []string{s.virtualAccount.AccountAddress}
+			}
+			filter.AccountScopes = []search.AccountScope{scope}
+		}
 	case sourceScopeAccount:
 		if s.accountID != nil {
 			id := *s.accountID
@@ -188,6 +273,14 @@ func (m Model) scopeOptions() []scopeOption {
 	for _, account := range m.accounts {
 		id := account.ID
 		options = append(options, scopeOption{kind: scopeOptionAccount, label: account.Identifier, accountID: &id})
+		if showVirtualChildren(account) {
+			for _, v := range account.VirtualAccounts {
+				child := v
+				options = append(options, scopeOption{
+					kind: scopeOptionVirtual, label: "  " + virtualAccountLabel(v), virtualAccount: &child, accountID: &id,
+				})
+			}
+		}
 	}
 	for _, collection := range m.collectionScopes {
 		options = append(options, scopeOption{kind: scopeOptionCollection, label: collection.Name,
@@ -212,6 +305,9 @@ func (s sourceScope) matches(option scopeOption) bool {
 	switch option.kind {
 	case scopeOptionAll:
 		return s.kind == sourceScopeAll
+	case scopeOptionVirtual:
+		return s.kind == sourceScopeVirtual && s.virtualAccount != nil && option.virtualAccount != nil &&
+			s.virtualAccount.Key == option.virtualAccount.Key
 	case scopeOptionAccount:
 		return s.kind == sourceScopeAccount && s.accountID != nil && option.accountID != nil && *s.accountID == *option.accountID
 	case scopeOptionCollection:
@@ -274,6 +370,15 @@ type selectionState struct {
 type Model struct {
 	viewState // Embedded state
 
+	reportScreen   func(context.Context, string) error
+	reportedScreen string
+	reportedDay    string
+	contentScreen  string
+
+	reportAction       func(context.Context, string, string, string) error
+	visibleDetailID    int64
+	messageReportedDay string
+
 	// Top-level mode: Email or Texts
 	mode tuiMode
 
@@ -296,6 +401,7 @@ type Model struct {
 	// People mode dependencies and state remain separate from every other mode.
 	peopleBackend peoplebrowser.Backend
 	peopleState   peopleState
+	localTimezone string
 
 	// Settings is a global shell surface, deliberately separate from the
 	// content-mode cycle so opening it cannot disturb content navigation.
@@ -304,7 +410,8 @@ type Model struct {
 	settingsRequestID uint64
 
 	// Version info for title bar
-	version string
+	version      string
+	distribution string
 
 	// Notice shown on the info line while aggregate data loads (e.g. the
 	// daemon is running live SQL because no analytics cache is built).
@@ -328,9 +435,14 @@ type Model struct {
 	// Global Stats (not view specific)
 	stats                 *query.TotalStats // Global stats
 	accounts              []query.AccountInfo
+	accountsLoaded        bool
 	collectionScopeLister query.CollectionScopeLister
 	collectionScopes      []query.CollectionScope
 	sourceScope           sourceScope
+
+	// accountCatalogRetries counts catalog rereads after the daemon reported
+	// the virtual account catalog unavailable.
+	accountCatalogRetries int
 
 	// Content filters
 	filters struct {
@@ -390,6 +502,8 @@ type Model struct {
 	restorePosition bool // When true, don't reset cursor/scroll on data load (used by goBack)
 
 	// Inline search state (vim-like search bar on info line)
+	submittedQuery       string
+	aggregateLoadFailed  bool
 	inlineSearchActive   bool   // True when inline search bar is active
 	inlineSearchDebounce uint64 // Increment to cancel pending debounce timers
 	inlineSearchLoading  bool   // True when a debounced search query is in-flight
@@ -466,11 +580,15 @@ func New(engine query.Engine, opts Options) Model {
 	}
 
 	return Model{
+		reportScreen:          opts.ReportScreen,
+		reportAction:          opts.ReportAction,
+		contentScreen:         "email",
 		engine:                engine,
 		textEngine:            textEngine,
 		collectionScopeLister: opts.CollectionScopeLister,
 		sourceScope:           allSourceScope(),
 		peopleBackend:         opts.PeopleBackend,
+		localTimezone:         opts.LocalTimezone,
 		settingsBackend:       opts.SettingsBackend,
 		settings:              newSettingsState(),
 		actions: NewActionControllerWithOptions(engine, ActionControllerOptions{
@@ -481,6 +599,7 @@ func New(engine query.Engine, opts Options) Model {
 		}),
 		semanticSearch:     opts.SemanticSearch,
 		version:            opts.Version,
+		distribution:       opts.Distribution,
 		analyticsNotice:    opts.AnalyticsNotice,
 		aggregateLimit:     aggLimit,
 		threadMessageLimit: threadLimit,
@@ -543,6 +662,7 @@ func (m Model) checkForUpdate() tea.Cmd {
 type dataLoadedMsg struct {
 	rows                   []query.AggregateRow
 	filteredStats          *query.TotalStats // distinct message stats when search is active
+	searchQuery            string
 	err                    error
 	requestID              uint64 // To detect stale responses
 	presentationGeneration uint64
@@ -556,10 +676,22 @@ type statsLoadedMsg struct {
 	presentationGeneration uint64
 }
 
-// accountsLoadedMsg is sent when accounts are loaded.
+// accountsLoadedMsg is sent when accounts are loaded. catalogUnavailable
+// reports that the virtual account catalog could not be read, so accounts
+// carry no receiving-address children.
 type accountsLoadedMsg struct {
-	accounts []query.AccountInfo
-	err      error
+	accounts           []query.AccountInfo
+	catalogUnavailable bool
+	err                error
+}
+
+// accountCatalogRetryMsg rereads accounts after an unavailable catalog.
+type accountCatalogRetryMsg struct{}
+
+// accountCatalogRetryDelays spaces catalog rereads, so receiving addresses
+// appear once a slow first catalog read finishes.
+var accountCatalogRetryDelays = []time.Duration{
+	2 * time.Second, 5 * time.Second, 10 * time.Second, 20 * time.Second, 30 * time.Second,
 }
 
 type collectionScopesLoadedMsg struct {
@@ -669,7 +801,7 @@ func (m Model) loadData() tea.Cmd {
 			}
 
 			return dataLoadedMsg{
-				rows: rows, filteredStats: filteredStats, err: err, requestID: requestID,
+				rows: rows, filteredStats: filteredStats, searchQuery: searchTerm, err: err, requestID: requestID,
 				presentationGeneration: presentationGeneration,
 			}
 		},
@@ -700,6 +832,11 @@ func (m Model) loadStats() tea.Cmd {
 			}
 			opts.SourceID = m.sourceScope.accountID
 			opts.SourceIDs = copySourceIDs(m.sourceScope.sourceIDs)
+			if m.sourceScope.virtualAccount != nil {
+				filter := emailScopedMessageFilter(query.MessageFilter{})
+				m.sourceScope.apply(&filter)
+				opts.Filter = &filter
+			}
 			stats, err := m.engine.GetTotalStats(context.Background(), opts)
 			return statsLoadedMsg{stats: stats, err: err, requestID: requestID, presentationGeneration: presentationGeneration}
 		},
@@ -720,9 +857,21 @@ func (m Model) loadAccounts() tea.Cmd {
 					"error", err)
 				return accountsLoadedMsg{err: err}
 			}
+			catalogUnavailable := false
+			if lister, ok := m.engine.(query.VirtualAccountLister); ok {
+				// The picker still works without children when the catalog fails.
+				if virtual, err := lister.ListVirtualAccounts(ctx); err != nil {
+					slog.Warn("tui loadAccounts: ListVirtualAccounts failed", "error", err)
+					catalogUnavailable = true
+				} else {
+					for i := range accounts {
+						accounts[i].VirtualAccounts = virtual[accounts[i].ID]
+					}
+				}
+			}
 			slog.Info("tui loadAccounts ok",
 				"accounts", len(accounts))
-			return accountsLoadedMsg{accounts: accounts}
+			return accountsLoadedMsg{accounts: accounts, catalogUnavailable: catalogUnavailable}
 		},
 		func(r any) tea.Msg {
 			return accountsLoadedMsg{err: fmt.Errorf("accounts panic: %v", r)}
@@ -776,6 +925,8 @@ type searchResultsMsg struct {
 	messages               []query.MessageSummary
 	totalCount             int64             // Total matching messages (for "N of M" display)
 	stats                  *query.TotalStats // Aggregate stats for the search results (size, attachments, etc.)
+	query                  string
+	searchMode             searchModeKind
 	err                    error
 	requestID              uint64 // To detect stale responses
 	append                 bool   // True if these results should be appended (pagination)
@@ -871,7 +1022,7 @@ func (m Model) loadSearchWithOffset(queryStr string, offset int, appendResults b
 	return safeCmdWithPanic(
 		func() tea.Msg {
 			ctx := context.Background()
-			q := search.Parse(queryStr)
+			q := search.ParseOR(queryStr)
 			searchFilter := emailScopedMessageFilter(m.searchFilter)
 			m.sourceScope.apply(&searchFilter)
 
@@ -966,6 +1117,8 @@ func (m Model) loadSearchWithOffset(queryStr string, offset int, appendResults b
 				messages:               results,
 				totalCount:             totalCount,
 				stats:                  stats,
+				query:                  queryStr,
+				searchMode:             m.searchMode,
 				err:                    err,
 				requestID:              requestID,
 				append:                 appendResults,
@@ -1183,7 +1336,7 @@ func emailScopedMessageFilter(filter query.MessageFilter) query.MessageFilter {
 // for conflicting message types.
 func emailScopedSearchQuery(raw string) (string, bool) {
 	merged := query.MergeFilterIntoQuery(
-		search.Parse(raw),
+		search.ParseOR(raw),
 		query.MessageFilter{MessageType: emailMessageType},
 	)
 	noMatches := merged.AccountIDs != nil && len(merged.AccountIDs) == 0
@@ -1230,7 +1383,52 @@ func (m *Model) startSpinner() tea.Cmd {
 }
 
 // Update implements tea.Model.
-func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+func (m Model) Update(msg tea.Msg) (result tea.Model, command tea.Cmd) {
+	defer func() {
+		updated, ok := result.(Model)
+		if !ok || updated.reportScreen == nil && updated.reportAction == nil || updated.width == 0 || updated.quitting {
+			return
+		}
+		if updated.transitionBuffer == "" {
+			updated.contentScreen = map[tuiMode]string{modeEmail: "email", modeTexts: "texts", modeMeetings: "meetings", modePeople: "directory"}[updated.mode]
+		}
+		screen := updated.contentScreen
+		if updated.settings.active {
+			screen = "settings"
+		}
+		day := time.Now().UTC().Format(time.DateOnly)
+		_, interaction := msg.(tea.KeyPressMsg)
+		if updated.reportScreen != nil && (screen != updated.reportedScreen || interaction && day != updated.reportedDay) {
+			updated.reportedScreen, updated.reportedDay = screen, day
+			report := updated.reportScreen
+			command = tea.Batch(command, reportTelemetryCmd(func(ctx context.Context) error { return report(ctx, screen) }))
+		}
+		var detailID int64
+		if detail := updated.displayedDetail(); detail != nil && updated.transitionBuffer == "" && !updated.settings.active {
+			detailID = detail.ID
+		}
+		if detailID != 0 && (detailID != updated.visibleDetailID || updated.mode != m.mode || interaction && day != updated.messageReportedDay) {
+			updated.messageReportedDay = day
+			command = tea.Batch(command, updated.reportActionCmd("message_opened", "", ""))
+		}
+		if updated.modal == modalError && m.modal != modalError {
+			updated.submittedQuery = ""
+			kind := "other"
+			switch msg.(type) {
+			case searchResultsMsg, textSearchResultMsg, meetingSearchLoadedMsg:
+				kind = "search"
+			case dataLoadedMsg, messagesLoadedMsg, textMessagesLoadedMsg:
+				if m.mode == modeEmail && m.searchQuery != "" || m.mode == modeTexts && m.textState.filter.SearchQuery != "" || m.mode == modeMeetings && m.meetingState.searchQuery != "" {
+					kind = "search"
+				}
+			case messageDetailLoadedMsg, threadMessagesLoadedMsg, textMessageLoadedMsg, meetingDetailLoadedMsg:
+				kind = "message"
+			}
+			command = tea.Batch(command, updated.reportActionCmd("error_shown", "kind", kind))
+		}
+		updated.visibleDetailID = detailID
+		result = updated
+	}()
 	switch msg := msg.(type) {
 	case tea.KeyPressMsg:
 		return m.handleKeyPress(msg)
@@ -1246,6 +1444,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleStatsLoaded(msg)
 	case accountsLoadedMsg:
 		return m.handleAccountsLoaded(msg)
+	case accountCatalogRetryMsg:
+		return m, m.loadAccounts()
 	case collectionScopesLoadedMsg:
 		return m.handleCollectionScopesLoaded(msg)
 	case updateCheckMsg:
@@ -1431,7 +1631,8 @@ func (m Model) handleTextMessagesLoaded(msg textMessagesLoadedMsg) (tea.Model, t
 	}
 	m.textState.cursor = 0
 	m.textState.scrollOffset = 0
-	return m, nil
+	cmd := m.acceptedSearchAction(msg.query, searchModeFast, len(msg.messages))
+	return m, cmd
 }
 
 // handleTextSearchResult processes text search results.
@@ -1456,7 +1657,8 @@ func (m Model) handleTextSearchResult(msg textSearchResultMsg) (tea.Model, tea.C
 	m.textState.unfilteredMessages = nil
 	m.textState.cursor = 0
 	m.textState.scrollOffset = 0
-	return m, nil
+	cmd := m.acceptedSearchAction(msg.query, searchModeFast, len(msg.messages))
+	return m, cmd
 }
 
 // handleTextStatsLoaded processes text stats load completion.
@@ -1510,6 +1712,7 @@ func (m Model) handleDataLoaded(msg dataLoadedMsg) (tea.Model, tea.Cmd) {
 	active := m.finishModePresentation(modeEmail, msg.presentationGeneration)
 	if active {
 		m.inlineSearchLoading = false
+		m.aggregateLoadFailed = msg.err != nil
 	}
 	if msg.err != nil {
 		if active {
@@ -1547,6 +1750,10 @@ func (m Model) handleDataLoaded(msg dataLoadedMsg) (tea.Model, tea.Cmd) {
 		// Clear contextStats when no search filter at top level
 		m.contextStats = nil
 	}
+	if active {
+		cmd := m.acceptedSearchAction(msg.searchQuery, searchModeFast, len(msg.rows))
+		return m, cmd
+	}
 	return m, nil
 }
 
@@ -1578,10 +1785,91 @@ func (m Model) handleStatsLoaded(msg statsLoadedMsg) (tea.Model, tea.Cmd) {
 
 // handleAccountsLoaded processes accounts load completion.
 func (m Model) handleAccountsLoaded(msg accountsLoadedMsg) (tea.Model, tea.Cmd) {
-	if msg.err == nil {
-		m.accounts = msg.accounts
+	if msg.err != nil {
+		// A failed reread during catalog recovery keeps to the backoff.
+		if m.accountCatalogRetries > 0 {
+			return m.scheduleAccountCatalogRetry()
+		}
+		return m, nil
 	}
-	return m, nil
+	m.accountsLoaded = true
+	if msg.catalogUnavailable {
+		keepKnownVirtualAccounts(msg.accounts, m.accounts)
+	}
+	m.replaceAccounts(msg.accounts)
+	if !msg.catalogUnavailable {
+		m.accountCatalogRetries = 0
+		return m, nil
+	}
+	return m.scheduleAccountCatalogRetry()
+}
+
+// scheduleAccountCatalogRetry rereads accounts after the next backoff delay,
+// until the delays run out.
+func (m Model) scheduleAccountCatalogRetry() (tea.Model, tea.Cmd) {
+	if m.accountCatalogRetries >= len(accountCatalogRetryDelays) {
+		return m, nil
+	}
+	delay := accountCatalogRetryDelays[m.accountCatalogRetries]
+	m.accountCatalogRetries++
+	return m, tea.Tick(delay, func(time.Time) tea.Msg { return accountCatalogRetryMsg{} })
+}
+
+// keepKnownVirtualAccounts gives an account that arrived without receiving
+// addresses the ones previous held. The daemon already passes along its last
+// known children, so only accounts it has none for fall back.
+func keepKnownVirtualAccounts(accounts, previous []query.AccountInfo) {
+	known := make(map[int64][]store.VirtualAccount, len(previous))
+	for _, account := range previous {
+		known[account.ID] = account.VirtualAccounts
+	}
+	for i := range accounts {
+		if len(accounts[i].VirtualAccounts) == 0 {
+			accounts[i].VirtualAccounts = known[accounts[i].ID]
+		}
+	}
+}
+
+// replaceAccounts swaps in a new account list and keeps an open account
+// selector on the option it highlighted, whose position the new list can
+// shift.
+func (m *Model) replaceAccounts(accounts []query.AccountInfo) {
+	var highlighted *scopeOption
+	if m.modal == modalAccountSelector {
+		if options := m.selectorOptions(); m.modalCursor >= 0 && m.modalCursor < len(options) {
+			highlighted = &options[m.modalCursor]
+		}
+	}
+	m.accounts = accounts
+	if highlighted == nil {
+		return
+	}
+	for i, option := range m.selectorOptions() {
+		if sameScopeOption(*highlighted, option) {
+			m.modalCursor = i
+			return
+		}
+	}
+	m.modalCursor = 0
+}
+
+// sameScopeOption reports whether two selector options pick the same scope.
+func sameScopeOption(a, b scopeOption) bool {
+	if a.kind != b.kind {
+		return false
+	}
+	switch a.kind {
+	case scopeOptionAll:
+		return true
+	case scopeOptionVirtual:
+		return a.virtualAccount != nil && b.virtualAccount != nil && a.virtualAccount.Key == b.virtualAccount.Key
+	case scopeOptionAccount:
+		return a.accountID != nil && b.accountID != nil && *a.accountID == *b.accountID
+	case scopeOptionCollection:
+		return a.collection.Name == b.collection.Name
+	default:
+		return false
+	}
 }
 
 func (m Model) handleCollectionScopesLoaded(msg collectionScopesLoadedMsg) (tea.Model, tea.Cmd) {
@@ -1739,6 +2027,10 @@ func (m Model) handleSearchResults(msg searchResultsMsg) (tea.Model, tea.Cmd) {
 		m.appendSearchResults(msg)
 	} else {
 		m.replaceSearchResults(msg)
+	}
+	if active && !msg.append {
+		cmd := m.acceptedSearchAction(msg.query, msg.searchMode, len(msg.messages))
+		return m, cmd
 	}
 	return m, nil
 }
@@ -2297,4 +2589,53 @@ func (m Model) exportAttachments() (tea.Model, tea.Cmd) {
 	m.loading = true
 	m.exportSelection = nil
 	return m, cmd
+}
+
+// displayedDetail returns the message or meeting detail the current screen
+// renders, or nil when no reader is visible.
+func (m Model) displayedDetail() *query.MessageDetail {
+	switch {
+	case m.mode == modeEmail && m.level == levelMessageDetail,
+		m.mode == modeTexts && m.textState.level == textLevelDetail,
+		m.mode == modePeople && (m.peopleState.level == peopleLevelActivityMessage || m.peopleState.level == peopleLevelMessage):
+		return m.messageDetail
+	case m.mode == modeMeetings && m.meetingState.level == meetingLevelDetail,
+		m.mode == modePeople && m.peopleState.level == peopleLevelMeetingDetail:
+		return m.meetingState.detail
+	default:
+		return nil
+	}
+}
+
+func (m Model) reportActionCmd(event, property, value string) tea.Cmd {
+	if m.reportAction == nil {
+		return nil
+	}
+	return reportTelemetryCmd(func(ctx context.Context) error { return m.reportAction(ctx, event, property, value) })
+}
+
+func reportTelemetryCmd(report func(context.Context) error) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = report(ctx)
+		return nil
+	}
+}
+
+func (m *Model) acceptedSearchAction(query string, mode searchModeKind, count int) tea.Cmd {
+	submitted := m.submittedQuery == query
+	m.submittedQuery = ""
+	if strings.TrimSpace(query) == "" {
+		return nil
+	}
+	kind := "text"
+	if mode == searchModeSemantic {
+		kind = "hybrid"
+	}
+	var empty tea.Cmd
+	if submitted && count == 0 {
+		empty = m.reportActionCmd("search_empty", "search_type", kind)
+	}
+	return tea.Batch(m.reportActionCmd("search_run", "search_type", kind), empty)
 }

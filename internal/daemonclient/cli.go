@@ -23,6 +23,7 @@ import (
 	"go.kenn.io/msgvault/internal/collectionops"
 	"go.kenn.io/msgvault/internal/contentverify"
 	"go.kenn.io/msgvault/internal/deletion"
+	"go.kenn.io/msgvault/internal/httpretry"
 	"go.kenn.io/msgvault/internal/identityops"
 	"go.kenn.io/msgvault/internal/jsonexact"
 	"go.kenn.io/msgvault/internal/query"
@@ -166,16 +167,20 @@ type CLIInitDB struct {
 }
 
 type CLISearchRequest struct {
-	Query         string
-	Account       string
-	Collection    string
-	DeletionScope string
-	MessageTypes  []string
-	Limit         int
-	Offset        int
+	IncludeSnippet bool
+	Query          string
+	Account        string
+	Collection     string
+	DeletionScope  string
+	MessageTypes   []string
+	Limit          int
+	Offset         int
 }
 
 type CLISearch struct {
+	HasMore          bool                   `json:"has_more,omitzero"`
+	Hints            []query.SearchHint     `json:"hints,omitempty"`
+	HybridAvailable  bool                   `json:"hybrid_available,omitzero"`
 	Results          []query.MessageSummary `json:"results"`
 	ScopeLabel       string                 `json:"scope_label,omitempty"`
 	ScopeSourceCount int                    `json:"scope_source_count,omitzero"`
@@ -202,16 +207,18 @@ type CLIHybridSearchRequest struct {
 }
 
 type CLIHybridSearch struct {
-	Results          []CLIHybridSearchResult
-	Generation       CLIHybridGeneration
-	TookMS           int64
-	Timings          CLIHybridSearchTimings
-	PoolSaturated    bool
-	Accelerator      string
-	ReturnedCount    int
-	ScopeLabel       string
-	ScopeSourceCount int
-	HasMore          bool
+	Results               []CLIHybridSearchResult
+	Generation            CLIHybridGeneration
+	TookMS                int64
+	Timings               CLIHybridSearchTimings
+	PoolSaturated         bool
+	Accelerator           string
+	ReturnedCount         int
+	ScopeLabel            string
+	ScopeSourceCount      int
+	HasMore               bool
+	RankingLimitReached   int
+	CandidateLimitReached int
 }
 
 type CLIHybridSearchTimings struct {
@@ -230,6 +237,7 @@ type CLIHybridGeneration struct {
 
 type CLIHybridSearchResult struct {
 	Message          query.MessageSummary
+	AttachmentCount  *int64
 	ID               int64
 	Subject          string
 	FromEmail        string
@@ -250,6 +258,7 @@ type CLIHybridSearchMatch struct {
 }
 
 type SimilarSearchRequest struct {
+	AccountScopes []search.AccountScope
 	MessageID     int64
 	Limit         int
 	Account       string
@@ -267,6 +276,13 @@ type SimilarSearch struct {
 }
 
 type CLIAccount struct {
+	VirtualAccounts []store.VirtualAccount `json:"virtual_accounts,omitempty"`
+
+	Identifier         string     `json:"identifier"`
+	Alias              string     `json:"alias"`
+	HistoryOnly        bool       `json:"history_only"`
+	ReanchorRequired   bool       `json:"reanchor_required"`
+	MergedIntoSourceID int64      `json:"merged_into_source_id"`
 	ID                 int64      `json:"id"`
 	Email              string     `json:"email"`
 	Type               string     `json:"type"`
@@ -274,6 +290,8 @@ type CLIAccount struct {
 	OAuthApp           string     `json:"oauth_app,omitempty"`
 	MessageCount       int64      `json:"message_count"`
 	SourceDeletedCount int64      `json:"source_deleted_count"`
+	Stale              bool       `json:"stale,omitempty"`
+	AsOf               *time.Time `json:"as_of,omitempty"`
 	LastSync           *time.Time `json:"last_sync"`
 }
 
@@ -861,7 +879,7 @@ func (c *Client) openCLIStream(
 		if resp.StatusCode == http.StatusOK {
 			return resp, nil
 		}
-		err = HandleCLIErrorResponse(resp)
+		err = handleRawErrorResponse(resp, handleCLIRunErrorBody)
 		_ = resp.Body.Close()
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, backoff.Permanent(ctxErr)
@@ -897,7 +915,7 @@ func (c *Client) runCLIStream(
 
 	return decodeCLIStream(resp.Body, operation, func(event cliStreamEvent) (bool, error) {
 		switch event.Type {
-		case "stdout", "stderr":
+		case "stdout", "stderr", "outcome":
 			if output != nil && event.Data != "" {
 				if err := output(event.Type, event.Data); err != nil {
 					return false, err
@@ -907,9 +925,9 @@ func (c *Client) runCLIStream(
 			return true, nil
 		case "error":
 			if event.Error != "" {
-				return false, errors.New(event.Error)
+				return false, &CLIRunError{err: errors.New(event.Error)}
 			}
-			return false, fmt.Errorf("%s failed", operation)
+			return false, &CLIRunError{err: fmt.Errorf("%s failed", operation)}
 		default:
 			return false, nil
 		}
@@ -940,7 +958,7 @@ func (c *Client) GetCLIStats(
 }
 
 func (c *Client) GetCLISearch(ctx context.Context, req CLISearchRequest) (*CLISearch, error) {
-	if err := c.requireListIDCapability(ctx, search.Parse(req.Query), query.MessageFilter{}); err != nil {
+	if err := c.requireListIDCapability(ctx, search.ParseOR(req.Query), query.MessageFilter{}); err != nil {
 		return nil, err
 	}
 	if req.DeletionScope != "" {
@@ -958,13 +976,14 @@ func (c *Client) GetCLISearch(ctx context.Context, req CLISearchRequest) (*CLISe
 	resp, err := APIResponse(c, func(client *apiclient.Client) (*generated.SearchCLIResp, error) {
 		return client.SearchCLIWithResponse(ctx, &generated.SearchCLIRequestOptions{
 			Query: &generated.SearchCLIQuery{
-				Q:             req.Query,
-				Account:       optionalString(req.Account),
-				Collection:    optionalString(req.Collection),
-				DeletionScope: optionalString(req.DeletionScope),
-				MessageType:   optionalMessageTypes(req.MessageTypes),
-				Limit:         optionalPositiveInt64(req.Limit),
-				Offset:        optionalPositiveInt64(req.Offset),
+				Q:              req.Query,
+				IncludeSnippet: optionalBool(req.IncludeSnippet),
+				Account:        optionalString(req.Account),
+				Collection:     optionalString(req.Collection),
+				DeletionScope:  optionalString(req.DeletionScope),
+				MessageType:    optionalMessageTypes(req.MessageTypes),
+				Limit:          optionalPositiveInt64(req.Limit),
+				Offset:         optionalPositiveInt64(req.Offset),
 			},
 		})
 	})
@@ -973,7 +992,7 @@ func (c *Client) GetCLISearch(ctx context.Context, req CLISearchRequest) (*CLISe
 	}
 	result := cliSearchFromGenerated(resp.JSON200)
 	for i := range result.Results {
-		result.Results[i].WebURL = c.messageWebURL(result.Results[i].ID)
+		result.Results[i].WebURL = c.messageWebURL(ctx, result.Results[i].ID)
 	}
 	return result, nil
 }
@@ -1003,6 +1022,7 @@ func (c *Client) GetCLIHybridSearch(
 				Domain:          optionalString(req.Filter.Domain),
 				Label:           optionalString(req.Filter.Label),
 				ListID:          optionalString(req.Filter.ListID),
+				AccountScopes:   encodedAccountScopes(req.Filter.AccountScopes),
 				TimePeriod:      optionalString(req.Filter.TimeRange.Period),
 				TimeGranularity: optionalString(timeGranularityToString(req.Filter.TimeRange.Granularity)),
 				ConversationID:  req.Filter.ConversationID,
@@ -1029,7 +1049,7 @@ func (c *Client) GetCLIHybridSearch(
 		return nil, err
 	}
 	for i := range result.Results {
-		result.Results[i].Message.WebURL = c.messageWebURL(result.Results[i].Message.ID)
+		result.Results[i].Message.WebURL = c.messageWebURL(ctx, result.Results[i].Message.ID)
 	}
 	return result, nil
 }
@@ -1038,10 +1058,17 @@ func (c *Client) FindSimilarMessages(
 	ctx context.Context,
 	req SimilarSearchRequest,
 ) (*SimilarSearch, error) {
+	if err := search.ValidateAccountScopes(req.AccountScopes); err != nil {
+		return nil, err
+	}
+	if err := c.requireListIDCapability(ctx, nil, query.MessageFilter{AccountScopes: req.AccountScopes}); err != nil {
+		return nil, err
+	}
 	resp, err := APIResponse(c, func(client *apiclient.Client) (*generated.FindSimilarMessagesResp, error) {
 		return client.FindSimilarMessagesWithResponse(ctx, &generated.FindSimilarMessagesRequestOptions{
 			Query: &generated.FindSimilarMessagesQuery{
 				MessageID:     req.MessageID,
+				AccountScopes: encodedAccountScopes(req.AccountScopes),
 				Limit:         optionalPositiveInt64(req.Limit),
 				Account:       optionalString(req.Account),
 				MessageType:   optionalString(req.MessageType),
@@ -1067,18 +1094,49 @@ func (c *Client) FindSimilarMessages(
 			Fingerprint: resp.JSON200.Generation.Fingerprint,
 			State:       resp.JSON200.Generation.State,
 		},
-		Messages: c.messageSummariesWithURLs(resp.JSON200.Messages),
+		Messages: c.messageSummariesWithURLs(ctx, resp.JSON200.Messages),
 	}, nil
 }
 
-func (c *Client) GetCLIAccounts(ctx context.Context) ([]CLIAccount, error) {
+// GetCLIAccounts lists archived accounts. countsPending reports that the
+// daemon's first count refresh is still running, so every count is zero.
+func (c *Client) GetCLIAccounts(ctx context.Context) (accounts []CLIAccount, countsPending bool, err error) {
+	allowPending := func(_ context.Context, req *http.Request) error {
+		req.Header.Set(apiprotocol.AllowPendingCountsHeader, "true")
+		return nil
+	}
+	resp, err := APIResponse(c, func(client *apiclient.Client) (*generated.ListCLIAccountsResp, error) {
+		return client.ListCLIAccountsWithResponse(ctx, allowPending)
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	return cliAccountsFromGenerated(resp.JSON200), resp.JSON200 != nil && boolValue(resp.JSON200.CountsPending), nil
+}
+
+// errVirtualAccountsUnavailable means the daemon could not read a current
+// virtual account catalog, which is different from a catalog with no entries.
+var errVirtualAccountsUnavailable = errors.New("virtual account catalog unavailable")
+
+// GetCLIVirtualAccounts reads each source's virtual accounts from
+// /cli/accounts, failing when the daemon could not read the catalog.
+func (c *Client) GetCLIVirtualAccounts(ctx context.Context) (map[int64][]store.VirtualAccount, error) {
 	resp, err := APIResponse(c, func(client *apiclient.Client) (*generated.ListCLIAccountsResp, error) {
 		return client.ListCLIAccountsWithResponse(ctx)
 	})
 	if err != nil {
 		return nil, err
 	}
-	return cliAccountsFromGenerated(resp.JSON200), nil
+	if resp.JSON200 != nil && resp.JSON200.VirtualAccountsUnavailable != nil && *resp.JSON200.VirtualAccountsUnavailable {
+		return nil, errVirtualAccountsUnavailable
+	}
+	out := make(map[int64][]store.VirtualAccount)
+	for _, account := range cliAccountsFromGenerated(resp.JSON200) {
+		if len(account.VirtualAccounts) > 0 {
+			out[account.ID] = account.VirtualAccounts
+		}
+	}
+	return out, nil
 }
 
 func (c *Client) UpdateCLIAccount(
@@ -1096,13 +1154,18 @@ func (c *Client) UpdateCLIAccount(
 	if req.SourceIDSet || req.SourceID != 0 {
 		sourceID = &req.SourceID
 	}
+	var displayName *string
+	if req.DisplayName != "" {
+		displayName = &req.DisplayName
+	}
 	resp, err := CLIResponse(c, func(client *apiclient.Client) (*generated.UpdateCLIAccountResp, error) {
 		return client.UpdateCLIAccountWithResponse(ctx, &generated.UpdateCLIAccountRequestOptions{
 			Body: &generated.UpdateCLIAccountBody{
 				Account:     account,
 				Email:       email,
 				SourceID:    sourceID,
-				DisplayName: req.DisplayName,
+				DisplayName: displayName,
+				Alias:       req.Alias, HistoryOnly: req.HistoryOnly, AcceptReanchor: &req.AcceptReanchor,
 			},
 		})
 	})
@@ -1349,23 +1412,48 @@ func (c *Client) RebuildCLIFTS(
 }
 
 func (c *Client) GetCLIMessage(ctx context.Context, id string) (*query.MessageDetail, error) {
-	resp, err := APIResponseWithNotFound(
-		c,
-		func(client *apiclient.Client) (*generated.GetCLIMessageResp, error) {
-			return client.GetCLIMessageWithResponse(ctx, &generated.GetCLIMessageRequestOptions{
-				Query: &generated.GetCLIMessageQuery{ID: id},
-			})
-		},
-		func(*generated.GetCLIMessageResp) error {
-			return fmt.Errorf("message %s: %w", id, store.ErrMessageNotFound)
-		},
-	)
-	if err != nil {
+	// Thread pages can exhaust a remote daemon's shared request burst.
+	policy := backoff.NewExponentialBackOff()
+	policy.InitialInterval = time.Second
+	policy.MaxInterval = 10 * time.Second
+	resp, err := backoff.Retry(ctx, func() (*generated.GetCLIMessageResp, error) {
+		var retryAfter string
+		resp, err := APIResponseWithNotFound(
+			c,
+			func(client *apiclient.Client) (*generated.GetCLIMessageResp, error) {
+				resp, err := client.GetCLIMessageWithResponse(ctx, &generated.GetCLIMessageRequestOptions{
+					Query: &generated.GetCLIMessageQuery{ID: id},
+				})
+				if resp != nil && resp.HTTPResponse != nil {
+					retryAfter = resp.HTTPResponse.Header.Get("Retry-After")
+				}
+				return resp, err
+			},
+			func(*generated.GetCLIMessageResp) error {
+				return fmt.Errorf("message %s: %w", id, store.ErrMessageNotFound)
+			},
+		)
+		if err == nil {
+			return resp, nil
+		}
+		apiErr, ok := errors.AsType[*APIError](err)
+		if !ok || apiErr.Status != http.StatusTooManyRequests {
+			return nil, backoff.Permanent(err)
+		}
+		if delay, ok := httpretry.ParseRetryAfter(retryAfter, 0, time.Now()); ok {
+			return nil, backoff.RetryAfter(delay, err)
+		}
 		return nil, err
+	}, backoff.WithBackOff(policy), backoff.WithMaxElapsedTime(time.Minute))
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, backoff.AsRetryError(err).LastErr
 	}
 	message := cliMessageDetailFromGenerated(resp.JSON200)
 	if message != nil {
-		message.WebURL = c.messageWebURL(message.ID)
+		message.WebURL = c.messageWebURL(ctx, message.ID)
 	}
 	return message, nil
 }
@@ -1593,22 +1681,23 @@ func cliAccountUpdateResultFromGenerated(result *generated.UpdateResult) *CLIAcc
 	return &CLIAccountUpdateResult{
 		Email:       result.Email,
 		DisplayName: result.DisplayName,
+		Identifier:  result.Identifier, Alias: result.Alias, HistoryOnly: result.HistoryOnly, ReanchorRequired: result.ReanchorRequired,
 	}
 }
 
 // messageWebURL opens the selected daemon's direct message route.
 // Message IDs are local to that daemon.
-func (c *Client) messageWebURL(id int64) string {
+func (c *Client) messageWebURL(ctx context.Context, id int64) string {
 	if id <= 0 {
 		return ""
 	}
-	return fmt.Sprintf("%s/messages/%d", c.baseURL, id)
+	return fmt.Sprintf("%s/messages/%d", apiprotocol.BrowserOrigin(ctx, c.currentDaemonURL()), id)
 }
 
-func (c *Client) messageSummariesWithURLs(messages []generated.MessageSummary) []query.MessageSummary {
+func (c *Client) messageSummariesWithURLs(ctx context.Context, messages []generated.MessageSummary) []query.MessageSummary {
 	result := messageSummariesFromGenerated(messages)
 	for i := range result {
-		result[i].WebURL = c.messageWebURL(result[i].ID)
+		result[i].WebURL = c.messageWebURL(ctx, result[i].ID)
 	}
 	return result
 }

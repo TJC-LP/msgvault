@@ -6,17 +6,23 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
+
+	"go.kenn.io/msgvault/internal/jobctx"
 )
 
 const (
 	SyncStatusRunning                      = "running"
 	SyncStatusCompleted                    = "completed"
 	SyncStatusFailed                       = "failed"
+	SyncStatusCancelled                    = "cancelled"
+	SyncStatusPaused                       = "paused"
 	GmailHistoryRecoveryRequestFingerprint = "gmail-history-recovery:v1"
 
-	SyncRunItemStatusError   = "error"
-	SyncRunItemStatusSkipped = "skipped"
+	SyncRunItemStatusError    = "error"
+	SyncRunItemStatusSkipped  = "skipped"
+	SyncRunItemStatusResolved = "resolved"
 
 	manualTransactionCleanupTimeout = 5 * time.Second
 	syncWorkerExitedMessage         = "sync worker exited before recording completion"
@@ -63,6 +69,7 @@ func (s *Store) ScopedToSync(sourceID, syncRunID int64) *Store {
 
 		initSchemaWindowHook:                  base.initSchemaWindowHook,
 		attributeSeedReadHook:                 base.attributeSeedReadHook,
+		organizationProfileRootReadHook:       base.organizationProfileRootReadHook,
 		contentChangedBackfillBatchHook:       base.contentChangedBackfillBatchHook,
 		backfillFTSBatchErrHook:               base.backfillFTSBatchErrHook,
 		attachmentRoleRepairPreparedHook:      base.attachmentRoleRepairPreparedHook,
@@ -71,7 +78,10 @@ func (s *Store) ScopedToSync(sourceID, syncRunID int64) *Store {
 		identityMatchAcceptBeforeDecisionHook: base.identityMatchAcceptBeforeDecisionHook,
 		identityMatchReviewAfterDecisionHook:  base.identityMatchReviewAfterDecisionHook,
 		personOperationBeforeIdentityLockHook: base.personOperationBeforeIdentityLockHook,
+		sourceMergeBeforeIdentityLockHook:     base.sourceMergeBeforeIdentityLockHook,
+		sourceMergeAfterJournalCheckHook:      base.sourceMergeAfterJournalCheckHook,
 		personMergeAfterSnapshotHook:          base.personMergeAfterSnapshotHook,
+		attributionAfterLockHook:              base.attributionAfterLockHook,
 
 		contentChangedBackfillBatchSizeOverride: base.contentChangedBackfillBatchSizeOverride,
 	}
@@ -105,6 +115,7 @@ func (s *Store) fenceSyncGenerationTx(
 		return fmt.Errorf("fence sync run %d for source %d: %w",
 			s.syncGeneration.runID, s.syncGeneration.sourceID, err)
 	}
+	tx.syncGenerationFenced = true
 	return nil
 }
 
@@ -191,7 +202,34 @@ func (s *Store) withSyncSourceWriteContext(
 	}
 	base := s.withoutSyncScope()
 	return base.withTxContext(ctx, func(tx *loggedTx) error {
-		if err := lockSyncSourceTx(ctx, tx, sourceID); err != nil {
+		if err := s.lockSyncSourceTx(ctx, tx, sourceID); err != nil {
+			return err
+		}
+		if err := s.fenceSyncGenerationTx(ctx, tx); err != nil {
+			return err
+		}
+		return write(boundQuerier{ctx: ctx, q: tx})
+	})
+}
+
+// withSyncSourceMaintenanceWriteContext serializes source-wide settings with
+// other maintenance writes before taking the per-source lock. Keep the source
+// lock ahead of the sync-generation fence, matching sync start and ordinary
+// scoped source writes.
+func (s *Store) withSyncSourceMaintenanceWriteContext(
+	ctx context.Context,
+	sourceID int64,
+	write func(querier) error,
+) error {
+	if err := s.requireSyncSource(sourceID); err != nil {
+		return err
+	}
+	base := s.withoutSyncScope()
+	return base.withTxContext(ctx, func(tx *loggedTx) error {
+		if err := lockSourceMaintenance(ctx, tx); err != nil {
+			return err
+		}
+		if err := s.lockSyncSourceTx(ctx, tx, sourceID); err != nil {
 			return err
 		}
 		if err := s.fenceSyncGenerationTx(ctx, tx); err != nil {
@@ -266,6 +304,7 @@ func scanSource(sc scanner) (*Source, error) {
 		&source.ID, &source.SourceType, &source.Identifier, &source.DisplayName,
 		&source.GoogleUserID, &source.LastSyncAt, &source.SyncCursor, &source.SyncConfig,
 		&source.OAuthApp, &createdAt, &updatedAt,
+		&source.Alias, &source.HistoryOnly, &source.MergedIntoSourceID, &source.ReanchorRequired,
 	)
 	if err != nil {
 		return nil, err
@@ -307,7 +346,7 @@ type SyncRun struct {
 	SourceID           int64
 	StartedAt          time.Time
 	CompletedAt        sql.NullTime
-	Status             string // SyncStatusRunning, SyncStatusCompleted, SyncStatusFailed
+	Status             string // SyncStatusRunning, SyncStatusCompleted, SyncStatusFailed, SyncStatusCancelled, SyncStatusPaused
 	MessagesProcessed  int64
 	MessagesAdded      int64
 	MessagesUpdated    int64
@@ -340,7 +379,15 @@ func (s *Store) RecoverSyncRunsContext(ctx context.Context, recoveredAt time.Tim
 
 // Checkpoint represents sync progress for resumption.
 type Checkpoint struct {
-	PageToken         string
+	PageToken string
+	// HandoffCursor, when set, is saved atomically with the checkpoint. Gmail
+	// full sync keeps its starting History boundary across retries; recovery
+	// keeps it until catch-up publishes the final source cursor.
+	HandoffCursor string
+	// InheritFromSyncID carries the predecessor's people-sweep lower sequence
+	// into this run so final publication covers mutations from earlier recovery
+	// phases. It is applied atomically with the inherited checkpoint.
+	InheritFromSyncID int64
 	MessagesProcessed int64
 	MessagesAdded     int64
 	MessagesUpdated   int64
@@ -350,6 +397,7 @@ type Checkpoint struct {
 // SyncRunItem records an individual item outcome within a sync run.
 // Error items are actionable and count toward SyncRun.ErrorsCount; skipped
 // items preserve expected churn such as Gmail messages deleted before fetch.
+// Resolved items settle earlier acquisition failures once a message is archived.
 type SyncRunItem struct {
 	ID              int64
 	SyncRunID       int64
@@ -395,8 +443,8 @@ func (s *Store) StartSyncContext(ctx context.Context, sourceID int64, syncType s
 // StartSyncOperation creates a sync run attributed to an operation previously
 // persisted with CreateSyncOperation. Every phase in a multi-run sync uses the
 // same operation ID.
-func (s *Store) StartSyncOperation(sourceID int64, operationID string) (int64, error) {
-	return s.startSyncContext(context.Background(), sourceID, "", operationID)
+func (s *Store) StartSyncOperation(ctx context.Context, sourceID int64, operationID string) (int64, error) {
+	return s.startSyncContext(ctx, sourceID, "", operationID)
 }
 
 func (s *Store) startSyncContext(
@@ -480,6 +528,9 @@ func (s *Store) startSyncOnce(
 			return 0, err
 		}
 	} else {
+		if err := s.lockSyncMaintenanceGate(ctx, conn); err != nil {
+			return 0, err
+		}
 		var lockedID int64
 		if err := conn.QueryRowContext(ctx,
 			rebind(`SELECT id FROM sources WHERE id = ?`+s.dialect.SelectForUpdate()),
@@ -553,11 +604,17 @@ func (s *Store) recoverAbandonedSyncSource(ctx context.Context, sourceID int64) 
 func (s *Store) recoverAbandonedSyncSourceQueries(
 	ctx context.Context, q contextStatementQuerier, sourceID int64, now string,
 ) error {
+	if err := s.lockSyncMaintenanceGate(ctx, q); err != nil {
+		return err
+	}
 	var lockedID int64
 	if err := q.QueryRowContext(ctx,
 		s.Rebind(`SELECT id FROM sources WHERE id = ?`+s.dialect.SelectForUpdate()),
 		sourceID,
 	).Scan(&lockedID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrSourceNotFound
+		}
 		return fmt.Errorf("lock source row: %w", err)
 	}
 	if _, err := q.ExecContext(ctx, s.Rebind(fmt.Sprintf(`
@@ -634,7 +691,7 @@ func (s *Store) CreateSyncOperation(
 
 	var createdAt sql.NullTime
 	err = s.withTx(func(tx *loggedTx) error {
-		if err := lockSyncSourceTx(context.Background(), tx, sourceID); err != nil {
+		if err := s.lockSyncSourceTx(context.Background(), tx, sourceID); err != nil {
 			return err
 		}
 		if err := s.rejectConflictingSyncOperation(
@@ -773,14 +830,17 @@ func (s *Store) recoverSyncSourceIfUnowned(ctx context.Context, sourceID int64) 
 
 // FinishSyncOperation records the first terminal result for an operation.
 // Repeated finalization is idempotent and cannot replace that result.
-func (s *Store) FinishSyncOperation(operationID, status string) error {
+func (s *Store) FinishSyncOperation(ctx context.Context, operationID, status string) error {
 	if status != "done" && status != "failed" {
 		return fmt.Errorf("invalid sync operation status %q", status)
 	}
 	base := s.withoutSyncScope()
-	return base.withTx(func(tx *loggedTx) error {
+	return base.withTxContext(ctx, func(tx *loggedTx) error {
+		if err := base.lockSyncMaintenanceGate(ctx, tx); err != nil {
+			return err
+		}
 		now := base.dialect.Now()
-		result, err := tx.Exec(fmt.Sprintf(`
+		result, err := tx.ExecContext(ctx, fmt.Sprintf(`
 			UPDATE sync_operations
 			SET status = ?, finished_at = %s
 			WHERE id = ? AND status IN ('pending', 'running')
@@ -794,7 +854,7 @@ func (s *Store) FinishSyncOperation(operationID, status string) error {
 		}
 		currentStatus := status
 		if updated != 1 {
-			if err := tx.QueryRow(`SELECT status FROM sync_operations WHERE id = ?`, operationID).Scan(&currentStatus); err != nil {
+			if err := tx.QueryRowContext(ctx, `SELECT status FROM sync_operations WHERE id = ?`, operationID).Scan(&currentStatus); err != nil {
 				if errors.Is(err, sql.ErrNoRows) {
 					return fmt.Errorf("finish sync operation %q: %w", operationID, ErrSyncRunNotFound)
 				}
@@ -807,7 +867,7 @@ func (s *Store) FinishSyncOperation(operationID, status string) error {
 		if currentStatus != SyncStatusFailed {
 			return nil
 		}
-		if _, err := tx.Exec(fmt.Sprintf(`
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`
 			UPDATE sync_runs
 			SET status = 'failed', completed_at = %s, error_message = ?
 			WHERE operation_id = ? AND status = 'running'
@@ -826,16 +886,32 @@ func (s *Store) UpdateSyncCheckpoint(syncID int64, cp *Checkpoint) error {
 // UpdateSyncCheckpointContext is the request-aware form of
 // UpdateSyncCheckpoint.
 func (s *Store) UpdateSyncCheckpointContext(ctx context.Context, syncID int64, cp *Checkpoint) error {
+	if (cp.HandoffCursor != "" || cp.InheritFromSyncID != 0) && s.syncGeneration == nil {
+		return errors.New("checkpoint handoff cursor: sync-scoped store required")
+	}
 	write := func(q querier) error {
+		if cp.InheritFromSyncID != 0 {
+			if _, err := q.Exec(`
+				UPDATE person_sweep_sync_publications
+				SET lower_sequence = COALESCE((
+					SELECT prior.lower_sequence FROM person_sweep_sync_publications prior
+					WHERE prior.sync_run_id = ?
+					  AND prior.source_id = person_sweep_sync_publications.source_id
+				), lower_sequence)
+				WHERE sync_run_id = ?`, cp.InheritFromSyncID, syncID); err != nil {
+				return fmt.Errorf("inherit sync publication range: %w", err)
+			}
+		}
 		_, err := q.Exec(`
 		UPDATE sync_runs
 		SET cursor_before = ?,
+		    cursor_after = COALESCE(NULLIF(?, ''), cursor_after),
 		    messages_processed = ?,
 		    messages_added = ?,
 		    messages_updated = ?,
 		    errors_count = ?
 		WHERE id = ?
-		`, cp.PageToken, cp.MessagesProcessed, cp.MessagesAdded, cp.MessagesUpdated, cp.ErrorsCount, syncID)
+		`, cp.PageToken, cp.HandoffCursor, cp.MessagesProcessed, cp.MessagesAdded, cp.MessagesUpdated, cp.ErrorsCount, syncID)
 		return err
 	}
 	if s.syncGeneration != nil {
@@ -851,8 +927,8 @@ func (s *Store) UpdateSyncCheckpointContext(ctx context.Context, syncID int64, c
 }
 
 // PinSyncHandoffCursorContext records the history cursor a resumable recovery
-// must catch up from after its full enumeration. A completed sync overwrites
-// cursor_after with the same value when it publishes the source cursor.
+// must catch up from after its full enumeration. Completion replaces cursor_after
+// with the final published cursor, which can be newer than this baseline.
 func (s *Store) PinSyncHandoffCursorContext(ctx context.Context, syncID int64, cursor string) error {
 	if cursor == "" {
 		return errors.New("pin sync handoff cursor: empty cursor")
@@ -873,9 +949,20 @@ func (s *Store) PinSyncHandoffCursorContext(ctx context.Context, syncID int64, c
 	})
 }
 
-// RecordSyncRunItem records a per-item sync outcome for diagnostics.
+// RecordSyncRunItem records a per-item outcome. Gmail also uses acquisition
+// errors as retry debt, so callers must not advance past an acquisition whose
+// error could not be recorded.
 func (s *Store) RecordSyncRunItem(item SyncRunItem) error {
-	_, err := s.db.Exec(fmt.Sprintf(`
+	return s.RecordSyncRunItemContext(context.Background(), item)
+}
+
+// RecordSyncRunItemContext honors cancellation during RecordSyncRunItem.
+func (s *Store) RecordSyncRunItemContext(ctx context.Context, item SyncRunItem) error {
+	return s.recordSyncRunItemWith(ctx, s.db, item)
+}
+
+func (s *Store) recordSyncRunItemWith(ctx context.Context, q contextQuerier, item SyncRunItem) error {
+	_, err := q.ExecContext(ctx, fmt.Sprintf(`
 		INSERT INTO sync_run_items (
 			sync_run_id, source_message_id, phase, status,
 			error_kind, error_message, created_at
@@ -943,6 +1030,42 @@ func (s *Store) ListSyncRunItemsContext(ctx context.Context, syncRunID int64, st
 	}
 	defer func() { _ = rows.Close() }()
 
+	return scanSyncRunItems(rows)
+}
+
+// ListUnresolvedSyncItemErrors returns the latest fetch or ingest outcome for
+// each source message since the latest completed incremental run, keeping only
+// errors. That run supersedes older debt by recording anything still failing.
+func (s *Store) ListUnresolvedSyncItemErrors(ctx context.Context, sourceID int64) ([]SyncRunItem, error) {
+	var lowerBound int64
+	last, err := s.getLastSuccessfulSyncContext(ctx, sourceID, "incremental", true)
+	if err != nil && !errors.Is(err, ErrSyncRunNotFound) {
+		return nil, fmt.Errorf("find latest completed incremental: %w", err)
+	}
+	if last != nil {
+		lowerBound = last.ID
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, sync_run_id, source_message_id, phase, status,
+		       error_kind, error_message, created_at
+		FROM sync_run_items
+		WHERE id IN (
+			SELECT MAX(i.id)
+			FROM sync_run_items i
+			JOIN sync_runs r ON r.id = i.sync_run_id
+			WHERE r.source_id = ? AND r.id >= ? AND i.phase IN ('fetch', 'ingest')
+			GROUP BY i.source_message_id
+		) AND status = ?
+		ORDER BY id
+	`, sourceID, lowerBound, SyncRunItemStatusError)
+	if err != nil {
+		return nil, fmt.Errorf("list unresolved sync item errors: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	return scanSyncRunItems(rows)
+}
+
+func scanSyncRunItems(rows *loggedRows) ([]SyncRunItem, error) {
 	items := make([]SyncRunItem, 0)
 	for rows.Next() {
 		var item SyncRunItem
@@ -1043,7 +1166,7 @@ func (s *Store) completeSyncAndUpdateSourceContext(
 ) error {
 	completionStore := s.withoutSyncScope()
 	err := completionStore.withTxContext(ctx, func(tx *loggedTx) error {
-		if err := validateCurrentSyncGeneration(
+		if err := s.validateCurrentSyncGeneration(
 			ctx, tx, sourceID, syncID, SyncStatusRunning,
 		); err != nil {
 			return fmt.Errorf("complete sync %d: %w", syncID, err)
@@ -1119,14 +1242,14 @@ func (s *Store) finalizeSyncExecution(syncID int64, writeErr error) error {
 	return errors.Join(writeErr, releaseErr)
 }
 
-func validateCurrentSyncGeneration(
+func (s *Store) validateCurrentSyncGeneration(
 	ctx context.Context,
 	tx *loggedTx,
 	sourceID int64,
 	syncRunID int64,
 	expectedStatus string,
 ) error {
-	if err := lockSyncSourceTx(ctx, tx, sourceID); err != nil {
+	if err := s.lockSyncSourceTx(ctx, tx, sourceID); err != nil {
 		return err
 	}
 
@@ -1153,7 +1276,25 @@ func validateCurrentSyncGeneration(
 	return nil
 }
 
-func lockSyncSourceTx(ctx context.Context, tx *loggedTx, sourceID int64) error {
+// lockSyncMaintenanceGate must precede source/operation locks in transactions
+// that later write sync_runs. Scoped writes already take this table lock in
+// their generation fence. ROW EXCLUSIVE lets syncs proceed together but makes
+// BeginExclusive wait before it holds any of their table locks. Attribution
+// transactions instead gate maintenance on the identity row before their fence.
+func (s *Store) lockSyncMaintenanceGate(ctx context.Context, q contextStatementQuerier) error {
+	if !s.IsPostgreSQL() {
+		return nil
+	}
+	if _, err := q.ExecContext(ctx, "LOCK TABLE sync_runs IN ROW EXCLUSIVE MODE"); err != nil {
+		return fmt.Errorf("lock sync maintenance gate: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) lockSyncSourceTx(ctx context.Context, tx *loggedTx, sourceID int64) error {
+	if err := s.lockSyncMaintenanceGate(ctx, tx); err != nil {
+		return err
+	}
 	result, err := tx.ExecContext(
 		ctx, `UPDATE sources SET updated_at = updated_at WHERE id = ?`, sourceID,
 	)
@@ -1194,7 +1335,7 @@ func (s *Store) FailSyncAndClearSourceCursorContext(
 ) error {
 	transitionStore := s.withoutSyncScope()
 	err := transitionStore.withTxContext(ctx, func(tx *loggedTx) error {
-		if err := validateCurrentSyncGeneration(
+		if err := s.validateCurrentSyncGeneration(
 			ctx, tx, sourceID, syncID, SyncStatusRunning,
 		); err != nil {
 			return fmt.Errorf("fail sync %d and clear source cursor: %w", syncID, err)
@@ -1243,12 +1384,39 @@ func (s *Store) FailSyncAndClearSourceCursorContext(
 // much work and how many item errors occurred when failure finalization remains
 // reachable.
 func (s *Store) FailSyncWithCheckpoint(syncID int64, errMsg string, cp *Checkpoint) error {
-	if cp == nil {
-		return s.FailSync(syncID, errMsg)
+	return s.FailSyncWithCheckpointContext(context.Background(), syncID, errMsg, cp)
+}
+
+// FailSyncWithCheckpointContext honors cancellation during FailSyncWithCheckpoint.
+func (s *Store) FailSyncWithCheckpointContext(ctx context.Context, syncID int64, errMsg string, cp *Checkpoint) error {
+	return s.finishSyncWithCheckpoint(ctx, syncID, SyncStatusFailed, errMsg, cp)
+}
+
+// InterruptSyncWithCheckpoint preserves progress when an importer exits early.
+// A scheduler handoff is cancelled rather than failed only when there are no
+// independent callback or item errors. Finalization must outlive the cancelled
+// worker context so the next attempt can resume its last in-memory progress.
+func (s *Store) InterruptSyncWithCheckpoint(ctx context.Context, syncID int64, syncErr error, cp *Checkpoint) error {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	if jobctx.YieldedToWaiter(ctx) && jobctx.ErrorAfterYield(ctx, syncErr) == nil && cp != nil && cp.ErrorsCount == 0 {
+		return s.finishSyncWithCheckpoint(cleanupCtx, syncID, SyncStatusCancelled, "", cp)
 	}
-	_, err := s.db.Exec(fmt.Sprintf(`
+	return s.FailSyncWithCheckpointContext(cleanupCtx, syncID, syncErr.Error(), cp)
+}
+
+// PauseSyncWithCheckpoint finishes a resumable pass without recording a failure.
+func (s *Store) PauseSyncWithCheckpoint(ctx context.Context, syncID int64, cp *Checkpoint) error {
+	return s.finishSyncWithCheckpoint(ctx, syncID, SyncStatusPaused, "", cp)
+}
+
+func (s *Store) finishSyncWithCheckpoint(ctx context.Context, syncID int64, status, errMsg string, cp *Checkpoint) error {
+	if cp == nil {
+		return s.FailSyncContext(ctx, syncID, errMsg)
+	}
+	_, err := s.db.ExecContext(ctx, fmt.Sprintf(`
 		UPDATE sync_runs
-		SET status = 'failed',
+		SET status = ?,
 		    completed_at = %s,
 		    error_message = ?,
 		    cursor_before = ?,
@@ -1257,7 +1425,7 @@ func (s *Store) FailSyncWithCheckpoint(syncID int64, errMsg string, cp *Checkpoi
 		    messages_updated = ?,
 		    errors_count = ?
 		WHERE id = ?
-	`, s.dialect.Now()), errMsg, cp.PageToken, cp.MessagesProcessed,
+	`, s.dialect.Now()), status, errMsg, cp.PageToken, cp.MessagesProcessed,
 		cp.MessagesAdded, cp.MessagesUpdated, cp.ErrorsCount, syncID)
 	return s.finalizeSyncExecution(syncID, err)
 }
@@ -1311,20 +1479,21 @@ func (s *Store) getActiveSyncContext(ctx context.Context, sourceID int64) (*Sync
 
 // GetLatestSync returns the most recent sync run for a source, if any.
 func (s *Store) GetLatestSync(sourceID int64) (*SyncRun, error) {
-	return s.GetLatestSyncContext(context.Background(), sourceID)
+	return s.GetLatestSyncContext(context.Background(), sourceID, 0)
 }
 
-// GetLatestSyncContext is the request-aware form of GetLatestSync.
-func (s *Store) GetLatestSyncContext(ctx context.Context, sourceID int64) (*SyncRun, error) {
+// GetLatestSyncContext is the request-aware form of GetLatestSync. A nonzero
+// excludeID leaves that run out, so a running sync can find the one before it.
+func (s *Store) GetLatestSyncContext(ctx context.Context, sourceID, excludeID int64) (*SyncRun, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, source_id, started_at, completed_at, status,
 		       messages_processed, messages_added, messages_updated, errors_count,
 		       error_message, cursor_before, cursor_after, request_fingerprint
 		FROM sync_runs
-		WHERE source_id = ?
+		WHERE source_id = ? AND id <> ?
 		ORDER BY started_at DESC, id DESC
 		LIMIT 1
-	`, sourceID)
+	`, sourceID, excludeID)
 
 	run, err := scanSyncRun(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -1333,18 +1502,23 @@ func (s *Store) GetLatestSyncContext(ctx context.Context, sourceID int64) (*Sync
 	return run, err
 }
 
-// GetLatestCheckpointedSync returns the newest running or failed checkpoint
-// since the source's last completed run. A newer uncheckpointed interruption
-// does not hide recoverable state, while completion remains authoritative and
-// makes every preceding checkpoint stale.
+// GetLatestCheckpointedSync returns the newest running, paused, failed or
+// cancelled checkpoint since the source's last completed run. A newer
+// uncheckpointed interruption does not hide recoverable state, while completion
+// remains authoritative and makes every preceding checkpoint stale.
 func (s *Store) GetLatestCheckpointedSync(sourceID int64) (*SyncRun, error) {
-	row := s.db.QueryRow(`
+	return s.GetLatestCheckpointedSyncContext(context.Background(), sourceID)
+}
+
+// GetLatestCheckpointedSyncContext honors cancellation during GetLatestCheckpointedSync.
+func (s *Store) GetLatestCheckpointedSyncContext(ctx context.Context, sourceID int64) (*SyncRun, error) {
+	row := s.db.QueryRowContext(ctx, `
 		SELECT id, source_id, started_at, completed_at, status,
 		       messages_processed, messages_added, messages_updated, errors_count,
 		       error_message, cursor_before, cursor_after, request_fingerprint
 		FROM sync_runs sr
 		WHERE sr.source_id = ?
-		  AND status IN ('running', 'failed')
+		  AND status IN ('running', 'failed', 'cancelled', 'paused')
 		  AND cursor_before IS NOT NULL AND cursor_before != ''
 		  AND id > COALESCE((
 		    SELECT MAX(completed.id)
@@ -1365,15 +1539,15 @@ func (s *Store) GetLatestCheckpointedSync(sourceID int64) (*SyncRun, error) {
 // GetLatestCheckpointedSyncByType returns the newest recoverable checkpoint
 // for one sync type since that type's last completion. Checkpoints created by
 // another importer for the same source are never considered resumable state.
-func (s *Store) GetLatestCheckpointedSyncByType(sourceID int64, syncType string) (*SyncRun, error) {
-	row := s.db.QueryRow(`
+func (s *Store) GetLatestCheckpointedSyncByType(ctx context.Context, sourceID int64, syncType string) (*SyncRun, error) {
+	row := s.db.QueryRowContext(ctx, `
 		SELECT id, source_id, started_at, completed_at, status,
 		       messages_processed, messages_added, messages_updated, errors_count,
 		       error_message, cursor_before, cursor_after, request_fingerprint
 		FROM sync_runs sr
 		WHERE sr.source_id = ?
 		  AND sr.sync_type = ?
-		  AND status IN ('running', 'failed')
+		  AND status IN ('running', 'failed', 'cancelled', 'paused')
 		  AND cursor_before IS NOT NULL AND cursor_before != ''
 		  AND id > COALESCE((
 		    SELECT MAX(completed.id)
@@ -1396,8 +1570,8 @@ func (s *Store) GetLatestCheckpointedSyncByType(sourceID int64, syncType string)
 	return run, err
 }
 
-func (s *Store) UpsertSourceImportItem(item SourceImportItem) error {
-	err := s.withSyncSourceWriteContext(context.Background(), item.SourceID, func(q querier) error {
+func (s *Store) UpsertSourceImportItem(ctx context.Context, item SourceImportItem) error {
+	err := s.withSyncSourceWriteContext(ctx, item.SourceID, func(q querier) error {
 		_, err := q.Exec(fmt.Sprintf(`
 		INSERT INTO source_import_items (
 			source_id, provider, provider_id, name, checksum, size, modified_at,
@@ -1448,8 +1622,8 @@ func (s *Store) GetSourceImportItem(sourceID int64, provider, providerID string)
 	return &item, nil
 }
 
-func (s *Store) ListImportedSourceItemChecksums(sourceID int64, provider string) (map[string]string, error) {
-	rows, err := s.db.Query(`
+func (s *Store) ListImportedSourceItemChecksums(ctx context.Context, sourceID int64, provider string) (map[string]string, error) {
+	rows, err := s.db.QueryContext(ctx, `
 		SELECT provider_id, checksum
 		FROM source_import_items
 		WHERE source_id = ? AND provider = ? AND status = 'imported'
@@ -1476,9 +1650,10 @@ func (s *Store) ListImportedSourceItemChecksums(sourceID int64, provider string)
 // HasAnyActiveSync returns true if any source currently has a running sync.
 // Use this as a safety gate before performing destructive file operations that
 // could race with concurrent attachment ingestion.
-func (s *Store) HasAnyActiveSync() (bool, error) {
+func (s *Store) HasAnyActiveSync(ctx context.Context) (bool, error) {
 	var count int
-	err := s.db.QueryRow(
+	err := s.db.QueryRowContext(
+		ctx,
 		`SELECT COUNT(*) FROM sync_runs WHERE status = 'running'`,
 	).Scan(&count)
 	if err != nil {
@@ -1500,8 +1675,8 @@ func (s *Store) GetLastSuccessfulSyncContext(ctx context.Context, sourceID int64
 // GetLastSuccessfulSyncByType returns the most recent successful sync whose
 // sync_type exactly equals syncType, the legacy empty value included; only
 // GetLastSuccessfulSync queries without a type filter.
-func (s *Store) GetLastSuccessfulSyncByType(sourceID int64, syncType string) (*SyncRun, error) {
-	return s.getLastSuccessfulSyncContext(context.Background(), sourceID, syncType, true)
+func (s *Store) GetLastSuccessfulSyncByType(ctx context.Context, sourceID int64, syncType string) (*SyncRun, error) {
+	return s.getLastSuccessfulSyncContext(ctx, sourceID, syncType, true)
 }
 
 func (s *Store) getLastSuccessfulSyncContext(ctx context.Context, sourceID int64, syncType string, filterByType bool) (*SyncRun, error) {
@@ -1533,17 +1708,21 @@ func (s *Store) getLastSuccessfulSyncContext(ctx context.Context, sourceID int64
 
 // Source represents a Gmail account or other message source.
 type Source struct {
-	ID           int64
-	SourceType   string // "gmail" or "imap"
-	Identifier   string // email address or IMAP identifier URL
-	DisplayName  sql.NullString
-	GoogleUserID sql.NullString
-	LastSyncAt   sql.NullTime
-	SyncCursor   sql.NullString // historyId for Gmail
-	SyncConfig   sql.NullString // JSON config for IMAP sources
-	OAuthApp     sql.NullString // named OAuth app binding (NULL = default)
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
+	ID                 int64
+	SourceType         string // "gmail" or "imap"
+	Identifier         string // email address or IMAP identifier URL
+	DisplayName        sql.NullString
+	GoogleUserID       sql.NullString
+	LastSyncAt         sql.NullTime
+	SyncCursor         sql.NullString // historyId for Gmail
+	SyncConfig         sql.NullString // JSON config for IMAP sources
+	OAuthApp           sql.NullString // named OAuth app binding (NULL = default)
+	CreatedAt          time.Time
+	UpdatedAt          time.Time
+	Alias              string
+	HistoryOnly        bool
+	MergedIntoSourceID int64
+	ReanchorRequired   bool
 }
 
 // GetOrCreateSource gets or creates a source by type and identifier.
@@ -1552,20 +1731,51 @@ type Source struct {
 // conflict path so the second caller receives the existing row's
 // fields instead of a unique-violation error.
 func (s *Store) GetOrCreateSource(sourceType, identifier string) (*Source, error) {
-	now := s.dialect.Now()
-	row := s.db.QueryRow(fmt.Sprintf(`
-		INSERT INTO sources (source_type, identifier, created_at, updated_at)
-		VALUES (?, ?, %s, %s)
-		ON CONFLICT (source_type, identifier) DO UPDATE
-		SET identifier = sources.identifier
-		RETURNING id, source_type, identifier, display_name, google_user_id,
-		          last_sync_at, sync_cursor, sync_config, oauth_app,
-		          created_at, updated_at
-	`, now, now), sourceType, identifier)
+	return s.GetOrCreateSourceContext(context.Background(), sourceType, identifier)
+}
 
-	source, err := scanSource(row)
+// GetOrCreateSourceContext carries cancellation through source creation and
+// default collection membership. A retry reuses an already committed source.
+func (s *Store) GetOrCreateSourceContext(ctx context.Context, sourceType, identifier string) (*Source, error) {
+	// Existing sources need no catalog mutation. Provider writes still check
+	// retirement under their execution lock, including a merge after this read.
+	source, err := scanSource(s.db.QueryRowContext(ctx, `SELECT `+sourceCatalogColumns+`
+ FROM sources WHERE source_type = ? AND identifier = ?`, sourceType, identifier))
+	if err == nil {
+		if source.MergedIntoSourceID != 0 {
+			return nil, fmt.Errorf("source %d: %w", source.ID, ErrSourceRetired)
+		}
+		return source, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("get source: %w", err)
+	}
+	err = s.withTxContext(ctx, func(tx *loggedTx) error {
+		if err := lockSourceMaintenance(ctx, tx); err != nil {
+			return err
+		}
+		var shadowed bool
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM source_settings ss WHERE ss.alias_key = ?
+   AND NOT EXISTS (SELECT 1 FROM sources existing WHERE existing.id = ss.source_id AND existing.source_type = ? AND existing.identifier = ?))`,
+			strings.ToLower(identifier), sourceType, identifier).Scan(&shadowed); err != nil {
+			return err
+		}
+		if shadowed {
+			return fmt.Errorf("%w: provider identifier conflicts with an archive alias", ErrSourceSettingsInvalid)
+		}
+		now := s.dialect.Now()
+		row := tx.QueryRowContext(ctx, fmt.Sprintf(`INSERT INTO sources (source_type, identifier, created_at, updated_at)
+   VALUES (?, ?, %s, %s) ON CONFLICT (source_type, identifier) DO UPDATE SET identifier = sources.identifier
+   RETURNING `+sourceCatalogColumns, now, now), sourceType, identifier)
+		var err error
+		source, err = scanSource(row)
+		if err != nil {
+			return fmt.Errorf("upsert source: %w", err)
+		}
+		return requireSourceWritableWith(boundQuerier{ctx: ctx, q: tx}, source.ID)
+	})
 	if err != nil {
-		return nil, fmt.Errorf("upsert source: %w", err)
+		return nil, err
 	}
 
 	// Add to the default "All" collection if it exists.
@@ -1573,18 +1783,21 @@ func (s *Store) GetOrCreateSource(sourceType, identifier string) (*Source, error
 	// This runs as a separate Exec rather than inside a transaction
 	// with the source insert. If this Exec fails, the source row is
 	// committed but the All membership is missing — and the next
-	// EnsureDefaultCollection call (which runs in InitSchema on every
-	// process launch) re-adds every source not yet linked. Self-heals
+	// EnsureDefaultCollection call during writer or daemon startup
+	// re-adds every source not yet linked. Self-heals
 	// on next CLI invocation; until then collection-scoped reads of
 	// All would miss this source. Acceptable for a single-user tool;
 	// a future refactor can fold this into a withTx.
-	if _, err := s.db.Exec(
+	if _, err := s.db.ExecContext(ctx,
 		s.dialect.InsertOrIgnore(
 			`INSERT OR IGNORE INTO collection_sources (collection_id, source_id)
 			 SELECT id, ? FROM collections WHERE name = ?`,
 		),
 		source.ID, DefaultCollectionName,
 	); err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		slog.Warn("failed to add source to default collection (self-heals on next InitSchema)",
 			sourceIDColumnName, source.ID,
 			"identifier", identifier,
@@ -1608,8 +1821,8 @@ func (s *Store) UpdateSourceSyncCursor(sourceID int64, cursor string) error {
 
 // UpdateSourceSyncState replaces adapter progress without marking a successful
 // sync. Unlike a run checkpoint, this retains only the source's current state.
-func (s *Store) UpdateSourceSyncState(sourceID int64, state string) error {
-	return s.withSyncSourceWriteContext(context.Background(), sourceID, func(q querier) error {
+func (s *Store) UpdateSourceSyncState(ctx context.Context, sourceID int64, state string) error {
+	return s.withSyncSourceWriteContext(ctx, sourceID, func(q querier) error {
 		_, err := q.Exec(fmt.Sprintf(`
 			UPDATE sources
 			SET sync_cursor = ?, updated_at = %s
@@ -1621,9 +1834,9 @@ func (s *Store) UpdateSourceSyncState(sourceID int64, state string) error {
 
 // TouchSourceLastSyncAt records that a source-level sync completed even when
 // the adapter does not maintain a cursor.
-func (s *Store) TouchSourceLastSyncAt(sourceID int64) error {
+func (s *Store) TouchSourceLastSyncAt(ctx context.Context, sourceID int64) error {
 	now := s.dialect.Now()
-	return s.withSyncSourceWriteContext(context.Background(), sourceID, func(q querier) error {
+	return s.withSyncSourceWriteContext(ctx, sourceID, func(q querier) error {
 		_, err := q.Exec(fmt.Sprintf(`
 			UPDATE sources
 			SET last_sync_at = %s, updated_at = %s
@@ -1641,26 +1854,24 @@ func (s *Store) ListSources(sourceType string) ([]*Source, error) {
 
 // ListSourcesContext is the request-aware form of ListSources.
 func (s *Store) ListSourcesContext(ctx context.Context, sourceType string) ([]*Source, error) {
+	scope, scopeArgs := sourceScopeClause(ctx, "id")
 	var rows *loggedRows
 	var err error
 
 	if sourceType != "" {
 		rows, err = s.db.QueryContext(ctx, `
-			SELECT id, source_type, identifier, display_name, google_user_id,
-			       last_sync_at, sync_cursor, sync_config, oauth_app,
-			       created_at, updated_at
+			SELECT `+sourceCatalogColumns+`
 			FROM sources
-			WHERE source_type = ?
+			WHERE source_type = ?`+scope+`
 			ORDER BY identifier
-		`, sourceType)
+		`, append([]any{sourceType}, scopeArgs...)...)
 	} else {
 		rows, err = s.db.QueryContext(ctx, `
-			SELECT id, source_type, identifier, display_name, google_user_id,
-			       last_sync_at, sync_cursor, sync_config, oauth_app,
-			       created_at, updated_at
+			SELECT `+sourceCatalogColumns+`
 			FROM sources
+			WHERE 1=1`+scope+`
 			ORDER BY identifier
-		`)
+		`, scopeArgs...)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("list sources: %w", err)
@@ -1694,7 +1905,10 @@ func (s *Store) UpdateSourceDisplayNameContext(
 	sourceID int64,
 	displayName string,
 ) error {
-	return s.withSyncSourceWriteContext(ctx, sourceID, func(q querier) error {
+	return s.withSyncSourceMaintenanceWriteContext(ctx, sourceID, func(q querier) error {
+		if err := checkSourceDisplayNameSelectorConflict(q, sourceID, displayName); err != nil {
+			return err
+		}
 		_, err := q.Exec(fmt.Sprintf(`
 			UPDATE sources
 			SET display_name = ?, updated_at = %s
@@ -1707,33 +1921,105 @@ func (s *Store) UpdateSourceDisplayNameContext(
 // UpdateSourceSyncConfig updates the JSON sync configuration for an IMAP source.
 // The sync_config column is JSONB on PG; the dialect supplies the
 // appropriate placeholder cast (?::JSONB on PG, bare ? on SQLite).
-func (s *Store) UpdateSourceSyncConfig(sourceID int64, configJSON string) error {
-	_, err := s.db.Exec(fmt.Sprintf(`
-		UPDATE sources
-		SET sync_config = %s, updated_at = %s
-		WHERE id = ?
-	`, s.dialect.JSONBindExpr(), s.dialect.Now()), configJSON, sourceID)
-	return err
+//
+// A calendar source's config names the mailbox its events belong to, so a
+// change to that mailbox re-derives the source's events in the same
+// transaction.
+func (s *Store) UpdateSourceSyncConfig(ctx context.Context, sourceID int64, configJSON string) error {
+	newConfig := sql.NullString{String: configJSON, Valid: true}
+	// The source lock orders this write against every derivation of the
+	// source's events, so the comparison below sees the config they used.
+	return s.withAttributionTxContext(ctx, attributionLock{Sources: []int64{sourceID}}, func(tx *loggedTx) error {
+		var current sql.NullString
+		err := tx.QueryRowContext(ctx, `SELECT sync_config FROM sources WHERE id = ?`, sourceID).Scan(&current)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("read source %d sync config: %w", sourceID, err)
+		}
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`
+			UPDATE sources
+			SET sync_config = %s, updated_at = %s
+			WHERE id = ?
+		`, s.dialect.JSONBindExpr(), s.dialect.Now()), configJSON, sourceID); err != nil {
+			return err
+		}
+		if calendarConfigZone(current) != calendarConfigZone(newConfig) {
+			if err := s.refreshSourceCalendarEventsTx(ctx, tx, sourceID); err != nil {
+				return err
+			}
+		}
+		if calendarMailbox(current) == calendarMailbox(newConfig) {
+			return nil
+		}
+		return s.refreshCalendarAccountAttributionTx(ctx, tx, sourceID)
+	})
 }
 
 // UpdateSourceIdentifier updates the identifier column for an existing source.
 // Used by add-o365 to fix up the IMAP host when re-authorizing an account
 // whose host classification changed (e.g. personal vs org scope correction).
-func (s *Store) UpdateSourceIdentifier(sourceID int64, identifier string) error {
-	_, err := s.db.Exec(fmt.Sprintf(`
-		UPDATE sources
-		SET identifier = ?, updated_at = %s
-		WHERE id = ?
-	`, s.dialect.Now()), identifier, sourceID)
-	return err
+//
+// A changed mailbox changes which rows fall back to the source default, so
+// those rows return to pending in the same transaction and re-derive after it.
+func (s *Store) UpdateSourceIdentifier(ctx context.Context, sourceID int64, identifier string) error {
+	var pending []int64
+	err := s.withAttributionTxContext(ctx, attributionLock{Exclusive: true}, func(tx *loggedTx) error {
+		pending = nil
+		if reset := s.dialect.MaintenanceTimeoutResetSQL(); reset != "" {
+			if _, err := tx.ExecContext(ctx, reset); err != nil {
+				return fmt.Errorf("disable maintenance statement timeout: %w", err)
+			}
+		}
+		if err := lockSourceMaintenance(ctx, tx); err != nil {
+			return err
+		}
+		if err := requireSourceWritableWith(boundQuerier{ctx: ctx, q: tx}, sourceID); err != nil {
+			return err
+		}
+		var shadowed bool
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM source_settings WHERE alias_key = ? AND source_id <> ?)`, strings.ToLower(identifier), sourceID).Scan(&shadowed); err != nil {
+			return fmt.Errorf("check identifier alias conflict: %w", err)
+		}
+		if shadowed {
+			return fmt.Errorf("%w: provider identifier conflicts with an archive alias", ErrSourceSettingsInvalid)
+		}
+		var sourceType, oldIdentifier string
+		err := tx.QueryRowContext(ctx,
+			`SELECT source_type, COALESCE(identifier, '') FROM sources WHERE id = ?`, sourceID,
+		).Scan(&sourceType, &oldIdentifier)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("read source %d identifier: %w", sourceID, err)
+		}
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`
+			UPDATE sources
+			SET identifier = ?, updated_at = %s
+			WHERE id = ?
+		`, s.dialect.Now()), identifier, sourceID); err != nil {
+			return err
+		}
+		oldSink, newSink := accountSink(sourceType, oldIdentifier), accountSink(sourceType, identifier)
+		if oldSink == newSink {
+			return nil
+		}
+		pending, err = s.markAccountAttributionPendingForAddressesTx(ctx, tx, sourceID, []string{oldSink, newSink})
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	s.deriveAccountAttributionAfterCommit(ctx, sourceID, pending)
+	return nil
 }
 
 // GetSourceByIdentifier returns a source by its identifier (email address).
-func (s *Store) GetSourceByIdentifier(identifier string) (*Source, error) {
-	row := s.db.QueryRow(`
-		SELECT id, source_type, identifier, display_name, google_user_id,
-		       last_sync_at, sync_cursor, sync_config, oauth_app,
-		       created_at, updated_at
+func (s *Store) GetSourceByIdentifier(ctx context.Context, identifier string) (*Source, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT `+sourceCatalogColumns+`
 		FROM sources
 		WHERE identifier = ?
 	`, identifier)

@@ -14,7 +14,7 @@ const profile: PeopleInferenceProfileSetting = {
   allow_sensitive: true, retention_posture: 'No retention', training_posture: 'No training',
 };
 const status: PeopleInferenceSettingsResponse = {
-  stored_credentials_supported: true, profiles: [profile], configured_enabled: false, running_enabled: false, pending_restart: false,
+  profiles: [profile], configured_enabled: false, running_enabled: false, pending_restart: false,
 };
 const preset = {
   preset_id: 'openrouter' as const, model: 'model-one', allowed_sources: ['conversation_text'],
@@ -62,30 +62,18 @@ async function checkAndConsent(controller: PeopleInferenceController): Promise<v
 }
 
 describe('PeopleInferenceSettings', () => {
-  it('hides stored-key enrollment on unsupported hosts while retaining host-managed profiles', async () => {
-    const { client, requests } = fixture({ ...status, stored_credentials_supported: false,
+  it('checks host-managed environment profiles without offering a replacement key', async () => {
+    const { client, requests } = fixture({ ...status,
       profiles: [{ ...profile, credential_source: 'env', credential_env: 'PEOPLE_API_KEY' }] });
-    render(PeopleInferenceSettings, { client });
-    await screen.findByText(/Configure an environment credential with/);
-    expect(screen.getByText('msgvault person provider add')).toBeDefined();
-    expect(screen.getByText('--credential-env')).toBeDefined();
-    expect(screen.getByText(/on the daemon host/)).toBeDefined();
-    expect(screen.queryByRole('button', { name: 'Create profile' })).toBeNull();
-    expect(screen.queryByLabelText('API key')).toBeNull();
+    const controller = new PeopleInferenceController(client);
+    await controller.load();
+    render(PeopleInferenceSettings, { client, controller });
+    await screen.findByRole('button', { name: 'Check provider' });
     expect(screen.queryByLabelText('Replacement API key')).toBeNull();
     await fireEvent.click(screen.getByRole('button', { name: 'Check provider' }));
     await screen.findByRole('region', { name: 'Archive disclosure' });
     expect(requests.some((request) => request.url.endsWith('/check'))).toBe(true);
     expect(requests.some((request) => request.method === 'PUT')).toBe(false);
-  });
-
-  it('hides replacement keys for saved stored-key profiles on unsupported hosts', async () => {
-    const { client } = fixture({ ...status, stored_credentials_supported: false,
-      profiles: [{ ...profile, credential_configured: false, credential_revision: undefined }] });
-    render(PeopleInferenceSettings, { client });
-    await screen.findByText(/Configure an environment credential with/);
-    expect(screen.queryByLabelText('Replacement API key')).toBeNull();
-    expect((screen.getByRole('button', { name: 'Check provider' }) as HTMLButtonElement).disabled).toBe(true);
   });
 
   it('keeps a newly saved profile visible when saving its key fails and lets the user retry', async () => {
@@ -110,7 +98,9 @@ describe('PeopleInferenceSettings', () => {
 
   it('requires the checked disclosure and consent before enabling, and shows saved versus running state', async () => {
     const { client, requests } = fixture();
-    render(PeopleInferenceSettings, { client });
+    const controller = new PeopleInferenceController(client);
+    await controller.load();
+    render(PeopleInferenceSettings, { client, controller });
     await screen.findByText('Stored key');
     expect((screen.getByRole('button', { name: 'Select and enable' }) as HTMLButtonElement).disabled).toBe(true);
     await fireEvent.click(screen.getByRole('button', { name: 'Check provider' }));
@@ -129,7 +119,9 @@ describe('PeopleInferenceSettings', () => {
 
   it('submits explicit archive policy with a write-only API key through the generated client', async () => {
     const { client, requests } = fixture({ ...status, profiles: [] });
-    render(PeopleInferenceSettings, { client });
+    const controller = new PeopleInferenceController(client);
+    await controller.load();
+    render(PeopleInferenceSettings, { client, controller });
     await screen.findByLabelText('Profile name');
     await fireEvent.click(screen.getByRole('combobox', { name: /^Provider:/ }));
     await fireEvent.click(screen.getByRole('option', { name: 'OpenRouter' }));
@@ -263,12 +255,16 @@ describe('PeopleInferenceSettings', () => {
   it('shows host-managed credentials and unavailable Codex profiles without actionable checks', async () => {
     const { client } = fixture({ ...status, profiles: [{ ...profile,
       credential_source: 'env', credential_env: 'PEOPLE_API_KEY', credential_configured: false }] });
-    const rendered = render(PeopleInferenceSettings, { client });
+    const controller = new PeopleInferenceController(client);
+    await controller.load();
+    const rendered = render(PeopleInferenceSettings, { client, controller });
     await screen.findByText('Set PEOPLE_API_KEY on daemon host');
     expect((screen.getByRole('button', { name: 'Check provider' }) as HTMLButtonElement).disabled).toBe(true);
     rendered.unmount();
     const codex = fixture({ ...status, profiles: [{ ...profile, protocol: 'codex_app_server' }] });
-    render(PeopleInferenceSettings, { client: codex.client });
+    const codexController = new PeopleInferenceController(codex.client);
+    await codexController.load();
+    render(PeopleInferenceSettings, { client: codex.client, controller: codexController });
     await screen.findByText('Codex is unavailable in this release');
     expect((screen.getByRole('button', { name: 'Check provider' }) as HTMLButtonElement).disabled).toBe(true);
   });
@@ -277,10 +273,13 @@ describe('PeopleInferenceSettings', () => {
     const { client, requests } = fixture({ ...status, configured_name: 'routed', configured_enabled: true,
       running_name: 'routed', running_enabled: true,
       profiles: [{ ...profile, consent_active: true }, { ...profile, name: 'backup' }] });
-    render(PeopleInferenceSettings, { client });
+    const controller = new PeopleInferenceController(client);
+    await controller.load();
+    render(PeopleInferenceSettings, { client, controller });
     await screen.findByText('Granted for this profile');
     await fireEvent.click(screen.getByRole('button', { name: 'Revoke consent' }));
     await screen.findByText('Not granted');
+    await waitFor(() => expect((screen.getByRole('button', { name: 'Disable people sweep' }) as HTMLButtonElement).disabled).toBe(false));
     await fireEvent.click(screen.getByRole('button', { name: 'Disable people sweep' }));
     await waitFor(() => expect((screen.getByRole('button', { name: 'Remove profile' }) as HTMLButtonElement).disabled).toBe(false));
     await fireEvent.click(screen.getByRole('button', { name: 'Remove profile' }));

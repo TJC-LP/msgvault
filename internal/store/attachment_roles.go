@@ -143,10 +143,11 @@ func (s *Store) UpsertAttachmentRecord(
 	}
 	if s.syncGeneration != nil {
 		return s.withTxContext(ctx, func(tx *loggedTx) error {
-			if err := s.requireSyncMessageSourceTx(tx, messageID); err != nil {
+			q := boundQuerier{ctx: ctx, q: tx}
+			if err := s.requireSyncMessageSourceTx(q, messageID); err != nil {
 				return err
 			}
-			return s.upsertAttachmentRecord(tx, messageID, write)
+			return s.upsertAttachmentRecord(q, messageID, write)
 		})
 	}
 	return s.upsertAttachmentRecord(boundQuerier{ctx: ctx, q: s.db}, messageID, write)
@@ -169,14 +170,14 @@ func (s *Store) UpsertAttachmentRecordPreservingStored(
 	}
 	return s.withTxContext(ctx, func(tx *loggedTx) error {
 		if s.syncGeneration != nil {
-			if err := s.requireSyncMessageSourceTx(tx, messageID); err != nil {
+			if err := s.requireSyncMessageSourceTx(boundQuerier{ctx: ctx, q: tx}, messageID); err != nil {
 				return err
 			}
 		}
 		if write.StoragePath == "" && write.ContentHash == "" {
 			var storagePath, contentHash, state, skipReason string
 			var size int64
-			err := tx.QueryRow(`
+			err := tx.QueryRowContext(ctx, `
 				SELECT storage_path, COALESCE(content_hash, ''), COALESCE(size, 0),
 				       COALESCE(attachment_state, ''), COALESCE(attachment_skip_reason, '')
 				FROM attachments WHERE message_id = ? AND source_part_key = ?
@@ -195,7 +196,7 @@ func (s *Store) UpsertAttachmentRecordPreservingStored(
 				return fmt.Errorf("load stored attachment occurrence: %w", err)
 			}
 		}
-		return s.upsertAttachmentRecord(tx, messageID, write)
+		return s.upsertAttachmentRecord(boundQuerier{ctx: ctx, q: tx}, messageID, write)
 	})
 }
 
@@ -210,17 +211,18 @@ func (s *Store) UpsertAttachmentRecordWithStats(
 		return err
 	}
 	return s.withTxContext(ctx, func(tx *loggedTx) error {
-		if err := s.requireSyncMessageSourceTx(tx, messageID); err != nil {
+		q := boundQuerier{ctx: ctx, q: tx}
+		if err := s.requireSyncMessageSourceTx(q, messageID); err != nil {
 			return err
 		}
-		if err := s.upsertAttachmentRecord(tx, messageID, write); err != nil {
+		if err := s.upsertAttachmentRecord(q, messageID, write); err != nil {
 			return err
 		}
-		if err := recomputeMessageAttachmentStatsWith(tx, messageID); err != nil {
+		if err := recomputeMessageAttachmentStatsWith(q, messageID); err != nil {
 			return err
 		}
 		if invalidateCache {
-			return s.bumpDerivedDataRevision(tx)
+			return s.bumpDerivedDataRevisionContext(ctx, tx)
 		}
 		return nil
 	})
@@ -282,7 +284,11 @@ func (s *Store) DeleteKeyedAttachmentsExceptContext(
 func (s *Store) DeleteMIMEAttachmentsExceptContext(
 	ctx context.Context, messageID int64, keep []string,
 ) error {
-	query := `DELETE FROM attachments WHERE message_id = ? AND source_attachment_id IS NULL`
+	query := `DELETE FROM attachments
+		WHERE message_id = ? AND source_attachment_id IS NULL
+		  AND NOT EXISTS (
+			SELECT 1 FROM source_merge_preserved_attachments spa WHERE spa.attachment_id = attachments.id
+		  )`
 	args := []any{messageID}
 	if len(keep) > 0 {
 		query += ` AND COALESCE(source_part_key, '') NOT IN (?` + strings.Repeat(`, ?`, len(keep)-1) + `)`
@@ -363,6 +369,10 @@ func (s *Store) upsertAttachmentRecordWithPolicy(
 			  AND source_part_key IS NULL
 			  AND content_hash = ?
 			  AND attachment_role = 'unknown'
+			  AND NOT EXISTS (
+				SELECT 1 FROM source_merge_preserved_attachments spa
+				WHERE spa.attachment_id = attachments.id
+			  )
 			  %s
 			  AND NOT EXISTS (
 				SELECT 1 FROM attachments keyed
@@ -526,6 +536,9 @@ func (s *Store) replaceMIMEAttachmentsWith(
 	if _, err := q.Exec(`
 		DELETE FROM attachments
 		WHERE message_id = ? AND source_attachment_id IS NULL
+		  AND NOT EXISTS (
+			SELECT 1 FROM source_merge_preserved_attachments spa WHERE spa.attachment_id = attachments.id
+		  )
 	`, messageID); err != nil {
 		return err
 	}

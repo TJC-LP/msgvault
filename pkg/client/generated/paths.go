@@ -173,7 +173,17 @@ type GetActivityDayPath struct {
 }
 
 func (g GetActivityDayPath) Validate() error {
-	return runtime.ConvertValidatorError(typesValidator.Struct(g))
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(g.Date, "required"); err != nil {
+		errors = errors.Append("Date", err)
+	}
+	if err := runtime.ValidatePattern(g.Date, `^[0-9]{4}-[0-9]{2}-[0-9]{2}$`); err != nil {
+		errors = errors.Append("Date", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
 }
 
 type ListDayEntriesPath struct {
@@ -182,7 +192,17 @@ type ListDayEntriesPath struct {
 }
 
 func (l ListDayEntriesPath) Validate() error {
-	return runtime.ConvertValidatorError(typesValidator.Struct(l))
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(l.Date, "required"); err != nil {
+		errors = errors.Append("Date", err)
+	}
+	if err := runtime.ValidatePattern(l.Date, `^[0-9]{4}-[0-9]{2}-[0-9]{2}$`); err != nil {
+		errors = errors.Append("Date", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
 }
 
 type CreateDayEntryPath struct {
@@ -191,7 +211,17 @@ type CreateDayEntryPath struct {
 }
 
 func (c CreateDayEntryPath) Validate() error {
-	return runtime.ConvertValidatorError(typesValidator.Struct(c))
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(c.Date, "required"); err != nil {
+		errors = errors.Append("Date", err)
+	}
+	if err := runtime.ValidatePattern(c.Date, `^[0-9]{4}-[0-9]{2}-[0-9]{2}$`); err != nil {
+		errors = errors.Append("Date", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
 }
 
 type CancelDeletionPath struct {
@@ -307,6 +337,51 @@ func (g GetImportJobPath) Validate() error {
 	return runtime.ConvertValidatorError(typesValidator.Struct(g))
 }
 
+type GetKataIssueContextPath struct {
+	// Ref Kata issue ref, qualified ref or UID
+	Ref string `json:"ref" validate:"required"`
+}
+
+func (g GetKataIssueContextPath) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(g))
+}
+
+type LinkKataEvidencePath struct {
+	// Ref Kata issue ref, qualified ref or UID
+	Ref string `json:"ref" validate:"required"`
+}
+
+func (l LinkKataEvidencePath) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(l))
+}
+
+type MarkLoopDonePath struct {
+	// MessageID ID of the message that anchors the loop
+	MessageID int64 `json:"message_id" validate:"gte=1"`
+}
+
+func (m MarkLoopDonePath) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(m))
+}
+
+type ReopenLoopPath struct {
+	// MessageID ID of the message that anchors the loop
+	MessageID int64 `json:"message_id" validate:"gte=1"`
+}
+
+func (r ReopenLoopPath) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(r))
+}
+
+type SnoozeLoopPath struct {
+	// MessageID ID of the message that anchors the loop
+	MessageID int64 `json:"message_id" validate:"gte=1"`
+}
+
+func (s SnoozeLoopPath) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(s))
+}
+
 type GetMessagePath struct {
 	// ID Message ID
 	ID int64 `json:"id"`
@@ -315,6 +390,21 @@ type GetMessagePath struct {
 type GetMessageInlinePartPath struct {
 	// ID Message ID
 	ID int64 `json:"id"`
+}
+
+type ListMessageRecordingsPath struct {
+	// ID Message ID
+	ID int64 `json:"id"`
+}
+
+type GetMessageTagsPath struct {
+	// ID Archived message ID
+	ID int `json:"id"`
+}
+
+type UpdateMessageTagsPath struct {
+	// ID Archived message ID
+	ID int `json:"id"`
 }
 
 type ListMessageTasksPath struct {
@@ -578,7 +668,20 @@ type GetPersonActivityDayPath struct {
 }
 
 func (g GetPersonActivityDayPath) Validate() error {
-	return runtime.ConvertValidatorError(typesValidator.Struct(g))
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(g.ID, "gte=1"); err != nil {
+		errors = errors.Append("ID", err)
+	}
+	if err := typesValidator.Var(g.Date, "required"); err != nil {
+		errors = errors.Append("Date", err)
+	}
+	if err := runtime.ValidatePattern(g.Date, `^[0-9]{4}-[0-9]{2}-[0-9]{2}$`); err != nil {
+		errors = errors.Append("Date", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
 }
 
 type ListPersonEmploymentsPath struct {
@@ -643,6 +746,16 @@ type SearchPersonFilesPath struct {
 	ID int64 `json:"id"`
 }
 
+type SuggestPersonFilesPath struct {
+	// ID Durable person ID
+	ID int64 `json:"id"`
+}
+
+type ListPersonIdentitiesPath struct {
+	// ID Durable person ID
+	ID int64 `json:"id"`
+}
+
 type MergePersonsPath struct {
 	// ID Durable person ID
 	ID int64 `json:"id"`
@@ -692,6 +805,11 @@ type ListPersonRelationshipsPath struct {
 }
 
 type SplitPersonMergePath struct {
+	// ID Durable person ID
+	ID int64 `json:"id"`
+}
+
+type ExplainPersonTierPath struct {
 	// ID Durable person ID
 	ID int64 `json:"id"`
 }

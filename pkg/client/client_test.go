@@ -2,7 +2,6 @@ package client
 
 import (
 	"bytes"
-	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -184,7 +183,7 @@ func TestGeneratedPersonMergeRoundTrip(t *testing.T) {
 	require.NoError(err)
 
 	response, err := client.MergePersonsWithResponse(
-		context.Background(), &generated.MergePersonsRequestOptions{
+		t.Context(), &generated.MergePersonsRequestOptions{
 			PathParams: &generated.MergePersonsPath{ID: 7},
 			Header: &generated.MergePersonsHeaders{
 				IfMatch:        `"person-7-r3", "person-9-r2"`,
@@ -564,7 +563,7 @@ func TestCreateCommunicationServiceAcceptsIdempotentOKResponse(t *testing.T) {
 	require.NoError(err)
 
 	service, err := c.CreateCommunicationService(
-		context.Background(), &generated.CreateCommunicationServiceRequestOptions{
+		t.Context(), &generated.CreateCommunicationServiceRequestOptions{
 			Body: &generated.CreateCommunicationServiceBody{
 				Slug: "example-chat", DisplayLabel: "Example Chat",
 				ScopePolicy:   generated.CreateCommunicationServiceRequestScopePolicyNone,
@@ -619,6 +618,56 @@ func TestGeneratedExploreGroupingValidatesExactlyOneDimension(t *testing.T) {
 	requirements.Error((generated.FileGroupsHTTPRequest{Grouping: []generated.ExploreGroupDimension{
 		generated.ExploreGroupDimensionSource, generated.ExploreGroupDimensionMonth,
 	}}).Validate(), "multiple file grouping dimensions")
+}
+
+func TestGeneratedMessageRecordingsAcceptUnnamedAudio(t *testing.T) {
+	assertions := assert.New(t)
+	requirements := require.New(t)
+	var response generated.MessageRecordingsResponse
+	requirements.NoError(json.Unmarshal([]byte(
+		`{"message_id":9,"recordings":[{"attachment_id":1,"filename":"","size_bytes":44,"state":"media_missing"}]}`,
+	), &response))
+	requirements.Len(response.Recordings, 1)
+	requirements.NotNil(response.Recordings[0].Filename)
+	assertions.Empty(*response.Recordings[0].Filename)
+	requirements.NoError(response.Validate(), "audio without a filename is a legitimate recording")
+
+	missing := response
+	missing.Recordings = []generated.MessageRecording{response.Recordings[0]}
+	missing.Recordings[0].Filename = nil
+	requirements.Error(missing.Validate(), "missing required filename")
+}
+
+func TestGeneratedCLIAccountsRequireAliasPresenceButAcceptEmptyStrings(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		aliasProperty string
+		valid         bool
+	}{
+		{name: "empty", aliasProperty: `,"alias":""`, valid: true},
+		{name: "nonempty", aliasProperty: `,"alias":"archive"`, valid: true},
+		{name: "missing"},
+		{name: "null", aliasProperty: `,"alias":null`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			requirements := require.New(t)
+			assertions := assert.New(t)
+			payload := `{"id":1,"email":"archive@example.com","type":"gmail","display_name":"Archive","identifier":"archive@example.com","last_sync":null,"message_count":0,"source_deleted_count":0,"history_only":false,"reanchor_required":false,"merged_into_source_id":0` + tc.aliasProperty + `}`
+			var account generated.CliAccountResponse
+			requirements.NoError(json.Unmarshal([]byte(payload), &account))
+			var response generated.CliAccountsResponse
+			requirements.NoError(json.Unmarshal([]byte(`{"accounts":[`+payload+`]}`), &response))
+			requirements.Len(response.Accounts, 1)
+
+			if tc.valid {
+				assertions.NoError(account.Validate())
+				assertions.NoError(response.Validate())
+			} else {
+				requirements.ErrorContains(account.Validate(), "Alias")
+				assertions.ErrorContains(response.Validate(), "Accounts[0].Alias")
+			}
+		})
+	}
 }
 
 func TestGeneratedFileMetadataRequiresPresenceButAcceptsEmptyLegacyStrings(t *testing.T) {
@@ -684,6 +733,43 @@ func TestGeneratedFileMetadataRequiresPresenceButAcceptsEmptyLegacyStrings(t *te
 		missingMIME.MimeType = nil
 		requirements.Error(missingMIME.Validate(), "missing required MIME type")
 	})
+}
+
+func TestGeneratedChatDiscoveryRequiresPresenceButAcceptsEmptyMetadata(t *testing.T) {
+	requirements := require.New(t)
+	assertions := assert.New(t)
+	const payload = `{"conversation_id":1,"message_id":7,"source_id":1,"source_type":"beeper","conversation_type":"direct_chat","network":"unknown","match_kind":"partial","matched_tokens":["peer"],"matched_names":["Peer"],"evidence_truncated":false,"title":"","source_display_name":"","source_conversation_id":"","source_identifier":""}`
+	var present generated.ChatDiscoveryResult
+	requirements.NoError(json.Unmarshal([]byte(payload), &present))
+	assertions.Equal(int64(7), present.MessageID)
+	requirements.NoError(present.Validate())
+	requirements.NoError((generated.ChatDiscoveryPage{Results: []generated.ChatDiscoveryResult{present}, HasMore: false}).Validate())
+	for _, field := range []string{"title", "source_display_name", "source_conversation_id", "source_identifier"} {
+		t.Run(field, func(t *testing.T) {
+			requirements := require.New(t)
+			var missing map[string]any
+			requirements.NoError(json.Unmarshal([]byte(payload), &missing))
+			delete(missing, field)
+			encoded, err := json.Marshal(missing)
+			requirements.NoError(err)
+			var result generated.ChatDiscoveryResult
+			requirements.NoError(json.Unmarshal(encoded, &result))
+			requirements.Error(result.Validate(), "missing required %s", field)
+			requirements.Error((generated.ChatDiscoveryPage{Results: []generated.ChatDiscoveryResult{result}, HasMore: false}).Validate())
+		})
+	}
+}
+
+func TestGeneratedMediaSearchAcceptsEmptyAttachmentMetadata(t *testing.T) {
+	requirements := require.New(t)
+	var response generated.MediaSearchResponse
+	requirements.NoError(json.Unmarshal([]byte(`{
+		"results":[],"coverage":{"state":"complete","binding_required":false,"complete_documents":1,"scoped_documents":1},"partial":false,"truncated":false,
+		"pending_occurrences":0,"unavailable_occurrences":0,"attribution_unavailable":0,
+		"attachments":{"results":[{"attachment_id":1,"message_id":2,"conversation_id":3,
+			"filename":"","containing_title":"","excerpt":"matching text"}],"truncated":false}
+	}`), &response))
+	requirements.NoError(response.Validate())
 }
 
 func TestGeneratedPersonFactEvidenceRequiresPresenceButAcceptsEmptyStrings(t *testing.T) {
@@ -941,7 +1027,7 @@ func TestListChangedMessagesRoundTripsTheCursorVerbatim(t *testing.T) {
 	// First poll: a consumer with no cursor yet. Sending cursor= would be a
 	// different request than omitting it, so the client must omit.
 	limit := int64(100)
-	first, err := c.ListChangedMessages(context.Background(), &generated.ListChangedMessagesRequestOptions{
+	first, err := c.ListChangedMessages(t.Context(), &generated.ListChangedMessagesRequestOptions{
 		Query: &generated.ListChangedMessagesQuery{Limit: &limit},
 	})
 	require.NoError(err, "ListChangedMessages first poll")
@@ -959,7 +1045,7 @@ func TestListChangedMessagesRoundTripsTheCursorVerbatim(t *testing.T) {
 
 	// Second poll: the response fed straight back, exactly as the docs tell a
 	// consumer to do it.
-	second, err := c.ListChangedMessages(context.Background(), &generated.ListChangedMessagesRequestOptions{
+	second, err := c.ListChangedMessages(t.Context(), &generated.ListChangedMessagesRequestOptions{
 		Query: &generated.ListChangedMessagesQuery{
 			Cursor: &first.NextCursor,
 			Limit:  &limit,
@@ -1048,7 +1134,7 @@ func TestListChangedMessagesDecodesTheDocumentedErrors(t *testing.T) {
 			require.NoError(err, "New")
 
 			resp, err := c.ListChangedMessagesWithResponse(
-				context.Background(), &generated.ListChangedMessagesRequestOptions{})
+				t.Context(), &generated.ListChangedMessagesRequestOptions{})
 			require.Error(err, "an error status must be reported as an error")
 			require.NotNil(resp, "the response is what carries the decoded body")
 			assert.Equal(tc.status, resp.StatusCode, "status code")
@@ -1082,7 +1168,7 @@ func TestGeneratedGetAttachmentContentReturnsBinaryBytes(t *testing.T) {
 	c, err := generated.NewDefaultClient(server.URL, runtime.WithHTTPClient(httpClientDoer{client: http.DefaultClient}))
 	require.NoError(err, "NewDefaultClient")
 
-	got, err := c.GetAttachmentContent(context.Background(), &generated.GetAttachmentContentRequestOptions{
+	got, err := c.GetAttachmentContent(t.Context(), &generated.GetAttachmentContentRequestOptions{
 		PathParams: &generated.GetAttachmentContentPath{Hash: hash},
 	})
 	require.NoError(err, "GetAttachmentContent")
@@ -1108,9 +1194,9 @@ func TestGetAttachmentContentVerifiesRequestedHash(t *testing.T) {
 	options := &generated.GetAttachmentContentRequestOptions{
 		PathParams: &generated.GetAttachmentContentPath{Hash: hash},
 	}
-	_, err = c.GetAttachmentContent(context.Background(), options)
+	_, err = c.GetAttachmentContent(t.Context(), options)
 	require.ErrorIs(err, contentverify.ErrMismatch)
-	response, err := c.GetAttachmentContentWithResponse(context.Background(), options)
+	response, err := c.GetAttachmentContentWithResponse(t.Context(), options)
 	require.ErrorIs(err, contentverify.ErrMismatch)
 	require.NotNil(response)
 	assert.Equal(t, corrupt, response.Body)
@@ -1130,7 +1216,7 @@ func TestNewCreatesTypedClient(t *testing.T) {
 	require.NoError(
 		err, "New")
 
-	stats, err := client.GetStats(context.Background())
+	stats, err := client.GetStats(t.Context())
 	require.NoError(
 		err, "GetStats")
 
@@ -1154,7 +1240,7 @@ func TestRunQueryDecodesScalarCells(t *testing.T) {
 	require.NoError(
 		err, "New")
 
-	got, err := c.RunQuery(context.Background(), &generated.RunQueryRequestOptions{
+	got, err := c.RunQuery(t.Context(), &generated.RunQueryRequestOptions{
 		Body: &generated.RunQueryBody{SQL: "SELECT 1"},
 	})
 	require.NoError(
@@ -1235,7 +1321,7 @@ func TestGetMessageRendersLargeIDInPath(t *testing.T) {
 	c, err := New(server.URL)
 	require.NoError(err, "New")
 
-	resp, err := c.GetMessageWithResponse(context.Background(), &generated.GetMessageRequestOptions{
+	resp, err := c.GetMessageWithResponse(t.Context(), &generated.GetMessageRequestOptions{
 		PathParams: &generated.GetMessagePath{ID: 24489626},
 	})
 	require.NoError(err, "GetMessageWithResponse")
@@ -1259,7 +1345,7 @@ func TestListMessagesRendersLargeQueryValue(t *testing.T) {
 	require.NoError(err, "New")
 
 	page := int64(12345678)
-	resp, err := c.ListMessagesWithResponse(context.Background(), &generated.ListMessagesRequestOptions{
+	resp, err := c.ListMessagesWithResponse(t.Context(), &generated.ListMessagesRequestOptions{
 		Query: &generated.ListMessagesQuery{Page: &page},
 	})
 	require.NoError(err, "ListMessagesWithResponse")
@@ -1283,7 +1369,7 @@ func TestAddAccountAcceptsIdempotentOK(t *testing.T) {
 	require.NoError(
 		err, "New")
 
-	got, err := c.AddAccount(context.Background(), &generated.AddAccountRequestOptions{
+	got, err := c.AddAccount(t.Context(), &generated.AddAccountRequestOptions{
 		Body: &generated.AddAccountBody{
 			Email:    "alice@example.com",
 			Enabled:  true,
@@ -1319,7 +1405,7 @@ func TestCreatePersonAcceptsIdempotentOK(t *testing.T) {
 	c, err := New(server.URL)
 	require.NoError(err, "New")
 
-	got, err := c.CreatePerson(context.Background(), &generated.CreatePersonRequestOptions{
+	got, err := c.CreatePerson(t.Context(), &generated.CreatePersonRequestOptions{
 		Body: &generated.CreatePersonBody{ParticipantID: 42},
 	})
 	require.NoError(err, "CreatePerson")
@@ -1345,7 +1431,7 @@ func TestImportMeetingAcceptsIdempotentOK(t *testing.T) {
 	c, err := New(server.URL)
 	require.NoError(err, "New")
 
-	got, err := c.ImportMeeting(context.Background(), &generated.ImportMeetingRequestOptions{
+	got, err := c.ImportMeeting(t.Context(), &generated.ImportMeetingRequestOptions{
 		Body: &generated.ImportMeetingBody{
 			Source: generated.Source{
 				Identifier:   "local-meetings",
@@ -1382,7 +1468,7 @@ func TestStageDeletionAcceptsDryRunOK(t *testing.T) {
 
 	sender := "alice@example.com"
 	dryRun := true
-	got, err := c.StageDeletion(context.Background(), &generated.StageDeletionRequestOptions{
+	got, err := c.StageDeletion(t.Context(), &generated.StageDeletionRequestOptions{
 		Body: &generated.StageDeletionBody{
 			Filter: &generated.StageDeletionFilter{Sender: &sender},
 			DryRun: &dryRun,
@@ -1394,4 +1480,69 @@ func TestStageDeletionAcceptsDryRunOK(t *testing.T) {
 	assert.True(got.DryRun, "dry_run")
 	assert.Equal(int64(3), got.MessageCount, "message_count")
 	assert.Len(got.SampleGmailIds, 3, "sample ids")
+}
+
+func TestCaptureTelemetryEventSendsPropertyValues(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+	var got map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"status":"queued"}`))
+	}))
+	t.Cleanup(server.Close)
+
+	c, err := New(server.URL)
+	require.NoError(err, "New")
+	_, err = c.CaptureTelemetryEvent(t.Context(), &generated.CaptureTelemetryEventRequestOptions{
+		Body: &generated.CaptureTelemetryEventBody{
+			Event:      "app_opened",
+			Properties: map[string]any{"surface": "web"},
+		},
+	})
+	require.NoError(err, "CaptureTelemetryEvent")
+	assert.Equal(t, map[string]any{"event": "app_opened", "properties": map[string]any{"surface": "web"}}, got)
+}
+
+func TestImportMuesliSuccessStatuses(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		code  int
+		body  string
+		valid bool
+	}{
+		{"registration", 200, `{"status":"registered","source_id":3,"changed":false}`, true},
+		{"unchanged", 200, `{"status":"unchanged","source_id":3,"message_id":42,"changed":false}`, true},
+		{"updated", 200, `{"status":"updated","source_id":3,"message_id":42,"changed":true}`, true},
+		{"created", 201, `{"status":"created","source_id":3,"message_id":42,"changed":true}`, true},
+		{"empty", 200, ``, false},
+		{"unauthorized", 401, `{"error":"unauthorized"}`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert := assert.New(t)
+			require := require.New(t)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				assert.Equal(http.MethodPost, r.Method)
+				assert.Equal("/api/v1/import/muesli", r.URL.Path)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tc.code)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			t.Cleanup(server.Close)
+			c, err := New(server.URL)
+			require.NoError(err)
+			got, err := c.ImportMuesli(t.Context(), &generated.ImportMuesliRequestOptions{Body: &generated.ImportMuesliBody{}})
+			if !tc.valid {
+				require.Error(err)
+				return
+			}
+			require.NoError(err)
+			assert.Equal(int64(3), got.SourceID)
+		})
+	}
 }

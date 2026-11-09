@@ -9,6 +9,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/dustin/go-humanize"
 	"github.com/spf13/cobra"
 	"go.kenn.io/msgvault/internal/daemonclient"
 )
@@ -17,19 +18,18 @@ var listAccountsJSON bool
 
 var listAccountsCmd = &cobra.Command{
 	Use:   "list-accounts",
-	Short: "List synced accounts",
-	Long: `List all accounts that have been added to msgvault, across email,
-chat, and meeting sources.
+	Short: "List archive accounts with type, message count, last sync",
+	Long: `List every account in the archive: email, chat, meeting, and file-import
+sources. JSON rows have id, email, type (gmail, imap, mbox, slack, ...),
+display_name, and last_sync. message_count and source_deleted_count are
+included when ready; counts_pending: true replaces them while refreshing.
+When fresh counts take over 500 ms, earlier counts show their age;
+stale JSON rows add stale and as_of.
 
-Uses configured remote server or the local daemon by default.
-Use --local to use the local daemon even when a remote is configured.
-
-Shows the account identifier, source type, message count, and last sync time.
-
-Examples:
-	msgvault list-accounts
-	msgvault list-accounts --json`,
-	Args: cobra.NoArgs,
+Pass email to --account or id to --source-id on other commands;
+export-messages takes --source <type>:<email>.`,
+	Example: `  msgvault list-accounts --json`,
+	Args:    cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		return listHTTPAccounts(cmd)
 	},
@@ -42,11 +42,11 @@ func listHTTPAccounts(cmd *cobra.Command) error {
 	}
 	defer func() { _ = s.Close() }()
 
-	accounts, err := s.GetCLIAccounts(cmd.Context())
+	accounts, countsPending, err := s.GetCLIAccounts(cmd.Context())
 	if err != nil {
 		return fmt.Errorf("list accounts: %w", err)
 	}
-	return outputAccountStats(daemonAccountsToStats(accounts))
+	return outputAccountStats(daemonAccountsToStats(accounts, countsPending))
 }
 
 func outputAccountStats(stats []accountStats) error {
@@ -63,16 +63,24 @@ func outputAccountStats(stats []accountStats) error {
 	return nil
 }
 
-func daemonAccountsToStats(accounts []daemonclient.CLIAccount) []accountStats {
+func daemonAccountsToStats(accounts []daemonclient.CLIAccount, countsPending bool) []accountStats {
 	stats := make([]accountStats, len(accounts))
 	for i, account := range accounts {
 		stats[i] = accountStats{
 			ID:                 account.ID,
+			Identifier:         account.Identifier,
+			Alias:              account.Alias,
+			HistoryOnly:        account.HistoryOnly,
+			ReanchorRequired:   account.ReanchorRequired,
+			MergedIntoSourceID: account.MergedIntoSourceID,
 			Email:              account.Email,
 			Type:               account.Type,
 			DisplayName:        account.DisplayName,
 			MessageCount:       account.MessageCount,
+			CountsPending:      countsPending,
 			SourceDeletedCount: account.SourceDeletedCount,
+			Stale:              account.Stale,
+			AsOf:               account.AsOf,
 			LastSync:           account.LastSync,
 		}
 	}
@@ -81,7 +89,7 @@ func daemonAccountsToStats(accounts []daemonclient.CLIAccount) []accountStats {
 
 func outputAccountsTable(stats []accountStats) {
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	_, _ = fmt.Fprintln(w, "ID\tACCOUNT\tTYPE\tDISPLAY NAME\tMESSAGES\tLAST SYNC")
+	_, _ = fmt.Fprintln(w, "ID\tACCOUNT\tTYPE\tDISPLAY NAME\tMESSAGES\tLAST SYNC\tALIAS\tSTATE")
 
 	for _, s := range stats {
 		displayName := s.DisplayName
@@ -92,7 +100,7 @@ func outputAccountsTable(stats []accountStats) {
 		if s.LastSync != nil && !s.LastSync.IsZero() {
 			lastSync = s.LastSync.Format("2006-01-02 15:04")
 		}
-		_, _ = fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s\t%s\n", s.ID, s.Email, s.Type, displayName, formatMessagesCell(s), lastSync)
+		_, _ = fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", s.ID, s.Email, s.Type, displayName, formatMessagesCell(s), lastSync, s.Alias, accountState(s))
 	}
 
 	_ = w.Flush()
@@ -103,23 +111,42 @@ func outputAccountsTable(stats []accountStats) {
 // deleted count so the primary column keeps its active-only meaning while
 // still surfacing the retained-but-source-deleted population.
 func formatMessagesCell(s accountStats) string {
-	if s.SourceDeletedCount > 0 {
-		return fmt.Sprintf("%s (+%s deleted from source)",
-			formatCount(s.MessageCount), formatCount(s.SourceDeletedCount))
+	if s.CountsPending {
+		return "pending"
 	}
-	return formatCount(s.MessageCount)
+	count := formatCount(s.MessageCount)
+	if s.SourceDeletedCount > 0 {
+		count = fmt.Sprintf("%s (+%s deleted from source)", count, formatCount(s.SourceDeletedCount))
+	}
+	if s.Stale && s.AsOf != nil {
+		count += " (counted " + humanize.Time(time.Now().Add(-max(time.Since(*s.AsOf), 0))) + ")"
+	}
+	return count
 }
 
 func outputAccountsJSON(stats []accountStats) error {
 	output := make([]map[string]any, len(stats))
 	for i, s := range stats {
 		entry := map[string]any{
-			"id":                   s.ID,
-			keyEmail:               s.Email,
-			"type":                 s.Type,
-			"display_name":         s.DisplayName,
-			"message_count":        s.MessageCount,
-			"source_deleted_count": s.SourceDeletedCount,
+			"id":                    s.ID,
+			"identifier":            s.Identifier,
+			"alias":                 s.Alias,
+			"history_only":          s.HistoryOnly,
+			"reanchor_required":     s.ReanchorRequired,
+			"merged_into_source_id": s.MergedIntoSourceID,
+			keyEmail:                s.Email,
+			"type":                  s.Type,
+			"display_name":          s.DisplayName,
+		}
+		if s.CountsPending {
+			entry["counts_pending"] = true
+		} else {
+			entry["message_count"] = s.MessageCount
+			entry["source_deleted_count"] = s.SourceDeletedCount
+			if s.Stale {
+				entry["stale"] = true
+				entry["as_of"] = s.AsOf
+			}
 		}
 		if s.LastSync != nil && !s.LastSync.IsZero() {
 			entry["last_sync"] = s.LastSync.Format(time.RFC3339)
@@ -153,16 +180,40 @@ func formatCount(n int64) string {
 }
 
 type accountStats struct {
+	CountsPending      bool
+	Identifier         string
+	Alias              string
+	HistoryOnly        bool
+	ReanchorRequired   bool
+	MergedIntoSourceID int64
 	ID                 int64
 	Email              string
 	Type               string
 	DisplayName        string
 	MessageCount       int64
 	SourceDeletedCount int64
+	Stale              bool
+	AsOf               *time.Time
 	LastSync           *time.Time
 }
 
 func init() {
 	rootCmd.AddCommand(listAccountsCmd)
 	listAccountsCmd.Flags().BoolVar(&listAccountsJSON, flagJSON, false, "Output as JSON")
+}
+
+const accountStateActive = "active"
+
+func accountState(s accountStats) string {
+	if s.MergedIntoSourceID != 0 {
+		return fmt.Sprintf("merged into %d", s.MergedIntoSourceID)
+	}
+	state := accountStateActive
+	if s.HistoryOnly {
+		state = "history-only"
+	}
+	if s.ReanchorRequired {
+		state += "; re-anchor required"
+	}
+	return state
 }

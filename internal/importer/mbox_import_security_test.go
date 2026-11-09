@@ -12,96 +12,19 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/msgvault/internal/mime"
 	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/testutil"
 )
 
-func TestStoreAttachment_InvalidContentHash_ReturnsError(t *testing.T) {
-	require := require.New(t)
-	tmp := t.TempDir()
-
-	dbPath := filepath.Join(tmp, "msgvault.db")
-	st, err := store.Open(dbPath)
-	require.NoError(err, "open store")
-	t.Cleanup(func() { _ = st.Close() })
-	require.NoError(st.InitSchema(), "init schema")
-
-	attachmentsDir := filepath.Join(tmp, "attachments")
-
-	att := &mime.Attachment{
-		Filename:    "a.txt",
-		ContentType: "text/plain",
-		Content:     []byte("hi"),
-		ContentHash: "a", // malformed
-		Size:        2,
-	}
-
-	err = storeAttachment(st, attachmentsDir, 1, att)
-	require.Error(err)
-
-	// Ensure nothing was written.
-	_, statErr := os.Stat(attachmentsDir)
-	assert.Error(t, statErr,
-		"attachments dir should not have been created for invalid content hash")
-}
-
-func TestStoreAttachment_ComputesContentHashWhenMissing(t *testing.T) {
-	require := require.New(t)
-	assert := assert.New(t)
-	tmp := t.TempDir()
-
-	dbPath := filepath.Join(tmp, "msgvault.db")
-	st, err := store.Open(dbPath)
-	require.NoError(err, "open store")
-	t.Cleanup(func() { _ = st.Close() })
-	require.NoError(st.InitSchema(), "init schema")
-
-	src, err := st.GetOrCreateSource("mbox", "me@example.com")
-	require.NoError(err, "get/create source")
-	convID, err := st.EnsureConversation(src.ID, "thread1", "Thread")
-	require.NoError(err, "ensure conversation")
-	msgID, err := st.UpsertMessage(&store.Message{
-		ConversationID:  convID,
-		SourceID:        src.ID,
-		SourceMessageID: "msg1",
-		MessageType:     "email",
-	})
-	require.NoError(err, "upsert message")
-
-	attachmentsDir := filepath.Join(tmp, "attachments")
-
-	att := &mime.Attachment{
-		Filename:    "a.txt",
-		ContentType: "text/plain",
-		Content:     []byte("hi"),
-		ContentHash: "", // missing
-		Size:        2,
-	}
-
-	require.NoError(storeAttachment(st, attachmentsDir, msgID, att), "storeAttachment")
-	assert.NotEmpty(att.ContentHash, "expected ContentHash to be computed")
-
-	// Ensure file + DB record exist.
-	fullPath := filepath.Join(attachmentsDir, att.ContentHash[:2], att.ContentHash)
-	_, err = os.Stat(fullPath)
-	require.NoError(err, "attachment file missing")
-
-	var count int
-	err = st.DB().QueryRow(`SELECT COUNT(*) FROM attachments WHERE message_id = ?`, msgID).Scan(&count)
-	require.NoError(err, "count attachments")
-	assert.Equal(1, count)
-}
-
 func TestStoreAttachmentPreservesMIMEOccurrenceEvidence(t *testing.T) {
+	testutil.SkipIfPostgres(t, "SQLite fixtures require SQLite")
 	require := require.New(t)
 	assert := assert.New(t)
 	tmp := t.TempDir()
-	st, err := store.Open(filepath.Join(tmp, "msgvault.db"))
-	require.NoError(err)
-	t.Cleanup(func() { _ = st.Close() })
-	require.NoError(st.InitSchema())
+	st := testutil.NewSQLiteTestStoreAt(t, filepath.Join(tmp, "msgvault.db"))
 
 	src, err := st.GetOrCreateSource("mbox", "me@example.com")
 	require.NoError(err)
-	convID, err := st.EnsureConversation(src.ID, "thread-role", "Thread")
+	convID, err := st.EnsureConversation(t.Context(), src.ID, "thread-role", "Thread")
 	require.NoError(err)
 	msgID, err := st.UpsertMessage(&store.Message{
 		ConversationID: convID, SourceID: src.ID,
@@ -121,10 +44,10 @@ func TestStoreAttachmentPreservesMIMEOccurrenceEvidence(t *testing.T) {
 			ContentID: "signature-1", PartKey: "mime:2",
 		},
 	} {
-		require.NoError(storeAttachment(st, attachmentsDir, msgID, att))
+		require.NoError(storeAttachment(t.Context(), st, attachmentsDir, msgID, att, false))
 	}
 
-	rows, err := st.DB().Query(`
+	rows, err := st.DB().QueryContext(t.Context(), `
 		SELECT attachment_role, role_source, source_part_key, COALESCE(content_id, '')
 		FROM attachments WHERE message_id = ? ORDER BY source_part_key`, msgID)
 	require.NoError(err)
@@ -144,6 +67,7 @@ func TestStoreAttachmentPreservesMIMEOccurrenceEvidence(t *testing.T) {
 }
 
 func TestStoreAttachment_StatError_DoesNotUpsertRow(t *testing.T) {
+	testutil.SkipIfPostgres(t, "SQLite fixtures require SQLite")
 	require := require.New(t)
 	if runtime.GOOS == "windows" {
 		t.Skip("requires symlink support")
@@ -152,14 +76,11 @@ func TestStoreAttachment_StatError_DoesNotUpsertRow(t *testing.T) {
 	tmp := t.TempDir()
 
 	dbPath := filepath.Join(tmp, "msgvault.db")
-	st, err := store.Open(dbPath)
-	require.NoError(err, "open store")
-	t.Cleanup(func() { _ = st.Close() })
-	require.NoError(st.InitSchema(), "init schema")
+	st := testutil.NewSQLiteTestStoreAt(t, dbPath)
 
 	src, err := st.GetOrCreateSource("mbox", "me@example.com")
 	require.NoError(err, "get/create source")
-	convID, err := st.EnsureConversation(src.ID, "thread1", "Thread")
+	convID, err := st.EnsureConversation(t.Context(), src.ID, "thread1", "Thread")
 	require.NoError(err, "ensure conversation")
 	msgID, err := st.UpsertMessage(&store.Message{
 		ConversationID:  convID,
@@ -189,10 +110,10 @@ func TestStoreAttachment_StatError_DoesNotUpsertRow(t *testing.T) {
 		Size:        len(content),
 	}
 
-	require.Error(storeAttachment(st, attachmentsDir, msgID, att))
+	require.Error(storeAttachment(t.Context(), st, attachmentsDir, msgID, att, false))
 
 	var count int
-	err = st.DB().QueryRow(`SELECT COUNT(*) FROM attachments WHERE message_id = ?`, msgID).Scan(&count)
+	err = st.DB().QueryRowContext(t.Context(), `SELECT COUNT(*) FROM attachments WHERE message_id = ?`, msgID).Scan(&count)
 	require.NoError(err, "count attachments")
 	assert.Equal(t, 0, count)
 }

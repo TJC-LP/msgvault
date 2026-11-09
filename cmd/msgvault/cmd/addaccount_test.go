@@ -17,16 +17,14 @@ import (
 	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/oauth"
 	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/testutil"
 )
 
 func TestFindGmailSource(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
 	tmpDir := t.TempDir()
-	s, err := store.Open(tmpDir + "/msgvault.db")
-	require.NoError(err, "open store")
-	defer func() { _ = s.Close() }()
-	require.NoError(s.InitSchema(), "init schema")
+	s := testutil.NewSQLiteTestStoreAt(t, tmpDir+"/msgvault.db")
 
 	const email = "user@company.com"
 
@@ -71,12 +69,10 @@ func TestAddAccount_InheritedBindingValidatesToken(t *testing.T) {
 			tmpDir := t.TempDir()
 			dbPath := filepath.Join(tmpDir, "msgvault.db")
 
-			s, err := store.Open(dbPath)
-			require.NoError(err, "open store")
-			require.NoError(s.InitSchema(), "init schema")
+			s := testutil.NewSQLiteTestStoreAt(t, dbPath)
 			source, err := s.GetOrCreateSource("gmail", "user@acme.com")
 			require.NoError(err, "create source")
-			require.NoError(s.UpdateSourceOAuthApp(source.ID, sql.NullString{String: "acme", Valid: true}), "set oauth_app")
+			require.NoError(s.UpdateSourceOAuthApp(t.Context(), source.ID, sql.NullString{String: "acme", Valid: true}), "set oauth_app")
 			_ = s.Close()
 
 			tokensDir := filepath.Join(tmpDir, "tokens")
@@ -295,12 +291,10 @@ func TestAddAccount_RebindWithExistingToken(t *testing.T) {
 	dbPath := filepath.Join(tmpDir, "msgvault.db")
 
 	// Set up DB with a source bound to "old-app"
-	s, err := store.Open(dbPath)
-	require.NoError(err, "open store")
-	require.NoError(s.InitSchema(), "init schema")
+	s := testutil.NewSQLiteTestStoreAt(t, dbPath)
 	source, err := s.GetOrCreateSource("gmail", "user-a@example.com")
 	require.NoError(err, "create source")
-	require.NoError(s.UpdateSourceOAuthApp(source.ID, sql.NullString{
+	require.NoError(s.UpdateSourceOAuthApp(t.Context(), source.ID, sql.NullString{
 		String: "old-app", Valid: true,
 	}), "set oauth_app")
 	_ = s.Close()
@@ -622,12 +616,10 @@ func TestAddAccount_ForceRebindPreservesBindingOnFailure(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "msgvault.db")
 
-	s, err := store.Open(dbPath)
-	require.NoError(err, "open store")
-	require.NoError(s.InitSchema(), "init schema")
+	s := testutil.NewSQLiteTestStoreAt(t, dbPath)
 	source, err := s.GetOrCreateSource("gmail", "user@acme.com")
 	require.NoError(err, "create source")
-	require.NoError(s.UpdateSourceOAuthApp(source.ID, sql.NullString{
+	require.NoError(s.UpdateSourceOAuthApp(t.Context(), source.ID, sql.NullString{
 		String: "old-app", Valid: true,
 	}), "set oauth_app")
 	_ = s.Close()
@@ -711,12 +703,10 @@ func TestAddAccount_HeadlessExplicitEmptyOAuthApp(t *testing.T) {
 	dbPath := filepath.Join(tmpDir, "msgvault.db")
 
 	// Set up DB with a source bound to "acme"
-	s, err := store.Open(dbPath)
-	require.NoError(err, "open store")
-	require.NoError(s.InitSchema(), "init schema")
+	s := testutil.NewSQLiteTestStoreAt(t, dbPath)
 	source, err := s.GetOrCreateSource("gmail", "user@acme.com")
 	require.NoError(err, "create source")
-	require.NoError(s.UpdateSourceOAuthApp(source.ID, sql.NullString{
+	require.NoError(s.UpdateSourceOAuthApp(t.Context(), source.ID, sql.NullString{
 		String: "acme", Valid: true,
 	}), "set oauth_app")
 	_ = s.Close()
@@ -934,7 +924,7 @@ func TestAddAccount_NoDefaultIdentitySuppresses(t *testing.T) {
 	assert.Empty(ids, "expected 0 identity rows with --no-default-identity")
 
 	// The daemon's shared helper must honor the choice after the store reopens.
-	confirmDefaultIdentity(io.Discard, s, src.ID, "user@example.com", "user@example.com", "account-identifier", logger)
+	confirmDefaultIdentity(t.Context(), io.Discard, s, src.ID, "user@example.com", "user@example.com", "account-identifier", logger)
 	ids, err = s.ListAccountIdentities(src.ID)
 	require.NoError(err)
 	assert.Empty(ids, "the shared identity helper must preserve the opt-out")

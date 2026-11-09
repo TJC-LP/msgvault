@@ -2,7 +2,6 @@ package imap
 
 import (
 	"bufio"
-	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -18,20 +17,6 @@ import (
 	gmailapi "go.kenn.io/msgvault/internal/gmail"
 	"go.kenn.io/msgvault/internal/testutil"
 )
-
-func TestNewRawBatchResultsKeepsInputIDs(t *testing.T) {
-	require := require.New(t)
-	assert := assert.New(t)
-	results := newRawBatchResults([]string{"Archive|10", "Archive|11"})
-
-	require.Len(results, 2)
-	assert.Equal("Archive|10", results[0].ID)
-	assert.Nil(results[0].Message)
-	require.NoError(results[0].Err)
-	assert.Equal("Archive|11", results[1].ID)
-	assert.Nil(results[1].Message)
-	require.NoError(results[1].Err)
-}
 
 func TestMarkRawBatchErrorMarksOnlyRequestedItems(t *testing.T) {
 	require := require.New(t)
@@ -117,14 +102,14 @@ func TestRawBatchFetchRecordsMembershipBeforeDedup(t *testing.T) {
 	client.observedMemberships = nil
 	var uidSet imapapi.UIDSet
 	uidSet.AddNum(1)
-	allMailSelectErr := client.selectMailbox("All Mail")
+	allMailSelectErr := client.selectMailbox(t.Context(), "All Mail")
 	var allMailStoreErr error
 	if allMailSelectErr == nil {
 		_, allMailStoreErr = client.conn.Store(uidSet, &imapapi.StoreFlags{
 			Op: imapapi.StoreFlagsSet, Flags: []imapapi.Flag{imapapi.FlagSeen},
 		}, nil).Collect()
 	}
-	archiveSelectErr := client.selectMailbox("Archive")
+	archiveSelectErr := client.selectMailbox(t.Context(), "Archive")
 	var archiveStoreErr error
 	if archiveSelectErr == nil {
 		_, archiveStoreErr = client.conn.Store(uidSet, &imapapi.StoreFlags{
@@ -137,7 +122,7 @@ func TestRawBatchFetchRecordsMembershipBeforeDedup(t *testing.T) {
 	require.NoError(archiveSelectErr)
 	require.NoError(archiveStoreErr)
 	results, err := client.GetMessagesRawBatchWithErrors(
-		context.Background(), []string{"All Mail|1", "Archive|1"})
+		t.Context(), []string{"All Mail|1", "Archive|1"})
 	require.NoError(err)
 	require.Len(results, 2)
 	require.NotNil(results[0].Message)
@@ -199,7 +184,7 @@ func TestLabelOnlyFetchRecordsCanonicalMembershipFlags(t *testing.T) {
 
 	client.mu.Lock()
 	client.observedMemberships = nil
-	selectErr := client.selectMailbox("INBOX")
+	selectErr := client.selectMailbox(t.Context(), "INBOX")
 	var uidSet imapapi.UIDSet
 	uidSet.AddNum(1)
 	var storeErr error
@@ -213,7 +198,7 @@ func TestLabelOnlyFetchRecordsCanonicalMembershipFlags(t *testing.T) {
 	require.NoError(selectErr)
 	require.NoError(storeErr)
 
-	results, err := client.GetMessageLabelsBatch(context.Background(), []string{"INBOX|1"})
+	results, err := client.GetMessageLabelsBatch(t.Context(), []string{"INBOX|1"})
 	require.NoError(err)
 	require.Len(results, 1)
 	require.NoError(results[0].Err)
@@ -254,7 +239,7 @@ func TestGetMessageLabelsBatchPreservesPerMessageMissingUID(t *testing.T) {
 	client := newTestClient(t, addr)
 
 	results, err := client.GetMessageLabelsBatch(
-		context.Background(),
+		t.Context(),
 		[]string{"INBOX|1", "INBOX|99"},
 	)
 
@@ -292,7 +277,7 @@ func TestLabelOnlyRescanDefersAllMailDedupUntilValidated(t *testing.T) {
 	)
 
 	labelResults, err := client.GetMessageLabelsBatch(
-		context.Background(),
+		t.Context(),
 		[]string{"All Mail|1"},
 	)
 	require.NoError(err)
@@ -313,7 +298,7 @@ func TestLabelOnlyRescanDefersAllMailDedupUntilValidated(t *testing.T) {
 	assert.Contains(client.seenRFC822IDs, messageID)
 
 	rawResults, err := client.GetMessagesRawBatchWithErrors(
-		context.Background(),
+		t.Context(),
 		[]string{"Archive|1"},
 	)
 	require.NoError(err)
@@ -324,7 +309,7 @@ func TestLabelOnlyRescanDefersAllMailDedupUntilValidated(t *testing.T) {
 		"the overlapping mailbox copy must remain a dedup stub")
 
 	validationResults, err := client.GetMessagesRawBatchWithIdentityValidation(
-		context.Background(), []string{"Archive|1"})
+		t.Context(), []string{"Archive|1"})
 	require.NoError(err)
 	require.Len(validationResults, 1)
 	require.NoError(validationResults[0].Err)
@@ -450,7 +435,7 @@ func TestIncompleteLabelMapDisablesCrossMailboxDedup(t *testing.T) {
 	assert.False(client.LabelsSnapshotComplete())
 
 	results, err := client.GetMessagesRawBatchWithErrors(
-		context.Background(), ids)
+		t.Context(), ids)
 	require.NoError(err)
 	require.Len(results, 2)
 	for _, result := range results {
@@ -720,7 +705,7 @@ func fetchMessageBufferWithoutEnvelope(raw []byte) *imapclient.FetchMessageBuffe
 
 func startMalformedEnvelopeIMAPServer(t *testing.T, raw []byte) (string, <-chan string) {
 	t.Helper()
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	listener, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = listener.Close() })
 
@@ -939,7 +924,7 @@ func TestOmittedUIDIsRecheckedBeforeItCountsAsGone(t *testing.T) {
 // follows therefore hits a dead socket and cannot reconnect.
 func startOmitThenDieIMAPServer(t *testing.T, uid imapapi.UID) string {
 	t.Helper()
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	listener, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	addr := listener.Addr().String()
 	t.Cleanup(func() { _ = listener.Close() })
@@ -1064,7 +1049,7 @@ func TestUIDTheMailboxStillReportsIsNotGone(t *testing.T) {
 // correctly. Every UID FETCH command is sent on the returned channel.
 func startEmptyHeaderFieldsIMAPServer(t *testing.T) (string, <-chan string) {
 	t.Helper()
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	listener, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = listener.Close() })
 
@@ -1173,7 +1158,7 @@ func TestEmptyHeaderFieldsSectionFallsBackToFullHeader(t *testing.T) {
 }
 
 func TestFullHeaderFallbackReselectFailureEndsTheBatch(t *testing.T) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	listener, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = listener.Close() })
 	unselectedFetches := make(chan string, 16)

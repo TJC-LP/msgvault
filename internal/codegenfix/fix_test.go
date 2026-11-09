@@ -1,6 +1,7 @@
 package codegenfix
 
 import (
+	"bytes"
 	"strings"
 	"testing"
 
@@ -17,6 +18,7 @@ func TestRewriteGeneratedValidatorsRepairsKnownGeneratorGaps(t *testing.T) {
 	assertions.NotContains(string(got), "if p.Filename != nil")
 	assertions.NotContains(string(got), "if p.MimeType != nil")
 	assertions.NotContains(string(got), "if p.SourceRef != nil")
+	assertions.NotContains(string(got), "if m.Filename != nil")
 	assertions.NotContains(string(got), "if p.SourceURL != nil")
 	assertions.NotContains(string(got), "if p.ContentSha256 != nil")
 	assertions.NotContains(string(got), "if p.SourceVersion != nil")
@@ -25,10 +27,44 @@ func TestRewriteGeneratedValidatorsRepairsKnownGeneratorGaps(t *testing.T) {
 	assertions.Contains(string(got), `typesValidator.Var(e.Grouping, "required,min=1,max=1")`)
 	assertions.Contains(string(got), `typesValidator.Var(f.Grouping, "required,min=1,max=1")`)
 	assertions.NotContains(string(got), exploreCacheRecoveryActionRequiredValidatorBlock())
+	assertions.NotContains(string(got), "typesValidator.Var(e.Excerpt")
 	assertions.Contains(string(got), "JSON jsontext.Value")
 	assertions.Contains(string(got), dailyNoteDecoyValidatorBlock())
 	assertions.Contains(string(got), dailyNotePersonIDsValidatorBlock("gte=1"))
 	assertions.NotContains(string(got), dailyNotePersonIDsValidatorBlock("omitempty,gte=1"))
+	again, err := RewriteGeneratedValidators(got)
+	require.NoError(t, err)
+	if !bytes.Equal(got, again) {
+		index := firstDifference(got, again)
+		start := max(0, index-40)
+		leftEnd, rightEnd := min(len(got), index+100), min(len(again), index+100)
+		assertions.Failf("validator rewrite is not idempotent", "first difference at byte %d: got=%q again=%q", index, got[start:leftEnd], again[start:rightEnd])
+	}
+}
+
+func firstDifference(left, right []byte) int {
+	for i := range min(len(left), len(right)) {
+		if left[i] != right[i] {
+			return i
+		}
+	}
+	return min(len(left), len(right))
+}
+
+func TestRewriteGeneratedValidatorsAllowsEmptyContactRouteStrings(t *testing.T) {
+	assertions := assert.New(t)
+	requirements := require.New(t)
+	got, err := RewriteGeneratedValidators([]byte(generatedValidatorFixture()))
+	requirements.NoError(err)
+	assertions.NotContains(string(got), `typesValidator.Var(m.MergedIntoChatID, "required")`)
+	assertions.NotContains(string(got), `typesValidator.Var(m.Network, "required")`)
+	assertions.NotContains(string(got), `typesValidator.Var(m.NetworkLabel, "required")`)
+	assertions.NotContains(string(got), `typesValidator.Var(m.ProviderChatID, "required")`)
+	assertions.NotContains(string(got), `typesValidator.Var(p.AliasReason, "required")`)
+	assertions.NotContains(string(got), `typesValidator.Var(c.DisplayName, "required")`)
+	assertions.Contains(string(got), "Address       string `json:\"address\"`\n")
+	assertions.Contains(string(got), "DisplayName   string `json:\"display_name\"`\n")
+	assertions.NotContains(string(got), `typesValidator.Var(l.Summary, "required")`)
 }
 
 func TestRewriteRunQueryClientPreservesSynchronousResultType(t *testing.T) {
@@ -51,6 +87,9 @@ func (c *Client) RunQuery(ctx context.Context, options *RunQueryRequestOptions, 
 	assert.Equal(2, strings.Count(string(got), "resp.StatusCode != 200"))
 	assert.NotContains(string(got), "RunQueryResponseJSON")
 	assert.NotContains(string(got), "RunArchiveQueryResponseJSON")
+	again, err := RewriteRunQueryClient(got)
+	require.NoError(t, err)
+	assert.Equal(got, again)
 }
 
 func TestRewriteGeneratedValidatorsRejectsMissingGroupingValidator(t *testing.T) {
@@ -111,7 +150,32 @@ func TestRewriteGeneratedValidatorsRejectsAmbiguousDailyNotePersonIDValidators(t
 }
 
 func generatedValidatorFixture() string {
-	return `type AttributeValue struct {
+	return `type Attendee struct {
+	Email string
+	DisplayName string
+}
+func (a Attendee) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(a))
+}
+type CalendarOccurrence struct {
+	StartDate string
+	EndDate string
+	Subject string
+}
+func (c CalendarOccurrence) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(c.StartDate, "required"); err != nil {
+		errors = errors.Append("StartDate", err)
+	}
+	if err := typesValidator.Var(c.EndDate, "required"); err != nil {
+		errors = errors.Append("EndDate", err)
+	}
+	if err := typesValidator.Var(c.Subject, "required"); err != nil {
+		errors = errors.Append("Subject", err)
+	}
+	return errors
+}
+type AttributeValue struct {
 	JSON *struct{}  ` + "`json:\"json,omitempty\"`" + `
 }
 type ExploreCacheUnavailableResponse struct {
@@ -121,6 +185,16 @@ func (e ExploreCacheUnavailableResponse) Validate() error {
 	var errors runtime.ValidationErrors
 ` + exploreCacheRecoveryActionRequiredValidatorBlock() + `
 }
+type Evidence struct {
+	Excerpt string
+}
+func (e Evidence) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(e.Excerpt, "required"); err != nil {
+		errors = errors.Append("Excerpt", err)
+	}
+	return errors
+}
 func (e ExploreGroupsHTTPRequest) Validate() error {
 	var errors runtime.ValidationErrors
 }
@@ -129,13 +203,46 @@ func (f FileGroupsHTTPRequest) Validate() error {
 }
 ` + pointerValidatorFixture("FileMetadataResponse", "f") + pointerValidatorFixture("FileSearchRow", "f") +
 		pointerValidatorFixture("PersonFileSearchRow", "p") +
+		requiredStringPointerValidatorFixture("FileSuggestionRow", "f", "MimeType") +
+		requiredStringPointerValidatorFixture("PersonFileSuggestionRow", "p", "MimeType") +
+		requiredStringPointerValidatorFixture("CliAccountResponse", "c", "Alias") +
+		requiredStringPointerValidatorFixture("MessageRecording", "m", "Filename") +
 		requiredStringPointerValidatorFixture("PersonFactEvidence", "p",
 			"SourceRef", "SourceURL", "ContentSha256", "SourceVersion", "SubjectRef", "Excerpt") + `
 func (c CreateDailyNoteEntryRequest) Validate() error {
 	var errors runtime.ValidationErrors
 ` + dailyNoteDecoyValidatorBlock() + dailyNotePersonIDsValidatorBlock("omitempty,gte=1") + `
 }
-`
+` + contactRouteEmptyStringValidatorFixture() + contactCandidateEmptyStringValidatorFixture() + loopCounterpartyEmptyStringValidatorFixture()
+}
+
+func contactRouteEmptyStringValidatorFixture() string {
+	return "type MessagingRoute struct {\n\tMergedIntoChatID string\n\tNetwork          string\n\tNetworkLabel     string\n\tProviderChatID   string\n}\n" +
+		"func (m MessagingRoute) Validate() error {\n\tvar errors runtime.ValidationErrors\n" +
+		"\tif err := typesValidator.Var(m.MergedIntoChatID, \"required\"); err != nil {\n\t\terrors = errors.Append(\"MergedIntoChatID\", err)\n\t}\n" +
+		"\tif err := typesValidator.Var(m.Network, \"required\"); err != nil {\n\t\terrors = errors.Append(\"Network\", err)\n\t}\n" +
+		"\tif err := typesValidator.Var(m.NetworkLabel, \"required\"); err != nil {\n\t\terrors = errors.Append(\"NetworkLabel\", err)\n\t}\n" +
+		"\tif err := typesValidator.Var(m.ProviderChatID, \"required\"); err != nil {\n\t\terrors = errors.Append(\"ProviderChatID\", err)\n\t}\n\treturn errors\n}\n" +
+		"type PersonMessagingRoutesPage struct {\n\tAliasReason string\n}\n" +
+		"func (p PersonMessagingRoutesPage) Validate() error {\n\tvar errors runtime.ValidationErrors\n" +
+		"\tif err := typesValidator.Var(p.AliasReason, \"required\"); err != nil {\n\t\terrors = errors.Append(\"AliasReason\", err)\n\t}\n\treturn errors\n}\n"
+}
+
+func contactCandidateEmptyStringValidatorFixture() string {
+	return "type ContactCandidate struct {\n\tDisplayName string\n}\n" +
+		"func (c ContactCandidate) Validate() error {\n\tvar errors runtime.ValidationErrors\n" +
+		"\tif err := typesValidator.Var(c.DisplayName, \"required\"); err != nil {\n\t\terrors = errors.Append(\"DisplayName\", err)\n\t}\n" +
+		"\tif len(errors) == 0 {\n\t\treturn nil\n\t}\n\treturn errors\n}\n"
+}
+
+func loopCounterpartyEmptyStringValidatorFixture() string {
+	return "type LoopCounterparty struct {\n\tAddress       string `json:\"address\" validate:\"required\"`\n" +
+		"\tDisplayName   string `json:\"display_name\" validate:\"required\"`\n\tParticipantID int64  `json:\"participant_id\"`\n}\n" +
+		"func (l LoopCounterparty) Validate() error {\n\treturn runtime.ConvertValidatorError(typesValidator.Struct(l))\n}\n" +
+		"type LoopItem struct {\n\tSummary string\n}\n" +
+		"func (l LoopItem) Validate() error {\n\tvar errors runtime.ValidationErrors\n" +
+		"\tif err := typesValidator.Var(l.Summary, \"required\"); err != nil {\n\t\terrors = errors.Append(\"Summary\", err)\n\t}\n" +
+		"\tif len(errors) == 0 {\n\t\treturn nil\n\t}\n\treturn errors\n}\n"
 }
 
 func exploreCacheRecoveryActionRequiredValidatorBlock() string {

@@ -2,11 +2,15 @@ package mcp
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/msgvault/internal/daemonclient"
 	"go.kenn.io/msgvault/internal/peoplebrowser"
 	"go.kenn.io/msgvault/internal/query/querytest"
 	"go.kenn.io/msgvault/internal/store"
@@ -44,6 +48,10 @@ func TestMCPListDirectoryPeopleForwardsQueryAndReturnsRows(t *testing.T) {
 	backend := &directoryPeopleBackend{page: &store.DirectoryPeoplePage{
 		People: []store.DirectoryPersonSummary{{
 			ID: 7, DisplayName: new("Alice Example"), Revision: 4,
+			VCardUID: "person-7", CardDAVBindings: []store.CardDAVBinding{{
+				Connection: "personal", Book: "Personal", Href: "https://contacts.example.test/book/person.vcf",
+				RemoteUID: "urn:uuid:remote-7", MappingStatus: store.CardDAVMappingMapped,
+			}},
 			PrimaryChannel: "chat", ContactState: "active", LastContactAt: &after,
 			Categories: []string{"friend"}, Organizations: []string{"Example Org"},
 		}},
@@ -51,14 +59,16 @@ func TestMCPListDirectoryPeopleForwardsQueryAndReturnsRows(t *testing.T) {
 	}}
 	result := rawCallTool(t, directoryToolOptions(backend), ToolListDirectoryPeople, map[string]any{
 		"query": "Alice", "cursor": "opaque/cursor+bytes", "limit": 7,
-		"sort": "last_contact_asc", "last_contact_after": after.Format(time.RFC3339Nano),
+		"address": `ÉCOLE+%_\@example.test`,
+		"sort":    "last_contact_asc", "last_contact_after": after.Format(time.RFC3339Nano),
 		"last_contact_before": before.Format(time.RFC3339Nano), "contact_state": "active",
 		"category": "friend", "organization": "Example Org", "primary_channel": "chat",
 	})
 	assert.NotEqual(true, result["isError"], "result: %#v", result)
 	assert.Equal(store.DirectoryPeopleQuery{
 		Query: "Alice", Cursor: "opaque/cursor+bytes", Limit: 7,
-		Sort: store.DirectoryPeopleSortLastContactAsc, LastContactAfter: &after,
+		Address: `ÉCOLE+%_\@example.test`,
+		Sort:    store.DirectoryPeopleSortLastContactAsc, LastContactAfter: &after,
 		LastContactBefore: &before, ContactState: "active", Category: "friend",
 		Organization: "Example Org", PrimaryChannel: "chat",
 	}, backend.query)
@@ -71,6 +81,13 @@ func TestMCPListDirectoryPeopleForwardsQueryAndReturnsRows(t *testing.T) {
 	require.True(ok)
 	assert.InDelta(7, row["id"], 0)
 	assert.Equal("Alice Example", row["display_name"])
+	assert.Equal("person-7", row["vcard_uid"])
+	bindings, ok := row["carddav_bindings"].([]any)
+	require.True(ok)
+	require.Len(bindings, 1)
+	binding, ok := bindings[0].(map[string]any)
+	require.True(ok)
+	assert.Equal("urn:uuid:remote-7", binding["remote_uid"])
 	assert.InDelta(4, row["revision"], 0)
 	assert.Equal("2026-08-20T12:30:00.123456789Z", row["last_contact_at"])
 	assert.Equal([]any{"friend"}, row["categories"])
@@ -119,6 +136,36 @@ func TestMCPListDirectoryPeopleMapsKnownErrors(t *testing.T) {
 			assert.Contains(t, toolErrorTextFromResult(t, result), test.want)
 		})
 	}
+}
+
+func TestMCPListDirectoryPeopleAddressCapability(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	var lookups atomic.Int32
+	daemon := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/api/v1/health" {
+			_, _ = w.Write([]byte(`{"status":"ok","api_schema_version":"3.28.0"}`))
+			return
+		}
+		lookups.Add(1)
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(daemon.Close)
+	engine, err := daemonclient.NewEngine(daemonclient.Config{URL: daemon.URL, AllowInsecure: true})
+	require.NoError(err)
+	t.Cleanup(func() { assert.NoError(engine.Close()) })
+	browser := daemonclient.NewPeopleBrowser(engine)
+	response, raw := task4RawRequest(t,
+		newMCPHTTPServer(directoryToolOptions(browser), HTTPOptions{}).Handler,
+		"tools/call", map[string]any{
+			"name": ToolListDirectoryPeople, "arguments": map[string]any{"address": "alex@example.test"},
+		}, nil)
+	assert.Equal(int32(0), lookups.Load())
+	require.Empty(response.Error, "response: %s", raw)
+	assert.Equal(true, response.Result["isError"])
+	assert.Contains(toolErrorTextFromResult(t, response.Result),
+		"requires daemon API schema 3.29.0 or newer; upgrade the daemon")
 }
 
 func TestMCPListDirectoryPeopleSanitizesUnavailableAndNilPages(t *testing.T) {

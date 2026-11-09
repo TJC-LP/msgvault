@@ -1,12 +1,28 @@
 name: CI
 
-# The PR dispatcher always calls the main-pinned workflow. That workflow
-# runs PR jobs on Namespace, including fork PRs.
+# The PR dispatcher always calls the main-pinned workflow.
 on:
   pull_request:
+  merge_group:
+    types: [checks_requested]
 
 permissions: read-all
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   run:
+    cache-mode: read
     uses: kenn-io/msgvault/.github/workflows/ci.yml@main
+
+  gate:
+    name: CI gate
+    needs: run
+    if: always()
+    runs-on: namespace-profile-linux-1cpu
+    steps:
+      - name: Check CI result
+        if: needs.run.result != 'success'
+        run: exit 1

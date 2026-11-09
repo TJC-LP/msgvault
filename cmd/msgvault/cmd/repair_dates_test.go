@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"bytes"
-	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -20,6 +19,7 @@ import (
 	"go.kenn.io/msgvault/internal/mime"
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/testutil"
 )
 
 func TestRepairDatesAlwaysProxiesThroughDaemonCLIRunner(t *testing.T) {
@@ -66,12 +66,11 @@ func TestRunRepairDatesLocalDryRunApplyAndIdempotency(t *testing.T) {
 	_ = testCtx
 	t.Cleanup(func() { cfg = savedCfg })
 
-	st, err := store.OpenForTest(cfg.DatabaseDSN())
-	require.NoError(err)
-	require.NoError(st.InitSchema())
+	st := testutil.NewSQLiteTestStoreAt(t, cfg.DatabaseDSN())
 	source, err := st.GetOrCreateSource("gmail", "archive@example.com")
 	require.NoError(err)
 	conversationID, err := st.EnsureConversation(
+		t.Context(),
 		source.ID,
 		"date-repair-thread",
 		"Date repair",
@@ -183,7 +182,7 @@ func TestRunRepairDatesLocalDryRunApplyAndIdempotency(t *testing.T) {
 	assert.Equal(fallbackMessageID, ledger.Repairs[1].MessageID)
 	assert.Equal("source-fallback", string(ledger.Repairs[1].Source))
 
-	st, err = store.OpenForTest(cfg.DatabaseDSN())
+	st, err = store.OpenForTest(t.Context(), cfg.DatabaseDSN())
 	require.NoError(err)
 	pending, err := st.ListActivityProjectionQueueContext(testCtx, 10)
 	require.NoError(err)
@@ -224,12 +223,11 @@ func TestRunRepairDatesLocalReportsUnresolvedReasons(t *testing.T) {
 	_ = testCtx
 	t.Cleanup(func() { cfg = savedCfg })
 
-	st, err := store.OpenForTest(cfg.DatabaseDSN())
-	require.NoError(err)
-	require.NoError(st.InitSchema())
+	st := testutil.NewSQLiteTestStoreAt(t, cfg.DatabaseDSN())
 	source, err := st.GetOrCreateSource("apple-mail", "archive@example.com")
 	require.NoError(err)
 	conversationID, err := st.EnsureConversation(
+		t.Context(),
 		source.ID,
 		"unresolved-date-thread",
 		"Unresolved dates",
@@ -311,13 +309,11 @@ func TestApplyPlannedDateRepairsRecordsGuardFailure(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
 	dataDir := t.TempDir()
-	st, err := store.OpenForTest(filepath.Join(dataDir, "msgvault.db"))
-	require.NoError(err)
-	t.Cleanup(func() { _ = st.Close() })
-	require.NoError(st.InitSchema())
+	st := testutil.NewSQLiteTestStoreAt(t, filepath.Join(dataDir, "msgvault.db"))
 	source, err := st.GetOrCreateSource("gmail", "archive@example.com")
 	require.NoError(err)
 	conversationID, err := st.EnsureConversation(
+		t.Context(),
 		source.ID,
 		"guarded-date-repair",
 		"Guarded date repair",
@@ -352,7 +348,7 @@ func TestApplyPlannedDateRepairsRecordsGuardFailure(t *testing.T) {
 	require.NoError(writeDateRepairLedger(ledgerPath, ledger))
 
 	err = applyPlannedDateRepairs(
-		context.Background(),
+		t.Context(),
 		st,
 		plan,
 		lowerBound,
@@ -362,7 +358,8 @@ func TestApplyPlannedDateRepairsRecordsGuardFailure(t *testing.T) {
 	)
 	require.ErrorContains(err, "changed after date repair planning")
 	var persistedSentAt time.Time
-	require.NoError(st.DB().QueryRow(
+	require.NoError(st.DB().QueryRowContext(
+		t.Context(),
 		st.Rebind("SELECT sent_at FROM messages WHERE id = ?"),
 		messageID,
 	).Scan(&persistedSentAt))
@@ -420,12 +417,11 @@ func TestRunRepairDatesLocalInvalidatesAndUnlocksCacheWhenApplyFails(t *testing.
 	_ = testCtx
 	t.Cleanup(func() { cfg = savedCfg })
 
-	st, err := store.OpenForTest(cfg.DatabaseDSN())
-	require.NoError(err)
-	require.NoError(st.InitSchema())
+	st := testutil.NewSQLiteTestStoreAt(t, cfg.DatabaseDSN())
 	source, err := st.GetOrCreateSource("gmail", "archive@example.com")
 	require.NoError(err)
 	conversationID, err := st.EnsureConversation(
+		t.Context(),
 		source.ID,
 		"failed-date-repair",
 		"Failed date repair",
@@ -446,7 +442,7 @@ func TestRunRepairDatesLocalInvalidatesAndUnlocksCacheWhenApplyFails(t *testing.
 		},
 	})
 	require.NoError(err)
-	_, err = st.DB().Exec(`
+	_, err = st.DB().ExecContext(t.Context(), `
 		CREATE TRIGGER reject_date_repair
 		BEFORE UPDATE OF sent_at ON messages
 		BEGIN
@@ -473,11 +469,11 @@ func TestRunRepairDatesLocalInvalidatesAndUnlocksCacheWhenApplyFails(t *testing.
 	_, statErr := os.Stat(statePath)
 	require.ErrorIs(statErr, os.ErrNotExist)
 
-	cacheLock, err := cacheBuildFileLock(cfg.AnalyticsDir())
+	cacheLock, err := cacheBuilderFileLock(cfg.AnalyticsDir())
 	require.NoError(err)
 	locked, err := cacheLock.TryLock()
 	require.NoError(err)
-	require.True(locked, "date repair must release the cache lock on failure")
+	require.True(locked, "date repair must release the builder lock on failure")
 	require.NoError(cacheLock.Unlock())
 }
 
@@ -496,12 +492,11 @@ func TestRunRepairDatesLocalReportsCommittedRepairWhenContactInvalidationFails(t
 	_ = testCtx
 	t.Cleanup(func() { cfg = savedCfg })
 
-	st, err := store.OpenForTest(cfg.DatabaseDSN())
-	require.NoError(err)
-	require.NoError(st.InitSchema())
+	st := testutil.NewSQLiteTestStoreAt(t, cfg.DatabaseDSN())
 	source, err := st.GetOrCreateSource("gmail", "archive@example.com")
 	require.NoError(err)
 	conversationID, err := st.EnsureConversation(
+		t.Context(),
 		source.ID, "invalidation-failure", "Invalidation failure")
 	require.NoError(err)
 	repairedAt := time.Date(2015, 5, 5, 12, 0, 0, 0, time.UTC)
@@ -524,7 +519,7 @@ func TestRunRepairDatesLocalReportsCommittedRepairWhenContactInvalidationFails(t
 	require.NoError(err)
 	require.True(created)
 	prepareDateRepairContactState(t, st, person.ID)
-	_, err = st.DB().Exec(`
+	_, err = st.DB().ExecContext(t.Context(), `
 		CREATE TRIGGER reject_contact_invalidation
 		BEFORE UPDATE OF dirty_at ON person_contact_state
 		BEGIN
@@ -548,7 +543,7 @@ func TestRunRepairDatesLocalReportsCommittedRepairWhenContactInvalidationFails(t
 	require.ErrorContains(err, "synthetic contact invalidation failure")
 	assert.Equal(repairedAt, readMessageSentAt(t, cfg.DatabaseDSN(), messageID),
 		"the repair committed before invalidation failed")
-	st, err = store.OpenForTest(cfg.DatabaseDSN())
+	st, err = store.OpenForTest(t.Context(), cfg.DatabaseDSN())
 	require.NoError(err)
 	pending, err := st.ListActivityProjectionQueueContext(testCtx, 10)
 	require.NoError(err)
@@ -596,11 +591,12 @@ func projectDateRepairActivity(t *testing.T, st *store.Store) {
 
 func readMessageSentAt(t *testing.T, dsn string, messageID int64) time.Time {
 	t.Helper()
-	st, err := store.OpenForTest(dsn)
+	st, err := store.OpenForTest(t.Context(), dsn)
 	require.NoError(t, err)
 	defer func() { require.NoError(t, st.Close()) }()
 	var sentAt time.Time
-	require.NoError(t, st.DB().QueryRow(
+	require.NoError(t, st.DB().QueryRowContext(
+		t.Context(),
 		st.Rebind("SELECT sent_at FROM messages WHERE id = ?"),
 		messageID,
 	).Scan(&sentAt))
@@ -609,11 +605,12 @@ func readMessageSentAt(t *testing.T, dsn string, messageID int64) time.Time {
 
 func readContactDirtyAt(t *testing.T, dsn string, personID int64) sql.NullTime {
 	t.Helper()
-	st, err := store.OpenForTest(dsn)
+	st, err := store.OpenForTest(t.Context(), dsn)
 	require.NoError(t, err)
 	defer func() { require.NoError(t, st.Close()) }()
 	var dirty sql.NullTime
-	require.NoError(t, st.DB().QueryRow(
+	require.NoError(t, st.DB().QueryRowContext(
+		t.Context(),
 		st.Rebind("SELECT dirty_at FROM person_contact_state WHERE person_id = ?"),
 		personID,
 	).Scan(&dirty))
